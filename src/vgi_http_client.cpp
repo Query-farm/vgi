@@ -275,11 +275,11 @@ static std::vector<std::string> CollectSetCookieHeaders(const RpcHttpResponse &r
 // and a failure with the flag set is still the interrupt, not a transport fault.
 // A response that completed normally is kept: the scan loop reports the
 // interrupt at its next check, and the stream token stays in step meanwhile.
-static bool IsInterruptedRequest(const std::atomic<bool> *cancellation, const HTTPResponse *response) {
-	if (!cancellation || !cancellation->load()) {
+static bool IsInterruptedRequest(ClientContext *cancellation, const HTTPResponse *response) {
+	if (!cancellation || !cancellation->IsInterrupted()) {
 		return false;
 	}
-	return !response || response->IsCancelled() || response->HasRequestError();
+	return !response || response->HasRequestError();
 }
 
 // Forward declarations — defined below with the capability-header parsing.
@@ -308,7 +308,7 @@ static std::string HttpPostArrowIpcInternal(
     bool allow_codec_retry = true, duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                                              ServerCapabilities *harvested_caps = nullptr,
                                              const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
-                                             const std::atomic<bool> *cancellation = nullptr) {
+                                             ClientContext *cancellation = nullptr) {
 	const bool is_httpi = IsHttpiTransport(url);
 	const uint64_t timeout_seconds = GetHttpTimeoutSeconds(context);
 	const int64_t accepted_max_response_bytes = GetAcceptedMaxResponseBytes(context);
@@ -412,7 +412,7 @@ static std::string HttpPostArrowIpcInternal(
 	post.try_request = true;
 		// Per request, never on the cached params: those are shared by every
 		// query against this ATTACH.
-		post.cancellation = cancellation;
+		if (cancellation) { throw NotImplementedException("VGI DuckDB 2 invocation profile does not support cancellable HTTP or external-location transfers"); }
 	if (client_holder) {
 			out_response->native = http_util.Request(post, *client_holder);
 	} else {
@@ -738,7 +738,7 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
                               const std::shared_ptr<HTTPParams> &cached_http_params,
                              duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *harvested_caps,
                              const std::shared_ptr<IrohClientConfig> &iroh_config,
-                             const std::atomic<bool> *cancellation) {
+                             ClientContext *cancellation) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -905,7 +905,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 // External Location Support
 // ============================================================================
 
-std::string HttpGetBytes(ClientContext &context, const std::string &url, const std::atomic<bool> *cancellation) {
+std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientContext *cancellation) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 	auto params = http_util.InitializeParameters(context, url);
@@ -927,7 +927,7 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, const s
 	};
 
 	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
-	get.cancellation = cancellation;
+	if (cancellation) { throw NotImplementedException("VGI DuckDB 2 invocation profile does not support cancellable HTTP or external-location transfers"); }
 	auto response = http_util.Request(get);
 	if (IsInterruptedRequest(cancellation, response.get())) {
 		throw InterruptException();
@@ -954,7 +954,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
                                             const std::string &worker_path, const std::string &invocation_id_hex,
                                              const std::string &attach_opaque_data_hex,
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata,
-                                             const std::atomic<bool> *cancellation) {
+                                             ClientContext *cancellation) {
 	if (IsHttpiTransport(location_url)) {
 		throw IOException("VGI external locations over httpi:// are unsupported; the worker must return an "
 		                  "https:// pre-signed URL [url: %s]",

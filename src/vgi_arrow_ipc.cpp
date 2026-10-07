@@ -12,6 +12,8 @@
 
 #if VGI_POSIX_TRANSPORT
 #include <sys/select.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #elif defined(_WIN32)
 #include <io.h> // _read, _write
@@ -51,6 +53,44 @@ namespace vgi {
 // costs, never how many bytes move. 1 GiB is far below every platform limit
 // and keeps the extra syscalls negligible (one per GiB).
 static constexpr int64_t kMaxIoChunkBytes = 1LL << 30; // 1 GiB
+
+#if VGI_POSIX_TRANSPORT && defined(VGI_DUCKDB2_INVOCATION_PROFILE)
+namespace {
+// Operation-local borrowed descriptor. Each leased worker has one caller; restore
+// its original flags before the lease can return to the pool.
+class InvocationIO {
+public:
+ explicit InvocationIO(int fd) : fd(fd), flags(fcntl(fd, F_GETFL)), last_progress(std::chrono::steady_clock::now()) {
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+   throw IOException("VGI invocation profile cannot configure nonblocking I/O: %s", strerror(errno));
+  }
+ }
+ ~InvocationIO() { fcntl(fd, F_SETFL, flags); }
+ arrow::Status Wait(short events, ClientContext *context) {
+  while (true) {
+   if (context && context->IsInterrupted()) return arrow::Status::IOError("VGI operation interrupted (query cancelled)");
+   if (std::chrono::steady_clock::now() - last_progress >= std::chrono::seconds(30)) {
+    return arrow::Status::IOError("VGI invocation profile idle I/O timeout after 30 seconds");
+   }
+   pollfd descriptor {fd, events, 0};
+   auto result = poll(&descriptor, 1, 100);
+   if (result < 0) {
+    if (errno == EINTR) continue;
+    return arrow::Status::IOError("VGI invocation I/O poll failed: ", strerror(errno));
+   }
+   if (result == 0) continue;
+   if (descriptor.revents & POLLNVAL) return arrow::Status::IOError("VGI invocation I/O descriptor is invalid");
+   return arrow::Status::OK(); // read/write reports EOF, EPIPE, and transport errors.
+  }
+ }
+ void Progress() { last_progress = std::chrono::steady_clock::now(); }
+private:
+ int fd;
+ int flags;
+ std::chrono::steady_clock::time_point last_progress;
+};
+} // namespace
+#endif
 
 // ============================================================================
 // Protocol State Metadata
@@ -265,18 +305,28 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 	// Pipes may return partial reads, so we must loop.
 	uint8_t *buffer = static_cast<uint8_t *>(out);
 	int64_t total_bytes_read = 0;
+#if VGI_POSIX_TRANSPORT && defined(VGI_DUCKDB2_INVOCATION_PROFILE)
+	InvocationIO io(fd_);
+#endif
 
 	while (total_bytes_read < nbytes) {
 		// Clamped per-syscall count; see kMaxIoChunkBytes.
 		const int64_t chunk = std::min<int64_t>(nbytes - total_bytes_read, kMaxIoChunkBytes);
 #if VGI_POSIX_TRANSPORT
+		#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+		ARROW_RETURN_NOT_OK(io.Wait(POLLIN, context_));
+#endif
 		ssize_t bytes_read = read(fd_, buffer + total_bytes_read, static_cast<size_t>(chunk));
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+		if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+		if (bytes_read > 0) io.Progress();
+#endif
 #else
 		// Windows: overlapped ReadFile so the engine thread blocks at 0% CPU and
 		// wakes the instant bytes arrive (poll()-equivalent), instead of
 		// busy-spinning and stealing a core from the worker. A non-overlapped
 		// handle (e.g. a socket) completes synchronously and we use that result.
-		// Cancellation: re-check context->interrupted every 250ms.
+		// Cancellation: re-check context->IsInterrupted() every 250ms.
 		int bytes_read;
 		{
 			DWORD want = static_cast<DWORD>(chunk);
@@ -313,7 +363,7 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 							break;
 						}
 						if (w == WAIT_TIMEOUT) {
-							if (context_ && context_->interrupted) {
+							if (context_ && context_->IsInterrupted()) {
 								::CancelIoEx(h, &ov);
 								cancelled = true;
 								break;
@@ -372,7 +422,7 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes
 }
 
 // FdOutputStream implementation
-FdOutputStream::FdOutputStream(int fd) : fd_(fd), position_(0), is_open_(true) {
+FdOutputStream::FdOutputStream(int fd, ClientContext *context) : fd_(fd), position_(0), is_open_(true), context_(context) {
 }
 
 arrow::Status FdOutputStream::Close() {
@@ -396,7 +446,21 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 	const uint8_t *bytes = static_cast<const uint8_t *>(data);
 	int64_t total_written = 0;
 
-#if VGI_POSIX_TRANSPORT
+#if VGI_POSIX_TRANSPORT && defined(VGI_DUCKDB2_INVOCATION_PROFILE)
+	InvocationIO io(fd_);
+	while (total_written < nbytes) {
+		ARROW_RETURN_NOT_OK(io.Wait(POLLOUT, context_));
+		const auto chunk = std::min<int64_t>(nbytes - total_written, 65536);
+		auto written = write(fd_, bytes + total_written, static_cast<size_t>(chunk));
+		if (written < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+			return arrow::Status::IOError("VGI invocation write failed: ", strerror(errno));
+		}
+		if (written == 0) return arrow::Status::IOError("VGI invocation write made no progress");
+		io.Progress();
+		total_written += written;
+	}
+#elif VGI_POSIX_TRANSPORT
 	// Bound: an unresponsive worker that fills its kernel pipe buffer
 	// would otherwise block write() forever. 60s is well above any
 	// realistic RPC payload write time on a healthy worker. Mirrors the

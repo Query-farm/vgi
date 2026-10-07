@@ -126,7 +126,7 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 				continue;
 			}
 			const auto previous_score = best.score;
-			const std::string previous_name = best.HasMatch() ? best.GetSecret().GetName() : std::string();
+			const std::string previous_name = best.HasMatch() ? best.GetSecret().GetName().GetIdentifierName() : std::string();
 			SecretEntry entry = MakeEntry(kv.second.secret->Clone(), GetName());
 			best = SelectBestMatch(entry, path, tie_break_offset, best);
 			if (best.HasMatch() &&
@@ -354,7 +354,7 @@ VgiRemoteSecretStorage::Synthesize(ClientContext &context, const string &type, c
 	std::string secret_name = name.empty() ? ("vgi_orchard_" + type) : name;
 	std::string secret_provider = provider.empty() ? std::string("orchard") : provider;
 
-	auto secret = make_uniq<KeyValueSecret>(prefix_paths, type, secret_provider, secret_name);
+	auto secret = make_uniq<KeyValueSecret>(prefix_paths, Identifier(type), Identifier(secret_provider), Identifier(secret_name));
 
 	// Convert the one-row values RecordBatch → DuckDB DataChunk via the Arrow→DuckDB
 	// bridge, then read each column's row-0 cell as a fully-typed Value (string,
@@ -388,12 +388,12 @@ VgiRemoteSecretStorage::Synthesize(ClientContext &context, const string &type, c
 		values_chunk.Verify();
 
 		for (idx_t col_idx = 0; col_idx < col_names.size(); col_idx++) {
-			secret->secret_map[col_names[col_idx]] = values_chunk.GetValue(col_idx, 0);
+			secret->secret_map[Identifier(col_names[col_idx])] = values_chunk.GetValue(col_idx, 0);
 		}
 	}
 
 	for (const auto &rk : redact_keys) {
-		secret->redact_keys.insert(rk);
+		secret->redact_keys.insert(Identifier(rk));
 	}
 	return std::move(secret);
 }
@@ -433,7 +433,7 @@ unique_ptr<SecretEntry> VgiRemoteSecretStorage::StoreSecret(unique_ptr<const Bas
 	    GetName());
 }
 
-void VgiRemoteSecretStorage::DropSecretByName(const string &name, OnEntryNotFound on_entry_not_found,
+void VgiRemoteSecretStorage::DropSecretByName(const Identifier &name, OnEntryNotFound on_entry_not_found,
                                               optional_ptr<CatalogTransaction> transaction) {
 	// No-op: nothing user-droppable lives here. Must not throw — DROP SECRET and
 	// ambiguity scans call this on every storage.

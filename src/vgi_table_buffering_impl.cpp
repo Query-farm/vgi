@@ -711,7 +711,7 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 				// the init runner is blocked (slow worker spawn, OAuth
 				// refresh, etc.) doesn't leave peers hung indefinitely.
 				while (!gstate.init_done.load(std::memory_order_acquire) && !gstate.init_failed) {
-					if (context.client.interrupted) {
+					if (context.client.IsInterrupted()) {
 						throw IOException("table_buffering init wait interrupted (query cancelled)");
 					}
 					gstate.init_cv.wait_for(lk, std::chrono::milliseconds(250));

@@ -24,7 +24,9 @@ TableFunction MakeVgiCopyFromTableFunction() {
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 	func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
+#endif
 	func.statistics = vgi::VgiTableFunctionStatistics;
 	// COPY FROM always projects all target columns (identity), so no projection
 	// pushdown is needed; leave projection_pushdown at its default (false).

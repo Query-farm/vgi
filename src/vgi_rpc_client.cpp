@@ -333,18 +333,18 @@ void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
 void WriteRpcRequest(int fd, const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
                      const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata,
-                     const VgiProtocolId &protocol) {
-	WriteRpcRequest(std::make_shared<FdOutputStream>(fd), method_name, params_batch, extra_metadata, protocol);
+                     const VgiProtocolId &protocol, ClientContext *context) {
+	WriteRpcRequest(std::make_shared<FdOutputStream>(fd, context), method_name, params_batch, extra_metadata, protocol);
 }
 
-void WriteEmptyRpcRequest(int fd, const std::string &method_name, const VgiProtocolId &protocol) {
+void WriteEmptyRpcRequest(int fd, const std::string &method_name, const VgiProtocolId &protocol, ClientContext *context) {
 	// Create an empty schema with zero fields
 	auto schema = arrow::schema({});
 
 	// Create a 1-row batch with zero columns
 	auto batch = arrow::RecordBatch::Make(schema, 1, std::vector<std::shared_ptr<arrow::Array>> {});
 
-	WriteRpcRequest(fd, method_name, batch, /*extra_metadata=*/nullptr, protocol);
+	WriteRpcRequest(fd, method_name, batch, /*extra_metadata=*/nullptr, protocol, context);
 }
 
 // ============================================================================

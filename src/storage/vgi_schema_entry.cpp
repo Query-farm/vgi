@@ -110,33 +110,33 @@ std::vector<T> LogSeedDecode(ClientContext &context, const std::string &schema, 
 std::vector<vgi::VgiTableInfo> VgiSchemaEntry::TakeTables(const vgi::CatalogRpcContext &rpc_ctx,
                                                           ClientContext &context) {
 	if (auto seed = ClaimSeed("table")) {
-		return LogSeedDecode(context, name, "table", vgi::DecodeContentsTables(*seed, context));
+		return LogSeedDecode(context, name.GetIdentifierName(), "table", vgi::DecodeContentsTables(*seed, context));
 	}
-	return vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, name, context);
+	return vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, name.GetIdentifierName(), context);
 }
 
 std::vector<vgi::VgiViewInfo> VgiSchemaEntry::TakeViews(const vgi::CatalogRpcContext &rpc_ctx,
                                                         ClientContext &context) {
 	if (auto seed = ClaimSeed("view")) {
-		return LogSeedDecode(context, name, "view", vgi::DecodeContentsViews(*seed));
+		return LogSeedDecode(context, name.GetIdentifierName(), "view", vgi::DecodeContentsViews(*seed));
 	}
-	return vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, name, context);
+	return vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, name.GetIdentifierName(), context);
 }
 
 std::vector<vgi::VgiFunctionInfo> VgiSchemaEntry::FetchFunctions(const vgi::CatalogRpcContext &rpc_ctx,
                                                                  const char *rpc_type, ClientContext &context) {
 	if (auto seed = ClaimSeed(rpc_type)) {
-		return LogSeedDecode(context, name, rpc_type, vgi::DecodeContentsFunctions(*seed, rpc_type));
+		return LogSeedDecode(context, name.GetIdentifierName(), rpc_type, vgi::DecodeContentsFunctions(*seed, rpc_type));
 	}
-	return vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name, rpc_type, context);
+	return vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name.GetIdentifierName(), rpc_type, context);
 }
 
 std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::FetchMacros(const vgi::CatalogRpcContext &rpc_ctx,
                                                            const char *rpc_type, ClientContext &context) {
 	if (auto seed = ClaimSeed(rpc_type)) {
-		return LogSeedDecode(context, name, rpc_type, vgi::DecodeContentsMacros(*seed, rpc_type));
+		return LogSeedDecode(context, name.GetIdentifierName(), rpc_type, vgi::DecodeContentsMacros(*seed, rpc_type));
 	}
-	return vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, rpc_type, context);
+	return vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name.GetIdentifierName(), rpc_type, context);
 }
 
 std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::GetMacroInventory(const vgi::CatalogRpcContext &rpc_ctx,
@@ -255,6 +255,10 @@ void DeferDrop(Catalog &catalog, unique_ptr<CatalogEntry> entry) {
 } // namespace
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
 		throw BinderException("Cannot CREATE TABLE in read-only VGI catalog '%s'", catalog.GetName());
@@ -361,6 +365,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 		DeferDrop(catalog, views_.HarvestEntries());
 	}
 	return tables_.GetEntry(context, create_info.table);
+
+#endif
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
@@ -373,6 +379,10 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateIndex(CatalogTransaction transa
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
 		throw BinderException("Cannot CREATE VIEW in read-only VGI catalog '%s'", catalog.GetName());
@@ -403,6 +413,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	// emptiness so the next view lookup doesn't get short-circuited.
 	views_.MarkPopulatedLocked();
 	return nullptr;
+
+#endif
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateSequence(CatalogTransaction transaction, CreateSequenceInfo &info) {
@@ -433,6 +445,10 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateType(CatalogTransaction transac
 }
 
 void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
 		throw BinderException("Cannot alter objects in read-only VGI catalog '%s'", catalog.GetName());
@@ -585,6 +601,8 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	default:
 		break;
 	}
+
+#endif
 }
 
 void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
@@ -636,6 +654,10 @@ void VgiSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntr
 }
 
 void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
 		throw BinderException("DROP %s is not supported for VGI catalogs", EnumUtil::ToString(info.type));
 	}
@@ -671,6 +693,8 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	// Views referencing the dropped table are now stale; clear to force re-fetch.
 	// With cascade, the worker may have also dropped dependent views.
 	DeferDrop(catalog, views_.HarvestEntries());
+
+#endif
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transaction,

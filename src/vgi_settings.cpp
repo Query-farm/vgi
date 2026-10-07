@@ -54,6 +54,11 @@ LogicalType Type(Kind kind) {
 }
 
 void Validate(const Definition &d, Value &value) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	if (std::string(d.name) == "vgi_async_prefetch" && !value.IsNull() && value.GetValue<bool>()) {
+		throw NotImplementedException("VGI DuckDB 2 invocation profile does not support async prefetch");
+	}
+#endif
 	if (value.IsNull()) {
 		throw InvalidInputException("%s must not be NULL", d.name);
 	}

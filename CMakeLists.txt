@@ -275,11 +275,16 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+option(VGI_DUCKDB2_INVOCATION_PROFILE "Build the isolated read-only DuckDB 2.0 invocation interoperability profile" ON)
+if(VGI_DUCKDB2_INVOCATION_PROFILE)
+  add_compile_definitions(VGI_DUCKDB2_INVOCATION_PROFILE=1 VGI_ASYNC_INIT_ENABLED=0)
+endif()
+
 include_directories(src/include)
-include_directories(duckdb/third_party/mbedtls/include)
-include_directories(duckdb/third_party/httplib)
-include_directories(duckdb/third_party/zstd/include)
-include_directories(duckdb/third_party/miniz)
+include_directories(${CMAKE_SOURCE_DIR}/third_party/mbedtls/include)
+include_directories(${CMAKE_SOURCE_DIR}/third_party/httplib)
+include_directories(${CMAKE_SOURCE_DIR}/third_party/zstd/include)
+include_directories(${CMAKE_SOURCE_DIR}/third_party/miniz)
 
 set(EXTENSION_SOURCES
 src/vgi_extension.cpp
@@ -387,12 +392,43 @@ if(EMSCRIPTEN)
     src/vgi_sab_stream.cpp)
 endif()
 
-build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
-build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+if(VGI_DUCKDB2_INVOCATION_PROFILE)
+  list(REMOVE_ITEM EXTENSION_SOURCES
+    src/vgi_streaming_window_operator.cpp
+    src/vgi_lateral_batch_operator.cpp
+    src/vgi_multi_scan_rewriter.cpp
+    src/vgi_table_buffering_builders.cpp
+    src/vgi_table_buffering_impl.cpp
+    src/vgi_scalar_function_impl.cpp
+    src/vgi_aggregate_function_impl.cpp
+    src/vgi_aggregate_streaming_impl.cpp
+    src/vgi_aggregate_window_impl.cpp
+    src/vgi_catalogs.cpp
+    src/vgi_table_branches_function.cpp
+    src/vgi_function_arguments_function.cpp
+    src/vgi_copy_from_impl.cpp
+    src/vgi_copy_to_impl.cpp
+    src/vgi_worker_pool_functions.cpp
+    src/vgi_result_cache_functions.cpp
+    src/vgi_worker_package_functions.cpp
+    src/vgi_github_functions.cpp
+    src/vgi_table_statistics_function.cpp
+    src/vgi_clear_cache.cpp
+    src/vgi_catalog_contents_function.cpp
+    src/storage/vgi_physical_write.cpp)
+endif()
+
+build_extension_library(${TARGET_NAME} ${EXTENSION_SOURCES})
+get_target_property(VGI_ARCHIVE_INTERFACE ${EXTENSION_NAME} INTERFACE_LINK_LIBRARIES)
+list(REMOVE_ITEM VGI_ARCHIVE_INTERFACE duckdb_static)
+set_property(TARGET ${EXTENSION_NAME} PROPERTY INTERFACE_LINK_LIBRARIES "${VGI_ARCHIVE_INTERFACE}")
+get_target_property(VGI_ARCHIVE_LINKS ${EXTENSION_NAME} LINK_LIBRARIES)
+list(REMOVE_ITEM VGI_ARCHIVE_LINKS duckdb_static)
+set_property(TARGET ${EXTENSION_NAME} PROPERTY LINK_LIBRARIES "${VGI_ARCHIVE_LINKS}")
 
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB} duckdb_mbedtls duckdb_yyjson duckdb_zstd)
 
 if(VGI_ENABLE_IROH)
   add_dependencies(${EXTENSION_NAME} vgi_iroh_rust)
@@ -625,4 +661,13 @@ if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS
     httpfs_extension
     duckdb_static
     dummy_static_extension_loader)
+endif()
+
+option(VGI_DUCKDB2_PROFILE_TESTS "Build isolated invocation transport tests" OFF)
+if(VGI_DUCKDB2_PROFILE_TESTS)
+  if(NOT VGI_DUCKDB2_INVOCATION_PROFILE OR WIN32 OR EMSCRIPTEN)
+    message(FATAL_ERROR "Invocation profile I/O tests require the POSIX profile")
+  endif()
+  add_executable(vgi_invocation_io_test test/duckdb2/invocation_io.cpp)
+  target_link_libraries(vgi_invocation_io_test PRIVATE ${EXTENSION_NAME} duckdb)
 endif()

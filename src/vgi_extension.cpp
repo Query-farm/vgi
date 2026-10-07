@@ -19,6 +19,7 @@
 #endif
 
 #include "duckdb.hpp"
+#include "duckdb/logging/log_manager.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
@@ -85,9 +86,15 @@
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_secret_storage.hpp"
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 #include "vgi_lateral_batch_operator.hpp"
+#endif
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 #include "vgi_streaming_window_operator.hpp"
+#endif
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 #include "vgi_table_buffering_impl.hpp"
+#endif
 #include "duckdb/planner/operator/logical_get.hpp"
 #ifndef __EMSCRIPTEN__
 #include "vgi_subprocess.hpp"
@@ -138,6 +145,7 @@ static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<S
 // All-or-nothing in v1: if any expression is ineligible, the whole node
 // stays a regular LogicalWindow. Mixed-eligibility splitting is a v2 task.
 
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 class VgiStreamingWindowOptimizer : public OptimizerExtension {
 public:
 	VgiStreamingWindowOptimizer() {
@@ -938,6 +946,8 @@ private:
 	}
 };
 
+#endif // VGI_DUCKDB2_INVOCATION_PROFILE
+
 // Storage extension for VGI — also holds per-secret-type redact keys
 class VgiStorageExtension : public StorageExtension {
 public:
@@ -1148,7 +1158,7 @@ public:
 	// attach_fn performs the real DatabaseManager::AttachDatabase and throws on
 	// failure (registry stays unchanged in that case — it propagates out).
 	CompanionOutcome AcquireCompanion(const std::string &alias, const std::string &target,
-	                                  const std::string &db_type, bool hidden, DatabaseManager &db_manager,
+	                                  const std::string &db_type, bool hidden, DatabaseManager &db_manager, ClientContext &context,
 	                                  const std::function<void()> &attach_fn, std::string &conflict_target_out) {
 		std::lock_guard<std::mutex> lock(companion_mutex_);
 		auto it = companion_catalogs_.find(alias);
@@ -1158,7 +1168,7 @@ public:
 				// If a user detached it out-of-band, the registry is stale; drop
 				// the stale record and fall through to a fresh attach so branches
 				// can still resolve it.
-				if (db_manager.GetDatabase(alias)) {
+				if (db_manager.GetDatabase(context, Identifier(alias))) {
 					it->second.refcount++;
 					return CompanionOutcome::SHARED;
 				}
@@ -1168,7 +1178,7 @@ public:
 				return CompanionOutcome::CONFLICT;
 			}
 		}
-		if (db_manager.GetDatabase(alias)) {
+		if (db_manager.GetDatabase(context, Identifier(alias))) {
 			conflict_target_out = "(existing non-companion catalog)";
 			return CompanionOutcome::CONFLICT;
 		}
@@ -1279,8 +1289,8 @@ static void InjectCompanionSecret(ClientContext &context, const std::string &sec
 	}
 	// Don't overwrite an option the worker set explicitly.
 	for (const auto &e : kv->secret_map) {
-		if (options.options.find(e.first) == options.options.end()) {
-			options.options[e.first] = e.second;
+		if (options.options.find(e.first.GetIdentifierName()) == options.options.end()) {
+			options.options[e.first.GetIdentifierName()] = e.second;
 		}
 	}
 }
@@ -1293,6 +1303,7 @@ static void InjectCompanionSecret(ClientContext &context, const std::string &sec
 // namespace. DuckDB keeps scalar / aggregate / table functions and macros in
 // ONE per-schema CatalogSet, so a lookup under any of those types surfaces the
 // others — possibly as a type-mismatch error, which is equally "taken".
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 static bool SystemFunctionNameTaken(ClientContext &context, Catalog &system_catalog, const std::string &name) {
 	static const CatalogType kFunctionTypes[] = {CatalogType::SCALAR_FUNCTION_ENTRY,
 	                                             CatalogType::AGGREGATE_FUNCTION_ENTRY,
@@ -1478,6 +1489,7 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 	}
 }
 
+#endif
 void ReleaseCompanionCatalogs(ClientContext &context, const std::vector<std::string> &aliases) {
 	if (aliases.empty()) {
 		return;
@@ -1493,7 +1505,7 @@ void ReleaseCompanionCatalogs(ClientContext &context, const std::vector<std::str
 		// (`USE companion; DETACH vgi_catalog`) — a rare edge case that must not
 		// abort the parent detach or leak the exception out of OnDetach.
 		try {
-			db_manager.DetachDatabase(context, alias, OnEntryNotFound::RETURN_NULL);
+			db_manager.DetachDatabase(context, Identifier(alias), OnEntryNotFound::RETURN_NULL);
 			VGI_LOG(context, "vgi.companion_detach", {{"alias", alias}});
 		} catch (const std::exception &e) {
 			VGI_LOG(context, "vgi.companion_detach.failed", {{"alias", alias}, {"error", e.what()}});
@@ -1514,12 +1526,12 @@ static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecr
 	auto vgi_ext = StorageExtension::Find(config, "vgi");
 	if (vgi_ext) {
 		auto &vgi_storage = static_cast<VgiStorageExtension &>(*vgi_ext);
-		secret->redact_keys = vgi_storage.GetRedactKeys(input.type);
+		for (const auto &key : vgi_storage.GetRedactKeys(input.type.GetIdentifierName())) { secret->redact_keys.insert(Identifier(key)); }
 	}
 
 	// Copy all user-provided options into the secret map
 	for (const auto &entry : input.options) {
-		secret->secret_map[entry.first] = entry.second;
+		secret->secret_map[Identifier(entry.first)] = entry.second;
 	}
 
 	return secret;
@@ -1531,7 +1543,7 @@ static unique_ptr<BaseSecret> IrohCreateSecret(ClientContext &, CreateSecretInpu
 	auto secret = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
 	secret->redact_keys.insert("secret_key");
 	for (const auto &entry : input.options) {
-		secret->secret_map[entry.first] = entry.second;
+		secret->secret_map[Identifier(entry.first)] = entry.second;
 	}
 	return secret;
 }
@@ -1587,7 +1599,7 @@ static ParsedContainerOptions ParseContainerLocationStruct(const Value &loc) {
 	auto &child_types = StructType::GetChildTypes(loc.type());
 	auto &children = StructValue::GetChildren(loc);
 	for (idx_t i = 0; i < children.size(); i++) {
-		auto key = StringUtil::Lower(child_types[i].first);
+		auto key = StringUtil::Lower(child_types[i].first.GetIdentifierName());
 		const Value &cv = children[i];
 		if (key == "image" || key == "location" || key == "path") {
 			out.image = cv.IsNull() ? "" : cv.ToString();
@@ -1632,6 +1644,9 @@ static ParsedContainerOptions ParseContainerLocationStruct(const Value &loc) {
 static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                             AttachedDatabase &db, const string &name, AttachInfo &info,
                                             AttachOptions &options) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	options.access_mode = AccessMode::READ_ONLY;
+#endif
 	string worker_path;
 	string catalog_name = info.path; // The first argument to ATTACH is the catalog name
 	bool worker_debug = false;
@@ -1908,6 +1923,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// detection / image inspection, database:// resolution, Iroh configuration,
 	// the discovery RPC). Checks the raw user LOCATION, before the rewrites below.
 	vgi::CheckLocationPolicy(context, worker_path, vgi::LocationEntryPoint::ATTACH);
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	if (vgi::IsHttpTransport(worker_path) || vgi::IsHttpiTransport(worker_path) || vgi::IsIrohTransport(worker_path)) {
+		throw NotImplementedException("VGI DuckDB 2 invocation profile supports synchronous subprocess/unix/tcp workers only");
+	}
+#endif
 
 	if (!tcp_proxy.empty() && !vgi::IsTcpTransport(worker_path)) {
 		throw BinderException("tcp_proxy is only valid for tcp:// LOCATIONs");
@@ -2150,6 +2170,12 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		cookie_jar = std::make_shared<vgi::SessionCookieJar>();
 	}
 
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	if (vgi::IsHttpTransport(worker_path) || vgi::IsHttpiTransport(worker_path) || vgi::IsIrohTransport(worker_path)) {
+		throw NotImplementedException("VGI DuckDB 2 invocation profile rejects resolved HTTP/Iroh worker transports");
+	}
+#endif
+
 	// Lifted from the InvokeCatalogAttach call below — these optionals must
 	// also flow into InvokeCatalogs so the discovery RPC primes the launcher
 	// cache with the user's overrides, not [defaults]. See InvokeCatalogs's
@@ -2207,7 +2233,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			// from the path basename) is left untouched.
 			auto &fs = FileSystem::GetFileSystem(context);
 			if (name == AttachedDatabase::ExtractDatabaseName(info.path, fs)) {
-				db.SetName(catalog_name);
+				db.SetName(Identifier(catalog_name));
 			}
 		}
 
@@ -2272,7 +2298,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 				Value casted;
 				std::string cast_error;
-				if (!opt.second.DefaultTryCastAs(matching_spec->type, casted, &cast_error)) {
+				auto cast_result = opt.second.DefaultTryCastAs(matching_spec->type, &cast_error);
+				if (!cast_result) {
 					if (matching_spec->secret) {
 						// The cast error quotes the value; a credential's must not surface.
 						throw BinderException("Cannot cast ATTACH option '%s' to declared type %s",
@@ -2281,6 +2308,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					throw BinderException("Cannot cast ATTACH option '%s' to declared type %s: %s",
 					                      matching_spec->name, matching_spec->type.ToString(), cast_error);
 				}
+				casted = std::move(*cast_result);
 				if (matching_spec->secret) {
 					secret_option_names.insert(opt.first);
 					key_options[opt.first] = hashed_key(opt.first, casted);
@@ -2327,10 +2355,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto &config = DBConfig::GetConfig(db.GetDatabase());
 
 	for (const auto &setting : attach_result.settings) {
-		if (config.HasExtensionOption(setting.name)) {
+		if (config.HasExtensionOption(Identifier(setting.name))) {
 			// Setting already exists - verify types match
 			ExtensionOption existing_option;
-			if (!config.TryGetExtensionOption(setting.name, existing_option)) {
+			if (!config.TryGetExtensionOption(Identifier(setting.name), existing_option)) {
 				throw BinderException("Failed to retrieve existing VGI setting '%s'", setting.name);
 			}
 			if (existing_option.type != setting.type) {
@@ -2341,7 +2369,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			// Types match - setting is already registered, no need to add again
 		} else {
 			// New setting - register it
-			config.AddExtensionOption(setting.name, setting.description, setting.type, setting.default_value);
+			config.AddExtensionOption(Identifier(setting.name), setting.description, setting.type, setting.default_value);
 		}
 	}
 
@@ -2366,7 +2394,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 		// Register the secret type with DuckDB
 		SecretType secret_type;
-		secret_type.name = st.name;
+		secret_type.name = Identifier(st.name);
 		secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
 		secret_type.default_provider = "config";
 		secret_type.extension = "vgi";
@@ -2391,7 +2419,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		create_func.provider = "config";
 		create_func.function = VgiCreateSecret;
 		for (const auto &param : st.parameters) {
-			create_func.named_parameters[param.name] = param.type;
+			create_func.named_parameters[Identifier(param.name)] = param.type;
 		}
 		secret_manager.RegisterSecretFunction(create_func, OnCreateConflict::IGNORE_ON_CONFLICT);
 	}
@@ -2578,6 +2606,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			// Old worker: advertises no COPY formats. Continue the ATTACH.
 		}
 
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+		if (!formats.empty()) {
+			throw NotImplementedException("VGI DuckDB 2 invocation profile does not support COPY formats");
+		}
+#else
 		if (!formats.empty()) {
 			auto *vgi_ext = VgiStorageExtension::Find(*context.db);
 			auto &system_catalog = Catalog::GetSystemCatalog(*context.db);
@@ -2660,6 +2693,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				vgi_ext->InsertCopyFormatLocked(registered_name, std::move(entry));
 			}
 		}
+#endif
 	}
 
 	// Publish the functions this catalog asked us to put into DuckDB's global
@@ -2675,7 +2709,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	//     re-resolves the live catalog (ResolveVgiGlobalBinding).
 	//   * `global_functions false` opts the catalog out entirely.
 	if (global_functions_enabled && attach_result_ptr && !attach_result_ptr->global_functions.empty()) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+		throw NotImplementedException("VGI DuckDB 2 invocation profile does not publish global functions; attach with global_functions false");
+#else
 		RegisterVgiGlobalFunctions(context, name, attach_params, *attach_result_ptr);
+#endif
 	}
 
 	// Capture the companion manifest before attach_result_ptr is moved into the
@@ -2719,6 +2757,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// catalog the VGI layer did not itself create). The secret provider was
 	// registered above, so a companion's credential lookups resolve through the
 	// Orchard catch-all automatically (see docs/companion_catalogs.md).
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	if (attach_companions_enabled && !companion_manifest.empty()) {
+		throw NotImplementedException("VGI DuckDB 2 invocation profile does not attach companion catalogs; attach with attach_companions false");
+	}
+#else
 	if (attach_companions_enabled && !companion_manifest.empty()) {
 		auto *vgi_ext = VgiStorageExtension::Find(*context.db);
 		if (vgi_ext) {
@@ -2765,7 +2808,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				VgiStorageExtension::CompanionOutcome outcome;
 				try {
 					outcome = vgi_ext->AcquireCompanion(
-					    c.alias, c.target, scheme, c.hidden, db_manager,
+					    c.alias, c.target, scheme, c.hidden, db_manager, context,
 					    [&]() {
 						    AttachInfo cinfo;
 						    cinfo.name = c.alias;
@@ -2820,6 +2863,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
+#endif
+
 	// Success path only — fire the attach telemetry event (async, fire-and-forget,
 	// honors QUERY_FARM_TELEMETRY_OPT_OUT; never throws).
 	tele.extension_version = VGI_EXTENSION_VERSION;
@@ -2848,6 +2893,7 @@ static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<S
 // vgi_oauth_logout() table function
 //===--------------------------------------------------------------------===//
 
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 struct OAuthLogoutBindData : public TableFunctionData {
 	std::string target_catalog; // empty = all catalogs
 	bool logout_all = false;
@@ -3462,6 +3508,7 @@ static void VgiGlobalFunctionsScan(ClientContext &context, TableFunctionInput &d
 	output.SetCardinality(count);
 }
 
+#endif
 static void LoadInternal(ExtensionLoader &loader) {
 #if defined(__EMSCRIPTEN__) && VGI_ASYNC_INIT_ENABLED
 	// Pre-spawn a bounded pool of background workers at extension load. Required
@@ -3535,6 +3582,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	iroh_secret_function.named_parameters["secret_key"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(std::move(iroh_secret_function));
 
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 	// -------------------------------------------------------------------------
 	// Register native GeoArrow Arrow extension types
 	// -------------------------------------------------------------------------
@@ -3601,14 +3649,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 		}
 	}
 
+#endif
 	// Built-in settings and their validation/defaults/docs share src/vgi_settings.json.
 	vgi::RegisterVgiSettings(config);
+
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 	vgi::RegisterVgiMultiScanRewriter(config);
 	OptimizerExtension::Register(config, VgiStreamingWindowOptimizer());
 	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
 	vgi::RegisterVgiLateralBatchRewriter(config);
 	OptimizerExtension::Register(config, VgiRequiredFiltersOptimizer());
+#endif
 
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
 
@@ -3789,6 +3842,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    {}, {}, {"SELECT * FROM vgi_oauth_identity();"}));
 		loader.RegisterFunction(std::move(identity_info));
 	}
+#endif
+
 }
 
 void VgiExtension::Load(ExtensionLoader &loader) {

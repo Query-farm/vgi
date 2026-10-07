@@ -37,7 +37,7 @@ public:
 		return "vgi";
 	}
 
-	std::string GetDefaultSchema() const override;
+	optional<Identifier> GetDefaultSchema() const override;
 
 	bool SupportsTimeTravel() const override {
 		return attach_result_ && attach_result_->supports_time_travel;

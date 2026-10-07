@@ -91,14 +91,15 @@ void VgiCatalog::Initialize(bool load_builtin) {
 	// Nothing to do - schemas are loaded lazily
 }
 
-std::string VgiCatalog::GetDefaultSchema() const {
-	if (attach_result_) {
-		return attach_result_->default_schema;
-	}
-	return "main";
+optional<Identifier> VgiCatalog::GetDefaultSchema() const {
+	return Identifier(attach_result_ ? attach_result_->default_schema : "main");
 }
 
 optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	if (access_mode_ == AccessMode::READ_ONLY) {
 		throw BinderException("Cannot CREATE SCHEMA in read-only VGI catalog '%s'", GetName());
 	}
@@ -119,6 +120,8 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 	// dangle.
 	ClearCache(/*force=*/false);
 	return nullptr;
+
+#endif
 }
 
 void VgiCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
@@ -146,15 +149,25 @@ optional_ptr<SchemaCatalogEntry> VgiCatalog::LookupSchema(CatalogTransaction tra
 
 PhysicalOperator &VgiCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                 LogicalCreateTable &op, PhysicalOperator &plan) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	// CREATE TABLE AS SELECT: create table at execution time (inside the transaction),
 	// then insert the SELECT results. Follows the Airport extension pattern.
 	auto &insert = planner.Make<VgiPhysicalInsert>(op, op.schema, std::move(op.info));
 	insert.children.push_back(plan);
 	return insert;
+
+#endif
 }
 
 PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                          optional_ptr<PhysicalOperator> plan) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	auto &table = op.table.Cast<VgiTableEntry>();
 	RequireWriteResultMode(table, "insert", op.return_chunk);
 	// Use DuckDB's built-in default resolution: insert a PhysicalProjection child
@@ -169,31 +182,49 @@ PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGen
 		insert.children.push_back(*plan);
 	}
 	return insert;
+
+#endif
 }
 
 PhysicalOperator &VgiCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                          PhysicalOperator &plan) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	auto &table = op.table.Cast<VgiTableEntry>();
 	RequireWriteResultMode(table, "delete", op.return_chunk);
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
 	auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, bound_ref.index);
 	del.children.push_back(plan);
 	return del;
+
+#endif
 }
 
 PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                          PhysicalOperator &plan) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	auto &table = op.table.Cast<VgiTableEntry>();
 	RequireWriteResultMode(table, "update", op.return_chunk);
 	auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk);
 	upd.children.push_back(plan);
 	return upd;
+
+#endif
 }
 
 // Helper: plan a single merge action using VGI physical operators
 static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &context, LogicalMergeInto &op,
                                                              PhysicalPlanGenerator &planner,
                                                              BoundMergeIntoAction &action) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	auto result = make_uniq<MergeIntoOperator>();
 	result->action_type = action.action_type;
 	result->condition = std::move(action.condition);
@@ -243,10 +274,16 @@ static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &conte
 		throw InternalException("Unsupported merge action");
 	}
 	return result;
+
+#endif
 }
 
 PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
                                              LogicalMergeInto &op, PhysicalOperator &plan) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	auto &table_for_returning = op.table.Cast<VgiTableEntry>();
 
 	// Refuse MERGE on multi-branch tables, regardless of which clauses the
@@ -298,6 +335,8 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 	                                               parallel, op.return_chunk);
 	result.children.push_back(plan);
 	return result;
+
+#endif
 }
 
 unique_ptr<LogicalOperator> VgiCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
@@ -595,6 +634,10 @@ std::optional<bool> VgiCatalog::RevalidateContents(ClientContext &context, const
 }
 
 void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile is read-only");
+#else
+
 	if (access_mode_ == AccessMode::READ_ONLY) {
 		throw BinderException("Cannot DROP SCHEMA in read-only VGI catalog '%s'", GetName());
 	}
@@ -613,6 +656,8 @@ void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	// Invalidate schema cache via the deferred path so any bound query
 	// holding a CatalogEntry* doesn't dangle.
 	ClearCache(/*force=*/false);
+
+#endif
 }
 
 } // namespace duckdb

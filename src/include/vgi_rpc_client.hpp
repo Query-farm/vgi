@@ -182,7 +182,7 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 void WriteRpcRequest(int fd, const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
                      const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr,
-                     const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL);
+                     const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL, ClientContext *context = nullptr);
 
 // Stream-based form used by transports that are not represented by an OS file
 // descriptor (notably native Iroh QUIC streams). The framing is byte-for-byte
@@ -196,7 +196,7 @@ void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
 // Write an RPC request with no parameters (zero-field schema, 1-row batch).
 // Used for parameterless methods like catalog_catalogs.
 void WriteEmptyRpcRequest(int fd, const std::string &method_name,
-                          const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL);
+                          const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL, ClientContext *context = nullptr);
 
 // ============================================================================
 // Response Reading

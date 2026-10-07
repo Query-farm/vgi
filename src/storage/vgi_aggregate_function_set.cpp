@@ -32,6 +32,10 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
                                                   const std::vector<vgi::VgiFunctionInfo> &overloads,
                                                   const VgiFunctionRegistrationTarget &target,
                                                   vector<FunctionDescription> &descriptions) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile supports table functions only");
+#else
+
 	AggregateFunctionSet func_set(registered_name);
 
 	for (const auto &func_info : overloads) {
@@ -169,6 +173,8 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 	}
 
 	return func_set;
+
+#endif
 }
 
 } // namespace vgi
@@ -190,7 +196,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::AGGREGATE_FUNCTION_ENTRY, context);
 
@@ -211,7 +217,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 	// empty and DispatchSchema() falls through to func_info.schema_name.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
-	target.catalog_name = catalog_.GetName();
+	target.catalog_name = catalog_.GetName().GetIdentifierName();
 	target.attach_params = attach_params;
 	target.attach_opaque_data = attach_result->attach_opaque_data;
 	target.setting_names = setting_names;
@@ -221,7 +227,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 		auto func_set = vgi::BuildVgiAggregateFunctionSet(context, pair.first, pair.second, target, descriptions);
 
 		CreateAggregateFunctionInfo info(func_set);
-		info.schema = schema_.name;
+		info.SetSchema(schema_.name);
 		info.internal = true;
 		info.descriptions = std::move(descriptions);
 

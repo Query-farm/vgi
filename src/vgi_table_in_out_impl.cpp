@@ -265,7 +265,9 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 		}
 		bind_data->single_row_scan = all_names_empty;
 	} else {
-		bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, input.input_table_names);
+		vector<string> input_names;
+		for (const auto &name : input.input_table_names) input_names.push_back(name.GetIdentifierName());
+		bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, input_names);
 	}
 
 	VGI_LOG(context, "table_in_out.bind",

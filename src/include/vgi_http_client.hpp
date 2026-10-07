@@ -152,13 +152,13 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                               ServerCapabilities *harvested_caps = nullptr,
                               const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
-                              const std::atomic<bool> *cancellation = nullptr);
+                              ClientContext *cancellation = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth
 // headers sent. cancellation: as for HttpPostArrowIpc.
 std::string HttpGetBytes(ClientContext &context, const std::string &url,
-                         const std::atomic<bool> *cancellation = nullptr);
+                         ClientContext *cancellation = nullptr);
 
 // Resolve an external location pointer batch by fetching and parsing the URL.
 // Returns the resolved data batch. Throws on redirect loops or fetch failures.
@@ -172,7 +172,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &invocation_id_hex = "",
                                              const std::string &attach_opaque_data_hex = "",
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata = nullptr,
-                                             const std::atomic<bool> *cancellation = nullptr);
+                                             ClientContext *cancellation = nullptr);
 
 // Check if a batch result is a pointer batch and resolve it if so.
 // Returns the original result if not a pointer batch, or the resolved result.

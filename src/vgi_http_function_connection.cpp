@@ -274,7 +274,7 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 	while (true) {
 		// A bundled response can hold many batches, each possibly an external
 		// location costing its own GET.
-		if (context_.interrupted) {
+		if (context_.IsInterrupted()) {
 			throw InterruptException();
 		}
 		auto read_result = reader->ReadNext();
@@ -303,7 +303,7 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
-			                                         bwm.custom_metadata, &context_.interrupted);
+			                                         bwm.custom_metadata, &context_);
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
 			buffered_partition_values_bytes_.push_back(
@@ -540,7 +540,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
 	                                        /*cookie_jar=*/nullptr, cached_params_init, &http_client_,
 	                                        &harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-	                                        &context_.interrupted);
+	                                        &context_);
 	PublishHarvestedCapabilities(harvested);
 #ifdef __EMSCRIPTEN__
 #endif
@@ -561,7 +561,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		if (loc_idx >= 0) {
 			auto location_url = header_result.header.metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, base_url_,
-			                                         "", "", header_result.header.metadata, &context_.interrupted);
+			                                         "", "", header_result.header.metadata, &context_);
 			header_result.header.header_batch = resolved.batch;
 			header_result.header.metadata = resolved.metadata;
 		}
@@ -758,6 +758,10 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
                                                     const std::vector<uint8_t> &execution_id,
                                                     const std::shared_ptr<arrow::RecordBatch> &input_batch,
                                                     std::optional<int64_t> batch_index) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not support buffered functions");
+#else
+
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id,
 	                                                          batch_bytes, attach_opaque_data_, batch_index);
@@ -779,12 +783,18 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
 	auto view = bin_array->GetView(0);
 	return std::vector<uint8_t>(view.data(), view.data() + view.size());
+
+#endif
 }
 
 std::vector<std::vector<uint8_t>>
 HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
                                                     const std::vector<uint8_t> &execution_id,
                                                     const std::vector<std::vector<uint8_t>> &state_ids) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not support buffered functions");
+#else
+
 	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids,
 	                                                          attach_opaque_data_);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
@@ -813,10 +823,16 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 		result.emplace_back(v.data(), v.data() + v.size());
 	}
 	return result;
+
+#endif
 }
 
 void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
                                                            const std::vector<uint8_t> &execution_id) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not support buffered functions");
+#else
+
 	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id,
 	                                                             attach_opaque_data_);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
@@ -831,6 +847,8 @@ void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &func
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_destructor", base_url_);
 	(void)inner;
+
+#endif
 }
 
 std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
@@ -863,7 +881,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		// Continuation: POST exchange with state token to get more data. The
 		// request itself is cancellable, but a fast worker answers each one before
 		// an interrupt lands mid-transfer, so check between them too.
-		if (context_.interrupted) {
+		if (context_.IsInterrupted()) {
 			throw InterruptException();
 		}
 		auto tick_schema = arrow::schema({});
@@ -887,7 +905,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
 		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_,
 		                                        &p_harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-		                                        &context_.interrupted);
+		                                        &context_);
 		PublishHarvestedCapabilities(p_harvested);
 
 		// Parse response — buffer new data batches (adopt the body, no copy)
@@ -965,7 +983,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
 	                                        /*cookie_jar=*/nullptr, x_cached_params, &http_client_,
 	                                        &x_harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-	                                        &context_.interrupted);
+	                                        &context_);
 	PublishHarvestedCapabilities(x_harvested);
 
 	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
@@ -1016,7 +1034,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
-			                                         bwm.custom_metadata, &context_.interrupted);
+			                                         bwm.custom_metadata, &context_);
 			if (!output_batch) {
 				output_batch = resolved.batch;
 			}

@@ -105,7 +105,7 @@ private:
 // NON-OWNING: Does not close the fd on destruction. The caller retains ownership.
 class FdOutputStream : public arrow::io::OutputStream {
 public:
-	explicit FdOutputStream(int fd);
+	explicit FdOutputStream(int fd, ClientContext *context = nullptr);
 	~FdOutputStream() override = default;
 
 	arrow::Status Close() override;
@@ -118,6 +118,7 @@ private:
 	int fd_;
 	int64_t position_;
 	bool is_open_;
+	ClientContext *context_;
 };
 
 // Extract string values from a result batch column

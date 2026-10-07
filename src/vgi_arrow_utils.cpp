@@ -26,7 +26,7 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
 	std::map<std::string, Value> settings;
 	for (const auto &name : setting_names) {
 		Value value;
-		if (context.TryGetCurrentSetting(name, value)) {
+		if (context.TryGetCurrentSetting(Identifier(name), value)) {
 			settings[name] = value;
 		}
 	}
@@ -143,7 +143,7 @@ void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow
 
 	// Populate the ColumnList
 	for (idx_t i = 0; i < types.size(); i++) {
-		columns.AddColumn(ColumnDefinition(names[i], types[i]));
+		columns.AddColumn(ColumnDefinition(Identifier(names[i]), types[i]));
 	}
 }
 
@@ -153,7 +153,7 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 
 	for (auto &col : columns.Logical()) {
 		types.push_back(col.GetType());
-		names.push_back(col.GetName());
+		names.push_back(col.GetName().GetIdentifierName());
 	}
 
 	return BuildArrowSchemaFromDuckDB(context, types, names);

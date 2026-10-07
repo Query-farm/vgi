@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
 #include "vgi_table_function_impl.hpp"
+#include "duckdb/execution/partition_info.hpp"
+#include "duckdb/function/partition_stats.hpp"
 #include "vgi_platform.hpp" // VGI_ASYNC_INIT_ENABLED
 #ifdef __EMSCRIPTEN__
 #include <pthread.h>
@@ -382,6 +384,19 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 // Expression Filter Pushdown Support
 // ============================================================================
 
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+bool VgiPushdownExpression(ClientContext &, const LogicalGet &, Expression &) { return false; }
+bool VgiContainsDynamicFilter(const TableFilter &) { return true; }
+SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
+                                      optional_ptr<TableFilterSet> filters, const vector<string> &column_names,
+                                      const string &worker_path, const string &rowid_column_name,
+                                      int64_t rowid_worker_col_index, const std::set<idx_t> *exclude_filter_keys,
+                                      VgiFilterColumnIndexDomain index_domain,
+                                      const std::vector<VgiFilterFunctionCapability> &additional_functions) {
+ if (filters && filters->HasFilters()) { throw NotImplementedException("VGI DuckDB 2 invocation profile does not accept pushed filters"); }
+ return {nullptr, {}};
+}
+#else
 namespace {
 
 bool HasFilterFunctionCapability(const std::vector<VgiFilterFunctionCapability> &capabilities,
@@ -1334,6 +1349,8 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	return {std::move(filter_bytes), std::move(join_keys_buffers)};
 }
 
+
+#endif
 // ============================================================================
 // VgiTableFunctionGlobalState::EnsureInitApplied
 // ============================================================================
@@ -1448,6 +1465,10 @@ static bool ResolvePartitionColumns(const VgiTableFunctionBindData &bind_data,
 //! `out`. Returns false for any range / NULL / AND / other shape (not enumerable). A
 //! TableFilterSet entry is per-column, so an OR here is `col=a OR col=b` on one column.
 static bool ExtractPartitionEqualityValues(const TableFilter &filter, std::vector<Value> &out) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+return false;
+#else
+
 	switch (filter.filter_type) {
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &cf = filter.Cast<ConstantFilter>();
@@ -1490,6 +1511,8 @@ static bool ExtractPartitionEqualityValues(const TableFilter &filter, std::vecto
 	default:
 		return false; // range / IS NULL / AND → not enumerable
 	}
+
+#endif
 }
 
 //! Classify the pushed filter for per-partition caching, filling the partition_* fields
@@ -1500,6 +1523,10 @@ static bool ExtractPartitionEqualityValues(const TableFilter &filter, std::vecto
 //! ANY partition column disables the whole per-partition layer (leaves it false).
 static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                                      TableFunctionInitInput &input, CacheEligibility &e) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+return;
+#else
+
 	if (bind_data.partition_kind != VgiPartitionKind::SingleValuePartitions) {
 		return;
 	}
@@ -1635,6 +1662,8 @@ static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunct
 	}
 	e.partition_enumerated_tuples = std::move(tuples);
 	e.partition_enumerable = true;
+
+#endif
 }
 
 //! The "p:"-prefixed input_hash discriminator for one partition-value tuple. Both the
@@ -1682,6 +1711,10 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
                                           const VgiTableFunctionBindData &bind_data,
                                           TableFunctionInitInput &input,
                                           const std::vector<int32_t> &projection_ids) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+CacheEligibility e; e.ineligible_reason = "duckdb2_invocation_profile"; return e;
+#else
+
 	CacheEligibility e;
 	// Global master switch.
 	Value master;
@@ -1836,6 +1869,8 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	ClassifyPartitionFilters(context, bind_data, input, e);
 	e.eligible = true;
 	return e;
+
+#endif
 }
 
 //! Log a result_cache.* event.
@@ -2336,6 +2371,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// Also traverse into ConjunctionAndFilter children, since DuckDB may combine
 	// a regular filter with an OptionalFilter(DynamicFilter) on the same column.
 	vector<VgiDynamicFilterInfo> dynamic_filters;
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 	if (input.filters) {
 		// Helper: try to capture a DynamicFilter from an OptionalFilter entry
 		auto try_capture_from_optional = [&](idx_t original_col_idx, const string &col_name,
@@ -2419,6 +2455,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			}
 		}
 	}
+#endif
+
 
 	if (!dynamic_filters.empty()) {
 		for (idx_t i = 0; i < dynamic_filters.size(); i++) {
@@ -2695,6 +2733,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// pthread-after-dlopen bug (#19425/#19199/#13303); flipping
 	// -DVGI_ASYNC_INIT_ENABLED=1 restores the async path.
 	auto applied = perform_init_with_retry(std::move(connection), acquired.from_pool);
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	if (applied.first.max_workers != 1) throw NotImplementedException("VGI DuckDB 2 invocation profile requires exactly one producer worker");
+#endif
 	global_state->global_execution_id = std::move(applied.first.execution_id);
 	global_state->max_processes = static_cast<idx_t>(applied.first.max_workers);
 	global_state->init_opaque_data = std::move(applied.first.opaque_data);
@@ -2934,6 +2975,10 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 
 std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
                                                               const vector<VgiDynamicFilterDeltaUpdate> &updates) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not support dynamic filters");
+#else
+
 	FilterSerializer serializer(worker_path, 0, /*allow_external_sets=*/false);
 	auto document = yyjson_mut_obj(serializer.GetDoc());
 	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "encoding", "vgi.filters.v2");
@@ -3026,6 +3071,8 @@ std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &con
 		throw IOException("Failed to finish dynamic filter delta: %s", finished.status().ToString());
 	}
 	return finished.ValueUnsafe();
+
+#endif
 }
 
 //! Update the TickFilterState with current DynamicFilter values.
@@ -3045,6 +3092,10 @@ std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &con
 //! connection has already sent is tracked per connection by `generation`.
 static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, ClientContext &context,
                                      const VgiTableFunctionBindData &bind_data) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+if (!global_state.dynamic_filters.empty()) throw NotImplementedException("VGI DuckDB 2 invocation profile does not support dynamic filters");
+#else
+
 	if (global_state.dynamic_filters.empty() || !global_state.tick_filter_state) {
 		return;
 	}
@@ -3122,6 +3173,8 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 		tick_state.encoded_filters.clear();
 		tick_state.has_filters = false;
 	}
+
+#endif
 }
 
 //! Per-DuckDB-pipeline cap on the batch_index space. Lives at
@@ -3873,7 +3926,7 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	while (true) {
 		// Empty batches and split claims loop here without returning to DuckDB,
 		// whose own interrupt check runs only between chunks.
-		if (context.interrupted) {
+		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
 		// Update dynamic filter state before each tick is sent
@@ -3956,7 +4009,7 @@ void VgiPrefetchTask::Execute() {
 			// ERROR slot, and a torn-down consumer never reads it. Either way
 			// this task returns now instead of after the next RPC — DuckDB
 			// waits for every executor task before an interrupted query ends.
-			if (context_.interrupted) {
+			if (context_.IsInterrupted()) {
 				throw InterruptException();
 			}
 			batch = slot_->connection->ReadDataBatch();
@@ -4061,7 +4114,11 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 	auto &local_state = input.local_state->Cast<VgiTableFunctionLocalState>();
 
 	// Determine whether async prefetch is enabled for this scan
+	#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	bool is_async = false;
+#else
 	bool is_async = (input.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR);
+#endif
 	if (is_async) {
 		Value async_val;
 		if (context.TryGetCurrentSetting("vgi_async_prefetch", async_val)) {
@@ -4270,6 +4327,7 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 // the user keys reflect whatever the user persisted up to that thread's
 // FinishSource (the *last* finisher will have the most complete view).
 
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctionDynamicToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	if (!input.bind_data || !input.global_state) {
@@ -4353,6 +4411,7 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 	}
 	return result;
 }
+#endif
 
 // ============================================================================
 // Virtual Column Callbacks for Row ID Support

@@ -72,12 +72,15 @@ struct VgiNativeDelegationMarkerBindData : public duckdb::TableFunctionData {
 TableFunction MakeNativeDelegationMarkerFunction();
 
 class VgiTableEntry : public TableCatalogEntry {
+private:
+	ColumnList columns_;
 public:
 	VgiTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
 	              const vgi::VgiTableInfo &table_info);
 	~VgiTableEntry() override;
 
 public:
+	const ColumnList &GetColumns() const override { return columns_; }
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;

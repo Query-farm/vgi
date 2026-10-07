@@ -58,7 +58,7 @@ TableFunction MakeNativeDelegationMarkerFunction() {
 
 VgiTableEntry::VgiTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                              const vgi::VgiTableInfo &table_info)
-    : TableCatalogEntry(catalog, schema, info), table_info_(table_info), catalog_(catalog) {
+    : TableCatalogEntry(catalog, schema, info), columns_(info.columns.Copy()), table_info_(table_info), catalog_(catalog) {
 	if (table_info_.row_id_column >= 0) {
 		rowid_type_ = table_info_.rowid_type;
 	}
@@ -67,6 +67,10 @@ VgiTableEntry::VgiTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Creat
 VgiTableEntry::~VgiTableEntry() = default;
 
 unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile supports catalog table functions, not stored table scans");
+#else
+
 	if (column_id == COLUMN_IDENTIFIER_ROW_ID || column_id == COLUMN_IDENTIFIER_EMPTY) {
 		return nullptr;
 	}
@@ -153,6 +157,8 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 		return it->second->ToUnique();
 	}
 	return nullptr;
+
+#endif
 }
 
 bool VgiTableEntry::StatsCache::IsStale() const {
@@ -173,6 +179,10 @@ bool VgiTableEntry::StatsCache::IsStale() const {
 // method runs the worker RPC with the mutex *released* and is responsible
 // for clearing the loading flag (and notifying waiters) on every exit.
 void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile supports catalog table functions, not stored table scans");
+#else
+
 	std::unordered_map<std::string, unique_ptr<BaseStatistics>> fetched_entries;
 	int64_t fetched_max_age = -1;
 	bool ok = false;
@@ -239,6 +249,8 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 		stats_cache_.loading = false;
 	}
 	stats_cache_.cv.notify_all();
+
+#endif
 }
 
 // Caller must have set stats_cache_.loading = true under the mutex. This
@@ -247,6 +259,10 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 // and is responsible for clearing the loading flag and notifying waiters
 // on every exit path.
 void VgiTableEntry::PopulateStatsCacheFromInline(ClientContext &context) const {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile supports catalog table functions, not stored table scans");
+#else
+
 	std::unordered_map<std::string, unique_ptr<BaseStatistics>> parsed_entries;
 	bool ok = false;
 
@@ -308,6 +324,8 @@ void VgiTableEntry::PopulateStatsCacheFromInline(ClientContext &context) const {
 		stats_cache_.loading = false;
 	}
 	stats_cache_.cv.notify_all();
+
+#endif
 }
 
 TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
@@ -319,7 +337,7 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	string at_value;
 	auto at = lookup.GetAtClause();
 	if (at) {
-		at_unit = at->Unit();
+		at_unit = at->Unit().GetIdentifierName();
 		at_value = at->GetValue().ToString();
 	}
 	return GetScanFunctionImpl(context, bind_data, at_unit, at_value);
@@ -358,7 +376,7 @@ vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &conte
 	                                vgi_tx_scan.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "table";
 	rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
-	auto result = vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name, name, context, at_unit, at_value);
+	auto result = vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name.GetIdentifierName(), name.GetIdentifierName(), context, at_unit, at_value);
 	// Populate the multi-branch hint for the no-AT case so subsequent
 	// write-refusal helpers can short-circuit without an RPC. AT-carrying
 	// fetches don't populate the hint because the count COULD differ
@@ -372,6 +390,10 @@ vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &conte
 
 TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
                                                   const string &at_unit, const string &at_value) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile supports catalog table functions, not stored table scans");
+#else
+
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -897,7 +919,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 	func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
+#endif
 	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
 	func.set_scan_order = vgi::VgiSetScanOrder;
 	func.statistics = vgi::VgiTableFunctionStatistics;
@@ -949,10 +973,16 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	}
 
 	return func;
+
+#endif
 }
 
 void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                           const TableFunction &function) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile supports catalog table functions, not stored table scans");
+#else
+
 	// The scan function carries no callable arguments; everything needed to
 	// rebuild it lives in the bind data. Persist only the table identity (and
 	// AT clause), mirroring DuckDB's own TableScanSerialize — the heavy bind
@@ -972,9 +1002,15 @@ void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional
 	serializer.WriteProperty(102, "table", table.name);
 	serializer.WriteProperty(103, "at_unit", bind_data.at_unit);
 	serializer.WriteProperty(104, "at_value", bind_data.at_value);
+
+#endif
 }
 
 unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile supports catalog table functions, not stored table scans");
+#else
+
 	auto catalog = deserializer.ReadProperty<string>(100, "catalog");
 	auto schema = deserializer.ReadProperty<string>(101, "schema");
 	auto table = deserializer.ReadProperty<string>(102, "table");
@@ -994,6 +1030,8 @@ unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &de
 	unique_ptr<FunctionData> bind_data;
 	function = vgi_entry.GetScanFunctionImpl(context, bind_data, at_unit, at_value);
 	return bind_data;
+
+#endif
 }
 
 TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {

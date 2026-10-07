@@ -267,7 +267,7 @@ bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &work
 		auto empty_params =
 		    arrow::RecordBatch::Make(arrow::schema({}), 1, std::vector<std::shared_ptr<arrow::Array>> {});
 		auto client_caps = arrow::KeyValueMetadata::Make({TRANSPORT_CAP_SHM_KEY}, {"true"});
-		WriteRpcRequest(in_fd, TRANSPORT_OPTIONS_METHOD, empty_params, client_caps);
+		WriteRpcRequest(in_fd, TRANSPORT_OPTIONS_METHOD, empty_params, client_caps, VGI_MAIN_PROTOCOL, &context);
 		auto resp = ReadUnaryResponse(out_fd, &context, worker_path, pid);
 		if (resp.metadata) {
 			auto v = resp.metadata->Get(TRANSPORT_CAP_SHM_KEY);
@@ -544,7 +544,7 @@ std::shared_ptr<arrow::io::OutputStream> FunctionConnection::TransportOutput() {
 	if (!proc_) {
 		throw InternalException("VGI byte transport is not connected");
 	}
-	return std::make_shared<FdOutputStream>(proc_->GetStdinFd());
+	return std::make_shared<FdOutputStream>(proc_->GetStdinFd(), &context_);
 }
 
 void FunctionConnection::WriteTransportRpc(
@@ -1279,7 +1279,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			const std::string location_url = result.custom_metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_, GetExecutionIdHex(),
 			                                        GetAttachOpaqueDataHex(), result.custom_metadata,
-			                                        &context_.interrupted);
+			                                        &context_);
 			result.batch = resolved.batch;
 			result.custom_metadata = resolved.metadata;
 		}
@@ -1741,6 +1741,10 @@ std::vector<uint8_t>
 FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, const std::vector<uint8_t> &execution_id,
                                                 const std::shared_ptr<arrow::RecordBatch> &input_batch,
                                                 std::optional<int64_t> batch_index) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not support buffered functions");
+#else
+
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id, batch_bytes,
 	                                                       attach_opaque_data_, batch_index);
@@ -1774,11 +1778,17 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, c
 	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
 	auto view = bin_array->GetView(0);
 	return std::vector<uint8_t>(view.data(), view.data() + view.size());
+
+#endif
 }
 
 std::vector<std::vector<uint8_t>>
 FunctionConnection::RpcTableBufferingCombine(const std::string &function_name, const std::vector<uint8_t> &execution_id,
                                                 const std::vector<std::vector<uint8_t>> &state_ids) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not support buffered functions");
+#else
+
 	auto rpc_params =
 	    vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_combine", worker_path_);
@@ -1804,10 +1814,16 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name, c
 		result.emplace_back(v.data(), v.data() + v.size());
 	}
 	return result;
+
+#endif
 }
 
 void FunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
                                                        const std::vector<uint8_t> &execution_id) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not support buffered functions");
+#else
+
 	auto rpc_params =
 	    vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_destructor", worker_path_);
@@ -1818,6 +1834,8 @@ void FunctionConnection::RpcTableBufferingDestructor(const std::string &function
 #endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_destructor", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_destructor", worker_path_);
+
+#endif
 }
 
 int FunctionConnection::Wait() {

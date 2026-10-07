@@ -110,6 +110,10 @@ bool VgiCancelDispatcher::Enqueue(CancelRequest req) noexcept {
 }
 
 bool VgiCancelDispatcher::EnqueueStreamingClose(StreamingCloseRequest req) noexcept {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+return false; // Aggregate profiles cannot register in the invocation-only build.
+#else
+
 	if (shutdown_.load(std::memory_order_acquire)) {
 		return false;
 	}
@@ -129,6 +133,8 @@ bool VgiCancelDispatcher::EnqueueStreamingClose(StreamingCloseRequest req) noexc
 		cv_.notify_one();
 	}
 	return true;
+
+#endif
 }
 
 bool VgiCancelDispatcher::EnsureWorkerStarted() {
@@ -230,6 +236,10 @@ void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
 }
 
 void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noexcept {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+return; // EnqueueStreamingClose rejects this excluded capability.
+#else
+
 	try {
 		if (!req.attach_params) {
 			return;
@@ -265,6 +275,8 @@ void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noex
 		} catch (...) {
 		}
 	}
+
+#endif
 }
 
 void VgiCancelDispatcher::DrainForTesting() {

@@ -22,6 +22,10 @@ namespace duckdb {
 // the entry instead surfaces a clean "view not found" error to the user.
 static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, SchemaCatalogEntry &schema,
                                                              const vgi::VgiViewInfo &view_info) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not expose views");
+#else
+
 	CreateViewInfo info;
 	info.view_name = view_info.name;
 	info.sql = view_info.definition;
@@ -54,6 +58,8 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 		return nullptr;
 	}
 	return make_uniq<ViewCatalogEntry>(catalog, schema, info);
+
+#endif
 }
 
 VgiViewSet::VgiViewSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet(catalog, &schema), schema_(schema) {
@@ -121,9 +127,9 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "view";
-	rpc_ctx.entity_qualifier = schema_.name + "." + name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName() + "." + name;
 
-	auto view_info_opt = vgi::InvokeCatalogViewGet(rpc_ctx, schema_.name, name, context);
+	auto view_info_opt = vgi::InvokeCatalogViewGet(rpc_ctx, schema_.name.GetIdentifierName(), name, context);
 
 	if (!view_info_opt) {
 		return nullptr;
@@ -160,7 +166,7 @@ void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 	auto views = schema_.TakeViews(rpc_ctx, context);
 
 	for (auto &view_info : views) {

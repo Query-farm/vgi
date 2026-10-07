@@ -204,10 +204,10 @@ void VgiCatalogSet::CreateEntryLocked(unique_ptr<CatalogEntry> entry) {
 	// see ColumnIsGenerated → ColumnList::GetColumn(0) UAF that surfaces as
 	// "Logical column index 0 out of range". Refresh goes through
 	// ClearEntries() / vgi_clear_cache() at safe points instead.
-	if (entries_.find(entry->name) != entries_.end()) {
+	if (entries_.find(entry->name.GetIdentifierName()) != entries_.end()) {
 		return;
 	}
-	entries_[entry->name] = std::move(entry);
+	entries_[entry->name.GetIdentifierName()] = std::move(entry);
 	generation_.fetch_add(1, std::memory_order_release);
 }
 

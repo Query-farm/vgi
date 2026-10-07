@@ -1430,7 +1430,7 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	idx_t pages = 0;
 
 	while (true) {
-		if (context.interrupted) {
+		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
 		if (pages >= max_pages) {
@@ -1525,7 +1525,7 @@ static unique_ptr<BaseStatistics> BuildColumnStatistics(
 			// the value with the target logical type (e.g., BLOB → GEOMETRY)
 			if (val.type().InternalType() == duck_type.InternalType()) {
 				auto reinterpreted = val;
-				reinterpreted.Reinterpret(duck_type);
+				throw NotImplementedException("VGI DuckDB 2 invocation profile does not reinterpret statistic value types");
 				return reinterpreted;
 			}
 			return val;
@@ -2766,7 +2766,8 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 		branch.branch_filter = filter_opt;
 		if (!branch.branch_filter.empty()) {
 			try {
-				auto exprs = Parser::ParseExpressionList(branch.branch_filter);
+				Parser parser(context);
+				auto exprs = parser.ParseExpressionList(branch.branch_filter);
 				if (exprs.empty()) {
 					throw BinderException("VGI branch_filter parsed to no expressions [worker: " + worker_path +
 					                       ", filter: " + branch.branch_filter + "]");
@@ -2920,6 +2921,10 @@ static std::string RenderRequiredFiltersJson(const std::vector<std::vector<std::
 
 CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo &table_info,
                                             const std::string &schema_name) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not expose stored tables");
+#else
+
 	CreateTableInfo create_info;
 	create_info.table = table_info.name;
 	create_info.schema = schema_name;
@@ -3094,6 +3099,8 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	}
 
 	return create_info;
+
+#endif
 }
 
 VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
@@ -3472,7 +3479,7 @@ static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret 
 	kv_pairs["name"] = Value(kv_secret.GetName());
 	// Add all custom key-value entries
 	for (const auto &[k, v] : kv_secret.secret_map) {
-		kv_pairs[k] = v;
+		kv_pairs[k.GetIdentifierName()] = v;
 	}
 	// Add the secret's scope prefixes (newline-joined), set AFTER the secret_map
 	// loop so it is reliable for worker-side scope matching. Lets a worker that
@@ -3498,7 +3505,7 @@ static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret 
 // type to avoid an empty key colliding.)
 static void InsertResolvedSecret(std::map<std::string, std::map<std::string, Value>> &result,
                                  const std::string &secret_type, const KeyValueSecret &kv_secret) {
-	std::string key = kv_secret.GetName();
+	std::string key = kv_secret.GetName().GetIdentifierName();
 	if (key.empty()) {
 		key = secret_type;
 	}

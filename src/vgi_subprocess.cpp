@@ -710,9 +710,15 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	// until the worker speaks. Cancellation comes via the context's
 	// `interrupted` flag (Ctrl-C, query cancel) — we poll it every 250ms.
 	constexpr int kPollIntervalMs = 250;
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+#endif
 
 	while (true) {
-		if (context && context->interrupted) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+		if (std::chrono::steady_clock::now() >= deadline) throw IOException("VGI invocation profile idle I/O timeout after 30 seconds");
+#endif
+		if (context && context->IsInterrupted()) {
 			throw IOException("VGI operation interrupted (query cancelled)");
 		}
 
@@ -1104,7 +1110,7 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 			// spin forever (recv() then observes the EOF). interrupted re-checked
 			// each iteration → prompt cancel.
 			for (unsigned attempt = 0;; attempt++) {
-				if (context && context->interrupted) {
+				if (context && context->IsInterrupted()) {
 					throw IOException("VGI operation interrupted (query cancelled)");
 				}
 				u_long avail = 0;

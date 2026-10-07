@@ -31,6 +31,10 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
                                             const std::vector<vgi::VgiFunctionInfo> &overloads,
                                             const VgiFunctionRegistrationTarget &target,
                                             vector<FunctionDescription> &descriptions) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile supports table functions only");
+#else
+
 	ScalarFunctionSet func_set(registered_name);
 
 	for (const auto &func_info : overloads) {
@@ -156,6 +160,8 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 	}
 
 	return func_set;
+
+#endif
 }
 
 } // namespace vgi
@@ -180,7 +186,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::SCALAR_FUNCTION_ENTRY, context);
 
@@ -198,11 +204,11 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 	// Registration target: this catalog's own schema.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
-	target.catalog_name = catalog_.GetName();
+	target.catalog_name = catalog_.GetName().GetIdentifierName();
 	target.attach_params = attach_params;
 	target.attach_opaque_data = attach_result->attach_opaque_data;
 	target.setting_names = setting_names;
-	target.schema_name = schema_.name;
+	target.schema_name = schema_.name.GetIdentifierName();
 
 	// Create function entries
 	for (const auto &pair : functions_by_name) {
@@ -212,7 +218,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 
 		// Create function info and entry
 		CreateScalarFunctionInfo info(func_set);
-		info.schema = schema_.name;
+		info.SetSchema(schema_.name);
 		info.internal = true;
 		info.descriptions = std::move(descriptions);
 

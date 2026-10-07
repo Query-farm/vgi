@@ -309,7 +309,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	std::string identity_scope;
 	const std::string &cat = attach_params->catalog_name();
 	if (!cat.empty()) {
-		auto catalog = Catalog::GetCatalogEntry(context, cat);
+		auto catalog = Catalog::GetCatalogEntry(context, Identifier(cat));
 		if (catalog && catalog->GetCatalogType() == "vgi") {
 			auto &vcat = catalog->Cast<VgiCatalog>();
 			catalog_version = vcat.GetKnownCatalogVersion();

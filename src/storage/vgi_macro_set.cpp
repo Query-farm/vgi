@@ -28,6 +28,7 @@
 
 namespace duckdb {
 
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 static void QualifyWorkerFunctions(QueryNode &node, const case_insensitive_set_t &worker_functions,
                                    const string &catalog_name, const string &schema_name);
 
@@ -60,6 +61,7 @@ static void QualifyWorkerFunctions(QueryNode &node, const case_insensitive_set_t
 	    });
 }
 
+#endif
 VgiMacroSet::VgiMacroSet(Catalog &catalog, VgiSchemaEntry &schema, CatalogType macro_type)
     : VgiCatalogSet(catalog, &schema), schema_(schema), macro_catalog_type_(macro_type) {
 }
@@ -106,6 +108,10 @@ static Value ExtractDefaultValue(const std::shared_ptr<arrow::Array> &array, int
 }
 
 void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+throw NotImplementedException("VGI DuckDB 2 invocation profile does not expose macros");
+#else
+
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -205,6 +211,8 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 			VGI_STDERR_DEBUG("[VGI] macro.parse_error name=%s error=unknown\n", macro_info.name.c_str());
 		}
 	}
+
+#endif
 }
 
 } // namespace duckdb

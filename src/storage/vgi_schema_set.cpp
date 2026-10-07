@@ -56,7 +56,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 		// on first use. Every entry shares the snapshot's response buffers.
 		for (auto &contents : snapshot->schemas) {
 			CreateSchemaInfo info;
-			info.schema = contents.name;
+			info.SetSchema(Identifier(contents.name));
 			auto seed = std::make_shared<const vgi::VgiSchemaContents>(std::move(contents));
 			auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, std::move(seed));
 			std::lock_guard<std::mutex> entry_lk(entry_lock_);
@@ -67,7 +67,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 
 	for (auto &schema_info : vgi::InvokeCatalogSchemas(rpc_ctx, context)) {
 		CreateSchemaInfo info;
-		info.schema = schema_info.name;
+		info.SetSchema(Identifier(schema_info.name));
 		if (!schema_info.comment.empty()) {
 			info.comment = Value(schema_info.comment);
 		}

@@ -931,7 +931,9 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 //! the function can return diagnostics it persisted during process(). Always also surfaces
 //! intrinsic keys (Worker, Function, Rows Read, Threads). Best-effort: any RPC failure is
 //! logged and degrades to just the intrinsic keys.
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctionDynamicToStringInput &input);
+#endif
 
 //! Get bind info callback for returning table entry reference
 BindInfo VgiTableScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p);

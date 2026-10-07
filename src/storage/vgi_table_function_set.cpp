@@ -26,9 +26,13 @@ namespace duckdb {
 namespace {
 
 bool SupportsVgiFilterV2(const vgi::VgiFunctionInfo &info) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	return false;
+#else
 	return info.filter_pushdown.value_or(false) &&
 	       std::find(info.filter_semantic_profiles.begin(), info.filter_semantic_profiles.end(),
 	                 "vgi.duckdb.standard.v1") != info.filter_semantic_profiles.end();
+#endif
 }
 
 //! Read the client-side ``vgi_split_scans`` kill switch. Defaults to true.
@@ -57,7 +61,7 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
 
 	for (const auto &name : setting_names) {
 		Value value;
-		if (context.TryGetCurrentSetting(name, value)) {
+		if (context.TryGetCurrentSetting(Identifier(name), value)) {
 			settings[name] = value;
 		}
 	}
@@ -95,7 +99,8 @@ VgiTableFunctionSet::VgiTableFunctionSet(Catalog &catalog, VgiSchemaEntry &schem
 // ============================================================================
 
 static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                                            vector<LogicalType> &return_types, vector<Identifier> &native_names) {
+	vector<string> names;
 	// Access the VgiTableFunctionInfo attached to this function
 	auto &vgi_info = input.info->Cast<vgi::VgiTableFunctionInfo>();
 
@@ -104,7 +109,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// Copy connection information from the catalog function info. A function
 	// published into system.main outlives DETACH, so its live state is resolved
 	// from the attached catalog here (see ResolveVgiFunctionBinding).
-	auto binding = vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.name);
+	auto binding = vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.GetName().GetIdentifierName());
 	bind_data->attach_params = binding.attach_params;
 	bind_data->attach_opaque_data = binding.attach_opaque_data;
 	auto &vgi_tx = VgiTransaction::Get(context, *binding.catalog);
@@ -234,6 +239,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 
 	input.table_function.projection_pushdown = bind_data->projection_pushdown;
 
+	for (const auto &name : names) native_names.emplace_back(name);
 	return bind_data;
 }
 
@@ -243,7 +249,8 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 
 static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                                  vector<LogicalType> &return_types,
-                                                                 vector<string> &names) {
+                                                                 vector<Identifier> &native_names) {
+	vector<string> names;
 	// Access the VgiTableFunctionInfo attached to this function
 	auto &vgi_info = input.info->Cast<vgi::VgiTableFunctionInfo>();
 
@@ -251,7 +258,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	vgi::VgiTableInOutBindParams params;
 	// A function published into system.main outlives DETACH, so its live state
 	// is resolved from the attached catalog here (see ResolveVgiFunctionBinding).
-	auto binding = vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.name);
+	auto binding = vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.GetName().GetIdentifierName());
 	params.attach_params = binding.attach_params;
 	params.function_name = vgi_info.function_info().name;
 	params.schema_name = vgi_info.function_info().schema_name;
@@ -308,7 +315,9 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	}
 
 	// Use the table-in-out bind function
-	return vgi::VgiTableInOutBind(context, input, return_types, names, params);
+	auto result = vgi::VgiTableInOutBind(context, input, return_types, names, params);
+	for (const auto &name : names) native_names.emplace_back(name);
+	return result;
 }
 
 namespace vgi {
@@ -317,15 +326,26 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
                                           const std::vector<vgi::VgiFunctionInfo> &overloads,
                                           const VgiFunctionRegistrationTarget &target,
                                           vector<FunctionDescription> &descriptions) {
-	TableFunctionSet func_set(registered_name);
+	TableFunctionSet func_set {Identifier(registered_name)};
 
 	for (const auto &func_info : overloads) {
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+		if (func_info.function_type == vgi::VgiFunctionType::TableBuffering || func_info.has_finalize || func_info.source_order_dependent || func_info.sink_order_dependent || func_info.requires_input_batch_index || func_info.max_workers.value_or(1) > 1 || func_info.supports_positions || func_info.supports_splits || func_info.supports_batch_index || func_info.partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
+			throw NotImplementedException("VGI DuckDB 2 invocation profile requires a synchronous producer or independent input_from_args row map: %s", func_info.name);
+		}
+#endif
 		// Parse argument types, distinguishing positional from named arguments
 		// Named arguments have metadata "vgi_arg: named" in the Arrow schema
 		vgi::FunctionArgumentTypes arg_types;
 		if (func_info.arguments_schema) {
 			arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
 		}
+
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+		if (arg_types.has_varargs || (arg_types.HasTableInput() && !func_info.input_from_args) || !func_info.parameter_default_values_bytes.empty()) {
+			throw NotImplementedException("VGI DuckDB 2 invocation profile requires fixed explicit arguments without defaults or TABLE input: %s", func_info.name);
+		}
+#endif
 
 		// Check if this is a table-in-out function: either it has a TABLE input
 		// argument (classic), or it is a blended ("UNNEST-style") function whose
@@ -404,14 +424,16 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 
 			// Register named parameters
-			table_func.named_parameters = arg_types.named_parameters;
+			for (const auto &parameter : arg_types.named_parameters) {
+				table_func.GetSignature().AddKeywordOnly(Identifier(parameter.first), parameter.second);
+			}
 
 			// Register varargs so DuckDB accepts a blended VARARGS call
 			// (row_sum(1,2,3) -> N input columns of varargs_type). Without this
 			// the signature would carry only the named params and DuckDB would
 			// reject any positional args.
 			if (arg_types.has_varargs) {
-				table_func.varargs = arg_types.varargs_type;
+				table_func.GetSignature().AddArgs("args", arg_types.varargs_type);
 			}
 
 			// Attach function info
@@ -435,7 +457,9 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			table_func.statistics = vgi::VgiTableFunctionStatistics;
 			table_func.table_scan_progress = vgi::VgiTableFunctionProgress;
 			table_func.to_string = vgi::VgiTableFunctionToString;
+#ifndef VGI_DUCKDB2_INVOCATION_PROFILE
 			table_func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
+#endif
 			table_func.set_scan_order = vgi::VgiSetScanOrder;
 			// batch_index opt-in: install the partition-data callback so
 			// ordered sinks (BatchCollector, BatchInsert,
@@ -492,11 +516,13 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// INITIALIZE_ON_SCHEDULE without sacrificing join pushdown.
 
 			// Register named parameters so DuckDB knows how to handle them
-			table_func.named_parameters = arg_types.named_parameters;
+			for (const auto &parameter : arg_types.named_parameters) {
+				table_func.GetSignature().AddKeywordOnly(Identifier(parameter.first), parameter.second);
+			}
 
 			// Register varargs support if the function accepts additional positional arguments
 			if (arg_types.has_varargs) {
-				table_func.varargs = arg_types.varargs_type;
+				table_func.GetSignature().AddArgs("args", arg_types.varargs_type);
 			}
 
 			// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
@@ -551,7 +577,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::TABLE_FUNCTION_ENTRY, context);
 
@@ -578,11 +604,11 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	// Registration target: this catalog's own schema.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
-	target.catalog_name = catalog_.GetName();
+	target.catalog_name = catalog_.GetName().GetIdentifierName();
 	target.attach_params = attach_params;
 	target.attach_opaque_data = attach_result->attach_opaque_data;
 	target.setting_names = setting_names;
-	target.schema_name = schema_.name;
+	target.schema_name = schema_.name.GetIdentifierName();
 
 	// Create function entries
 	for (const auto &pair : functions_by_name) {
@@ -592,7 +618,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 
 		// Create function info and entry
 		CreateTableFunctionInfo info(func_set);
-		info.schema = schema_.name;
+		info.SetSchema(schema_.name);
 		info.internal = true;
 		info.descriptions = std::move(descriptions);
 
