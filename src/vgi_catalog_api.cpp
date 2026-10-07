@@ -106,13 +106,14 @@ public:
 		info.reserve(8);
 		info.emplace_back("method", method_name_);
 		info.emplace_back("worker_path", ctx_.params->worker_path());
-		auto attach_hex = BytesToHex(ctx_.attach_opaque_data);
-		if (!attach_hex.empty()) {
-			info.emplace_back("attach_opaque_data", attach_hex);
+		// Short digests only, never the raw values (OpaqueDigest).
+		auto attach_digest = OpaqueDigest(ctx_.attach_opaque_data);
+		if (!attach_digest.empty()) {
+			info.emplace_back("attach_opaque_data_sha256", attach_digest);
 		}
-		auto txn_hex = BytesToHex(ctx_.transaction_opaque_data);
-		if (!txn_hex.empty()) {
-			info.emplace_back("transaction_opaque_data", txn_hex);
+		auto txn_digest = OpaqueDigest(ctx_.transaction_opaque_data);
+		if (!txn_digest.empty()) {
+			info.emplace_back("transaction_opaque_data_sha256", txn_digest);
 		}
 		if (!ctx_.entity_kind.empty()) {
 			info.emplace_back("entity_kind", ctx_.entity_kind);

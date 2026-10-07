@@ -71,8 +71,8 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
                           ClientContext *context, const std::string &worker_path, pid_t worker_pid,
                           const std::string &invocation_id_hex = "",
-                          const std::string &attach_opaque_data_hex = "",
-                          const std::string &transaction_opaque_data_hex = "",
+                          const std::string &attach_opaque_data_digest = "",
+                          const std::string &transaction_opaque_data_digest = "",
                           const std::string &conn_id_hex = "") {
 	auto type = ClassifyBatch(batch, custom_metadata);
 
@@ -80,16 +80,16 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 	case RpcBatchType::ERROR: {
 		// Extract error details and throw
 		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, worker_pid,
-		                      invocation_id_hex, attach_opaque_data_hex,
-		                      transaction_opaque_data_hex, conn_id_hex);
+		                      invocation_id_hex, attach_opaque_data_digest,
+		                      transaction_opaque_data_digest, conn_id_hex);
 		// HandleBatchLogMessage throws for EXCEPTION level, but just in case:
 		throw IOException("VGI RPC error from worker [worker: %s]", worker_path);
 	}
 	case RpcBatchType::LOG: {
 		// Forward to logger
 		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, worker_pid,
-		                      invocation_id_hex, attach_opaque_data_hex,
-		                      transaction_opaque_data_hex, conn_id_hex);
+		                      invocation_id_hex, attach_opaque_data_digest,
+		                      transaction_opaque_data_digest, conn_id_hex);
 		return true; // Handled, caller should read next batch
 	}
 	case RpcBatchType::DATA:
@@ -106,8 +106,8 @@ bool DispatchWorkerBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
                          const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
                          const WorkerStreamOptions &opts) {
 	return DispatchBatch(batch, custom_metadata, opts.context, opts.log_worker.empty() ? opts.worker : opts.log_worker,
-	                     opts.pid, opts.invocation_id_hex, opts.attach_opaque_data_hex,
-	                     opts.transaction_opaque_data_hex, opts.conn_id_hex);
+	                     opts.pid, opts.invocation_id_hex, opts.attach_opaque_data_digest,
+	                     opts.transaction_opaque_data_digest, opts.conn_id_hex);
 }
 
 namespace {
@@ -359,7 +359,7 @@ void WriteEmptyRpcRequest(int fd, const std::string &method_name, const VgiProto
 static UnaryResponseResult ReadUnaryResponseImpl(
     const std::shared_ptr<arrow::io::InputStream> &input, ClientContext *context,
     const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex,
-    const std::string &attach_opaque_data_hex, const std::string &transaction_opaque_data_hex,
+    const std::string &attach_opaque_data_digest, const std::string &transaction_opaque_data_digest,
     const std::string &conn_id_hex, const std::function<void()> &before_read) {
 	WorkerStreamOptions opts;
 	opts.context = context;
@@ -367,8 +367,8 @@ static UnaryResponseResult ReadUnaryResponseImpl(
 	opts.pid = worker_pid;
 	opts.before_read = before_read;
 	opts.invocation_id_hex = invocation_id_hex;
-	opts.attach_opaque_data_hex = attach_opaque_data_hex;
-	opts.transaction_opaque_data_hex = transaction_opaque_data_hex;
+	opts.attach_opaque_data_digest = attach_opaque_data_digest;
+	opts.transaction_opaque_data_digest = transaction_opaque_data_digest;
 	opts.conn_id_hex = conn_id_hex;
 	return ReadWorkerUnaryStream(input, opts);
 }
@@ -376,23 +376,23 @@ static UnaryResponseResult ReadUnaryResponseImpl(
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &worker_path, pid_t worker_pid,
                                       const std::string &invocation_id_hex,
-                                      const std::string &attach_opaque_data_hex,
-                                      const std::string &transaction_opaque_data_hex,
+                                      const std::string &attach_opaque_data_digest,
+                                      const std::string &transaction_opaque_data_digest,
                                       const std::string &conn_id_hex) {
 	auto wait = [fd, context]() { WaitForReadableUntilCancel(fd, context); };
 	return ReadUnaryResponseImpl(std::make_shared<FdInputStream>(fd, context), context, worker_path,
-	                             worker_pid, invocation_id_hex, attach_opaque_data_hex,
-	                             transaction_opaque_data_hex, conn_id_hex, wait);
+	                             worker_pid, invocation_id_hex, attach_opaque_data_digest,
+	                             transaction_opaque_data_digest, conn_id_hex, wait);
 }
 
 UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStream> &input,
                                       ClientContext *context, const std::string &worker_path,
                                       pid_t worker_pid, const std::string &invocation_id_hex,
-                                      const std::string &attach_opaque_data_hex,
-                                      const std::string &transaction_opaque_data_hex,
+                                      const std::string &attach_opaque_data_digest,
+                                      const std::string &transaction_opaque_data_digest,
                                       const std::string &conn_id_hex) {
 	return ReadUnaryResponseImpl(input, context, worker_path, worker_pid, invocation_id_hex,
-	                             attach_opaque_data_hex, transaction_opaque_data_hex, conn_id_hex,
+	                             attach_opaque_data_digest, transaction_opaque_data_digest, conn_id_hex,
 	                             []() {});
 }
 
@@ -488,8 +488,8 @@ static UnaryResponseResult ReadUnaryResponseFromOwnedBuffer(
     ClientContext *context,
     const std::string &url,
     const std::string &invocation_id_hex,
-    const std::string &attach_opaque_data_hex,
-    const std::string &transaction_opaque_data_hex,
+    const std::string &attach_opaque_data_digest,
+    const std::string &transaction_opaque_data_digest,
     const std::string &conn_id_hex) {
 	WorkerStreamOptions opts;
 	opts.context = context;
@@ -497,8 +497,8 @@ static UnaryResponseResult ReadUnaryResponseFromOwnedBuffer(
 	opts.http_messages = true;
 	opts.lenient = true;
 	opts.invocation_id_hex = invocation_id_hex;
-	opts.attach_opaque_data_hex = attach_opaque_data_hex;
-	opts.transaction_opaque_data_hex = transaction_opaque_data_hex;
+	opts.attach_opaque_data_digest = attach_opaque_data_digest;
+	opts.transaction_opaque_data_digest = transaction_opaque_data_digest;
 	opts.conn_id_hex = conn_id_hex;
 	return ReadWorkerUnaryStream(std::make_shared<arrow::io::BufferReader>(std::move(buffer)), opts);
 }
@@ -541,24 +541,24 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  ClientContext *context,
                                                  const std::string &url,
                                                  const std::string &invocation_id_hex,
-                                                 const std::string &attach_opaque_data_hex,
-                                                 const std::string &transaction_opaque_data_hex,
+                                                 const std::string &attach_opaque_data_digest,
+                                                 const std::string &transaction_opaque_data_digest,
                                                  const std::string &conn_id_hex) {
 	return ReadUnaryResponseFromOwnedBuffer(CopyToOwnedBuffer(data, len), context, url,
-	                                        invocation_id_hex, attach_opaque_data_hex,
-	                                        transaction_opaque_data_hex, conn_id_hex);
+	                                        invocation_id_hex, attach_opaque_data_digest,
+	                                        transaction_opaque_data_digest, conn_id_hex);
 }
 
 UnaryResponseResult ReadUnaryResponseFromBuffer(std::string &&body,
                                                  ClientContext *context,
                                                  const std::string &url,
                                                  const std::string &invocation_id_hex,
-                                                 const std::string &attach_opaque_data_hex,
-                                                 const std::string &transaction_opaque_data_hex,
+                                                 const std::string &attach_opaque_data_digest,
+                                                 const std::string &transaction_opaque_data_digest,
                                                  const std::string &conn_id_hex) {
 	return ReadUnaryResponseFromOwnedBuffer(arrow::Buffer::FromString(std::move(body)), context, url,
-	                                        invocation_id_hex, attach_opaque_data_hex,
-	                                        transaction_opaque_data_hex, conn_id_hex);
+	                                        invocation_id_hex, attach_opaque_data_digest,
+	                                        transaction_opaque_data_digest, conn_id_hex);
 }
 
 BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t len,

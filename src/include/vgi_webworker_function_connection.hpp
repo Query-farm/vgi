@@ -191,8 +191,8 @@ public:
 	}
 
 	std::string GetExecutionIdHex() const override;
-	std::string GetAttachOpaqueDataHex() const override;
-	std::string GetTransactionOpaqueDataHex() const override;
+	std::string GetAttachOpaqueDataDigest() const override;
+	std::string GetTransactionOpaqueDataDigest() const override;
 
 	std::string GetConnIdHex() const override {
 		return conn_id_hex_;

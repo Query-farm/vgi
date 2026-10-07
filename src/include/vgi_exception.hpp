@@ -13,6 +13,7 @@
 
 #include "duckdb/common/exception.hpp"
 
+#include "vgi_sha256.hpp"
 #include "vgi_subprocess.hpp"
 
 namespace duckdb {
@@ -32,6 +33,18 @@ inline std::string BytesToHex(const std::vector<uint8_t> &bytes) {
 		result[i * 2 + 1] = hex_chars[bytes[i] & 0x0F];
 	}
 	return result;
+}
+
+// The loggable form of an opaque value (attach_opaque_data,
+// transaction_opaque_data): the first 12 hex characters of its SHA-256, ""
+// when empty. The raw bytes, or their full hex, MUST NOT reach a log, trace,
+// error message or telemetry attribute: some SDKs carry secret attach options
+// in plaintext inside attach_opaque_data (vgi-opaque-data-sealing.md rule 7).
+inline std::string OpaqueDigest(const std::vector<uint8_t> &bytes) {
+	if (bytes.empty()) {
+		return "";
+	}
+	return VgiSha256Hex(std::string(bytes.begin(), bytes.end())).substr(0, 12);
 }
 
 // Build the standard extra_info map for VGI exceptions

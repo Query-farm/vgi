@@ -74,7 +74,7 @@ true
 
 # Check attach_opaque_data is present in in-band messages (for catalog-attached functions)
 query I
-SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%attach_opaque_data=%';
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%attach_opaque_data_sha256=%';
 ----
 true
 

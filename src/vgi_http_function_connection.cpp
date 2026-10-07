@@ -135,18 +135,18 @@ std::string HttpFunctionConnection::GetExecutionIdHex() const {
 	return BytesToHex(execution_id_);
 }
 
-std::string HttpFunctionConnection::GetAttachOpaqueDataHex() const {
+std::string HttpFunctionConnection::GetAttachOpaqueDataDigest() const {
 	if (attach_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(attach_opaque_data_);
+	return OpaqueDigest(attach_opaque_data_);
 }
 
-std::string HttpFunctionConnection::GetTransactionOpaqueDataHex() const {
+std::string HttpFunctionConnection::GetTransactionOpaqueDataDigest() const {
 	if (transaction_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(transaction_opaque_data_);
+	return OpaqueDigest(transaction_opaque_data_);
 }
 
 // ============================================================================
@@ -287,12 +287,12 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex());
 			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex());
 			++spike_log_batches;
 			continue;
 		}
@@ -302,7 +302,7 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
-			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
+			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
 			                                         bwm.custom_metadata, &context_.interrupted);
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
@@ -767,7 +767,7 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_process", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
-	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                             GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
@@ -793,7 +793,7 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_combine", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
-	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                             GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
@@ -825,7 +825,7 @@ void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &func
 	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_destructor", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
-	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                             GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
@@ -1001,12 +1001,12 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex());
 			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex());
 			continue;
 		}
 
@@ -1015,7 +1015,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
-			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
+			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
 			                                         bwm.custom_metadata, &context_.interrupted);
 			if (!output_batch) {
 				output_batch = resolved.batch;

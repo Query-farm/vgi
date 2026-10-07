@@ -358,11 +358,11 @@ public:
 		return proc_ ? proc_->GetPid() : -1;
 	}
 
-	// Get the attach ID as hex string (empty if no attach_opaque_data)
-	std::string GetAttachOpaqueDataHex() const override;
+	// Short SHA-256 digest of attach_opaque_data (OpaqueDigest; empty if none)
+	std::string GetAttachOpaqueDataDigest() const override;
 
-	// Get the transaction ID as hex string (empty if no transaction_opaque_data)
-	std::string GetTransactionOpaqueDataHex() const override;
+	// Short SHA-256 digest of transaction_opaque_data (OpaqueDigest; empty if none)
+	std::string GetTransactionOpaqueDataDigest() const override;
 
 	// Stable 8-hex correlation id for this connection checkout
 	std::string GetConnIdHex() const override {

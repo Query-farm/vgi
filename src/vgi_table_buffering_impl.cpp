@@ -18,6 +18,7 @@
 #include "vgi_cached_replay_connection.hpp" // CachedReplayConnection (M3 hit replay)
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_exchange_cache_key.hpp"   // exchange-mode result cache (M3)
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_result_cache.hpp"         // VgiResultCache singleton (M3)
 #include "vgi_unary_rpc.hpp"
@@ -846,21 +847,12 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 	lstate.state_id = lstate.connection->RpcTableBufferingProcess(
 	    gstate.function_name, gstate.execution_id, input_batch, batch_index);
 	if (VgiInfoLogActive(context.client)) {
-		// Render state_id as hex — opaque bytes have no canonical decimal form.
-		auto to_hex = [](const std::vector<uint8_t> &b) {
-			std::string out;
-			out.reserve(b.size() * 2);
-			static const char *digits = "0123456789abcdef";
-			for (auto c : b) {
-				out.push_back(digits[c >> 4]);
-				out.push_back(digits[c & 0xF]);
-			}
-			return out;
-		};
+		// state_id is a worker-issued value the client stores and returns, so it
+		// is logged only as a short digest (OpaqueDigest), never raw.
 		vector<std::pair<string, string>> info {
 		    {"conn", lstate.connection->GetConnIdHex()},
 		    {"function_name", bd.function_name},
-		    {"state_id", to_hex(lstate.state_id)},
+		    {"state_id_sha256", OpaqueDigest(lstate.state_id)},
 		    {"input_rows", std::to_string(input_batch->num_rows())},
 		};
 		if (batch_index.has_value()) {

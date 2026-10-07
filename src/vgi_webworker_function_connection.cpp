@@ -66,13 +66,13 @@ WorkerStreamOptions SabStreamOptions(ClientContext *context, const std::string &
 // until the first data batch, then drain to EOS.
 UnaryResponseResult SabReadUnaryResponse(int region_offset, int slot, ClientContext *context,
                                          const std::string &worker_path, const std::string &invocation_id_hex = "",
-                                         const std::string &attach_opaque_data_hex = "",
-                                         const std::string &transaction_opaque_data_hex = "",
+                                         const std::string &attach_opaque_data_digest = "",
+                                         const std::string &transaction_opaque_data_digest = "",
                                          const std::string &conn_id_hex = "") {
 	auto opts = SabStreamOptions(context, worker_path);
 	opts.invocation_id_hex = invocation_id_hex;
-	opts.attach_opaque_data_hex = attach_opaque_data_hex;
-	opts.transaction_opaque_data_hex = transaction_opaque_data_hex;
+	opts.attach_opaque_data_digest = attach_opaque_data_digest;
+	opts.transaction_opaque_data_digest = transaction_opaque_data_digest;
 	opts.conn_id_hex = conn_id_hex;
 	return ReadWorkerUnaryStream(std::make_shared<SabInputStream>(region_offset, slot, context), opts);
 }
@@ -1112,7 +1112,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// so the worker's drain returns and the slot frees, then rethrow.
 		try {
 			if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, location_, -1,
-			                          GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex())) {
+			                          GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex())) {
 				continue;
 			}
 		} catch (...) {
@@ -1227,18 +1227,18 @@ std::string WebWorkerFunctionConnection::GetExecutionIdHex() const {
 	return BytesToHex(execution_id_);
 }
 
-std::string WebWorkerFunctionConnection::GetAttachOpaqueDataHex() const {
+std::string WebWorkerFunctionConnection::GetAttachOpaqueDataDigest() const {
 	if (attach_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(attach_opaque_data_);
+	return OpaqueDigest(attach_opaque_data_);
 }
 
-std::string WebWorkerFunctionConnection::GetTransactionOpaqueDataHex() const {
+std::string WebWorkerFunctionConnection::GetTransactionOpaqueDataDigest() const {
 	if (transaction_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(transaction_opaque_data_);
+	return OpaqueDigest(transaction_opaque_data_);
 }
 
 void WebWorkerFunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {
@@ -1393,7 +1393,7 @@ std::vector<uint8_t> WebWorkerFunctionConnection::RpcTableBufferingProcess(
 		                    write_status.ToString());
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
-	                                     GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                                     GetAttachOpaqueDataDigest(), "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_process", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_process", location_);
 	if (!inner || inner->num_rows() == 0) {
@@ -1421,7 +1421,7 @@ WebWorkerFunctionConnection::RpcTableBufferingCombine(const std::string &functio
 		                    write_status.ToString());
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
-	                                     GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                                     GetAttachOpaqueDataDigest(), "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_combine", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_combine", location_);
 	if (!inner || inner->num_rows() == 0) {
@@ -1455,7 +1455,7 @@ void WebWorkerFunctionConnection::RpcTableBufferingDestructor(const std::string 
 		                    GetExecutionIdHex(), write_status.ToString());
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
-	                                     GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                                     GetAttachOpaqueDataDigest(), "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_destructor", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_destructor", location_);
 }

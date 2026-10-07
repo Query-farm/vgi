@@ -1,0 +1,63 @@
+# name: test/sql/integration/attach/opaque_data_logging.test
+# description: Opaque values are never logged raw (vgi-opaque-data-sealing.md
+#              rule 7). Some SDKs carry secret attach options in plaintext
+#              inside attach_opaque_data, so its full hex in duckdb_logs()
+#              would hand out the credential. Every log field for an opaque
+#              value is the first 12 hex characters of its SHA-256.
+# group: [vgi_integration_attach]
+
+require-env VGI_ATTACH_OPTIONS_REQUIRED_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'attach_options_required' AS gated (
+    TYPE vgi,
+    LOCATION '${VGI_ATTACH_OPTIONS_REQUIRED_WORKER}',
+    api_key 'sk-opaque-logging-must-not-leak'
+);
+
+# Catalog RPCs, each carrying attach_opaque_data, each logged.
+statement ok
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'gated';
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT count(*) FROM duckdb_views() WHERE database_name = 'gated';
+
+statement ok
+COMMIT;
+
+# The catalog RPCs were logged, with the short digest.
+query I
+SELECT count(*) > 0 FROM duckdb_logs()
+WHERE type = 'VGI' AND regexp_matches(message, 'attach_opaque_data_sha256=[0-9a-f]{12}\b');
+----
+true
+
+# No opaque value is logged longer than the 12-character digest.
+query I
+SELECT count(*) FROM duckdb_logs()
+WHERE regexp_matches(message, 'opaque_data[a-z0-9_]*[=:] *''?[0-9a-f]{13,}');
+----
+0
+
+# Neither the credential nor its hex appears anywhere in the logs. (DuckDB's
+# own QueryLog records the ATTACH statement text, which the extension cannot
+# redact: see docs/catalog-discovery.md.)
+query I
+SELECT count(*) FROM duckdb_logs()
+WHERE type <> 'QueryLog' AND (contains(message, 'sk-opaque-logging-must-not-leak')
+   OR contains(lower(message), lower(hex('sk-opaque-logging-must-not-leak'))));
+----
+0
+
+statement ok
+DETACH gated;

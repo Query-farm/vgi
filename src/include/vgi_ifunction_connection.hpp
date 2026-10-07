@@ -348,8 +348,9 @@ public:
 
 	// Identity/diagnostics
 	virtual std::string GetExecutionIdHex() const = 0;
-	virtual std::string GetAttachOpaqueDataHex() const = 0;
-	virtual std::string GetTransactionOpaqueDataHex() const = 0;
+	// Short SHA-256 digests (OpaqueDigest), never the raw values.
+	virtual std::string GetAttachOpaqueDataDigest() const = 0;
+	virtual std::string GetTransactionOpaqueDataDigest() const = 0;
 	//! Stable short hex id for this connection checkout. Generated at construction,
 	//! unique per IFunctionConnection instance regardless of transport. Use as the
 	//! primary correlation key in log lines: one `conn=<hex>` covers the full

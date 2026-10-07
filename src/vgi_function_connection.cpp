@@ -558,10 +558,10 @@ void FunctionConnection::WriteTransportRpc(
 UnaryResponseResult FunctionConnection::ReadTransportUnary() {
 	if (transport_input_) {
 		return ReadUnaryResponse(transport_input_, &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
-		                         GetAttachOpaqueDataHex(), GetTransactionOpaqueDataHex(), GetConnIdHex());
+		                         GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
 	}
 	return ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
-	                         GetAttachOpaqueDataHex(), GetTransactionOpaqueDataHex(), GetConnIdHex());
+	                         GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
 }
 
 StreamHeaderResult FunctionConnection::ReadTransportHeader() {
@@ -1259,7 +1259,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 
 		// Check for log/error batches via HandleBatchLogMessage
 		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, TransportPid(),
-		                          GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex())) {
+		                          GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex())) {
 			continue;  // Skip log batch, read next
 		}
 
@@ -1280,7 +1280,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			int loc_idx = result.custom_metadata->FindKey(RPC_LOCATION_KEY);
 			const std::string location_url = result.custom_metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_, GetExecutionIdHex(),
-			                                        GetAttachOpaqueDataHex(), result.custom_metadata,
+			                                        GetAttachOpaqueDataDigest(), result.custom_metadata,
 			                                        &context_.interrupted);
 			result.batch = resolved.batch;
 			result.custom_metadata = resolved.metadata;
@@ -1432,18 +1432,18 @@ std::string FunctionConnection::GetExecutionIdHex() const {
 	return BytesToHex(execution_id_);
 }
 
-std::string FunctionConnection::GetAttachOpaqueDataHex() const {
+std::string FunctionConnection::GetAttachOpaqueDataDigest() const {
 	if (attach_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(attach_opaque_data_);
+	return OpaqueDigest(attach_opaque_data_);
 }
 
-std::string FunctionConnection::GetTransactionOpaqueDataHex() const {
+std::string FunctionConnection::GetTransactionOpaqueDataDigest() const {
 	if (transaction_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(transaction_opaque_data_);
+	return OpaqueDigest(transaction_opaque_data_);
 }
 
 void FunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {

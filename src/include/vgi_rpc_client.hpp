@@ -227,8 +227,8 @@ struct WorkerStreamOptions {
 	// Called before every read: fd readiness + cancellation. Empty = none.
 	std::function<void()> before_read;
 	std::string invocation_id_hex;
-	std::string attach_opaque_data_hex;
-	std::string transaction_opaque_data_hex;
+	std::string attach_opaque_data_digest;
+	std::string transaction_opaque_data_digest;
 	std::string conn_id_hex;
 };
 
@@ -260,8 +260,8 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &worker_path = "",
                                       pid_t worker_pid = -1,
                                       const std::string &invocation_id_hex = "",
-                                      const std::string &attach_opaque_data_hex = "",
-                                      const std::string &transaction_opaque_data_hex = "",
+                                      const std::string &attach_opaque_data_digest = "",
+                                      const std::string &transaction_opaque_data_digest = "",
                                       const std::string &conn_id_hex = "");
 
 // Stream-based response reader. Cancellation/deadline polling is provided by
@@ -272,8 +272,8 @@ UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStre
                                       const std::string &worker_path = "",
                                       pid_t worker_pid = -1,
                                       const std::string &invocation_id_hex = "",
-                                      const std::string &attach_opaque_data_hex = "",
-                                      const std::string &transaction_opaque_data_hex = "",
+                                      const std::string &attach_opaque_data_digest = "",
+                                      const std::string &transaction_opaque_data_digest = "",
                                       const std::string &conn_id_hex = "");
 
 // Result from reading a stream header
@@ -337,8 +337,8 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  ClientContext *context,
                                                  const std::string &url = "",
                                                  const std::string &invocation_id_hex = "",
-                                                 const std::string &attach_opaque_data_hex = "",
-                                                 const std::string &transaction_opaque_data_hex = "",
+                                                 const std::string &attach_opaque_data_digest = "",
+                                                 const std::string &transaction_opaque_data_digest = "",
                                                  const std::string &conn_id_hex = "");
 
 // Dispatch every Arrow IPC stream concatenated in an error response body,
@@ -367,8 +367,8 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(std::string &&body,
                                                  ClientContext *context,
                                                  const std::string &url = "",
                                                  const std::string &invocation_id_hex = "",
-                                                 const std::string &attach_opaque_data_hex = "",
-                                                 const std::string &transaction_opaque_data_hex = "",
+                                                 const std::string &attach_opaque_data_digest = "",
+                                                 const std::string &transaction_opaque_data_digest = "",
                                                  const std::string &conn_id_hex = "");
 
 // Result from reading a stream header from a buffer.

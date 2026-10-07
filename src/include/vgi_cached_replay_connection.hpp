@@ -67,10 +67,10 @@ public:
 	std::string GetExecutionIdHex() const override {
 		return "";
 	}
-	std::string GetAttachOpaqueDataHex() const override {
+	std::string GetAttachOpaqueDataDigest() const override {
 		return "";
 	}
-	std::string GetTransactionOpaqueDataHex() const override {
+	std::string GetTransactionOpaqueDataDigest() const override {
 		return "";
 	}
 	bool IsTableInOut() const override {
