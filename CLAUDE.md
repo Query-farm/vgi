@@ -48,6 +48,12 @@ cold-starts a worker per connection; use it only when testing the spawn path its
 `uv run --project ~/Development/vgi-python vgi-fixture-worker`. **If it is unset every
 integration test SKIPs**, and the runner reports skips as passes.
 
+`VGI_DATABASE_PACKAGE_WORKER` is the worker *command* that `database_worker/package.test`
+packages as a `database://` executable. It defaults to `VGI_TEST_WORKER` (minus `launch:`);
+lanes whose `VGI_TEST_WORKER` is a location (`http://`, `unix://`) must set it — the
+`run_http_integration.sh` / `run_unix_integration.sh` scripts default it to the Python fixture
+worker. Unset on such a lane, the packaged fixture fails with a message naming the variable.
+
 ### Running specific tests
 
 ```bash

@@ -23,7 +23,10 @@ SELECT * FROM vgi_worker_package(
     'test-1');
 
 # This fast default-suite fixture is an executable wrapper around
-# VGI_TEST_WORKER. The heavyweight test_database_workers target separately
+# VGI_TEST_WORKER, or around VGI_DATABASE_PACKAGE_WORKER on lanes where
+# VGI_TEST_WORKER is a location (http://, unix://) rather than a command: a
+# database:// worker is always exec'd locally, whatever transport the lane
+# tests. The run_*_integration.sh scripts set it. The heavyweight test_database_workers target separately
 # packages and runs self-contained Python, Bun, and Rust worker artifacts.
 
 query TITT

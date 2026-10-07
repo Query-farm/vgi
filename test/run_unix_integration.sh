@@ -9,6 +9,12 @@ BUILD_DIR="${BUILD_DIR:-release}"
 FILTER="${1:-test/sql/integration/*}"
 shift 2>/dev/null || true
 
+# database_worker/package.test packages a worker as an executable that the
+# database:// resolver execs locally. VGI_TEST_WORKER is a location on this lane,
+# not a command, so give the package a launchable one (override to package a
+# different SDK's worker).
+PACKAGE_WORKER="${VGI_DATABASE_PACKAGE_WORKER:-uv run --project $VGI_PYTHON_DIR vgi-fixture-worker}"
+
 SOCKET_DIR="$(mktemp -d)"
 SOCKET_PATH="$SOCKET_DIR/fixture.sock"
 LOG_FILE="$SOCKET_DIR/worker.log"
@@ -56,4 +62,5 @@ fi
 echo "Unix worker listening at $SOCKET_PATH (pid $SERVER_PID)"
 
 VGI_TEST_WORKER="unix://$SOCKET_PATH" \
+VGI_DATABASE_PACKAGE_WORKER="$PACKAGE_WORKER" \
     ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"

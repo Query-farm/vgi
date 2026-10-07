@@ -9,6 +9,12 @@ BUILD_DIR="${BUILD_DIR:-release}"
 FILTER="${1:-test/sql/integration/*}"
 shift 2>/dev/null || true
 
+# database_worker/package.test packages a worker as an executable that the
+# database:// resolver execs locally. VGI_TEST_WORKER is a location on this lane,
+# not a command, so give the package a launchable one (override to package a
+# different SDK's worker).
+PACKAGE_WORKER="${VGI_DATABASE_PACKAGE_WORKER:-uv run --project $VGI_PYTHON_DIR vgi-fixture-worker}"
+
 LOG_FILE="/tmp/vgi-http-test-server.log"
 
 # ``VGI_HTTP_DISABLE_ZSTD=1`` propagates into the fixture so the server's
@@ -70,4 +76,5 @@ echo "HTTP server running on port $PORT (pid $SERVER_PID)"
 # which subprocess can't carry) gate themselves via `require-env VGI_HTTP_TRANSPORT`.
 VGI_TEST_WORKER="http://localhost:$PORT" \
 VGI_HTTP_TRANSPORT=1 \
+VGI_DATABASE_PACKAGE_WORKER="$PACKAGE_WORKER" \
     ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"
