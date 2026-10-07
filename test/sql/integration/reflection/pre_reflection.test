@@ -1,0 +1,64 @@
+# name: test/sql/integration/reflection/pre_reflection.test
+# description: A worker that does not host vgi_rpc.Reflection.v1 (one that
+#              predates vgi-rpc reflection) answers a reflection request with
+#              protocol_not_supported. By location, vgi_protocols() reports
+#              that cause; by attached catalog it is not an error: the worker
+#              is taken to host exactly vgi.v2 (no version or hash known), and
+#              that answer is cached like any other.
+#              Fixture: test/support/no_reflection_worker.py (vgi-python's
+#              fixture worker with reflection not hosted).
+# group: [vgi_integration_reflection]
+
+# Gated first on VGI_MALFORMED_BATCH_WORKER: like that fixture, this one lives in
+# this repo's test/support and runs in vgi-python's environment, so it exists
+# only on this repo's own lanes. Every SDK lane already accepts the
+# VGI_MALFORMED_BATCH_WORKER skip, so a lane without vgi's test/support
+# fixtures skips here with a reason it allows, rather than failing on a new one.
+require-env VGI_MALFORMED_BATCH_WORKER
+
+require-env VGI_NO_REFLECTION_WORKER
+
+require vgi
+
+require httpfs
+
+statement error
+SELECT * FROM vgi_protocols('${VGI_NO_REFLECTION_WORKER}');
+----
+does not host vgi_rpc.Reflection.v1, so it cannot list its protocols: it predates vgi-rpc reflection
+
+# vgi.v2 is unaffected: the worker attaches and serves queries.
+statement ok
+ATTACH 'example' AS old_worker (TYPE vgi, LOCATION '${VGI_NO_REFLECTION_WORKER}');
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query IIII
+SELECT * FROM vgi_protocols(catalog := 'old_worker');
+----
+0	vgi.v2	NULL	NULL
+
+# Cached: the "predates reflection" answer is not re-asked per call.
+query IIII
+SELECT * FROM vgi_protocols(catalog := 'old_worker');
+----
+0	vgi.v2	NULL	NULL
+
+query I
+SELECT count(*) FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%reflection.list_protocols%' AND message LIKE '%predates_reflection=true%';
+----
+1
+
+# vgi.v2 queries keep working against it.
+query I
+SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = 'old_worker';
+----
+true
+
+statement ok
+DETACH old_worker;

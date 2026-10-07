@@ -35,7 +35,10 @@
 | `vgi_arrow_ipc.cpp` | Arrow IPC stream I/O: `FdInputStream`, `FdOutputStream`, `ReadRecordBatch` |
 | `vgi_arrow_utils.cpp` | Arrow-to-DuckDB type conversion |
 | `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
-| `vgi_catalogs.cpp` | `vgi_catalogs()` SQL function |
+| `vgi_catalogs.cpp` | `vgi_catalogs()` SQL function, plus the bind-time LOCATION/auth/`iroh_*` handling it shares with `vgi_protocols()` (`BindDiscoveryTarget`) |
+| `vgi_protocols.cpp` | `vgi_protocols()` SQL function — hosted protocols by LOCATION or by attached catalog |
+| `vgi_reflection.cpp` | Client side of `vgi_rpc.Reflection.v1`: `list_protocols` decode (tolerant, by name), pre-reflection detection, and the per-catalog capability check `GetHostedProtocols` / `HostsProtocol` |
+| `vgi_hosted_protocols.cpp` | std-only half: `HostedProtocolsCache` (held by `VgiAttachParameters`) and the per-LOCATION worker connection generations that invalidate it |
 | `vgi_batch_validation.cpp` | `vgi_validate_worker_batches` levels + `ValidateWorkerBatch` (Arrow `Validate`/`ValidateFull` on worker batches). See *Worker Batch Validation* |
 | `vgi_location_policy.cpp` | `vgi_allowed_transports` narrow-only LOCATION transport allowlist: classifier (mirrors dispatch), parser, per-DB CAS-narrowed state (owned by `VgiStorageExtension`), `CheckLocationPolicy` |
 | `vgi_clear_cache.cpp` | `vgi_clear_cache()` SQL function — clears all VGI catalog caches |

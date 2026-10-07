@@ -42,7 +42,12 @@ static void VgiClearCacheScan(ClientContext &context, TableFunctionInput &data_p
 		// User-initiated; force-purge the deferred-drop graveyard too.
 		// Documented to invalidate any in-flight bound queries against
 		// VGI catalogs.
-		catalog.Cast<VgiCatalog>().ClearCache(/*force=*/true);
+		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
+		vgi_catalog.ClearCache(/*force=*/true);
+		// And what the worker hosts (vgi_rpc.Reflection.v1): refetched on next use.
+		if (vgi_catalog.attach_parameters()) {
+			vgi_catalog.attach_parameters()->hosted_protocols().Invalidate();
+		}
 		VGI_LOG(context, "catalog.cache_clear",
 		        {{"catalog", catalog.GetName()}, {"trigger", "vgi_clear_cache"}});
 		++catalogs_cleared;

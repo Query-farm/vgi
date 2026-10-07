@@ -315,6 +315,9 @@ src/vgi_oauth.cpp
 src/vgi_oauth_env.cpp
 src/vgi_oauth_store.cpp
 src/vgi_catalogs.cpp
+src/vgi_protocols.cpp
+src/vgi_reflection.cpp
+src/vgi_hosted_protocols.cpp
 src/vgi_location_policy.cpp
 src/vgi_batch_validation.cpp
 src/vgi_table_function_impl.cpp
@@ -477,6 +480,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_attach_credentials.cpp
     test/cpp/test_request_schema_parity.cpp
     test/cpp/test_protocol_routing.cpp
+    test/cpp/test_hosted_protocols.cpp
     test/cpp/test_sab_stream.cpp
     test/cpp/test_sab_e2e.cpp
     test/cpp/test_sab_conn.cpp
@@ -504,6 +508,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_unix_socket.cpp
     src/vgi_launcher.cpp
     src/vgi_launcher_cache.cpp
+    src/vgi_hosted_protocols.cpp
     src/vgi_transport.cpp
     src/vgi_container_runtime.cpp
     src/vgi_subprocess.cpp

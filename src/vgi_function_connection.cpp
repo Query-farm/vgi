@@ -13,6 +13,7 @@
 #include "vgi_container_runtime.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_hosted_protocols.hpp"
 #include "vgi_http_client.hpp" // ResolveExternalLocation (externalized-batch resolution)
 #include "vgi_http_function_connection.hpp"
 #include "vgi_iroh_native.hpp"
@@ -384,6 +385,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	// Attempt bind with single retry for stale pool connections
 	if (!try_bind(false)) {
 		// Pooled worker was stale, retry with fresh
+		NoteWorkerConnectionReestablished(params.worker_path());
 		conn = CreateFreshConnection(context, params);
 		from_pool = false;
 		auto fields = BuildConnLogFields(*conn);
@@ -2014,6 +2016,7 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 					throw;
 				}
 				InvalidateSharedContainer(shared_spec);
+				NoteWorkerConnectionReestablished(worker_path);
 			}
 		}
 #else

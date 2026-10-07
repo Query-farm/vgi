@@ -12,7 +12,7 @@ routing decision. A request that omits it is unroutable: the server raises
 value is projected into the URL as `{base}/{protocol}/{method}`, and the server
 rejects a request whose two carriers disagree.
 
-This client addresses **two** protocols, both declared as `VgiProtocolId`
+This client addresses **three** protocols. Two are declared as `VgiProtocolId`
 constants in `vgi_rpc_client.hpp` (name + that protocol's own surface version,
 carried as a pair so a request can never mix one protocol's name with another's
 version):
@@ -21,6 +21,11 @@ version):
 |---|---|---|
 | `VGI_MAIN_PROTOCOL` | `vgi.v2` | everything: `bind`, `init`, `catalog_*`, aggregates, `table_buffering_*` |
 | `VGI_SECRET_PROTOCOL` | `vgi.secret.v1` | `secret_lookup` against Orchard's standalone secret service |
+| `REFLECTION_PROTOCOL_NAME` (`vgi_hosted_protocols.hpp`) | `vgi_rpc.Reflection.v1` | `list_protocols`: `vgi_protocols()` and the per-catalog capability check `vgi::HostsProtocol` |
+
+Reflection declares no version and is exempt from the version gate, so its
+requests carry no `vgi_rpc.protocol_version` key at all: the serializers omit
+the key for any `VgiProtocolId` whose version is empty.
 
 The major version is part of the name, so an incompatible major is a *different*
 protocol: a stale client's request 404s instead of reaching a handler that then

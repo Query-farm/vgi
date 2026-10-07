@@ -252,6 +252,8 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 	// Also check legacy vgi.log_extra for backwards compatibility
 	std::string traceback;
 	std::string exception_type;
+	std::string extra_error_kind;
+	std::string extra_error_code;
 	int extra_idx = custom_metadata->FindKey("vgi_rpc.log_extra");
 	if (extra_idx < 0) {
 		extra_idx = custom_metadata->FindKey("vgi.log_extra");
@@ -270,6 +272,16 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 				if (type_val && yyjson_is_str(type_val)) {
 					exception_type = yyjson_get_str(type_val);
 				}
+				// log_extra mirrors of the top-level error_kind / error_code keys
+				// (WIRE_PROTOCOL "Error kinds"): read when the top-level key is absent.
+				auto kind_val = yyjson_obj_get(root, "error_kind");
+				if (kind_val && yyjson_is_str(kind_val)) {
+					extra_error_kind = yyjson_get_str(kind_val);
+				}
+				auto code_val = yyjson_obj_get(root, "error_code");
+				if (code_val && yyjson_is_str(code_val)) {
+					extra_error_code = yyjson_get_str(code_val);
+				}
 			}
 			yyjson_doc_free(doc);
 		}
@@ -283,6 +295,17 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 	int kind_idx = custom_metadata->FindKey("vgi_rpc.error_kind");
 	if (kind_idx >= 0) {
 		error_kind = custom_metadata->value(kind_idx);
+	} else {
+		error_kind = extra_error_kind;
+	}
+	// Canonical code (gRPC code name, e.g. UNIMPLEMENTED): top-level key first,
+	// then the log_extra mirror.
+	std::string error_code;
+	int code_idx = custom_metadata->FindKey("vgi_rpc.error_code");
+	if (code_idx >= 0) {
+		error_code = custom_metadata->value(code_idx);
+	} else {
+		error_code = extra_error_code;
 	}
 
 	// Handle based on log level
@@ -297,7 +320,7 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		// unsafe for stateful aggregate operations and masks the real error.
 		// When `error_kind` is set, throws the typed VgiRpcException subclass
 		// instead so capability-detection callers can pattern-match.
-		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, invocation_id_hex, error_kind);
+		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, invocation_id_hex, error_kind, error_code);
 	}
 
 	// For non-exception log levels, log to DuckDB if we have a context

@@ -66,6 +66,7 @@
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_catalogs.hpp"
+#include "vgi_protocols.hpp"
 #include "vgi_copy_from_impl.hpp"
 #include "vgi_copy_to_impl.hpp"
 #include "vgi_exception.hpp"
@@ -3611,6 +3612,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
+	RegisterVgiProtocolsFunction(loader);
 
 	// Register the synthetic catalog-scan function under its name. VgiTableEntry
 	// builds an unnamed-in-catalog "vgi_table_scan" TableFunction per scan, but

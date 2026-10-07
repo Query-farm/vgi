@@ -33,7 +33,14 @@ constexpr TokenBit kTokens[] = {
 };
 
 const char *EntryPointName(LocationEntryPoint entry) {
-	return entry == LocationEntryPoint::ATTACH ? "attach" : "vgi_catalogs";
+	switch (entry) {
+	case LocationEntryPoint::ATTACH:
+		return "attach";
+	case LocationEntryPoint::VGI_PROTOCOLS:
+		return "vgi_protocols";
+	default:
+		return "vgi_catalogs";
+	}
 }
 
 // SET calls the callback with the statement's raw scope (AUTOMATIC resolves to
@@ -182,8 +189,9 @@ uint32_t ClassifyLocationForPolicy(const std::string &location, LocationEntryPoi
 		if (entry != LocationEntryPoint::ATTACH) {
 			// Only ATTACH resolves database:// into a verified artifact; anywhere
 			// else the raw string would be handed to the shell.
-			refusal = "vgi: vgi_catalogs() does not resolve database:// LOCATIONs; ATTACH the database:// "
-			          "LOCATION instead";
+			refusal = StringUtil::Format("vgi: %s() does not resolve database:// LOCATIONs; ATTACH the "
+			                             "database:// LOCATION instead",
+			                             EntryPointName(entry));
 			return 0;
 		}
 		return POLICY_DATABASE;

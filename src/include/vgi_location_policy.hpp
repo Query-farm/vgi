@@ -53,7 +53,8 @@ constexpr uint32_t POLICY_ALL_TRANSPORTS = POLICY_LOCAL_TRANSPORTS | POLICY_HTTP
 
 // Where a LOCATION enters VGI. The two entry points resolve differently, so the
 // same string can dispatch to a different transport at each.
-enum class LocationEntryPoint { ATTACH, VGI_CATALOGS };
+// VGI_PROTOCOLS (vgi_protocols(location)) resolves exactly as VGI_CATALOGS does.
+enum class LocationEntryPoint { ATTACH, VGI_CATALOGS, VGI_PROTOCOLS };
 
 // Classify `location` as the transport the dispatch code will ACTUALLY use for
 // it at `entry` on this build. Built from the same predicates, in the same

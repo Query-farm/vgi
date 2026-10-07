@@ -96,6 +96,15 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
                                            const std::string &tcp_proxy = "",
                                            std::shared_ptr<IrohClientConfig> iroh = nullptr);
 
+// One vgi_rpc.Reflection.v1/list_protocols call through the catalog's
+// connection and auth, returning the decoded ProtocolList payload batch (one
+// row). Uncached and undecoded: callers use GetHostedProtocols /
+// HostsProtocol / InvokeListProtocols in vgi_reflection.hpp. A worker that
+// does not host reflection throws (VgiRpcException protocol_not_supported, or
+// method_not_implemented from a server that predates routing keys).
+std::shared_ptr<arrow::RecordBatch> InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
+                                                                  ClientContext &context);
+
 // Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);
 

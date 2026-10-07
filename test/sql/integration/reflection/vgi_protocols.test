@@ -1,0 +1,202 @@
+# name: test/sql/integration/reflection/vgi_protocols.test
+# description: vgi_protocols() lists what a worker hosts, from its
+#              vgi_rpc.Reflection.v1 list_protocols, by location and by
+#              attached catalog. Asserts only what every SDK's fixture worker
+#              must satisfy: vgi.v2 is listed first with a semver; reflection
+#              itself and conformance.Secondary.v1 (hosted by every SDK
+#              fixture since the multi-protocol release) are listed; every
+#              hash is 64 lowercase hex; positions are 0..n-1; and both call
+#              forms give the same answer. See docs/catalog-discovery.md.
+# group: [vgi_integration_reflection]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# --- By location -------------------------------------------------------------
+
+query II
+SELECT position, protocol_name FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE position = 0;
+----
+0	vgi.v2
+
+query I
+SELECT regexp_full_match(protocol_version, '[0-9]+\.[0-9]+\.[0-9]+.*')
+FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE protocol_name = 'vgi.v2';
+----
+true
+
+query I
+SELECT count(*) FROM vgi_protocols('${VGI_TEST_WORKER}')
+WHERE protocol_name IN ('vgi.v2', 'vgi_rpc.Reflection.v1', 'conformance.Secondary.v1');
+----
+3
+
+# Every listed protocol carries a hash, and every hash is 64 lowercase hex.
+query I
+SELECT count(*) FROM vgi_protocols('${VGI_TEST_WORKER}')
+WHERE protocol_hash IS NULL OR NOT regexp_full_match(protocol_hash, '[0-9a-f]{64}');
+----
+0
+
+# Names are unique; positions are exactly 0..n-1 in listed order.
+query I
+SELECT count(*) = count(DISTINCT protocol_name)
+   AND min(position) = 0
+   AND max(position) = count(*) - 1
+   AND count(DISTINCT position) = count(*)
+FROM vgi_protocols('${VGI_TEST_WORKER}');
+----
+true
+
+# The answer is a property of the worker build: stable across calls.
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM vgi_protocols('${VGI_TEST_WORKER}')
+     EXCEPT SELECT * FROM vgi_protocols('${VGI_TEST_WORKER}'))
+);
+----
+0
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM vgi_protocols('${VGI_TEST_WORKER}'));
+----
+position	INTEGER
+protocol_name	VARCHAR
+protocol_version	VARCHAR
+protocol_hash	VARCHAR
+
+# --- By attached catalog -----------------------------------------------------
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Both forms agree, row for row.
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM vgi_protocols('${VGI_TEST_WORKER}')
+     EXCEPT SELECT * FROM vgi_protocols(catalog := 'example'))
+    UNION ALL
+    (SELECT * FROM vgi_protocols(catalog := 'example')
+     EXCEPT SELECT * FROM vgi_protocols('${VGI_TEST_WORKER}'))
+);
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM vgi_protocols(catalog := 'example'))
+     = (SELECT count(*) FROM vgi_protocols('${VGI_TEST_WORKER}'));
+----
+true
+
+query II
+SELECT position, protocol_name FROM vgi_protocols(catalog := 'example') WHERE position = 0;
+----
+0	vgi.v2
+
+# The catalog form is cached per catalog: one list_protocols per attach until
+# vgi_clear_cache() or DETACH. The queries above already fetched it.
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT * FROM vgi_protocols(catalog := 'example');
+
+statement ok
+SELECT * FROM vgi_protocols(catalog := 'example');
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%reflection.list_protocols%';
+----
+0
+
+statement ok
+SELECT * FROM vgi_clear_cache();
+
+statement ok
+SELECT * FROM vgi_protocols(catalog := 'example');
+
+statement ok
+SELECT * FROM vgi_protocols(catalog := 'example');
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%reflection.list_protocols%';
+----
+1
+
+# Catalog aliases are case-insensitive, like every DuckDB catalog name.
+query I
+SELECT count(*) > 0 FROM vgi_protocols(catalog := 'EXAMPLE');
+----
+true
+
+# DETACH drops the cache; a new ATTACH under the same alias asks again.
+statement ok
+DETACH example;
+
+statement error
+SELECT * FROM vgi_protocols(catalog := 'example');
+----
+no attached catalog named 'example'
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_protocols(catalog := 'example');
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%reflection.list_protocols%';
+----
+2
+
+# --- Errors ------------------------------------------------------------------
+
+statement error
+SELECT * FROM vgi_protocols(catalog := 'memory');
+----
+catalog 'memory' is not a VGI catalog
+
+statement error
+SELECT * FROM vgi_protocols(catalog := 'no_such_catalog');
+----
+no attached catalog named 'no_such_catalog'
+
+statement error
+SELECT * FROM vgi_protocols();
+----
+pass a worker location
+
+statement error
+SELECT * FROM vgi_protocols('${VGI_TEST_WORKER}', catalog := 'example');
+----
+not both
+
+statement error
+SELECT * FROM vgi_protocols(catalog := 'example', oauth_profile := 'p');
+----
+oauth_profile is only valid with a worker location
+
+statement error
+SELECT * FROM vgi_protocols(NULL::VARCHAR);
+----
+must not be NULL
+
+# Location forms share vgi_catalogs()'s option validation.
+statement error
+SELECT * FROM vgi_protocols('./not-http-worker', bearer_token := 'tok');
+----
+only valid for HTTP transport
+
+statement error
+SELECT * FROM vgi_protocols('database://nowhere');
+----
+vgi_protocols() does not resolve database:// LOCATIONs
+
+statement ok
+DETACH example;

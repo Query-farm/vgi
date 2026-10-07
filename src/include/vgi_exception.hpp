@@ -95,16 +95,24 @@ template <typename... ARGS>
 class VgiRpcException : public InvalidInputException {
 public:
 	VgiRpcException(const std::unordered_map<std::string, std::string> &extra_info,
-	                const std::string &msg, std::string error_kind)
-	    : InvalidInputException(extra_info, msg), error_kind_(std::move(error_kind)) {
+	                const std::string &msg, std::string error_kind, std::string error_code = "")
+	    : InvalidInputException(extra_info, msg), error_kind_(std::move(error_kind)),
+	      error_code_(std::move(error_code)) {
 	}
 
 	const std::string &GetErrorKind() const noexcept {
 		return error_kind_;
 	}
 
+	// Canonical code (`vgi_rpc.error_code`, a gRPC code name such as
+	// "UNIMPLEMENTED"), or empty when the worker sent none.
+	const std::string &GetErrorCode() const noexcept {
+		return error_code_;
+	}
+
 private:
 	std::string error_kind_;
+	std::string error_code_;
 };
 
 // Throw an InvalidInputException (or VgiRpcException if `error_kind` is set)
@@ -116,11 +124,12 @@ private:
 // user-code error behind a silent NULL result.
 [[noreturn]] inline void ThrowVgiUserException(const std::string &msg, const std::string &worker_path,
                                                 pid_t worker_pid, const std::string &invocation_id_hex = "",
-                                                const std::string &error_kind = "") {
+                                                const std::string &error_kind = "",
+                                                const std::string &error_code = "") {
 	auto extra_info = BuildExtraInfo(worker_path, worker_pid, invocation_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path);
-	if (!error_kind.empty()) {
-		throw VgiRpcException(extra_info, full_msg, error_kind);
+	if (!error_kind.empty() || !error_code.empty()) {
+		throw VgiRpcException(extra_info, full_msg, error_kind, error_code);
 	}
 	throw InvalidInputException(extra_info, full_msg);
 }
@@ -129,6 +138,9 @@ private:
 // at any time, callers should treat unknown values as "kind not recognised".
 namespace error_kind {
 inline constexpr const char *kMethodNotImplemented = "method_not_implemented";
+// The worker does not host the protocol the request named (vgi-rpc WIRE_PROTOCOL
+// §3.1). The capability-probe answer for an optional protocol.
+inline constexpr const char *kProtocolNotSupported = "protocol_not_supported";
 } // namespace error_kind
 
 // Format captured worker stderr into a suffix appended to worker-failure

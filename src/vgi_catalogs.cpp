@@ -44,84 +44,11 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<VgiCatalogsBindData>();
 
-	bind_data->worker_path = input.inputs[0].GetValue<string>();
-	// Checked here for an early error, and again at InitGlobal (where the worker
-	// is actually contacted) so a statement prepared before the policy was
-	// narrowed cannot run under EXECUTE without being re-checked.
-	vgi::CheckLocationPolicy(context, bind_data->worker_path, vgi::LocationEntryPoint::VGI_CATALOGS);
-
-	vgi::IrohOptions iroh_options;
-	std::string bearer_token, refresh_token, cache_mode;
-	// Discovery has no attached alias. Callers can explicitly share a profile
-	// with a later ATTACH; OAuth session keys also include the discovered issuer,
-	// client and resource, so the default does not merge unrelated services.
-	std::string profile = "default";
-	for (auto &kv : input.named_parameters) {
-		auto name = StringUtil::Lower(kv.first);
-		if (name == "bearer_token" || name == "oauth_refresh_token" ||
-		    name == "oauth_profile" || name == "oauth_cache") {
-			if (kv.second.IsNull()) {
-				throw BinderException("%s must not be NULL", name);
-			}
-			auto value = kv.second.GetValue<string>();
-			if (name == "bearer_token") {
-				bearer_token = std::move(value);
-				kv.second = Value("<redacted>");
-			} else if (name == "oauth_refresh_token") {
-				refresh_token = std::move(value);
-				kv.second = Value("<redacted>");
-			} else if (name == "oauth_profile") {
-				profile = std::move(value);
-				if (profile.empty()) {
-					throw BinderException("oauth_profile must not be empty");
-				}
-			} else {
-				cache_mode = StringUtil::Lower(value);
-			}
-		} else {
-			vgi::ApplyIrohOption(name, kv.second, iroh_options);
-		}
-	}
-	if (!bearer_token.empty() && !refresh_token.empty()) {
-		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
-	}
-	if (cache_mode.empty()) {
-		Value value;
-		cache_mode = context.TryGetCurrentSetting("vgi_oauth_cache", value)
-		                 ? StringUtil::Lower(value.ToString()) : "auto";
-	}
-	if (cache_mode != "auto" && cache_mode != "persistent" && cache_mode != "memory" && cache_mode != "none") {
-		throw BinderException("oauth_cache must be auto, persistent, memory, or none (got '%s')", cache_mode);
-	}
-	if ((!bearer_token.empty() || !refresh_token.empty()) &&
-	    !vgi::IsHttpTransport(bind_data->worker_path) && !vgi::IsHttpiTransport(bind_data->worker_path)) {
-		throw BinderException("bearer_token and oauth_refresh_token are only valid for HTTP transport "
-		                      "(worker_path must be an HTTP/HTTPS or httpi:// URL)");
-	}
-	if (!bearer_token.empty()) {
-		bind_data->auth = std::make_shared<vgi::BearerTokenCatalogAuth>(std::move(bearer_token));
-	} else {
-		auto auth = std::make_shared<vgi::OAuthCatalogAuth>(std::move(profile), std::move(cache_mode));
-		if (!refresh_token.empty()) {
-			auth->SeedRefreshToken(refresh_token);
-		}
-		bind_data->auth = std::move(auth);
-	}
-	bind_data->iroh =
-	    vgi::BuildIrohClientConfigForLocation(context, bind_data->worker_path, std::move(iroh_options), "vgi_catalogs()");
-
-	if (vgi::IsHttpTransport(bind_data->worker_path)) {
-		auto &db = DatabaseInstance::GetDatabase(context);
-		try {
-			ExtensionHelper::TryAutoLoadExtension(db, "httpfs");
-		} catch (...) {
-			// ignore auto-load errors, check below
-		}
-		if (!db.ExtensionIsLoaded("httpfs")) {
-			throw BinderException("VGI HTTP transport requires the httpfs extension. "
-			                      "Install it with: INSTALL httpfs; LOAD httpfs;");
-		}
-	}
+	auto target = vgi::BindDiscoveryTarget(context, input.inputs[0].GetValue<string>(), input.named_parameters,
+	                                       "vgi_catalogs()", vgi::LocationEntryPoint::VGI_CATALOGS);
+	bind_data->worker_path = std::move(target.worker_path);
+	bind_data->auth = std::move(target.auth);
+	bind_data->iroh = std::move(target.iroh);
 
 	VGI_LOG(context, "vgi_catalogs.bind", {{"worker_path", bind_data->worker_path}});
 
@@ -265,9 +192,96 @@ static InsertionOrderPreservingMap<string> VgiCatalogsToString(TableFunctionToSt
 
 } // anonymous namespace
 
-void RegisterVgiCatalogsFunction(ExtensionLoader &loader) {
-	TableFunction func("vgi_catalogs", {LogicalType::VARCHAR}, VgiCatalogsScan, VgiCatalogsBind, VgiCatalogsInitGlobal);
+namespace vgi {
 
+VgiDiscoveryTarget BindDiscoveryTarget(ClientContext &context, std::string worker_path,
+                                       named_parameter_map_t &named_parameters, const char *function_name,
+                                       LocationEntryPoint entry, const std::unordered_set<std::string> &skip) {
+	VgiDiscoveryTarget target;
+	target.worker_path = std::move(worker_path);
+	// Checked here for an early error, and again at InitGlobal (where the worker
+	// is actually contacted) so a statement prepared before the policy was
+	// narrowed cannot run under EXECUTE without being re-checked.
+	CheckLocationPolicy(context, target.worker_path, entry);
+
+	IrohOptions iroh_options;
+	std::string bearer_token, refresh_token, cache_mode;
+	// Discovery has no attached alias. Callers can explicitly share a profile
+	// with a later ATTACH; OAuth session keys also include the discovered issuer,
+	// client and resource, so the default does not merge unrelated services.
+	std::string profile = "default";
+	for (auto &kv : named_parameters) {
+		auto name = StringUtil::Lower(kv.first);
+		if (skip.count(name)) {
+			continue;
+		}
+		if (name == "bearer_token" || name == "oauth_refresh_token" ||
+		    name == "oauth_profile" || name == "oauth_cache") {
+			if (kv.second.IsNull()) {
+				throw BinderException("%s must not be NULL", name);
+			}
+			auto value = kv.second.GetValue<string>();
+			if (name == "bearer_token") {
+				bearer_token = std::move(value);
+				kv.second = Value("<redacted>");
+			} else if (name == "oauth_refresh_token") {
+				refresh_token = std::move(value);
+				kv.second = Value("<redacted>");
+			} else if (name == "oauth_profile") {
+				profile = std::move(value);
+				if (profile.empty()) {
+					throw BinderException("oauth_profile must not be empty");
+				}
+			} else {
+				cache_mode = StringUtil::Lower(value);
+			}
+		} else {
+			ApplyIrohOption(name, kv.second, iroh_options);
+		}
+	}
+	if (!bearer_token.empty() && !refresh_token.empty()) {
+		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
+	}
+	if (cache_mode.empty()) {
+		Value value;
+		cache_mode = context.TryGetCurrentSetting("vgi_oauth_cache", value)
+		                 ? StringUtil::Lower(value.ToString()) : "auto";
+	}
+	if (cache_mode != "auto" && cache_mode != "persistent" && cache_mode != "memory" && cache_mode != "none") {
+		throw BinderException("oauth_cache must be auto, persistent, memory, or none (got '%s')", cache_mode);
+	}
+	if ((!bearer_token.empty() || !refresh_token.empty()) &&
+	    !IsHttpTransport(target.worker_path) && !IsHttpiTransport(target.worker_path)) {
+		throw BinderException("bearer_token and oauth_refresh_token are only valid for HTTP transport "
+		                      "(worker_path must be an HTTP/HTTPS or httpi:// URL)");
+	}
+	if (!bearer_token.empty()) {
+		target.auth = std::make_shared<BearerTokenCatalogAuth>(std::move(bearer_token));
+	} else {
+		auto auth = std::make_shared<OAuthCatalogAuth>(std::move(profile), std::move(cache_mode));
+		if (!refresh_token.empty()) {
+			auth->SeedRefreshToken(refresh_token);
+		}
+		target.auth = std::move(auth);
+	}
+	target.iroh = BuildIrohClientConfigForLocation(context, target.worker_path, std::move(iroh_options), function_name);
+
+	if (IsHttpTransport(target.worker_path)) {
+		auto &db = DatabaseInstance::GetDatabase(context);
+		try {
+			ExtensionHelper::TryAutoLoadExtension(db, "httpfs");
+		} catch (...) {
+			// ignore auto-load errors, check below
+		}
+		if (!db.ExtensionIsLoaded("httpfs")) {
+			throw BinderException("VGI HTTP transport requires the httpfs extension. "
+			                      "Install it with: INSTALL httpfs; LOAD httpfs;");
+		}
+	}
+	return target;
+}
+
+void AddDiscoveryNamedParameters(TableFunction &func) {
 	// Authentication uses the same handlers and options as ATTACH, including
 	// challenge discovery, token refresh and the vgi_oauth_enabled setting.
 	func.named_parameters["bearer_token"] = LogicalType::VARCHAR;
@@ -283,6 +297,15 @@ void RegisterVgiCatalogsFunction(ExtensionLoader &loader) {
 	func.named_parameters["iroh_no_relay"] = LogicalType::BOOLEAN;
 	func.named_parameters["iroh_remote_relay_url"] = LogicalType::VARCHAR;
 	func.named_parameters["iroh_direct_addresses"] = LogicalType::LIST(LogicalType::VARCHAR);
+}
+
+} // namespace vgi
+
+void RegisterVgiCatalogsFunction(ExtensionLoader &loader) {
+	TableFunction func("vgi_catalogs", {LogicalType::VARCHAR}, VgiCatalogsScan, VgiCatalogsBind, VgiCatalogsInitGlobal);
+
+	// Same authentication and iroh_* options as ATTACH (and vgi_protocols()).
+	vgi::AddDiscoveryNamedParameters(func);
 
 	// Enable EXPLAIN output
 	func.to_string = VgiCatalogsToString;

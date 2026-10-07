@@ -53,7 +53,7 @@ An unknown or empty token is an error, so a typo can never loosen the policy.
 - **`enable_external_access = false`** also refuses every *local* transport, whatever the
   setting says. DuckDB already prevents turning external access back on.
 - **Where it applies.** The check runs when a LOCATION enters VGI: `ATTACH`, and `vgi_catalogs()`
-  both at bind and again at execution, so a statement prepared before narrowing is re-checked.
+  and `vgi_protocols()` both at bind and again at execution, so a statement prepared before narrowing is re-checked.
   It runs before any I/O: container inspection, package resolution, connecting or spawning.
 - **Existing catalogs keep working.** Catalogs attached before the setting was narrowed keep
   running, spawning and pooling their workers. This is the same model as extensions loaded before
@@ -73,7 +73,7 @@ Some LOCATIONs are refused whatever the policy says:
 
 - The internal tokens `vgi-artifact:` and `container-shared:`, which ATTACH creates itself and
   users never type.
-- `database://` given to `vgi_catalogs()`, which never resolves it. There the raw string would
+- `database://` given to `vgi_catalogs()` or `vgi_protocols()`, which never resolve it. There the raw string would
   otherwise go to the shell.
 
 ## Limitations

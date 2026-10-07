@@ -299,12 +299,17 @@ void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
 	// routing key, so it is what makes the request routable at all. Reserved
 	// server-level methods are resolved by the server before routing and are
 	// owned by no protocol, so they are sent without the key.
-	std::vector<std::string> keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY, RPC_PROTOCOL_VERSION_KEY};
+	std::vector<std::string> keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY};
 	std::vector<std::string> values = {
 	    method_name,
 	    RPC_REQUEST_VERSION_VALUE,
-	    std::string(protocol.version),
 	};
+	// A protocol that declares no version (vgi_rpc.Reflection.v1, which is
+	// exempt from the version gate) is sent without the key, as other clients do.
+	if (!protocol.version.empty()) {
+		keys.push_back(RPC_PROTOCOL_VERSION_KEY);
+		values.emplace_back(protocol.version);
+	}
 	if (!IsReservedRpcMethod(method_name)) {
 		keys.push_back(RPC_PROTOCOL_KEY);
 		values.emplace_back(protocol.name);
@@ -432,10 +437,13 @@ std::vector<uint8_t> SerializeRpcRequest(
 	// carrier and the URL's protocol segment its projection: the server rejects a
 	// request whose two disagree, so both are built from this one VgiProtocolId.
 	// Reserved server-level methods are owned by no protocol and carry no key.
-	std::vector<std::string> meta_keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY,
-	                                      RPC_PROTOCOL_VERSION_KEY};
-	std::vector<std::string> meta_values = {method_name, RPC_REQUEST_VERSION_VALUE,
-	                                        std::string(protocol.version)};
+	std::vector<std::string> meta_keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY};
+	std::vector<std::string> meta_values = {method_name, RPC_REQUEST_VERSION_VALUE};
+	// Omitted for a protocol that declares no version (reflection).
+	if (!protocol.version.empty()) {
+		meta_keys.emplace_back(RPC_PROTOCOL_VERSION_KEY);
+		meta_values.emplace_back(protocol.version);
+	}
 	if (!IsReservedRpcMethod(method_name)) {
 		meta_keys.emplace_back(RPC_PROTOCOL_KEY);
 		meta_values.emplace_back(protocol.name);

@@ -46,6 +46,7 @@
 
 #include "catch.hpp"
 
+#include "vgi_hosted_protocols.hpp"
 #include "vgi_rpc_client.hpp"
 
 #include <arrow/api.h>
@@ -123,4 +124,16 @@ TEST_CASE("reserved server-level methods carry no routing key", "[protocol-routi
 	REQUIRE(IsReservedRpcMethod("__upload_url__/init"));
 	REQUIRE_FALSE(IsReservedRpcMethod("bind"));
 	REQUIRE_FALSE(IsReservedRpcMethod("catalog_attach"));
+}
+
+TEST_CASE("a reflection request names reflection and carries no protocol_version", "[protocol-routing]") {
+	// vgi_rpc.Reflection.v1 declares no version and is exempt from the version
+	// gate (it is what a mismatched client asks to learn what mismatched), so
+	// the key is omitted rather than sent empty, as every other client does.
+	const VgiProtocolId reflection {REFLECTION_PROTOCOL_NAME, ""};
+	auto md = RequestMetadata(SerializeEmptyRpcRequest("list_protocols", reflection));
+
+	REQUIRE(MetadataValue(md, RPC_PROTOCOL_KEY) == std::string(REFLECTION_PROTOCOL_NAME));
+	REQUIRE(MetadataValue(md, RPC_METHOD_KEY) == "list_protocols");
+	REQUIRE_FALSE(md->Contains(RPC_PROTOCOL_VERSION_KEY));
 }

@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "vgi_hosted_protocols.hpp"     // arrow-free; per-catalog reflection cache
 #include "vgi_server_capabilities.hpp" // arrow-free; per-catalog capability snapshot
 
 namespace duckdb {
@@ -244,6 +245,13 @@ public:
 	// out-of-line (vgi_catalog_api.cpp) so this header stays light.
 	std::shared_ptr<VgiHttpClientPool> GetOrInitHttpClientPool() const;
 
+	// Per-catalog cache of the worker's vgi_rpc.Reflection.v1 listing. Never
+	// null. Read through vgi::GetHostedProtocols / vgi::HostsProtocol
+	// (vgi_reflection.hpp), not directly.
+	HostedProtocolsCache &hosted_protocols() const {
+		return *hosted_protocols_;
+	}
+
 private:
 	std::string worker_path_;
 	std::string catalog_name_;
@@ -276,6 +284,9 @@ private:
 	// Keep-alive HTTP client pool for unary RPCs. Guarded by
 	// http_params_mutex_ for lazy init (same tiny critical section).
 	mutable std::shared_ptr<VgiHttpClientPool> http_client_pool_;
+
+	// Reflection listing cache. See hosted_protocols() above.
+	std::shared_ptr<HostedProtocolsCache> hosted_protocols_ = std::make_shared<HostedProtocolsCache>();
 };
 
 // Bundles all catalog state needed for an RPC call.

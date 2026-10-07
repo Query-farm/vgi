@@ -11,6 +11,7 @@
 #if VGI_POSIX_TRANSPORT
 
 #include "vgi_launcher_cache.hpp"
+#include "vgi_hosted_protocols.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -140,8 +141,12 @@ std::string ResolveLauncherSocketPath(const std::string &location, const LaunchO
 }
 
 void InvalidateLauncherSocketCache(const std::string &location) {
-	std::lock_guard<std::mutex> lk(g_cache_mutex);
-	g_cache.erase(location);
+	{
+		std::lock_guard<std::mutex> lk(g_cache_mutex);
+		g_cache.erase(location);
+	}
+	// The next connect reaches a relaunched (possibly upgraded) worker.
+	NoteWorkerConnectionReestablished(location);
 }
 
 void ClearLauncherSocketCache() {

@@ -195,15 +195,22 @@ std::shared_ptr<VgiHttpClientPool> VgiAttachParameters::GetOrInitHttpClientPool(
 // Delegates to InvokePooledUnaryRpc which handles pool acquire/release, stderr
 // draining (critical — without it, long-running catalogs hang when the worker
 // stderr pipe buffer fills), and stale-pool retry.
+//
+// `protocol` selects the routing key (and the URL's protocol segment on HTTP).
+// Only `vgi.v2` methods have entries in the schema registry, so request
+// validation applies to those alone; other protocols' callers decode by name.
 static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const std::string &method_name,
-                                            const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context) {
+                                            const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context,
+                                            const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL) {
 	CatalogRpcInstrumentation instr(context, ctx, method_name);
 	try {
 		// Validate the outgoing request against the registered params schema.
 		// Catches encoder drift in BuildXxxParams (e.g. flipped nullability,
 		// missing fields) at the C++ boundary, before it turns into an opaque
 		// failure on the worker side.
-		ValidateRequestSchema(params, method_name, ctx.params->worker_path());
+		if (protocol.name == VGI_MAIN_PROTOCOL.name) {
+			ValidateRequestSchema(params, method_name, ctx.params->worker_path());
+		}
 
 		UnaryRpcOptions opts {context,
 		                      ctx.params->worker_path(),
@@ -241,6 +248,7 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		if (ctx.params->launcher_state_dir().has_value()) {
 			opts.launcher_state_dir = *ctx.params->launcher_state_dir();
 		}
+		opts.protocol = protocol;
 		auto result = InvokePooledUnaryRpc(opts, method_name, params);
 		instr.MarkOk();
 		return result;
@@ -302,6 +310,41 @@ static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &metho
                           const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context) {
 	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 	ExtractAndDeserializeResult(response, method_name, ctx.params->worker_path());
+}
+
+// ============================================================================
+// vgi_rpc.Reflection.v1
+// ============================================================================
+
+std::shared_ptr<arrow::RecordBatch> InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
+                                                                  ClientContext &context) {
+	// Reflection declares no protocol_version and is exempt from the version
+	// gate, so the request carries the routing key and no version.
+	static constexpr VgiProtocolId kReflection {REFLECTION_PROTOCOL_NAME, ""};
+	auto response = InvokeRpcMethod(ctx, "list_protocols", nullptr, context, kReflection);
+	const auto &worker_path = ctx.params->worker_path();
+	if (!response.batch || response.batch->num_rows() == 0) {
+		throw IOException("Empty response from %s/list_protocols [worker: %s]", REFLECTION_PROTOCOL_NAME,
+		                  worker_path);
+	}
+	// The ordinary unary envelope: the ProtocolList rides as one serialized
+	// IPC batch in a binary `result` column (WIRE_PROTOCOL §14).
+	auto result_col = response.batch->GetColumnByName("result");
+	if (!result_col || result_col->type()->id() != arrow::Type::BINARY) {
+		throw IOException("%s/list_protocols reply carried no binary 'result' column [worker: %s]",
+		                  REFLECTION_PROTOCOL_NAME, worker_path);
+	}
+	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+	if (binary_array->IsNull(0)) {
+		throw IOException("%s/list_protocols reply carried a NULL 'result' [worker: %s]", REFLECTION_PROTOCOL_NAME,
+		                  worker_path);
+	}
+	try {
+		return DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
+	} catch (const std::exception &e) {
+		throw IOException("Could not decode the %s/list_protocols reply [worker: %s]: %s", REFLECTION_PROTOCOL_NAME,
+		                  worker_path, e.what());
+	}
 }
 
 // ============================================================================

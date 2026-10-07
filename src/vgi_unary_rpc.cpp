@@ -9,6 +9,7 @@
 
 #include "vgi_container_runtime.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_hosted_protocols.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_iroh_native.hpp"
 #include "vgi_logging.hpp"
@@ -262,6 +263,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 					throw;
 				}
 				InvalidateSharedContainer(shared_spec);
+				NoteWorkerConnectionReestablished(opts.worker_path);
 				std::this_thread::sleep_for(backoff);
 				backoff = std::min(backoff * 2, std::chrono::milliseconds(1000));
 			}
@@ -391,6 +393,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 			throw; // nothing to retry — not pooled
 		}
 		// Single retry with a fresh worker. If that also fails, propagate.
+		NoteWorkerConnectionReestablished(opts.worker_path);
 		return AttemptUnaryRpc(opts, method_name, params, /*force_fresh=*/true);
 	}
 #endif
