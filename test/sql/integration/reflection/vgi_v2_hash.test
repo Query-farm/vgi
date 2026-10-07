@@ -1,0 +1,31 @@
+# name: test/sql/integration/reflection/vgi_v2_hash.test
+# description: Cross-SDK drift guard for the vgi.v2 surface. Every SDK's
+#              fixture worker must report, via vgi_rpc.Reflection.v1, the
+#              same vgi.v2 protocol_version and protocol_hash as the
+#              reference (vgi-python's VgiProtocol). The hash covers every
+#              method name and request/response schema, so an SDK that adds,
+#              drops, renames or retypes a vgi.v2 method fails here. Uses only
+#              reflection, which every worker hosts on every transport.
+# group: [vgi_integration_reflection]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# THE reference (protocol_version, protocol_hash) pair for vgi.v2 -- the only
+# place either constant lives in this suite. It changes only when vgi.v2's
+# protocol_version changes (the hash is a pure function of the surface, and the
+# surface may not change without a version bump). Update it in lockstep with:
+#   - vgi-python VgiProtocol.protocol_version (the reference; read the hash
+#     from `vgi_protocols()` against vgi-fixture-worker),
+#   - src/generated/vgi_protocol_version.hpp (VGI_PROTOCOL_VERSION, regenerated
+#     from vgi-python), and
+#   - each SDK's pinned vgi.v2 hash constant.
+# A version bump is this one expected-result line.
+query II
+SELECT protocol_version, protocol_hash
+FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE protocol_name = 'vgi.v2';
+----
+2.1.0	774cb80090d71ea76d09aa311b9cda4ca4c33c3bf72c43242eb6dc87b6f79ce5
