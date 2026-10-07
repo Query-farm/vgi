@@ -56,4 +56,4 @@ fi
 echo "Unix worker listening at $SOCKET_PATH (pid $SERVER_PID)"
 
 VGI_TEST_WORKER="unix://$SOCKET_PATH" \
-    ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"
+    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"

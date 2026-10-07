@@ -54,4 +54,4 @@ echo "HTTP server (compression disabled) running on port $PORT (pid $SERVER_PID)
 VGI_TEST_WORKER="http://localhost:$PORT" \
 VGI_HTTP_TRANSPORT=1 \
 VGI_HTTP_NO_COMPRESSION=1 \
-    ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"
+    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"

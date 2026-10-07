@@ -10,6 +10,15 @@ or
 make test_debug
 ```
 
+**Every integration lane passes `--test-config test/configs/no_error_skip.json`.**
+Without a config, DuckDB's sqllogictest runner turns any error whose text
+contains `HTTP` or `Unable to connect` into a SKIP and exits 0. Over the HTTP
+transport every worker error contains `HTTP`, so a lane without the config
+reports real failures, and a worker that died mid-run, as skips. The test/run_*.sh
+scripts, the Makefile's direct `unittest` calls and `scripts/run_tests.py`
+(by default) all pass it. A lane outside this repo that runs this suite (the
+SDK repos' CI) should pass the same file.
+
 ## Windows OAuth credential storage
 
 Configure the extension build with `-DBUILD_VGI_OAUTH_STORE_TESTS=ON`, then run:

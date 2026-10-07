@@ -58,4 +58,4 @@ TEST_FILE="${OVERRIDE_FILTER:-test/sql/integration/attach/attach_options_*}"
 
 VGI_ATTACH_OPTIONS_WORKER="http://localhost:$PORT" \
 VGI_ATTACH_OPTIONS_REQUIRED_WORKER="http://localhost:$PORT" \
-    ./build/$BUILD_DIR/test/unittest "$TEST_FILE"
+    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$TEST_FILE"

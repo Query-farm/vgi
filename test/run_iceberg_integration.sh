@@ -35,4 +35,4 @@ echo "iceberg extension available; running iceberg function-branch tests"
 
 VGI_TEST_WORKER="uv run --project ${VGI_PYTHON_DIR} vgi-fixture-worker" \
 	VGI_TEST_ICEBERG=1 \
-	"$UNITTEST" "$FILTER" "$@"
+	"$UNITTEST" --test-config test/configs/no_error_skip.json "$FILTER" "$@"

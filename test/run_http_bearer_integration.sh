@@ -51,4 +51,4 @@ echo "HTTP server (bearer auth) running on port $PORT (pid $SERVER_PID)"
 # Run tests — VGI_TEST_BEARER_TOKEN is used by the test SQL files
 VGI_TEST_WORKER="http://localhost:$PORT" \
 VGI_TEST_BEARER_TOKEN="$BEARER_TOKEN" \
-    ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"
+    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"

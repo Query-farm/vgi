@@ -69,4 +69,4 @@ if "$RUNTIME" image inspect --format '{{ index .Config.Labels "farm.query.vgi.tr
 fi
 
 echo "Running container integration tests: $FILTER"
-./build/"$BUILD_DIR"/test/unittest "$FILTER" "$@"
+./build/"$BUILD_DIR"/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"

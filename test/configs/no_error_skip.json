@@ -1,0 +1,4 @@
+{
+  "description": "VGI integration lanes: fail on every unexpected error. Given no --test-config, DuckDB's sqllogictest runner turns any error whose text contains \"HTTP\" or \"Unable to connect\" into a SKIP (exit 0); over the HTTP transport every worker error contains \"HTTP\", so real failures were reported as skips. The runner cannot parse an empty list, so the list holds one string no error message contains.",
+  "skip_error_messages": ["<vgi: never skip a test on its error message>"]
+}

@@ -70,4 +70,4 @@ echo "HTTP server running on port $PORT (pid $SERVER_PID)"
 # which subprocess can't carry) gate themselves via `require-env VGI_HTTP_TRANSPORT`.
 VGI_TEST_WORKER="http://localhost:$PORT" \
 VGI_HTTP_TRANSPORT=1 \
-    ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"
+    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"

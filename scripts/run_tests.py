@@ -92,12 +92,12 @@ def discover(patterns: list[str], root: Path) -> list[Path]:
 # --- Execution ---
 
 
-def run_one(test_path: Path, unittest: Path, env: dict[str, str]) -> dict:
-    """Invoke ``unittest <test_path>`` and capture everything."""
+def run_one(test_path: Path, unittest: Path, env: dict[str, str], extra_args: list[str]) -> dict:
+    """Invoke ``unittest [extra_args] <test_path>`` and capture everything."""
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
-            [str(unittest), str(test_path)],
+            [str(unittest), *extra_args, str(test_path)],
             env=env,
             capture_output=True,
             text=True,
@@ -370,9 +370,23 @@ def main(argv: Iterable[str] | None = None) -> int:
         "run — so a test that silently stops executing is a failure, not a quieter "
         "green. Match is on the reason text the runner prints.",
     )
+    parser.add_argument(
+        "--test-config",
+        default=None,
+        metavar="PATH",
+        help="sqllogictest --test-config for every unittest. Defaults to "
+        "test/configs/no_error_skip.json: without a config the runner turns any error "
+        "containing 'HTTP' or 'Unable to connect' into a SKIP, hiding real failures. "
+        "Pass '' for the runner's default.",
+    )
     args = parser.parse_args(argv)
 
     unittest = _find_unittest(args.root, args.build)
+    test_config = args.test_config
+    if test_config is None:
+        default_config = args.root / "test" / "configs" / "no_error_skip.json"
+        test_config = str(default_config) if default_config.exists() else ""
+    extra_args = ["--test-config", test_config] if test_config else []
     tests = discover(args.patterns, args.root)
     if not tests:
         print(YELLOW("no tests matched the given patterns"), file=sys.stderr)
@@ -404,7 +418,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     t0 = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(run_one, t, unittest, env): t for t in tests}
+        futures = {pool.submit(run_one, t, unittest, env, extra_args): t for t in tests}
         completed = 0
         for fut in concurrent.futures.as_completed(futures):
             r = fut.result()

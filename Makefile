@@ -218,7 +218,7 @@ test_launcher:
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/release/test/unittest "test/*" \
+	./build/release/test/unittest --test-config test/configs/no_error_skip.json "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test"
 
@@ -237,7 +237,7 @@ test_launcher_debug:
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/debug/test/unittest "test/*" \
+	./build/debug/test/unittest --test-config test/configs/no_error_skip.json "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test"
 
@@ -410,19 +410,19 @@ test_iceberg_debug:
 # Writable catalog tests (subprocess transport) — opt-in, require a worker
 # with writable-catalog support.
 test_writable:
-	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/release/test/unittest "test/sql/integration/writable/*"
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/release/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/writable/*"
 
 test_writable_debug:
-	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/debug/test/unittest "test/sql/integration/writable/*"
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/debug/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/writable/*"
 
 # Minimal-writable tests run by default through test_spawn (the env var is
 # already wired there); this target is for running just the simple-writable
 # sqllogictests in isolation.
 test_simple_writable:
-	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/release/test/unittest "test/sql/integration/simple_writable/*"
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/release/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/simple_writable/*"
 
 test_simple_writable_debug:
-	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/debug/test/unittest "test/sql/integration/simple_writable/*"
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/debug/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/simple_writable/*"
 
 # The production shared-transport parity gate: identical SQLLogicTests over a
 # local Unix socket and HTTP.
@@ -509,7 +509,7 @@ test_database_workers: build_database_workers
 	VGI_DATABASE_PYTHON_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-python-worker" \
 	VGI_DATABASE_BUN_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-open-meteo" \
 	VGI_DATABASE_RUST_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-rust-worker.tar.gz" \
-	./build/release/test/unittest "test/sql/integration/database_worker/real_*"
+	./build/release/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/database_worker/real_*"
 	VGI_DATABASE_PYTHON_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-python-worker" \
 	VGI_DATABASE_BUN_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-open-meteo" \
 	VGI_DATABASE_RUST_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-rust-worker.tar.gz" \

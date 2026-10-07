@@ -48,10 +48,10 @@ echo "HTTP versioned-tables worker running on port $PORT (pid $SERVER_PID)"
 
 if [[ -n "$OVERRIDE_FILTER" ]]; then
     VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
-        ./build/$BUILD_DIR/test/unittest "$OVERRIDE_FILTER"
+        ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$OVERRIDE_FILTER"
 else
     for t in versioned_tables_http versioned_tables_spec_http versioned_tables_impl_http versioned_tables_resolved_http; do
         VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
-            ./build/$BUILD_DIR/test/unittest "test/sql/integration/attach/${t}.test"
+            ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/attach/${t}.test"
     done
 fi

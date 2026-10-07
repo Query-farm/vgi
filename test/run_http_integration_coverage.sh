@@ -53,4 +53,4 @@ echo "HTTP server running on port $PORT (pid $SERVER_PID) [coverage enabled]"
 
 # Run tests
 VGI_TEST_WORKER="http://localhost:$PORT/vgi" \
-    ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"
+    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"
