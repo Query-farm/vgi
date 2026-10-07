@@ -34,6 +34,8 @@ class SessionCookieJar;
 // Forward declaration — full definition in vgi_http_client.hpp
 class VgiHttpClientPool;
 struct IrohClientConfig;
+// Full definition in vgi_attach_tickets.hpp
+struct VgiRetainedAttach;
 
 // POD constructor argument for ``VgiAttachParameters``.  Replaces the
 // 8-positional-default-param constructor that previous versions of this
@@ -73,6 +75,11 @@ struct VgiAttachParametersConfig {
 	// transport and never forwarded in catalog_attach worker options. Kept last
 	// so existing aggregate initializers retain their positional meaning.
 	std::string tcp_proxy;
+	// What the user attached with (remote catalog name, catalog options
+	// INCLUDING secret ones, version specs as typed), kept in memory only so
+	// vgi_export_session() can seal_attach it. Never logged or serialized
+	// anywhere else. Null for internal/temporary parameters.
+	std::shared_ptr<const VgiRetainedAttach> retained_attach;
 };
 
 // Parameters for connecting to a VGI worker
@@ -91,6 +98,7 @@ struct VgiAttachParameters {
 	      tcp_proxy_(std::move(cfg.tcp_proxy)),
 	      attach_options_canonical_(std::move(cfg.attach_options_canonical)) {
 		worker_artifact_anchor_ = std::move(cfg.worker_artifact_anchor);
+		retained_attach_ = std::move(cfg.retained_attach);
 	}
 
 	// Legacy constructor — thin wrapper for in-tree call sites that haven't
@@ -200,6 +208,11 @@ struct VgiAttachParameters {
 	const std::shared_ptr<void> &worker_artifact_anchor() const {
 		return worker_artifact_anchor_;
 	}
+	// See VgiAttachParametersConfig::retained_attach. Null when not retained.
+	const std::shared_ptr<const VgiRetainedAttach> &retained_attach() const {
+		return retained_attach_;
+	}
+
 	void ReleaseWorkerArtifactAnchor() {
 		worker_artifact_anchor_.reset();
 	}
@@ -268,6 +281,7 @@ private:
 	std::string tcp_proxy_;
 	std::string attach_options_canonical_;
 	std::shared_ptr<void> worker_artifact_anchor_;
+	std::shared_ptr<const VgiRetainedAttach> retained_attach_;
 
 	// See GetOrInitHttpParams above for the rationale behind caching these.
 	mutable std::mutex http_params_mutex_;

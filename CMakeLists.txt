@@ -316,6 +316,7 @@ src/vgi_oauth_env.cpp
 src/vgi_oauth_store.cpp
 src/vgi_catalogs.cpp
 src/vgi_protocols.cpp
+src/vgi_attach_tickets.cpp
 src/vgi_reflection.cpp
 src/vgi_hosted_protocols.cpp
 src/vgi_location_policy.cpp

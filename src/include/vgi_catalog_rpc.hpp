@@ -23,6 +23,7 @@
 
 #include "vgi_attach_parameters.hpp"
 #include "vgi_catalog_metadata.hpp"
+#include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 
 namespace duckdb {
@@ -104,6 +105,14 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 // method_not_implemented from a server that predates routing keys).
 std::shared_ptr<arrow::RecordBatch> InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
                                                                   ClientContext &context);
+
+// One unary call to a non-vgi.v2 protocol through the catalog's connection and
+// auth (routing key and, when non-empty, version from `protocol`). Returns the
+// decoded one-row payload of the binary `result` envelope; decode it by name.
+// Worker errors surface as VgiRpcException carrying error_kind / error_code.
+std::shared_ptr<arrow::RecordBatch> InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
+                                                        const VgiProtocolId &protocol, const std::string &method_name,
+                                                        const std::shared_ptr<arrow::RecordBatch> &params);
 
 // Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);

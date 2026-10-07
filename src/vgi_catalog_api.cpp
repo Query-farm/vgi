@@ -317,35 +317,46 @@ static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &metho
 // vgi_rpc.Reflection.v1
 // ============================================================================
 
+std::shared_ptr<arrow::RecordBatch> InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
+                                                        const VgiProtocolId &protocol, const std::string &method_name,
+                                                        const std::shared_ptr<arrow::RecordBatch> &params) {
+	auto response = InvokeRpcMethod(ctx, method_name, params, context, protocol);
+	const auto &worker_path = ctx.params->worker_path();
+	const std::string protocol_name(protocol.name);
+	if (!response.batch || response.batch->num_rows() == 0) {
+		throw IOException("Empty response from %s/%s [worker: %s]", protocol_name, method_name, worker_path);
+	}
+	// The ordinary unary envelope: a structured return rides as one serialized
+	// IPC batch in a binary `result` column.
+	auto result_col = response.batch->GetColumnByName("result");
+	if (!result_col || result_col->type()->id() != arrow::Type::BINARY) {
+		throw IOException("%s/%s reply carried no binary 'result' column [worker: %s]", protocol_name, method_name,
+		                  worker_path);
+	}
+	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+	if (binary_array->IsNull(0)) {
+		throw IOException("%s/%s reply carried a NULL 'result' [worker: %s]", protocol_name, method_name,
+		                  worker_path);
+	}
+	std::shared_ptr<arrow::RecordBatch> payload;
+	try {
+		payload = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
+	} catch (const std::exception &e) {
+		throw IOException("Could not decode the %s/%s reply [worker: %s]: %s", protocol_name, method_name,
+		                  worker_path, e.what());
+	}
+	if (!payload || payload->num_rows() < 1) {
+		throw IOException("%s/%s reply carried no rows [worker: %s]", protocol_name, method_name, worker_path);
+	}
+	return payload;
+}
+
 std::shared_ptr<arrow::RecordBatch> InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
                                                                   ClientContext &context) {
 	// Reflection declares no protocol_version and is exempt from the version
 	// gate, so the request carries the routing key and no version.
 	static constexpr VgiProtocolId kReflection {REFLECTION_PROTOCOL_NAME, ""};
-	auto response = InvokeRpcMethod(ctx, "list_protocols", nullptr, context, kReflection);
-	const auto &worker_path = ctx.params->worker_path();
-	if (!response.batch || response.batch->num_rows() == 0) {
-		throw IOException("Empty response from %s/list_protocols [worker: %s]", REFLECTION_PROTOCOL_NAME,
-		                  worker_path);
-	}
-	// The ordinary unary envelope: the ProtocolList rides as one serialized
-	// IPC batch in a binary `result` column (WIRE_PROTOCOL §14).
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col || result_col->type()->id() != arrow::Type::BINARY) {
-		throw IOException("%s/list_protocols reply carried no binary 'result' column [worker: %s]",
-		                  REFLECTION_PROTOCOL_NAME, worker_path);
-	}
-	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-	if (binary_array->IsNull(0)) {
-		throw IOException("%s/list_protocols reply carried a NULL 'result' [worker: %s]", REFLECTION_PROTOCOL_NAME,
-		                  worker_path);
-	}
-	try {
-		return DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
-	} catch (const std::exception &e) {
-		throw IOException("Could not decode the %s/list_protocols reply [worker: %s]: %s", REFLECTION_PROTOCOL_NAME,
-		                  worker_path, e.what());
-	}
+	return InvokeProtocolUnary(ctx, context, kReflection, "list_protocols", nullptr);
 }
 
 // ============================================================================

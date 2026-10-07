@@ -1,0 +1,191 @@
+# name: test/sql/integration/attach_ticket/round_trip.test
+# description: Export, detach, reattach with nothing but a grant and a ticket.
+#              ticket_probe (spec §7) needs a secret, required api_key, so a
+#              reattach that reads the same probe row proves the secret took
+#              effect without travelling again. Also: another principal's grant
+#              cannot open the ticket; tampered, expired and foreign-worker
+#              tickets are refused; a grant-authenticated caller cannot export
+#              (stale_login); the ticket and grant never show in
+#              duckdb_databases().
+#
+#              Needs an HTTP fixture worker hosting vgi.attach_tickets.v1
+#              (VGI_SIGNING_KEY + VGI_RPC_GRANT_KEYS) and a second one with a
+#              different signing key: `make test_http_attach_ticket`
+#              (test/run_http_attach_ticket_integration.sh). Every statement
+#              authenticates explicitly (some SDKs' fixtures answer an
+#              unauthenticated request with 401 once test bearers are on).
+#              Gated first on VGI_TEST_BEARER_TOKEN, a skip every SDK lane
+#              already accepts, then on the ticket workers.
+# group: [vgi_integration_attach_ticket]
+
+require-env VGI_TEST_BEARER_TOKEN
+
+require-env VGI_ATTACH_TICKET_WORKER
+
+require-env VGI_ATTACH_TICKET_FOREIGN_WORKER
+
+require vgi
+
+require httpfs
+
+# --- Alice attaches with a plain and a secret option, and exports ------------
+
+statement ok
+ATTACH 'ticket_probe' AS alice_probe (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token 'vgi-test-alice', region 'eu-west-1', api_key 'sk-test-0123456789');
+
+query II
+SELECT region, api_key_sha256 FROM alice_probe.main.probe;
+----
+eu-west-1	0d3b56072291
+
+statement ok
+CREATE TABLE exported AS SELECT * FROM vgi_export_session(aliases := ['alice_probe'], ttl_seconds := 3600);
+
+query IIIIII
+SELECT alias, location = '${VGI_ATTACH_TICKET_WORKER}', catalog_name, status, grant LIKE 'vgig1.%',
+       ticket LIKE 'vgia1.%'
+FROM exported;
+----
+alice_probe	true	ticket_probe	ok	true	true
+
+# Both halves were asked for an hour; the entry lives until the first expires.
+query I
+SELECT epoch(expires_at::TIMESTAMP) - epoch(current_timestamp::TIMESTAMP) BETWEEN 3500 AND 3700 FROM exported;
+----
+true
+
+statement ok
+SET VARIABLE alice_grant = (SELECT grant FROM exported);
+
+statement ok
+SET VARIABLE alice_ticket = (SELECT ticket FROM exported);
+
+statement ok
+DETACH alice_probe;
+
+# --- The runner reattaches with only the grant and the ticket ---------------
+
+statement ok
+ATTACH 'ticket_probe' AS runner (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token getvariable('alice_grant'), attach_ticket getvariable('alice_ticket'));
+
+query II
+SELECT region, api_key_sha256 FROM runner.main.probe;
+----
+eu-west-1	0d3b56072291
+
+# Neither credential is visible in duckdb_databases().
+query I
+SELECT position(getvariable('alice_ticket') IN options::VARCHAR) = 0
+   AND position(getvariable('alice_grant') IN options::VARCHAR) = 0
+   AND options::VARCHAR LIKE '%<redacted>%'
+FROM duckdb_databases() WHERE database_name = 'runner';
+----
+true
+
+# A catalog attached by ticket has no original options in this session, so
+# there is nothing to re-seal.
+query I
+SELECT status FROM vgi_export_session(aliases := ['runner']);
+----
+not_supported
+
+statement ok
+DETACH runner;
+
+statement ok
+ATTACH 'ticket_probe' AS grant_session (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token getvariable('alice_grant'), api_key 'sk-test-0123456789');
+
+# A grant cannot mint a grant: a grant-authenticated session is a stale login.
+query I
+SELECT status FROM vgi_export_session(aliases := ['grant_session']);
+----
+stale_login
+
+statement ok
+DETACH grant_session;
+
+# Without the ticket the reattach fails: api_key is required and never travelled.
+statement error
+ATTACH 'ticket_probe' AS no_ticket (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token getvariable('alice_grant'));
+----
+api_key
+
+# --- Another principal cannot open alice's ticket ---------------------------
+
+statement ok
+ATTACH 'ticket_probe' AS bob_probe (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token 'vgi-test-bob', api_key 'sk-bob');
+
+statement ok
+SET VARIABLE bob_grant = (SELECT grant FROM vgi_export_session(aliases := ['bob_probe']) WHERE status = 'ok');
+
+statement ok
+DETACH bob_probe;
+
+statement error
+ATTACH 'ticket_probe' AS stolen (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token getvariable('bob_grant'), attach_ticket getvariable('alice_ticket'));
+----
+attach_ticket was refused (attach_ticket_invalid)
+
+# --- Tampered, expired and foreign-worker tickets ---------------------------
+
+statement ok
+SET VARIABLE tampered = substr(getvariable('alice_ticket'), 1, 40)
+    || CASE WHEN substr(getvariable('alice_ticket'), 41, 1) = 'A' THEN 'B' ELSE 'A' END
+    || substr(getvariable('alice_ticket'), 42);
+
+statement error
+ATTACH 'ticket_probe' AS tampered (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token getvariable('alice_grant'), attach_ticket getvariable('tampered'));
+----
+attach_ticket was refused (attach_ticket_invalid)
+
+# An authentic ticket past its lifetime (+ the spec's 60 s skew). Only the
+# ticket is short-lived: the hour-long grant still authenticates alice.
+statement ok
+ATTACH 'ticket_probe' AS short_probe (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token 'vgi-test-alice', api_key 'sk-test-0123456789');
+
+statement ok
+SET VARIABLE short_ticket = (SELECT ticket FROM vgi_export_session(aliases := ['short_probe'], ttl_seconds := 1)
+                             WHERE status = 'ok');
+
+statement ok
+DETACH short_probe;
+
+sleep 62 seconds
+
+statement error
+ATTACH 'ticket_probe' AS expired (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token getvariable('alice_grant'), attach_ticket getvariable('short_ticket'));
+----
+attach_ticket was refused (attach_ticket_expired)
+
+# Sealed by a worker with another signing key, for the same principal.
+statement ok
+ATTACH 'ticket_probe' AS foreign_probe (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_FOREIGN_WORKER}',
+    bearer_token 'vgi-test-alice', api_key 'sk-test-0123456789');
+
+statement ok
+SET VARIABLE foreign_ticket = (SELECT ticket FROM vgi_export_session(aliases := ['foreign_probe']) WHERE status = 'ok');
+
+statement ok
+DETACH foreign_probe;
+
+statement error
+ATTACH 'ticket_probe' AS foreign_redeem (TYPE vgi, LOCATION '${VGI_ATTACH_TICKET_WORKER}',
+    bearer_token getvariable('alice_grant'), attach_ticket getvariable('foreign_ticket'));
+----
+attach_ticket was refused (attach_ticket_invalid)
+
+# None of the refused attaches left a catalog behind.
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name IN ('stolen', 'tampered', 'expired', 'foreign_redeem', 'no_ticket');
+----
+0

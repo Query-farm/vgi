@@ -70,6 +70,7 @@ VGI_NO_REFLECTION_WORKER ?= uv run --project $(HOME)/Development/vgi-python pyth
 .PHONY: test_spawn test_spawn_debug test_unix test_unix_debug test_http test_http_debug \
 	test_shm test_shm_debug \
 	test_launcher test_launcher_debug \
+	test_http_attach_ticket test_http_attach_ticket_debug \
 	test_launcher_cloudflare_do test_launcher_cloudflare_do_debug \
 	test_http_versioned_tables test_http_versioned_tables_debug \
 	test_http_attach_options test_http_attach_options_debug \
@@ -352,6 +353,14 @@ test_http_bearer:
 test_http_bearer_debug:
 	BUILD_DIR=debug ./test/run_http_bearer_integration.sh "test/sql/integration/bearer_auth/*"
 
+# Attach tickets (vgi.attach_tickets.v1 + sealed grants): two HTTP fixture
+# workers with signing and grant keys. See test/sql/integration/attach_ticket/.
+test_http_attach_ticket:
+	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" ./test/run_http_attach_ticket_integration.sh "test/sql/integration/attach_ticket/*"
+
+test_http_attach_ticket_debug:
+	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" BUILD_DIR=debug ./test/run_http_attach_ticket_integration.sh "test/sql/integration/attach_ticket/*"
+
 # HTTP versioned-tables tests (runs against the vgi-fixture-versioned-tables-worker
 # in HTTP mode). Separate from test_http because it needs its own server.
 test_http_versioned_tables:
@@ -431,9 +440,9 @@ test_transport_matrix: test_unix test_http
 test_transport_matrix_debug: test_unix_debug test_http_debug
 
 # Run all transports
-test_all: test_spawn test_shm test_unix test_http test_http_bearer test_http_versioned_tables test_http_attach_options test_http_no_compression
+test_all: test_spawn test_shm test_unix test_http test_http_bearer test_http_attach_ticket test_http_versioned_tables test_http_attach_options test_http_no_compression
 
-test_all_debug: test_spawn_debug test_shm_debug test_unix_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug test_http_no_compression_debug
+test_all_debug: test_spawn_debug test_shm_debug test_unix_debug test_http_debug test_http_bearer_debug test_http_attach_ticket_debug test_http_versioned_tables_debug test_http_attach_options_debug test_http_no_compression_debug
 
 # ---------------------------------------------------------------------------
 # Per-language integration runs

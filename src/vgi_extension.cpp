@@ -67,6 +67,8 @@
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_catalogs.hpp"
 #include "vgi_protocols.hpp"
+#include "vgi_attach_tickets.hpp"
+#include "vgi_reflection.hpp"
 #include "vgi_copy_from_impl.hpp"
 #include "vgi_copy_to_impl.hpp"
 #include "vgi_exception.hpp"
@@ -1644,6 +1646,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	string oauth_profile;
 	string oauth_cache_mode;
 	string bearer_token;
+	// ATTACH `attach_ticket`: a vgi.attach_tickets.v1 ticket from
+	// vgi_export_session(). A credential: redacted, never logged, and keyed only
+	// as a salted hash. Sent as the sole catalog option, vgi_attach_ticket.
+	string attach_ticket;
+	bool attach_ticket_given = false;
 	string tcp_proxy;
 	vgi::IrohOptions iroh_options; // iroh_* options (shared parser with vgi_catalogs)
 	string data_version_spec;
@@ -1705,7 +1712,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		// options are deferred until their spec says whether they are secret.
 		const bool keyable = lower_name != "type" && lower_name != "location" && lower_name != "path" &&
 		                     lower_name != "bearer_token" && lower_name != "oauth_refresh_token" &&
-		                     lower_name != "iroh_secret_key" && value.type().id() != LogicalTypeId::STRUCT;
+		                     lower_name != "iroh_secret_key" && lower_name != vgi::ATTACH_TICKET_OPTION &&
+		                     value.type().id() != LogicalTypeId::STRUCT;
 		bool worker_option = false;
 		if (lower_name == "type") {
 			return;
@@ -1751,6 +1759,12 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			oauth_cache_mode = StringUtil::Lower(value.ToString());
 		} else if (lower_name == "bearer_token") {
 			bearer_token = value.ToString();
+		} else if (lower_name == vgi::ATTACH_TICKET_OPTION) {
+			if (value.IsNull()) {
+				throw BinderException("attach_ticket must not be NULL");
+			}
+			attach_ticket = value.ToString();
+			attach_ticket_given = true;
 		} else if (lower_name == "tcp_proxy") {
 			tcp_proxy = value.ToString();
 			if (tcp_proxy.empty()) {
@@ -1817,7 +1831,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					auto lower_key = StringUtil::Lower(key);
 					path_query_keys.insert(lower_key);
 					if (lower_key == "oauth_refresh_token" || lower_key == "bearer_token" ||
-					    lower_key == "iroh_secret_key") {
+					    lower_key == "iroh_secret_key" || lower_key == vgi::ATTACH_TICKET_OPTION) {
 						secret_in_path = true;
 					}
 					apply_option(lower_key, Value(val));
@@ -1858,7 +1872,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		auto lower_name = StringUtil::Lower(entry.first);
 		apply_option(lower_name, entry.second);
 	}
-	for (const char *token_option : {"oauth_refresh_token", "bearer_token", "iroh_secret_key"}) {
+	for (const char *token_option :
+	     {"oauth_refresh_token", "bearer_token", "iroh_secret_key", vgi::ATTACH_TICKET_OPTION}) {
 		redact_option(token_option);
 	}
 
@@ -1875,6 +1890,29 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	if (!bearer_token.empty() && !oauth_refresh_token.empty()) {
 		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
 	}
+	// An attach ticket IS the catalog's options: the worker restores the sealed
+	// options and version specs and refuses anything beside it, so reject that
+	// here, clearly, before any I/O. Extension options (LOCATION, auth, pool,
+	// ...) are not catalog options and remain allowed.
+	if (attach_ticket_given) {
+		if (attach_ticket.empty()) {
+			throw BinderException("attach_ticket must not be empty");
+		}
+		if (!attach_options.empty()) {
+			std::string extra;
+			for (const auto &opt : attach_options) {
+				extra += (extra.empty() ? "" : ", ") + opt.first;
+			}
+			throw BinderException("attach_ticket cannot be combined with catalog options (%s): the ticket carries "
+			                      "the options the catalog was originally attached with",
+			                      extra);
+		}
+		if (!data_version_spec.empty() || !implementation_version.empty()) {
+			throw BinderException("attach_ticket cannot be combined with data_version_spec or "
+			                      "implementation_version: the ticket carries the original version specs");
+		}
+	}
+
 	if (oauth_profile.empty()) {
 		oauth_profile = name;
 	}
@@ -1905,6 +1943,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	if (worker_path.empty()) {
 		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
 	}
+	// What the user typed as LOCATION, for vgi_export_session() (worker_path may
+	// be rewritten below, e.g. database:// into an internal artifact token).
+	const std::string user_location = location_is_struct ? location_struct.ToString() : worker_path;
 	// Transport policy gate: before ANY I/O on the location (container runtime
 	// detection / image inspection, database:// resolution, Iroh configuration,
 	// the discovery RPC). Checks the raw user LOCATION, before the rewrites below.
@@ -2312,16 +2353,87 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
+	// Retained for vgi_export_session(): the catalog options as validated above
+	// (secret ones included, in memory only) and the version specs as typed.
+	auto retained_attach = std::make_shared<vgi::VgiRetainedAttach>();
+	retained_attach->location = user_location;
+	retained_attach->catalog_name = catalog_name;
+	retained_attach->options = attach_options;
+	retained_attach->data_version_spec = data_version_spec;
+	retained_attach->implementation_version = implementation_version;
+
+	if (attach_ticket_given) {
+		// Only a worker hosting vgi.attach_tickets.v1 redeems the reserved
+		// option; anything else would reject it as an unknown option or, worse,
+		// hand it to catalog code. Ask reflection first (spec §5.1).
+		vgi::VgiAttachParametersConfig probe_cfg;
+		probe_cfg.worker_path = worker_path;
+		probe_cfg.worker_debug = worker_debug;
+		probe_cfg.use_pool = use_pool;
+		probe_cfg.auth = auth;
+		probe_cfg.cookie_jar = cookie_jar;
+		probe_cfg.iroh = iroh_config;
+		probe_cfg.launcher_idle_timeout_seconds = launcher_idle_for_attach;
+		probe_cfg.launcher_state_dir = launcher_state_dir_for_attach;
+		probe_cfg.worker_artifact_anchor = worker_artifact_anchor;
+		probe_cfg.tcp_proxy = tcp_proxy;
+		auto probe_params = std::make_shared<vgi::VgiAttachParameters>(std::move(probe_cfg));
+		if (!vgi::HostsProtocol(context, probe_params, vgi::ATTACH_TICKETS_PROTOCOL_NAME)) {
+			throw BinderException("The VGI worker at '%s' does not host %s, so it cannot redeem attach_ticket. "
+			                      "Attach tickets need an HTTP worker with a configured signing key and grant keys.",
+			                      worker_path, vgi::ATTACH_TICKETS_PROTOCOL_NAME);
+		}
+		attach_options.clear();
+		attach_options.emplace(vgi::ATTACH_TICKET_WIRE_OPTION, Value(attach_ticket));
+		retained_attach->options.clear();
+		retained_attach->via_ticket = true;
+		// Two attaches with different tickets may restore different options:
+		// key the result cache on the ticket, as a salted hash only.
+		std::string cache_dir;
+#ifndef __EMSCRIPTEN__
+		Value dir_value;
+		if (context.TryGetCurrentSetting("vgi_result_cache_dir", dir_value) && !dir_value.IsNull()) {
+			cache_dir = dir_value.ToString();
+		}
+#endif
+		key_options[vgi::ATTACH_TICKET_OPTION] = vgi::HashedAttachOptionKeyValue(
+		    vgi::AttachOptionKeySalt(cache_dir), vgi::ATTACH_TICKET_OPTION, attach_ticket);
+	}
+
 	// Call catalog_attach via RPC. The worker validates data_version_spec and
 	// implementation_version and throws with a human-readable message on
 	// unsatisfiable requests; that surfaces as the ATTACH failure. The
 	// launcher_*_for_attach optionals were already built above (alongside the
 	// InvokeCatalogs path) so the override flows into both RPCs identically.
-	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
-	                                              data_version_spec, implementation_version, cookie_jar,
-	                                              attach_options, launcher_idle_for_attach,
-	                                              launcher_state_dir_for_attach, worker_artifact_anchor, tcp_proxy,
-	                                              iroh_config);
+	auto invoke_attach = [&]() {
+		return vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
+		                                data_version_spec, implementation_version, cookie_jar, attach_options,
+		                                launcher_idle_for_attach, launcher_state_dir_for_attach, worker_artifact_anchor,
+		                                tcp_proxy, iroh_config);
+	};
+	vgi::CatalogAttachResult attach_result;
+	if (!attach_ticket_given) {
+		attach_result = invoke_attach();
+	} else {
+		// A refused ticket is reported by its error kind, the same for every SDK,
+		// without the worker's own wording (spec §4: never the ticket text).
+		try {
+			attach_result = invoke_attach();
+		} catch (const vgi::VgiRpcException &e) {
+			const auto &kind = e.GetErrorKind();
+			if (kind == "attach_ticket_invalid") {
+				throw InvalidInputException(
+				    "attach_ticket was refused (attach_ticket_invalid): the worker could not open it for this "
+				    "caller. A ticket opens only on the worker that sealed it, unmodified, for the principal it was "
+				    "sealed for: pair it with that principal's grant (bearer_token).");
+			}
+			if (kind == "attach_ticket_expired") {
+				throw InvalidInputException("attach_ticket was refused (attach_ticket_expired): the ticket has "
+				                            "expired. Export the session again with vgi_export_session().");
+			}
+			throw;
+		}
+	}
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings
@@ -2465,6 +2577,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// Canonical (sorted) serialization of the non-secret ATTACH options for the
 	// result-cache key. std::map iteration is already sorted.
 	attach_cfg.attach_options_canonical = vgi::CanonicalAttachOptions(key_options);
+	attach_cfg.retained_attach = std::move(retained_attach);
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(std::move(attach_cfg));
 
 	// Prime the HTTPParams cache while we're outside any VGI catalog
@@ -3613,6 +3726,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
 	RegisterVgiProtocolsFunction(loader);
+	vgi::RegisterVgiExportSessionFunction(loader);
 
 	// Register the synthetic catalog-scan function under its name. VgiTableEntry
 	// builds an unnamed-in-catalog "vgi_table_scan" TableFunction per scan, but

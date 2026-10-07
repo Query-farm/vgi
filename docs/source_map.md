@@ -36,6 +36,7 @@
 | `vgi_arrow_utils.cpp` | Arrow-to-DuckDB type conversion |
 | `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
 | `vgi_catalogs.cpp` | `vgi_catalogs()` SQL function, plus the bind-time LOCATION/auth/`iroh_*` handling it shares with `vgi_protocols()` (`BindDiscoveryTarget`) |
+| `vgi_attach_tickets.cpp` | Attach tickets: `issue_grant` / `seal_attach` clients and `vgi_export_session()`. The `attach_ticket` ATTACH option lives in `VgiCatalogAttach` (`vgi_extension.cpp`). See [attach-tickets.md](attach-tickets.md) |
 | `vgi_protocols.cpp` | `vgi_protocols()` SQL function — hosted protocols by LOCATION or by attached catalog |
 | `vgi_reflection.cpp` | Client side of `vgi_rpc.Reflection.v1`: `list_protocols` decode (tolerant, by name), pre-reflection detection, and the per-catalog capability check `GetHostedProtocols` / `HostsProtocol` |
 | `vgi_hosted_protocols.cpp` | std-only half: `HostedProtocolsCache` (held by `VgiAttachParameters`) and the per-LOCATION worker connection generations that invalidate it |

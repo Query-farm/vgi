@@ -1,0 +1,74 @@
+# name: test/sql/integration/attach_ticket/unsupported.test
+# description: Against a worker that does not host vgi.attach_tickets.v1 (every
+#              fixture worker by default: tickets need HTTP plus a configured
+#              signing key and grant keys), vgi_export_session() reports
+#              not_supported, a non-VGI catalog reports not_vgi, and ATTACH ...
+#              attach_ticket fails clearly before catalog_attach. The rules about
+#              what may accompany attach_ticket are checked before any I/O.
+#              Runs against every SDK's fixture worker.
+# group: [vgi_integration_attach_ticket]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# A mix of VGI and non-VGI catalogs: one row each, nothing aborts.
+query IIIIII
+SELECT alias, catalog_name, grant IS NULL, ticket IS NULL, expires_at IS NULL, status
+FROM vgi_export_session() ORDER BY alias;
+----
+example	example	true	true	true	not_supported
+memory	NULL	true	true	true	not_vgi
+
+query I
+SELECT message FROM vgi_export_session(aliases := ['example']);
+----
+the worker does not host vgi.attach_tickets.v1
+
+query II
+SELECT alias, status FROM vgi_export_session(aliases := ['memory', 'no_such_alias']) ORDER BY alias;
+----
+memory	not_vgi
+no_such_alias	error
+
+statement error
+SELECT * FROM vgi_export_session(ttl_seconds := 0);
+----
+ttl_seconds must be positive
+
+# The worker is asked (reflection) before the ticket is ever sent.
+statement error
+ATTACH 'example' AS ticketed (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', attach_ticket 'vgia1.AAAA');
+----
+does not host vgi.attach_tickets.v1, so it cannot redeem attach_ticket
+
+# Nothing may accompany the ticket: it carries the original options and specs.
+statement error
+ATTACH 'example' AS ticketed (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', attach_ticket 'vgia1.AAAA', region 'x');
+----
+attach_ticket cannot be combined with catalog options (region)
+
+statement error
+ATTACH 'example' AS ticketed (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', attach_ticket 'vgia1.AAAA',
+    data_version_spec '1.0.0');
+----
+attach_ticket cannot be combined with data_version_spec or implementation_version
+
+statement error
+ATTACH 'example' AS ticketed (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', attach_ticket '');
+----
+attach_ticket must not be empty
+
+# The failed attempts did not disturb the attached catalog.
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'ticketed';
+----
+0
+
+statement ok
+DETACH example;
