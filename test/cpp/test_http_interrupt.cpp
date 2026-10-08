@@ -221,4 +221,6 @@ TEST_CASE("an unarmed POST still completes while the query is interrupted", "[ht
 	// is the error it reports — the point is that it got that far.
 	REQUIRE(elapsed >= 0.9);
 	REQUIRE(error.find("did not respond as a VGI server") != std::string::npos);
+	// what() is DuckDB's JSON form; the classification rides in extra_info.
+	REQUIRE(error.find("\"error_subtype\":\"NOT_VGI_SERVER\"") != std::string::npos);
 }

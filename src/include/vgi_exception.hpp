@@ -64,6 +64,44 @@ inline std::unordered_map<std::string, std::string> BuildExtraInfo(const std::st
 	return extra_info;
 }
 
+// `error_subtype` values for HTTP-transport errors. DuckDB's own convention
+// for the key; under `errors_as_json` every extra_info entry is a top-level
+// JSON field, so callers branch on these instead of parsing the message.
+namespace http_error {
+// No response at all: connection refused, DNS, timeout, connection reset.
+inline constexpr const char *kTransportFailure = "TRANSPORT_FAILURE";
+// A response with no VGI capability headers: a proxy or tunnel error page,
+// a load balancer with no backend, or the wrong URL.
+inline constexpr const char *kNotVgiServer = "NOT_VGI_SERVER";
+// A VGI server that lacks a capability this client requires.
+inline constexpr const char *kServerTooOld = "SERVER_TOO_OLD";
+// A VGI server answered with a non-success status.
+inline constexpr const char *kHttpError = "HTTP_ERROR";
+inline constexpr const char *kAuthRequired = "AUTH_REQUIRED";
+inline constexpr const char *kAuthFailed = "AUTH_FAILED";
+// The response exceeded a client-side size bound.
+inline constexpr const char *kResponseTooLarge = "RESPONSE_TOO_LARGE";
+// The server answered but broke the protocol (malformed or missing content).
+inline constexpr const char *kProtocolViolation = "PROTOCOL_VIOLATION";
+inline constexpr const char *kChecksumMismatch = "CHECKSUM_MISMATCH";
+inline constexpr const char *kUnsupported = "UNSUPPORTED";
+} // namespace http_error
+
+// extra_info for an HTTP-transport error. `http_status` < 0 means no status
+// (no response was received).
+inline std::unordered_map<std::string, std::string> BuildHttpExtraInfo(const char *error_subtype,
+                                                                        const std::string &url, int http_status = -1) {
+	std::unordered_map<std::string, std::string> extra_info;
+	extra_info["error_subtype"] = error_subtype;
+	if (!url.empty()) {
+		extra_info["url"] = url;
+	}
+	if (http_status >= 0) {
+		extra_info["http_status"] = std::to_string(http_status);
+	}
+	return extra_info;
+}
+
 // Build message with worker path context for CLI visibility
 // The worker_path is included in the message since DuckDB CLI doesn't display extra_info
 inline std::string BuildMessageWithContext(const std::string &msg, const std::string &worker_path) {

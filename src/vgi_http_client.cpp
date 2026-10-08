@@ -14,6 +14,7 @@
 #include "duckdb/common/enums/http_status_code.hpp"
 
 #include "vgi_cookie_jar.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_http_compression.hpp"
 #include "vgi_httpi.hpp"
 #include "vgi_iroh_native.hpp"
@@ -428,14 +429,16 @@ static std::string HttpPostArrowIpcInternal(
 			throw InterruptException();
 		}
 		if (!out_response->native) {
-		throw IOException("VGI HTTP POST returned no response (transport failure) [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
+		                  "VGI HTTP POST returned no response (transport failure) [url: %s]", url);
 	}
 		if (!post.buffer_out.empty()) {
 			response_body.assign(post.buffer_out.data(), post.buffer_out.data() + post.buffer_out.size());
 		}
 	}
 	if (response_body.size() > kMaxBufferedRepresentationBytes) {
-		throw IOException("VGI HTTP response representation exceeds buffered transport limit (%llu > %llu) [url: %s]",
+		throw IOException(BuildHttpExtraInfo(http_error::kResponseTooLarge, url),
+		                  "VGI HTTP response representation exceeds buffered transport limit (%llu > %llu) [url: %s]",
 		                  static_cast<unsigned long long>(response_body.size()),
 		                  static_cast<unsigned long long>(kMaxBufferedRepresentationBytes), url);
 	}
@@ -457,6 +460,14 @@ static std::string HttpPostArrowIpcInternal(
 	// can. A response with no VGI capability header at all (a proxy error page,
 	// a non-VGI endpoint) never came from a VGI server, so it is reported as
 	// that rather than parsed as "server advertises nothing".
+	// Transport-level failure (connection refused, timeout, reset): with
+	// try_request set, HTTPUtil hands these back as a response carrying a
+	// request error rather than throwing. There is no HTTP status, body or
+	// header to inspect, so it is reported before anything reads them.
+	if (out_response->HasRequestError()) {
+		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
+		                  "VGI HTTP request failed (transport error): %s [url: %s]", out_response->GetError(), url);
+	}
 	if (!HasCapabilityHeaders(*out_response)) {
 		ThrowNotAVgiServer(*out_response, static_cast<int>(out_response->Status()), out_response->FallbackBody(),
 		                   url);
@@ -489,7 +500,8 @@ static std::string HttpPostArrowIpcInternal(
 		*harvested_caps = response_caps;
 	}
 	if (!response_caps.accept_max_response_bytes_support) {
-		throw IOException("VGI HTTP server does not advertise %s: true; it predates the response size budget "
+		throw IOException(BuildHttpExtraInfo(http_error::kServerTooOld, url),
+		                  "VGI HTTP server does not advertise %s: true; it predates the response size budget "
 		                  "this client requires, so upgrade the worker [url: %s]",
 		                  kAcceptMaxResponseBytesSupportHeader, url);
 	}
@@ -531,19 +543,11 @@ static std::string HttpPostArrowIpcInternal(
 		}
 	}
 
-	// Transport-level failure (connection refused, timeout, cancellation): with
-	// try_request set, HTTPUtil hands these back as a response carrying a
-	// request error rather than throwing. There is no HTTP status or body to
-	// report, so surface the transport error directly instead of falling into
-	// the status-code formatting below.
-	if (out_response->HasRequestError()) {
-		throw IOException("VGI HTTP request failed (transport error): %s [url: %s]", out_response->GetError(), url);
-	}
-
 	if (!out_response->Success()) {
 		std::string error_body = response_body.empty() ? out_response->FallbackBody() : response_body;
 		if (error_body.size() > kMaxBufferedRepresentationBytes) {
-			throw IOException("VGI HTTP response representation exceeds buffered transport limit (%llu > %llu) [url: %s]",
+			throw IOException(BuildHttpExtraInfo(http_error::kResponseTooLarge, url),
+		                  "VGI HTTP response representation exceeds buffered transport limit (%llu > %llu) [url: %s]",
 			                  static_cast<unsigned long long>(error_body.size()),
 			                  static_cast<unsigned long long>(kMaxBufferedRepresentationBytes), url);
 		}
@@ -556,7 +560,8 @@ static std::string HttpPostArrowIpcInternal(
 			                           static_cast<size_t>(effective_max_response_bytes));
 		}
 		if (error_body.size() > static_cast<uint64_t>(effective_max_response_bytes)) {
-			throw IOException("VGI HTTP response exceeds max_response_bytes (%llu > %llu) [url: %s]",
+			throw IOException(BuildHttpExtraInfo(http_error::kResponseTooLarge, url),
+		                  "VGI HTTP response exceeds max_response_bytes (%llu > %llu) [url: %s]",
 			                  static_cast<unsigned long long>(error_body.size()),
 			                  static_cast<unsigned long long>(effective_max_response_bytes), url);
 		}
@@ -618,7 +623,12 @@ static std::string HttpPostArrowIpcInternal(
 			body_preview.resize(1024);
 			body_preview += "...<truncated>";
 		}
-		throw IOException("VGI HTTP request failed (HTTP %d)%s%s: %s [url: %s]",
+		auto extra_info =
+		    BuildHttpExtraInfo(http_error::kHttpError, url, static_cast<int>(out_response->Status()));
+		if (!content_type.empty()) {
+			extra_info["content_type"] = content_type;
+		}
+		throw IOException(extra_info, "VGI HTTP request failed (HTTP %d)%s%s: %s [url: %s]",
 		                  static_cast<int>(out_response->Status()),
 		                  content_type.empty() ? "" : " Content-Type=", content_type,
 		    body_preview.empty() ? out_response->GetError() : body_preview, url);
@@ -656,7 +666,8 @@ static std::string HttpPostArrowIpcInternal(
 		try {
 			auto declared = std::stoull(content_length_str);
 			if (declared != response_body.size()) {
-				throw IOException("VGI HTTP response body size mismatch: Content-Length=%llu, got %llu bytes [url: %s]",
+				throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, url),
+				                  "VGI HTTP response body size mismatch: Content-Length=%llu, got %llu bytes [url: %s]",
 				    static_cast<unsigned long long>(declared),
 				                  static_cast<unsigned long long>(response_body.size()), url);
 			}
@@ -683,7 +694,8 @@ static std::string HttpPostArrowIpcInternal(
 	}
 	const size_t resp_decoded_bytes = response_body.size();
 	if (resp_decoded_bytes > static_cast<uint64_t>(effective_max_response_bytes)) {
-		throw IOException("VGI HTTP response exceeds max_response_bytes (%llu > %llu) [url: %s]",
+		throw IOException(BuildHttpExtraInfo(http_error::kResponseTooLarge, url),
+		                  "VGI HTTP response exceeds max_response_bytes (%llu > %llu) [url: %s]",
 		                  static_cast<unsigned long long>(resp_decoded_bytes),
 		                  static_cast<unsigned long long>(effective_max_response_bytes), url);
 	}
@@ -731,7 +743,8 @@ static std::string HttpPostArrowIpcInternal(
 			DispatchErrorStreamsFromBuffer(reinterpret_cast<const uint8_t *>(error_body.data()), error_body.size(),
 			                               nullptr, url);
 		}
-		throw IOException("VGI HTTP RPC error [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, url),
+		                  "VGI HTTP RPC error [url: %s]", url);
 	}
 
 	return response_body;
@@ -767,7 +780,8 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 
 	// Got 401 — need auth to handle it
 	if (!auth) {
-		throw IOException("VGI HTTP authentication required (HTTP 401) but no auth configured for this catalog "
+		throw IOException(BuildHttpExtraInfo(http_error::kAuthRequired, url, 401),
+		                  "VGI HTTP authentication required (HTTP 401) but no auth configured for this catalog "
 		                  "[url: %s]. Use bearer_token or oauth_refresh_token in ATTACH options.",
 		                  url);
 	}
@@ -802,7 +816,8 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 		// a non-OAuth situation. Catch it here while the URL is still in
 		// scope and produce an actionable error that names the fix.
 		if (!auth->IsExplicitlyConfigured()) {
-			throw IOException("VGI HTTP authentication failed (HTTP 401) [url: %s]. The server requires "
+			throw IOException(BuildHttpExtraInfo(http_error::kAuthRequired, url, 401),
+			                  "VGI HTTP authentication failed (HTTP 401) [url: %s]. The server requires "
 			    "authentication but advertised no OAuth challenge (%s). Pass bearer_token "
 			    "in ATTACH options, or oauth_refresh_token if the server uses OAuth "
 			    "without challenge advertising.",
@@ -816,7 +831,8 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 		OAuthChallenge empty_challenge;
 		auth->HandleUnauthorized(empty_challenge, context);
 		// If HandleUnauthorized didn't throw (shouldn't happen), surface a generic error
-		throw IOException("VGI HTTP authentication failed (HTTP 401) [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(http_error::kAuthFailed, url, 401),
+		                  "VGI HTTP authentication failed (HTTP 401) [url: %s]", url);
 	}
 
 	VGI_STDERR_DEBUG("[VGI] http.401_received url=%s resource_metadata=%s\n", url.c_str(),
@@ -831,7 +847,8 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps, iroh_config,
 	                                  cancellation);
 	if (response->Status() == HTTPStatusCode::Unauthorized_401) {
-		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
+		throw IOException(BuildHttpExtraInfo(http_error::kAuthFailed, url, 401),
+		                  "VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s",
 		                  url, response->FallbackBody());
 	}
@@ -866,7 +883,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 		*effective_caps = HttpDiscoverCapabilities(context, base_url, iroh_config);
 	}
 	if (!effective_caps->discovered || !effective_caps->accept_max_response_bytes_support) {
-		throw IOException("VGI HTTP server does not advertise %s: true; it predates the response size budget "
+		throw IOException(BuildHttpExtraInfo(http_error::kServerTooOld, base_url),
+		                  "VGI HTTP server does not advertise %s: true; it predates the response size budget "
 		                  "this client requires, so upgrade the worker [url: %s]",
 		                  kAcceptMaxResponseBytesSupportHeader, base_url);
 	}
@@ -939,11 +957,13 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, const s
 		throw InterruptException();
 	}
 	if (!response) {
-		throw IOException("VGI external location fetch returned no response (transport failure) [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
+		                  "VGI external location fetch returned no response (transport failure) [url: %s]", url);
 	}
 
 	if (!response->Success()) {
-		throw IOException("VGI external location fetch failed (HTTP %d) [url: %s]", static_cast<int>(response->status),
+		throw IOException(BuildHttpExtraInfo(http_error::kHttpError, url, static_cast<int>(response->status)),
+		                  "VGI external location fetch failed (HTTP %d) [url: %s]", static_cast<int>(response->status),
 		                  url);
 	}
 
@@ -961,8 +981,16 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
                                              const std::string &attach_opaque_data_digest,
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata,
                                              const std::atomic<bool> *cancellation) {
+	// The fetched URL is a pre-signed object, not the worker; name both.
+	auto location_error = [&](const char *error_subtype) {
+		auto extra_info = BuildHttpExtraInfo(error_subtype, location_url);
+		auto worker_info = BuildExtraInfo(worker_path, -1, invocation_id_hex);
+		extra_info.insert(worker_info.begin(), worker_info.end());
+		return extra_info;
+	};
 	if (IsHttpiTransport(location_url)) {
-		throw IOException("VGI external locations over httpi:// are unsupported; the worker must return an "
+		throw IOException(location_error(http_error::kUnsupported),
+		                  "VGI external locations over httpi:// are unsupported; the worker must return an "
 		                  "https:// pre-signed URL [url: %s]",
 		                  location_url);
 	}
@@ -970,7 +998,8 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 	auto body = HttpGetBytes(context, location_url, cancellation);
 
 	if (body.empty()) {
-		throw IOException("VGI external location returned empty response [url: %s]", location_url);
+		throw IOException(location_error(http_error::kProtocolViolation),
+		                  "VGI external location returned empty response [url: %s]", location_url);
 	}
 
 	// Verify SHA-256 checksum if present in pointer batch metadata
@@ -988,7 +1017,8 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 			std::string actual_hex(hex_buf, duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT);
 
 			if (actual_hex != expected_hex) {
-				throw IOException("VGI external location SHA-256 checksum mismatch [url: %s]: "
+				throw IOException(location_error(http_error::kChecksumMismatch),
+				                  "VGI external location SHA-256 checksum mismatch [url: %s]: "
 				                  "expected %s, got %s",
 				                  location_url, expected_hex, actual_hex);
 			}
@@ -1015,13 +1045,15 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 	opts.attach_opaque_data_digest = attach_opaque_data_digest;
 	auto result = ReadWorkerUnaryStream(std::make_shared<arrow::io::BufferReader>(owned), opts);
 	if (result.batch && ClassifyBatch(result.batch, result.metadata) == RpcBatchType::EXTERNAL_LOCATION) {
-		throw IOException("VGI external location redirect loop: resolved batch from %s "
+		throw IOException(location_error(http_error::kProtocolViolation),
+		                  "VGI external location redirect loop: resolved batch from %s "
 		                  "contains another vgi_rpc.location",
 		                  location_url);
 	}
 
 	if (!result.batch) {
-		throw IOException("VGI external location contained no data batch [url: %s]", location_url);
+		throw IOException(location_error(http_error::kProtocolViolation),
+		                  "VGI external location contained no data batch [url: %s]", location_url);
 	}
 
 	return result;
@@ -1141,18 +1173,21 @@ static std::string BodyPreviewForError(const std::string &body) {
 template <class RESPONSE>
 [[noreturn]] static void ThrowNotAVgiServer(const RESPONSE &response, int status, const std::string &body,
                                             const std::string &url) {
+	auto extra_info = BuildHttpExtraInfo(http_error::kNotVgiServer, url, status);
 	std::string detail = "HTTP " + std::to_string(status);
 	if (response.HasHeader("Content-Type")) {
 		const auto content_type = response.GetHeaderValue("Content-Type");
 		if (!content_type.empty()) {
 			detail += ", Content-Type: " + content_type;
+			extra_info["content_type"] = content_type;
 		}
 	}
 	const auto preview = BodyPreviewForError(body);
 	if (!preview.empty()) {
 		detail += ", body: \"" + preview + "\"";
+		extra_info["body_preview"] = preview;
 	}
-	throw IOException("VGI HTTP endpoint did not respond as a VGI server (%s). Check that the worker is running and "
+	throw IOException(extra_info, "VGI HTTP endpoint did not respond as a VGI server (%s). Check that the worker is running and "
 	                  "reachable at this URL [url: %s]",
 	                  detail, url);
 }
@@ -1170,21 +1205,21 @@ static bool HasSingleResponseBudgetSupport(const RpcHttpResponse &response) {
 
 static int64_t ParseCanonicalResponseMaximum(const std::string &value) {
 	if (value.empty() || value.front() == '0') {
-		throw IOException("VGI-Max-Response-Bytes must match [1-9][0-9]*");
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, std::string()), "VGI-Max-Response-Bytes must match [1-9][0-9]*");
 	}
 	int64_t parsed = 0;
 	for (const auto byte : value) {
 		if (byte < '0' || byte > '9') {
-			throw IOException("VGI-Max-Response-Bytes must match [1-9][0-9]*");
+			throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, std::string()), "VGI-Max-Response-Bytes must match [1-9][0-9]*");
 		}
 		const auto digit = static_cast<int64_t>(byte - '0');
 		if (parsed > (kMaxSafeInteger - digit) / 10) {
-			throw IOException("VGI-Max-Response-Bytes must be between 65536 and 9007199254740991");
+			throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, std::string()), "VGI-Max-Response-Bytes must be between 65536 and 9007199254740991");
 		}
 		parsed = parsed * 10 + digit;
 	}
 	if (parsed < kMinAcceptedMaxResponseBytes || parsed > kMaxSafeInteger) {
-		throw IOException("VGI-Max-Response-Bytes must be between 65536 and 9007199254740991");
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, std::string()), "VGI-Max-Response-Bytes must be between 65536 and 9007199254740991");
 	}
 	return parsed;
 }
@@ -1203,7 +1238,7 @@ static std::optional<int64_t> ParseAdvertisedResponseMaximum(const RpcHttpRespon
 		return std::nullopt;
 	}
 	if (values.size() != 1) {
-		throw IOException("VGI-Max-Response-Bytes must occur exactly once");
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, std::string()), "VGI-Max-Response-Bytes must occur exactly once");
 	}
 	return ParseCanonicalResponseMaximum(values[0]);
 }
@@ -1271,7 +1306,8 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 			ThrowNotAVgiServer(response, static_cast<int>(response.Status()), response.FallbackBody(), url);
 		}
 		if (!response.Success()) {
-			throw IOException("VGI HTTPI capability discovery failed (HTTP %d) [url: %s]",
+			throw IOException(BuildHttpExtraInfo(http_error::kHttpError, url, static_cast<int>(response.Status())),
+			                  "VGI HTTPI capability discovery failed (HTTP %d) [url: %s]",
 			                  static_cast<int>(response.Status()), url);
 		}
 		return ParseCapabilityHeaders(response);
@@ -1289,7 +1325,8 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 			ThrowNotAVgiServer(response, static_cast<int>(response.Status()), response.FallbackBody(), url);
 		}
 		if (!response.Success()) {
-			throw IOException("VGI HTTPI capability discovery failed (HTTP %d) [url: %s]",
+			throw IOException(BuildHttpExtraInfo(http_error::kHttpError, url, static_cast<int>(response.Status())),
+			                  "VGI HTTPI capability discovery failed (HTTP %d) [url: %s]",
 			                  static_cast<int>(response.Status()), url);
 		}
 		return ParseCapabilityHeaders(response);
@@ -1309,9 +1346,18 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	HTTPHeaders headers;
 	headers.Insert(kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes));
 	HeadRequestInfo head(url, headers, *params);
+	// Hand transport failures back rather than letting HTTPUtil throw its own
+	// "Could not connect" error, so an unreachable endpoint is reported like
+	// every other VGI HTTP failure, with structured extra_info.
+	head.try_request = true;
 	auto response = http_util.Request(head);
 	if (!response) {
-		throw IOException("VGI HTTP capability discovery returned no response [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
+		                  "VGI HTTP capability discovery returned no response [url: %s]", url);
+	}
+	if (response->HasRequestError()) {
+		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
+		                  "VGI HTTP endpoint is unreachable: %s [url: %s]", response->GetError(), url);
 	}
 	const auto status = static_cast<int>(response->status);
 	if (!HasCapabilityHeaders(*response)) {
@@ -1319,7 +1365,8 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 		ThrowNotAVgiServer(*response, status, std::string(), url);
 	}
 	if (status < 200 || status >= 300) {
-		throw IOException("VGI HTTP capability discovery failed (HTTP %d) [url: %s]", status, url);
+		throw IOException(BuildHttpExtraInfo(http_error::kHttpError, url, status),
+		                  "VGI HTTP capability discovery failed (HTTP %d) [url: %s]", status, url);
 	}
 
 	return ParseCapabilityHeaders(*response);
@@ -1342,7 +1389,8 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 	                              "", "", "", "", VGI_MAIN_PROTOCOL, nullptr, nullptr, iroh_config);
 
 	if (!result.batch || result.batch->num_rows() == 0) {
-		throw IOException("VGI server returned no upload URLs [url: %s]", base_url);
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI server returned no upload URLs [url: %s]", base_url);
 	}
 
 	// Parse response: {upload_url: utf8, download_url: utf8, expires_at: timestamp}
@@ -1350,7 +1398,8 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 	auto download_col = std::static_pointer_cast<arrow::StringArray>(result.batch->GetColumnByName("download_url"));
 
 	if (!upload_col || !download_col) {
-		throw IOException("VGI upload URL response missing required columns [url: %s]", base_url);
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI upload URL response missing required columns [url: %s]", base_url);
 	}
 
 	std::vector<UploadUrl> urls;
@@ -1386,11 +1435,13 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const std::vec
 	                   static_cast<idx_t>(body_size), content_type);
 	auto response = http_util.Request(put);
 	if (!response) {
-		throw IOException("VGI upload returned no response (transport failure) [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
+		                  "VGI upload returned no response (transport failure) [url: %s]", url);
 	}
 
 	if (!response->Success()) {
-		throw IOException("VGI upload failed (HTTP %d) [url: %s]", static_cast<int>(response->status), url);
+		throw IOException(BuildHttpExtraInfo(http_error::kHttpError, url, static_cast<int>(response->status)),
+		                  "VGI upload failed (HTTP %d) [url: %s]", static_cast<int>(response->status), url);
 	}
 }
 
