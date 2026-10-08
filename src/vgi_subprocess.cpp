@@ -32,6 +32,8 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "vgi_errno_name.hpp"
+#include "vgi_exception.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -85,7 +87,9 @@ ScopedForkSignalBlock::~ScopedForkSignalBlock() {
 Pipe::Pipe() {
 	int fds[2];
 	if (pipe(fds) != 0) {
-		throw IOException("Failed to create pipe");
+		const int err = errno;
+		throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kErrno, ErrnoName(err)),
+		                  "Failed to create pipe");
 	}
 	read_fd = fds[0];
 	write_fd = fds[1];
@@ -109,7 +113,8 @@ Pipe::Pipe() {
 		::close(write_fd);
 		read_fd = -1;
 		write_fd = -1;
-		throw IOException("Failed to set FD_CLOEXEC on pipe: %s", std::strerror(saved));
+		throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kErrno, ErrnoName(saved)),
+		                  "Failed to set FD_CLOEXEC on pipe: %s", std::strerror(saved));
 	}
 }
 
@@ -173,7 +178,9 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough, bool
 	ScopedForkSignalBlock fork_signal_block;
 	pid_ = fork();
 	if (pid_ < 0) {
-		throw IOException("Failed to fork process");
+		const int err = errno;
+		throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kErrno, ErrnoName(err)),
+		                  "Failed to fork process");
 	}
 
 	if (pid_ == 0) {
@@ -394,10 +401,13 @@ void WriteAll(int fd, const uint8_t *data, size_t len) {
 			}
 			if (errno == EPIPE) {
 				// Worker closed its stdin - it likely crashed or exited early
-				throw IOException("Worker closed pipe (EPIPE). Worker may have crashed - "
+				throw IOException(ErrorInfo(error_subtype::kTransportFailure).Set(error_key::kErrno, ErrnoName(EPIPE)),
+				                  "Worker closed pipe (EPIPE). Worker may have crashed - "
 				                  "use VGI_WORKER_STDERR_PASSTHROUGH=1 for diagnostics");
 			}
-			throw IOException("Failed to write to pipe: %s", strerror(errno));
+			const int err = errno;
+			throw IOException(ErrorInfo(error_subtype::kTransportFailure).Set(error_key::kErrno, ErrnoName(err)),
+			                  "Failed to write to pipe: %s", strerror(err));
 		}
 		written += result;
 	}
@@ -650,10 +660,13 @@ void WriteAll(int fd, const uint8_t *data, size_t len) {
 				continue;
 			}
 			if (errno == EPIPE) {
-				throw IOException("Worker closed pipe (EPIPE). Worker may have crashed - "
+				throw IOException(ErrorInfo(error_subtype::kTransportFailure).Set(error_key::kErrno, ErrnoName(EPIPE)),
+				                  "Worker closed pipe (EPIPE). Worker may have crashed - "
 				                  "check worker stderr output");
 			}
-			throw IOException("Failed to write to worker: %s", std::strerror(errno));
+			const int err = errno;
+			throw IOException(ErrorInfo(error_subtype::kTransportFailure).Set(error_key::kErrno, ErrnoName(err)),
+			                  "Failed to write to worker: %s", std::strerror(err));
 		}
 		written += static_cast<size_t>(result);
 	}
@@ -713,7 +726,9 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 
 	while (true) {
 		if (context && context->interrupted) {
-			throw IOException("VGI operation interrupted (query cancelled)");
+			// InterruptException, not IOException: the pool retries
+			// IOException on a fresh worker, and a cancel must not be retried.
+			throw InterruptException();
 		}
 
 		// poll() (not select()) so high-numbered fds don't overrun fd_set.
@@ -726,7 +741,9 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 			if (errno == EINTR) {
 				continue;
 			}
-			throw IOException("VGI operation failed: poll error: %s", strerror(errno));
+			const int err = errno;
+			throw IOException(ErrorInfo(error_subtype::kTransportFailure).Set(error_key::kErrno, ErrnoName(err)),
+			                  "VGI operation failed: poll error: %s", strerror(err));
 		}
 		if (result == 0) {
 			// Quantum elapsed without data — loop to re-poll interrupted.
@@ -1105,7 +1122,7 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 			// each iteration → prompt cancel.
 			for (unsigned attempt = 0;; attempt++) {
 				if (context && context->interrupted) {
-					throw IOException("VGI operation interrupted (query cancelled)");
+					throw InterruptException(); // not IOException: never retried
 				}
 				u_long avail = 0;
 				if (::ioctlsocket(sock, FIONREAD, &avail) == 0 && avail > 0) {

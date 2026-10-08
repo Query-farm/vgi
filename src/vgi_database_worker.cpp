@@ -10,6 +10,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
+#include "vgi_exception.hpp"
 #include "vgi_platform.hpp"
 #include "vgi_sha256.hpp"
 #include "vgi_worker_archive.hpp"
@@ -586,8 +587,16 @@ DatabaseWorkerResolution ResolveDatabaseWorker(const std::string &location, Clie
 	}
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() == 0) {
-		throw BinderException("vgi: no worker package '%s' for platform '%s' and package_version '%s' in %s",
-		                      coords.worker_name, DuckDB::Platform(), coords.package_version, qualified);
+		throw BinderException(ErrorInfo(error_subtype::kWorkerNotFound)
+		                          .Set(error_key::kTransport, "database")
+		                          .Set(error_key::kPackageName, coords.worker_name)
+		                          .Set(error_key::kPlatform, DuckDB::Platform())
+		                          .Set(error_key::kPackageVersion, coords.package_version)
+		                          .Set(error_key::kTable, qualified),
+		                      StringUtil::Format("vgi: no worker package '%s' for platform '%s' and package_version "
+		                                         "'%s' in %s",
+		                                         coords.worker_name, DuckDB::Platform(), coords.package_version,
+		                                         qualified));
 	}
 	if (chunk->GetValue(8, 0).GetValue<uint64_t>() != 1) {
 		throw BinderException("vgi: multiple worker packages match '%s' for platform '%s' and package_version '%s' in %s",
@@ -623,11 +632,19 @@ DatabaseWorkerResolution ResolveDatabaseWorker(const std::string &location, Clie
 	}
 	auto digest = VgiSha256Hex(contents);
 	if (digest != declared) {
-		throw IOException("vgi: database worker package SHA-256 mismatch: row declares %s, contents hash to %s",
+		throw IOException(ErrorInfo(error_subtype::kChecksumMismatch)
+		                      .Set(error_key::kTransport, "database")
+		                      .Set(error_key::kPackageName, coords.worker_name)
+		                      .ExpectedActual(declared, digest),
+		                  "vgi: database worker package SHA-256 mismatch: row declares %s, contents hash to %s",
 		                  declared, digest);
 	}
 	if (!coords.expected_sha256.empty() && digest != coords.expected_sha256) {
-		throw IOException("vgi: database worker package LOCATION pin mismatch: expected %s, got %s",
+		throw IOException(ErrorInfo(error_subtype::kChecksumMismatch)
+		                      .Set(error_key::kTransport, "database")
+		                      .Set(error_key::kPackageName, coords.worker_name)
+		                      .ExpectedActual(coords.expected_sha256, digest),
+		                  "vgi: database worker package LOCATION pin mismatch: expected %s, got %s",
 		                  coords.expected_sha256, digest);
 	}
 	return Install(location, contents, digest, format, entrypoint, context);

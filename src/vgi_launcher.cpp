@@ -11,6 +11,8 @@
 #include "vgi_launcher.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "vgi_errno_name.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_launcher_internal.hpp"
 #include "vgi_subprocess.hpp" // ResetChildSignalDispositions
 #include "vgi_unix_socket.hpp"
@@ -40,6 +42,16 @@ namespace duckdb {
 namespace vgi {
 
 namespace {
+
+// extra_info for a launcher-side local failure (state dir, lock, pipe, fork).
+ErrorInfo LauncherLocalInfo(int err = 0) {
+	ErrorInfo info(error_subtype::kLocalResource);
+	info.Set(error_key::kTransport, "launch");
+	if (err != 0) {
+		info.Set(error_key::kErrno, ErrnoName(err));
+	}
+	return info;
+}
 
 // ---------------------------------------------------------------------------
 // Centralised worker-pid reaper
@@ -172,9 +184,10 @@ void MkdirRecursive(const std::string &path) {
 			if (::stat(sub.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
 				continue;
 			}
-			throw IOException("vgi launcher: %s exists but is not a directory", sub);
+			throw IOException(LauncherLocalInfo(), "vgi launcher: %s exists but is not a directory", sub);
 		}
-		throw IOException("vgi launcher: mkdir(%s) failed: %s", sub, std::strerror(errno));
+		const int err = errno;
+		throw IOException(LauncherLocalInfo(err), "vgi launcher: mkdir(%s) failed: %s", sub, std::strerror(err));
 	}
 }
 
@@ -190,8 +203,9 @@ public:
 	static FlockGuard Acquire(const std::string &path, std::chrono::milliseconds timeout) {
 		int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
 		if (fd < 0) {
-			throw IOException("vgi launcher: open(%s) for flock failed: %s", path,
-			                   std::strerror(errno));
+			const int err = errno;
+			throw IOException(LauncherLocalInfo(err), "vgi launcher: open(%s) for flock failed: %s", path,
+			                  std::strerror(err));
 		}
 		auto deadline = std::chrono::steady_clock::now() + timeout;
 		// flock(2) doesn't have a native timeout; spin on LOCK_NB with a
@@ -207,13 +221,13 @@ public:
 			if (errno != EWOULDBLOCK && errno != EINTR) {
 				int saved = errno;
 				::close(fd);
-				throw IOException("vgi launcher: flock(%s) failed: %s", path,
-				                   std::strerror(saved));
+				throw IOException(LauncherLocalInfo(saved), "vgi launcher: flock(%s) failed: %s", path,
+				                  std::strerror(saved));
 			}
 			if (std::chrono::steady_clock::now() >= deadline) {
 				::close(fd);
 				throw IOException(
-				    "vgi launcher: timed out acquiring lock %s after %lldms", path,
+				    LauncherLocalInfo(), "vgi launcher: timed out acquiring lock %s after %lldms", path,
 				    static_cast<long long>(timeout.count()));
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -267,11 +281,12 @@ std::string ResolveAndEnsureStateDir(const std::optional<std::string> &override_
 	::chmod(dir.c_str(), 0700);
 	struct stat st;
 	if (::stat(dir.c_str(), &st) != 0) {
-		throw IOException("vgi launcher: stat(%s) failed: %s", dir, std::strerror(errno));
+		const int err = errno;
+		throw IOException(LauncherLocalInfo(err), "vgi launcher: stat(%s) failed: %s", dir, std::strerror(err));
 	}
 	if (st.st_uid != ::geteuid()) {
 		throw IOException(
-		    "vgi launcher: state directory %s is not owned by current user (uid=%u)", dir,
+		    LauncherLocalInfo(), "vgi launcher: state directory %s is not owned by current user (uid=%u)", dir,
 		    static_cast<unsigned>(st.st_uid));
 	}
 	return dir;
@@ -315,7 +330,8 @@ SpawnResult SpawnWorker(const std::vector<std::string> &final_argv,
                          const std::optional<std::string> &worker_stderr_path) {
 	int pipefd[2];
 	if (::pipe(pipefd) != 0) {
-		throw IOException("vgi launcher: pipe() failed: %s", std::strerror(errno));
+		const int err = errno;
+		throw IOException(LauncherLocalInfo(err), "vgi launcher: pipe() failed: %s", std::strerror(err));
 	}
 	// CLOEXEC the parent-retained read end so it doesn't leak into any
 	// later fork+exec in the host process.  The child clears CLOEXEC on
@@ -325,7 +341,7 @@ SpawnResult SpawnWorker(const std::vector<std::string> &final_argv,
 		int saved = errno;
 		::close(pipefd[0]);
 		::close(pipefd[1]);
-		throw IOException("vgi launcher: fcntl(FD_CLOEXEC) failed: %s", std::strerror(saved));
+		throw IOException(LauncherLocalInfo(saved), "vgi launcher: fcntl(FD_CLOEXEC) failed: %s", std::strerror(saved));
 	}
 
 	// See ScopedForkSignalBlock: closes the fork()->reset window.
@@ -335,7 +351,7 @@ SpawnResult SpawnWorker(const std::vector<std::string> &final_argv,
 		int saved = errno;
 		::close(pipefd[0]);
 		::close(pipefd[1]);
-		throw IOException("vgi launcher: fork() failed: %s", std::strerror(saved));
+		throw IOException(LauncherLocalInfo(saved), "vgi launcher: fork() failed: %s", std::strerror(saved));
 	}
 	if (pid == 0) {
 		// --- Child ---
@@ -407,16 +423,23 @@ void WaitForReadinessAndDetach(pid_t worker_pid, int stdout_fd,
                                 std::chrono::steady_clock::time_point deadline) {
 	std::string buffer;
 	char chunk[4096];
-	auto fail = [&](const std::string &msg) {
+	auto launch_info = [&](const char *subtype) {
+		return ErrorInfo(subtype)
+		    .Set(error_key::kTransport, "launch")
+		    .Set(error_key::kWorkerPid, static_cast<int64_t>(worker_pid))
+		    .Set(error_key::kSocketPath, expected_path);
+	};
+	auto fail = [&](const std::string &msg, const char *subtype) {
 		::kill(worker_pid, SIGTERM);
 		::close(stdout_fd);
 		PidReaper::Instance().Register(worker_pid);
-		throw IOException("%s", msg);
+		throw IOException(launch_info(subtype), "%s", msg);
 	};
 	while (true) {
 		auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) {
-			fail("vgi launcher: worker did not emit UNIX:<path> within startup timeout");
+			fail("vgi launcher: worker did not emit UNIX:<path> within startup timeout",
+			     error_subtype::kWorkerStartTimeout);
 		}
 		auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
 
@@ -431,7 +454,8 @@ void WaitForReadinessAndDetach(pid_t worker_pid, int stdout_fd,
 			if (errno == EINTR) {
 				continue;
 			}
-			fail(std::string("vgi launcher: select() failed: ") + std::strerror(errno));
+			fail(std::string("vgi launcher: select() failed: ") + std::strerror(errno),
+			     error_subtype::kTransportFailure);
 		}
 		if (sel == 0) {
 			// Loop will hit deadline check.
@@ -443,24 +467,40 @@ void WaitForReadinessAndDetach(pid_t worker_pid, int stdout_fd,
 			::close(stdout_fd);
 			int status = 0;
 			::waitpid(worker_pid, &status, 0);
-			throw IOException(
-			    "vgi launcher: worker exited before emitting UNIX:<path> (status=%d)", status);
+			// Decode the raw waitpid status: printing it verbatim made exit
+			// 127 read as 32512.
+			if (WIFSIGNALED(status)) {
+				const int sig = WTERMSIG(status);
+				throw IOException(launch_info(error_subtype::kWorkerKilled)
+				                      .Set(error_key::kExitSignal, static_cast<int64_t>(sig)),
+				                  "vgi launcher: worker exited before emitting UNIX:<path> (killed by signal %d)",
+				                  sig);
+			}
+			const int code = WIFEXITED(status) ? WEXITSTATUS(status) : status;
+			const char *subtype = code == 127   ? error_subtype::kWorkerNotFound
+			                      : code == 126 ? error_subtype::kWorkerNotExecutable
+			                                    : error_subtype::kWorkerExited;
+			throw IOException(launch_info(subtype).Set(error_key::kExitCode, static_cast<int64_t>(code)),
+			                  "vgi launcher: worker exited before emitting UNIX:<path> (exit code %d)", code);
 		}
 		if (n < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
 			fail(std::string("vgi launcher: read() from worker stdout failed: ") +
-			     std::strerror(errno));
+			         std::strerror(errno),
+			     error_subtype::kTransportFailure);
 		}
 		if (buffer.size() + static_cast<size_t>(n) > kDiscoveryBufferLimit) {
 			fail("vgi launcher: worker emitted >1 MiB of pre-discovery output without "
-			     "the UNIX:<path> line; aborting");
+			     "the UNIX:<path> line; aborting",
+			     error_subtype::kProtocolViolation);
 		}
 		buffer.append(chunk, static_cast<size_t>(n));
 		auto parse = launcher::ParseDiscoveryLine(buffer, expected_path);
 		if (parse == launcher::DiscoveryParseResult::kMismatch) {
-			fail("vgi launcher: worker bound to a different path than requested");
+			fail("vgi launcher: worker bound to a different path than requested",
+			     error_subtype::kProtocolViolation);
 		}
 		if (parse == launcher::DiscoveryParseResult::kFound) {
 			// Close our read end of the worker's stdout.  The cross-language
@@ -597,6 +637,7 @@ std::string Launch(const LaunchConfig &cfg) {
 #include "vgi_launcher.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_launcher_internal.hpp"
 
 #include <chrono>
@@ -710,7 +751,8 @@ public:
 		DWORD r = WaitForSingleObject(h, static_cast<DWORD>(timeout.count()));
 		if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) {
 			CloseHandle(h);
-			throw IOException("vgi launcher: timed out acquiring spawn mutex %s after %lldms", name,
+			throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kTransport, "launch"),
+			                  "vgi launcher: timed out acquiring spawn mutex %s after %lldms", name,
 			                  static_cast<long long>(timeout.count()));
 		}
 		return WinMutexGuard(h);
@@ -827,7 +869,8 @@ void SpawnWorkerWin(const std::vector<std::string> &argv, const std::string &pip
 			TerminateProcess(pi.hProcess, 1);
 			CloseHandle(rd);
 			CloseHandle(pi.hProcess);
-			throw IOException("vgi launcher: worker announced an unexpected pipe (expected %s)", pipe_name);
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kTransport, "launch"),
+			                  "vgi launcher: worker announced an unexpected pipe (expected %s)", pipe_name);
 		}
 		if (buffer.size() > kDiscoveryBufferLimit) {
 			break;
@@ -839,7 +882,8 @@ void SpawnWorkerWin(const std::vector<std::string> &argv, const std::string &pip
 	// detached process automatically — no reaper needed.)
 	CloseHandle(pi.hProcess);
 	if (!found) {
-		throw IOException("vgi launcher: worker did not emit %s%s within %lldms", prefix, pipe_name,
+		throw IOException(ErrorInfo(error_subtype::kWorkerStartTimeout).Set(error_key::kTransport, "launch"),
+		                  "vgi launcher: worker did not emit %s%s within %lldms", prefix, pipe_name,
 		                  static_cast<long long>(startup_timeout.count()));
 	}
 }

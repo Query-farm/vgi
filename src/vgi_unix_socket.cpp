@@ -10,6 +10,8 @@
 #include "vgi_unix_socket.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "vgi_errno_name.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_launcher_internal.hpp"
 
 #include <algorithm>
@@ -95,6 +97,19 @@ int UnixSocket::Release() {
 	return fd;
 }
 
+namespace {
+// extra_info for an AF_UNIX connect failure. `err` == 0 means no errno applies
+// (a timeout).
+ErrorInfo UnixConnectInfo(const char *subtype, const std::string &path, int err) {
+	ErrorInfo info(subtype);
+	info.Set(error_key::kTransport, "unix").Set(error_key::kSocketPath, path);
+	if (err != 0) {
+		info.Set(error_key::kErrno, ErrnoName(err));
+	}
+	return info;
+}
+} // namespace
+
 UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::milliseconds connect_timeout) {
 	// Cheap, deterministic check before we touch the kernel.  Translates
 	// std::invalid_argument from ValidateUnixPathLength into the DuckDB
@@ -116,8 +131,9 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 	while (true) {
 		int raw_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
 		if (raw_fd < 0) {
-			throw IOException("vgi unix socket: socket() failed for %s: %s", path,
-			                   std::strerror(errno));
+			const int err = errno;
+			throw IOException(UnixConnectInfo(error_subtype::kLocalResource, path, err),
+			                  "vgi unix socket: socket() failed for %s: %s", path, std::strerror(err));
 		}
 		FdGuard guard(raw_fd);
 
@@ -125,8 +141,9 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 		// AF_UNIX connect normally returns immediately, but a hung worker
 		// could leave the kernel queue in a state that blocks us.
 		if (!SetNonBlocking(raw_fd, true)) {
-			throw IOException("vgi unix socket: fcntl(O_NONBLOCK) failed for %s: %s", path,
-			                   std::strerror(errno));
+			const int err = errno;
+			throw IOException(UnixConnectInfo(error_subtype::kLocalResource, path, err),
+			                  "vgi unix socket: fcntl(O_NONBLOCK) failed for %s: %s", path, std::strerror(err));
 		}
 
 		int rc = ::connect(raw_fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
@@ -138,7 +155,8 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 			// there is nothing to select() on; retry the connect instead.)
 			auto now = std::chrono::steady_clock::now();
 			if (now >= deadline) {
-				throw IOException("vgi unix socket: connect to %s timed out after %lldms: the worker's "
+				throw IOException(UnixConnectInfo(error_subtype::kConnectFailed, path, 0),
+				                  "vgi unix socket: connect to %s timed out after %lldms: the worker's "
 				                   "accept queue stayed full",
 				                   path, static_cast<long long>(connect_timeout.count()));
 			}
@@ -166,34 +184,41 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 			tv.tv_usec = static_cast<suseconds_t>((remaining.count() % 1000) * 1000);
 			int sel = ::select(raw_fd + 1, nullptr, &wfds, nullptr, &tv);
 			if (sel == 0) {
-				throw IOException("vgi unix socket: connect to %s timed out after %lldms", path,
+				throw IOException(UnixConnectInfo(error_subtype::kConnectFailed, path, 0),
+				                  "vgi unix socket: connect to %s timed out after %lldms", path,
 				                   static_cast<long long>(connect_timeout.count()));
 			}
 			if (sel < 0) {
-				throw IOException("vgi unix socket: select() failed for %s: %s", path,
-				                   std::strerror(errno));
+				const int err = errno;
+				throw IOException(UnixConnectInfo(error_subtype::kConnectFailed, path, err),
+				                  "vgi unix socket: select() failed for %s: %s", path, std::strerror(err));
 			}
 			// select() said writable; check SO_ERROR to confirm connect succeeded.
 			int so_err = 0;
 			socklen_t so_err_len = sizeof(so_err);
 			if (::getsockopt(raw_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len) < 0) {
-				throw IOException("vgi unix socket: getsockopt(SO_ERROR) failed for %s: %s", path,
-				                   std::strerror(errno));
+				const int err = errno;
+				throw IOException(UnixConnectInfo(error_subtype::kConnectFailed, path, err),
+				                  "vgi unix socket: getsockopt(SO_ERROR) failed for %s: %s", path,
+				                  std::strerror(err));
 			}
 			if (so_err != 0) {
-				throw IOException("vgi unix socket: connect to %s failed: %s", path,
-				                   std::strerror(so_err));
+				throw IOException(UnixConnectInfo(error_subtype::kConnectFailed, path, so_err),
+				                  "vgi unix socket: connect to %s failed: %s", path, std::strerror(so_err));
 			}
 		} else {
-			throw IOException("vgi unix socket: connect to %s failed: %s", path,
-			                   std::strerror(errno));
+			const int err = errno;
+			throw IOException(UnixConnectInfo(error_subtype::kConnectFailed, path, err),
+			                  "vgi unix socket: connect to %s failed: %s", path, std::strerror(err));
 		}
 
 		// Restore blocking mode for downstream read/write — vgi's IPC code
 		// expects classic blocking semantics.
 		if (!SetNonBlocking(raw_fd, false)) {
-			throw IOException("vgi unix socket: fcntl(clear O_NONBLOCK) failed for %s: %s", path,
-			                   std::strerror(errno));
+			const int err = errno;
+			throw IOException(UnixConnectInfo(error_subtype::kLocalResource, path, err),
+			                  "vgi unix socket: fcntl(clear O_NONBLOCK) failed for %s: %s", path,
+			                  std::strerror(err));
 		}
 
 		return UnixSocket(guard.Release());

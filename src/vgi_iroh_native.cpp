@@ -5,6 +5,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "vgi_exception.hpp"
 
 #include <openssl/rand.h>
 
@@ -81,11 +82,43 @@ uint8_t CheckDuckDBInterrupted(void *userdata) {
 	return context && context->interrupted.load() ? 1 : 0;
 }
 
+ErrorInfo IrohInfo(const char *subtype) {
+	return std::move(ErrorInfo(subtype).Set(error_key::kTransport, "iroh"));
+}
+
+// Map the Rust ABI's error category (and stage) onto a transport-neutral
+// error_subtype.
+const char *IrohErrorSubtype(const vgi_iroh_error &error) {
+	const bool reaching = error.stage == VGI_IROH_STAGE_RESOLVE || error.stage == VGI_IROH_STAGE_CONNECT ||
+	                      error.stage == VGI_IROH_STAGE_ALPN || error.stage == VGI_IROH_STAGE_OPEN_STREAM;
+	switch (error.category) {
+	case VGI_IROH_CATEGORY_UNAVAILABLE:
+	case VGI_IROH_CATEGORY_TIMEOUT:
+	case VGI_IROH_CATEGORY_CONNECTION_RESET:
+		return reaching ? error_subtype::kConnectFailed : error_subtype::kTransportFailure;
+	case VGI_IROH_CATEGORY_PROTOCOL:
+		return error_subtype::kProtocolViolation;
+	case VGI_IROH_CATEGORY_AUTHENTICATION:
+		return error_subtype::kPeerIdentityMismatch;
+	case VGI_IROH_CATEGORY_UNSUPPORTED:
+		return error_subtype::kUnsupported;
+	case VGI_IROH_CATEGORY_RESOURCE_EXHAUSTED:
+		return error_subtype::kLocalResource;
+	default:
+		return error_subtype::kTransportFailure;
+	}
+}
+
 [[noreturn]] void ThrowIroh(const char *operation, const vgi_iroh_error &error) {
 	// The Rust ABI deliberately returns a sanitized bounded message. Include
 	// structured stage/category/certainty for diagnostics without ever logging
 	// keys, relay credentials, or request bodies.
-	throw IOException(FormatIrohError(operation, error));
+	throw IOException(IrohInfo(IrohErrorSubtype(error))
+	                      .Set(error_key::kOperation, operation)
+	                      .Set(error_key::kIrohStage, IrohStageName(error.stage))
+	                      .Set(error_key::kIrohCategory, IrohCategoryName(error.category))
+	                      .Set(error_key::kIrohDispatch, IrohDispatchName(error.dispatch_certainty)),
+	                  FormatIrohError(operation, error));
 }
 
 void CheckIroh(vgi_iroh_result result, const char *operation, const vgi_iroh_error &error) {
@@ -104,7 +137,8 @@ std::string CopyEndpointId(const vgi_iroh_endpoint *endpoint) {
 		          "endpoint id", error);
 	}
 	if (required != 65 || result.back() != '\0') {
-		throw IOException("VGI Iroh endpoint returned an invalid endpoint ID");
+		throw IOException(IrohInfo(error_subtype::kProtocolViolation),
+		                  "VGI Iroh endpoint returned an invalid endpoint ID");
 	}
 	result.resize(required - 1);
 	return result;
@@ -120,7 +154,8 @@ std::string CopyRemoteId(const vgi_iroh_stream *stream) {
 		          "remote id", error);
 	}
 	if (required != 65 || result.back() != '\0') {
-		throw IOException("VGI Iroh stream returned an invalid remote endpoint ID");
+		throw IOException(IrohInfo(error_subtype::kProtocolViolation),
+		                  "VGI Iroh stream returned an invalid remote endpoint ID");
 	}
 	result.resize(required - 1);
 	return result;
@@ -137,7 +172,8 @@ std::string CopyHttpRemoteId(const vgi_iroh_http_response *response) {
 		          "HTTP remote id", error);
 	}
 	if (required != 65 || result.back() != '\0') {
-		throw IOException("VGI Iroh HTTP response returned an invalid remote endpoint ID");
+		throw IOException(IrohInfo(error_subtype::kProtocolViolation),
+		                  "VGI Iroh HTTP response returned an invalid remote endpoint ID");
 	}
 	result.resize(required - 1);
 	return result;
@@ -188,7 +224,8 @@ const IrohSecretKey &ProcessEphemeralSecret() {
 	static const auto *secret = []() {
 		std::array<unsigned char, 32> raw {};
 		if (RAND_bytes(raw.data(), static_cast<int>(raw.size())) != 1) {
-			throw IOException("VGI Iroh could not generate a process-stable ephemeral identity");
+			throw IOException(IrohInfo(error_subtype::kLocalResource),
+			                  "VGI Iroh could not generate a process-stable ephemeral identity");
 		}
 		static constexpr char kHex[] = "0123456789abcdef";
 		std::string encoded(raw.size() * 2, '\0');
@@ -451,7 +488,9 @@ IrohNativeDuplex OpenIrohArrowMuxStream(const std::shared_ptr<IrohClientConfig> 
 	result.remote_endpoint_id = CopyRemoteId(raw);
 	if (result.remote_endpoint_id != config->endpoint_id) {
 		vgi_iroh_stream_cancel(raw);
-		throw IOException("VGI Iroh authenticated peer identity did not match the requested EndpointId");
+		throw IOException(IrohInfo(error_subtype::kPeerIdentityMismatch)
+		                      .ExpectedActual(config->endpoint_id, result.remote_endpoint_id),
+		                  "VGI Iroh authenticated peer identity did not match the requested EndpointId");
 	}
 	return result;
 }
@@ -498,9 +537,12 @@ IrohNativeHttpResponse PerformIrohHttpRequest(
 	CheckIroh(request_result, "HTTP request", error);
 	std::unique_ptr<vgi_iroh_http_response, decltype(&vgi_iroh_http_response_free)> response(
 	    raw, &vgi_iroh_http_response_free);
-	if (CopyHttpRemoteId(raw) != config->endpoint_id) {
+	auto http_remote_id = CopyHttpRemoteId(raw);
+	if (http_remote_id != config->endpoint_id) {
 		vgi_iroh_http_response_cancel(raw);
-		throw IOException("VGI Iroh HTTP authenticated peer identity did not match the requested EndpointId");
+		throw IOException(IrohInfo(error_subtype::kPeerIdentityMismatch)
+		                      .ExpectedActual(config->endpoint_id, http_remote_id),
+		                  "VGI Iroh HTTP authenticated peer identity did not match the requested EndpointId");
 	}
 
 	IrohNativeHttpResponse result;
@@ -536,7 +578,8 @@ IrohNativeHttpResponse PerformIrohHttpRequest(
 			if (std::chrono::steady_clock::now() - last_progress >=
 			    std::chrono::seconds(config->io_timeout_seconds)) {
 				vgi_iroh_http_response_cancel(raw);
-				throw IOException("VGI Iroh HTTP response exceeded its idle timeout");
+				throw IOException(IrohInfo(error_subtype::kTransportFailure),
+				                  "VGI Iroh HTTP response exceeded its idle timeout");
 			}
 			continue;
 		}
@@ -545,7 +588,9 @@ IrohNativeHttpResponse PerformIrohHttpRequest(
 		}
 		if (max_body_bytes && (count > max_body_bytes || result.body.size() > max_body_bytes - count)) {
 			vgi_iroh_http_response_cancel(raw);
-			throw IOException("VGI Iroh HTTP response exceeded the configured encoded response limit");
+			throw IOException(IrohInfo(error_subtype::kResponseTooLarge)
+			                      .Set(error_key::kLimit, static_cast<int64_t>(max_body_bytes)),
+			                  "VGI Iroh HTTP response exceeded the configured encoded response limit");
 		}
 		result.body.insert(result.body.end(), chunk, chunk + count);
 		last_progress = std::chrono::steady_clock::now();
@@ -558,7 +603,8 @@ IrohNativeHttpResponse PerformIrohHttpRequest(
 class IrohNativeEndpoint {};
 
 [[noreturn]] static void ThrowIrohDisabled() {
-	throw IOException("Native Iroh support was not compiled into this VGI extension");
+	throw IOException(ErrorInfo(error_subtype::kUnsupported).Set(error_key::kTransport, "iroh"),
+	                  "Native Iroh support was not compiled into this VGI extension");
 }
 
 std::shared_ptr<IrohNativeEndpoint>

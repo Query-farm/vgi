@@ -16,6 +16,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_platform.hpp"
 #include "vgi_subprocess.hpp" // ResetChildSignalDispositions
 #include "vgi_transport.hpp"
@@ -182,6 +183,17 @@ GithubCoords ParseGithubAutoLocation(const std::string &location, const std::str
 #if VGI_SUBPROCESS_TRANSPORT
 
 namespace {
+
+// extra_info for a github:// / github-auto:// failure, keyed to the release
+// coordinates.
+ErrorInfo GithubInfo(const char *subtype, const GithubCoords &c) {
+	ErrorInfo info(subtype);
+	info.Set(error_key::kTransport, "github")
+	    .Set(error_key::kGithubRepo, c.owner + "/" + c.repo)
+	    .Set(error_key::kGithubTag, c.tag)
+	    .Set(error_key::kGithubAsset, c.asset);
+	return info;
+}
 
 // Always the real local filesystem — the cached binary must be a real path we can
 // hand to the child-process spawn; never an overridable virtual FS.
@@ -386,10 +398,13 @@ std::string GithubApiGet(ClientContext &context, const std::string &url) {
 	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
 	auto response = http_util.Request(get);
 	if (!response) {
-		throw IOException("github: no response (transport failure) [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(error_subtype::kTransportFailure, url).Set(error_key::kTransport, "github"),
+		                  "github: no response (transport failure) [url: %s]", url);
 	}
 	if (!response->Success()) {
-		throw IOException("github: HTTP %d [url: %s]", static_cast<int>(response->status), url);
+		throw IOException(BuildHttpExtraInfo(error_subtype::kHttpError, url, static_cast<int>(response->status))
+		                      .Set(error_key::kTransport, "github"),
+		                  "github: HTTP %d [url: %s]", static_cast<int>(response->status), url);
 	}
 	return body;
 }
@@ -399,7 +414,8 @@ std::string FindAssetUrl(const std::string &json, const std::string &asset_name,
 	using namespace duckdb_yyjson;
 	yyjson_doc *doc = yyjson_read(json.c_str(), json.size(), 0);
 	if (!doc) {
-		throw IOException("github: releases API returned unparseable JSON");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kTransport, "github"),
+		                  "github: releases API returned unparseable JSON");
 	}
 	struct DocGuard {
 		yyjson_doc *d;
@@ -411,11 +427,13 @@ std::string FindAssetUrl(const std::string &json, const std::string &asset_name,
 	} guard {doc};
 	yyjson_val *root = yyjson_doc_get_root(doc);
 	if (!root || !yyjson_is_obj(root)) {
-		throw IOException("github: releases API JSON is not an object");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kTransport, "github"),
+		                  "github: releases API JSON is not an object");
 	}
 	yyjson_val *assets = yyjson_obj_get(root, "assets");
 	if (!assets || !yyjson_is_arr(assets)) {
-		throw IOException("github: release has no assets array");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kTransport, "github"),
+		                  "github: release has no assets array");
 	}
 	std::string found;
 	size_t idx, max;
@@ -793,9 +811,14 @@ struct FsLockGuard {
 			try {
 				handle = fs.OpenFile(path, flags);
 				return;
-			} catch (const std::exception &) {
+			} catch (const std::exception &e) {
 				if (attempt >= 600) { // ~60s at 100ms
-					throw IOException("github: timed out acquiring lock %s", path.c_str());
+					// Keep the message; carry the last OpenFile error (a
+					// permission problem looks like contention otherwise).
+					throw IOException(ErrorInfo(error_subtype::kLocalResource)
+					                      .Set(error_key::kTransport, "github")
+					                      .Set(error_key::kActual, RawMessageOf(e)),
+					                  "github: timed out acquiring lock %s", path.c_str());
 				}
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			}
@@ -970,7 +993,8 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 		for (auto &n : names) {
 			list += "\n  " + n;
 		}
-		throw IOException("github: asset '%s' not found in %s/%s@%s. Available assets:%s", c.asset.c_str(),
+		throw IOException(GithubInfo(error_subtype::kWorkerNotFound, c),
+		                  "github: asset '%s' not found in %s/%s@%s. Available assets:%s", c.asset.c_str(),
 		                  c.owner.c_str(), c.repo.c_str(), c.tag.c_str(), list.c_str());
 	}
 
@@ -987,7 +1011,8 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 			}
 		}
 		if (sidecar_url.empty()) {
-			throw IOException("github-auto: no .sha256 sidecar (tried '%s' and '%s') to verify integrity; "
+			throw IOException(GithubInfo(error_subtype::kProtocolViolation, c),
+			                  "github-auto: no .sha256 sidecar (tried '%s' and '%s') to verify integrity; "
 			                  "add #sha256= or publish the sidecar",
 			                  candidates[0].c_str(), candidates[1].c_str());
 		}
@@ -1001,7 +1026,8 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 			}
 		}
 		if (token.size() != 64) {
-			throw IOException("github-auto: malformed .sha256 sidecar (no 64-hex digest)");
+			throw IOException(GithubInfo(error_subtype::kProtocolViolation, c).Url(sidecar_url),
+			                  "github-auto: malformed .sha256 sidecar (no 64-hex digest)");
 		}
 		expected = token;
 	}
@@ -1009,11 +1035,13 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 	// Download + verify BEFORE extracting (so the tar parser only sees trusted bytes).
 	std::string bytes = HttpGetBytes(context, dl);
 	if (bytes.empty()) {
-		throw IOException("github: empty download for asset '%s'", c.asset.c_str());
+		throw IOException(GithubInfo(error_subtype::kProtocolViolation, c),
+		                  "github: empty download for asset '%s'", c.asset.c_str());
 	}
 	std::string digest = Sha256Hex(bytes);
 	if (!expected.empty() && digest != expected) {
-		throw IOException("github: SHA256 mismatch for '%s': expected %s, got %s", c.asset.c_str(),
+		throw IOException(GithubInfo(error_subtype::kChecksumMismatch, c).ExpectedActual(expected, digest),
+		                  "github: SHA256 mismatch for '%s': expected %s, got %s", c.asset.c_str(),
 		                  expected.c_str(), digest.c_str());
 	}
 

@@ -19,6 +19,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include "vgi_exception.hpp"
 #include "vgi_transport.hpp"
 #include "yyjson.hpp"
 #if VGI_POSIX_TRANSPORT
@@ -48,6 +49,11 @@
 
 namespace duckdb {
 namespace vgi {
+
+// extra_info for a container-transport failure (`transport=oci`).
+static ErrorInfo OciInfo(const char *subtype) {
+	return std::move(ErrorInfo(subtype).Set(error_key::kTransport, "oci"));
+}
 
 const char *const kContainerNamePlaceholder = "__VGI_CONTAINER_NAME__";
 const char *const kVgiVolumesLabel = "farm.query.vgi.volumes";
@@ -221,6 +227,7 @@ ContainerRuntime DetectContainerRuntime(const std::string &override_kind) {
 		std::string bin = WhichBinary(kind);
 		if (bin.empty()) {
 			throw IOException(
+			    OciInfo(error_subtype::kRuntimeNotFound).Set(error_key::kContainerRuntime, kind),
 			    "vgi container: requested container_runtime '%s' was not found on PATH", override_kind);
 		}
 		return ContainerRuntime {bin, kind};
@@ -232,6 +239,7 @@ ContainerRuntime DetectContainerRuntime(const std::string &override_kind) {
 		}
 	}
 	throw IOException(
+	    OciInfo(error_subtype::kRuntimeNotFound),
 	    "vgi container: no container runtime found on PATH (searched docker, podman, nerdctl, container). "
 	    "Install one, or use a bare-command / http:// LOCATION instead.");
 }
@@ -254,12 +262,18 @@ std::vector<ContainerVolume> InspectImageVolumes(const ContainerRuntime &runtime
 		CommandResult pull = RunCaptureCommand(pull_cmd);
 		if (pull.exit_code != 0) {
 			throw IOException(
+			    OciInfo(error_subtype::kWorkerNotFound)
+			        .Set(error_key::kContainerImage, image)
+			        .Set(error_key::kContainerRuntime, runtime.kind),
 			    "vgi container: failed to pull image '%s' via %s: %s", image, runtime.kind,
 			    StringUtil::Replace(pull.output, "\n", " "));
 		}
 		res = run_inspect();
 		if (res.exit_code != 0) {
-			throw IOException("vgi container: failed to inspect image '%s' via %s: %s", image, runtime.kind,
+			throw IOException(OciInfo(error_subtype::kWorkerNotFound)
+			                      .Set(error_key::kContainerImage, image)
+			                      .Set(error_key::kContainerRuntime, runtime.kind),
+			                  "vgi container: failed to inspect image '%s' via %s: %s", image, runtime.kind,
 			                  StringUtil::Replace(res.output, "\n", " "));
 		}
 	}
@@ -274,7 +288,8 @@ std::vector<ContainerVolume> InspectImageVolumes(const ContainerRuntime &runtime
 	yyjson_doc *doc = yyjson_read(label.c_str(), label.size(), 0);
 	if (!doc) {
 		// Malformed label — warn-by-throwing so the image author notices.
-		throw IOException("vgi container: image '%s' has a malformed %s label: %s", image, kVgiVolumesLabel,
+		throw IOException(OciInfo(error_subtype::kProtocolViolation).Set(error_key::kContainerImage, image),
+		                  "vgi container: image '%s' has a malformed %s label: %s", image, kVgiVolumesLabel,
 		                  label);
 	}
 	struct DocGuard {
@@ -284,7 +299,8 @@ std::vector<ContainerVolume> InspectImageVolumes(const ContainerRuntime &runtime
 
 	yyjson_val *root = yyjson_doc_get_root(doc);
 	if (!yyjson_is_arr(root)) {
-		throw IOException("vgi container: image '%s' %s label is not a JSON array: %s", image, kVgiVolumesLabel,
+		throw IOException(OciInfo(error_subtype::kProtocolViolation).Set(error_key::kContainerImage, image),
+		                  "vgi container: image '%s' %s label is not a JSON array: %s", image, kVgiVolumesLabel,
 		                  label);
 	}
 	size_t idx, max;
@@ -1070,6 +1086,7 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 
 	if (requested_mode == ContainerConnMode::UNIX) {
 		throw IOException(
+		    OciInfo(error_subtype::kUnsupported),
 		    "vgi container: the 'unix' shared connection is not yet implemented (planned); use http or tcp");
 	}
 
@@ -1119,7 +1136,8 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 	auto finish = [&](ContainerConnMode mode, int cport) -> ContainerEndpoint {
 		int hp = ResolveHostPort(rt, name, cport);
 		if (hp <= 0) {
-			throw IOException("vgi container: shared container '%s' port is not published yet", name);
+			throw IOException(OciInfo(error_subtype::kWorkerStartTimeout).Set(error_key::kContainerName, name),
+			                  "vgi container: shared container '%s' port is not published yet", name);
 		}
 		ContainerEndpoint ep;
 		ep.mode = mode;
@@ -1179,7 +1197,11 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 			}
 			return cache_put(finish(mode, got));
 		}
-		throw IOException("vgi container: failed to start shared container '%s': %s", name,
+		throw IOException(OciInfo(error_subtype::kWorkerExited)
+		                      .Set(error_key::kContainerName, name)
+		                      .Set(error_key::kContainerImage, spec.image)
+		                      .Set(error_key::kContainerRuntime, spec.runtime.kind),
+		                  "vgi container: failed to start shared container '%s': %s", name,
 		                  StringUtil::Replace(run.output, "\n", " "));
 	}
 	return cache_put(finish(requested_mode, cport));
@@ -1190,13 +1212,18 @@ std::unique_ptr<SubProcess> ConnectSharedContainer(const ContainerEndpoint &endp
 		std::string connect_error;
 		int fd = TcpConnect(endpoint.host, endpoint.port, 10000, &connect_error);
 		if (fd < 0) {
-			throw IOException("vgi container: failed to connect to shared tcp endpoint %s:%d: %s",
+			throw IOException(OciInfo(error_subtype::kConnectFailed)
+			                      .Set(error_key::kContainerName, endpoint.container_name)
+			                      .Set(error_key::kHost, endpoint.host)
+			                      .Set(error_key::kPort, static_cast<int64_t>(endpoint.port)),
+			                  "vgi container: failed to connect to shared tcp endpoint %s:%d: %s",
 			                  endpoint.host, endpoint.port, connect_error);
 		}
 		return std::make_unique<UnixSocketWorker>(fd);
 	}
 	if (endpoint.mode == ContainerConnMode::UNIX) {
-		throw IOException("vgi container: the 'unix' shared connection is not implemented");
+		throw IOException(OciInfo(error_subtype::kUnsupported),
+		                  "vgi container: the 'unix' shared connection is not implemented");
 	}
 	throw IOException("vgi container: ConnectSharedContainer is only for socket modes (tcp/unix)");
 }
@@ -1248,13 +1275,15 @@ void ReapDeadSharedContainers(const ContainerRuntime &runtime) noexcept {
 }
 #else  // !VGI_POSIX_TRANSPORT
 ContainerEndpoint EnsureSharedContainer(const ContainerSpec &, ContainerConnMode) {
-	throw IOException("vgi: shared containers require POSIX sockets (not available in this build)");
+	throw IOException(OciInfo(error_subtype::kUnsupported),
+	                  "vgi: shared containers require POSIX sockets (not available in this build)");
 }
 void InvalidateSharedContainer(const ContainerSpec &) {}
 void ReapDeadSharedContainers(const ContainerRuntime &) noexcept {}
 #if VGI_SUBPROCESS_TRANSPORT
 std::unique_ptr<SubProcess> ConnectSharedContainer(const ContainerEndpoint &) {
-	throw IOException("vgi: shared container socket connections require POSIX (not available in this build)");
+	throw IOException(OciInfo(error_subtype::kUnsupported),
+	                  "vgi: shared container socket connections require POSIX (not available in this build)");
 }
 #endif
 #endif // VGI_POSIX_TRANSPORT

@@ -284,7 +284,11 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		std::string connect_error;
 		int fd = TcpConnect(tcp_host, tcp_port, 10000, &connect_error, opts.tcp_proxy);
 		if (fd < 0) {
-			throw IOException("vgi: failed to connect to tcp worker %s: %s", opts.worker_path, connect_error);
+			throw IOException(ErrorInfo(error_subtype::kConnectFailed)
+			                      .Worker(opts.worker_path)
+			                      .Set(error_key::kHost, tcp_host)
+			                      .Set(error_key::kPort, static_cast<int64_t>(tcp_port)),
+			                  "vgi: failed to connect to tcp worker %s: %s", opts.worker_path, connect_error);
 		}
 		UnixSocketWorker worker(fd);
 		if (params) {
@@ -303,7 +307,11 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		std::string connect_error;
 		int fd = TcpConnect(tcp_host, tcp_port, 10000, &connect_error, opts.tcp_proxy);
 		if (fd < 0) {
-			throw IOException("vgi: failed to connect to tcp worker %s: %s", opts.worker_path, connect_error);
+			throw IOException(ErrorInfo(error_subtype::kConnectFailed)
+			                      .Worker(opts.worker_path)
+			                      .Set(error_key::kHost, tcp_host)
+			                      .Set(error_key::kPort, static_cast<int64_t>(tcp_port)),
+			                  "vgi: failed to connect to tcp worker %s: %s", opts.worker_path, connect_error);
 		}
 		NamedPipeWorker worker(fd);
 		if (params) {

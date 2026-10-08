@@ -32,6 +32,8 @@
 #include <arrow/type.h>
 
 #include "duckdb/common/exception.hpp"
+#include "vgi_errno_name.hpp"
+#include "vgi_exception.hpp"
 
 #include "vgi_rpc_client.hpp" // for SHM_OFFSET_KEY / SHM_LENGTH_KEY
 
@@ -213,17 +215,17 @@ std::shared_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 	                                static_cast<DWORD>(static_cast<uint64_t>(size_bytes) >> 32),
 	                                static_cast<DWORD>(size_bytes & 0xFFFFFFFFu), name.c_str());
 	if (h == nullptr) {
-		throw IOException("VgiShmSegment: CreateFileMapping failed: " + std::to_string(::GetLastError()));
+		throw IOException(ErrorInfo(error_subtype::kLocalResource), "VgiShmSegment: CreateFileMapping failed: " + std::to_string(::GetLastError()));
 	}
 	if (::GetLastError() == ERROR_ALREADY_EXISTS) {
 		::CloseHandle(h);
-		throw IOException("VgiShmSegment: name collision: " + name);
+		throw IOException(ErrorInfo(error_subtype::kLocalResource), "VgiShmSegment: name collision: " + name);
 	}
 	void *map = ::MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, size_bytes);
 	if (map == nullptr) {
 		DWORD e = ::GetLastError();
 		::CloseHandle(h);
-		throw IOException("VgiShmSegment: MapViewOfFile failed: " + std::to_string(e));
+		throw IOException(ErrorInfo(error_subtype::kLocalResource), "VgiShmSegment: MapViewOfFile failed: " + std::to_string(e));
 	}
 	// Windows maps exactly size_bytes; the worker attaches with the same size.
 	size_t actual_size = size_bytes;
@@ -232,14 +234,16 @@ std::shared_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 	// O_CREAT | O_EXCL: fail if a stale segment exists with this name.
 	int fd = ::shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
 	if (fd < 0) {
-		throw IOException("VgiShmSegment: shm_open(" + name + ") failed: " + std::string(std::strerror(errno)));
+		const int err = errno;
+		throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kErrno, ErrnoName(err)),
+		                  "VgiShmSegment: shm_open(" + name + ") failed: " + std::string(std::strerror(err)));
 	}
 
 	if (::ftruncate(fd, static_cast<off_t>(size_bytes)) != 0) {
 		int err = errno;
 		::close(fd);
 		::shm_unlink(name.c_str());
-		throw IOException("VgiShmSegment: ftruncate failed: " + std::string(std::strerror(err)));
+		throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kErrno, ErrnoName(err)), "VgiShmSegment: ftruncate failed: " + std::string(std::strerror(err)));
 	}
 
 	// stat to learn the actual mapped size — POSIX may round up to page
@@ -250,7 +254,7 @@ std::shared_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 		int err = errno;
 		::close(fd);
 		::shm_unlink(name.c_str());
-		throw IOException("VgiShmSegment: fstat failed: " + std::string(std::strerror(err)));
+		throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kErrno, ErrnoName(err)), "VgiShmSegment: fstat failed: " + std::string(std::strerror(err)));
 	}
 	size_t actual_size = static_cast<size_t>(st.st_size);
 
@@ -259,7 +263,7 @@ std::shared_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 		int err = errno;
 		::close(fd);
 		::shm_unlink(name.c_str());
-		throw IOException("VgiShmSegment: mmap failed: " + std::string(std::strerror(err)));
+		throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kErrno, ErrnoName(err)), "VgiShmSegment: mmap failed: " + std::string(std::strerror(err)));
 	}
 	auto *base = static_cast<uint8_t *>(map);
 #endif
@@ -331,7 +335,7 @@ void VgiShmSegment::RetainOnly(const std::vector<uint64_t> &offsets) {
 	}
 	uint32_t num = LoadU32LE(base_ + 16);
 	if (num > VGI_SHM_MAX_ALLOCS) {
-		throw IOException("VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
 		                  " exceeds max " + std::to_string(VGI_SHM_MAX_ALLOCS));
 	}
 	// Compact the kept entries to the front, preserving their order (the
@@ -372,7 +376,7 @@ void VgiShmSegment::FreeAllocation(uint64_t offset) {
 	if (num > VGI_SHM_MAX_ALLOCS) {
 		// Corrupt header: num_allocs can't exceed what the header region holds.
 		// Trusting it would walk reads far past the mapping (OOB).
-		throw IOException("VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
 		                  " exceeds max " + std::to_string(VGI_SHM_MAX_ALLOCS));
 	}
 	uint8_t *entries = base_ + 24;
@@ -402,7 +406,7 @@ std::optional<uint64_t> VgiShmSegment::Allocate(size_t len) {
 	}
 	uint32_t num = LoadU32LE(base_ + 16);
 	if (num > VGI_SHM_MAX_ALLOCS) {
-		throw IOException("VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
 		                  " exceeds max " + std::to_string(VGI_SHM_MAX_ALLOCS));
 	}
 	if (num >= VGI_SHM_MAX_ALLOCS) {
@@ -471,14 +475,14 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 		offset = std::stoull(offset_str.ValueUnsafe());
 		length = std::stoull(length_str.ValueUnsafe());
 	} catch (const std::exception &e) {
-		throw IOException("VgiShmSegment: malformed pointer batch offset/length metadata: " +
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "VgiShmSegment: malformed pointer batch offset/length metadata: " +
 		                  std::string(e.what()));
 	}
 	// Bounds check written without addition so a huge worker-supplied length
 	// can't overflow uint64 and wrap past the guard. offset <= size_ is checked
 	// first so size_ - offset below can't underflow.
 	if (offset < VGI_SHM_HEADER_SIZE || offset > size_ || length > size_ - offset) {
-		throw IOException("VgiShmSegment: pointer batch out of range (offset=" + std::to_string(offset) +
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "VgiShmSegment: pointer batch out of range (offset=" + std::to_string(offset) +
 		                  ", length=" + std::to_string(length) + ", size=" + std::to_string(size_) + ")");
 	}
 
