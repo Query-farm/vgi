@@ -20,6 +20,7 @@
 #include "generated/vgi_secret_protocol_schemas.hpp"
 #include "generated/vgi_secret_request_builders.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
@@ -283,15 +284,15 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 		auto response = InvokePooledUnaryRpc(opts, "secret_lookup", params);
 
 		if (!response.batch || response.batch->num_rows() == 0) {
-			throw IOException("empty response");
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "empty response");
 		}
 		auto result_col = response.batch->GetColumnByName("result");
 		if (!result_col || result_col->type()->id() != arrow::Type::BINARY) {
-			throw IOException("response missing a Binary 'result' column");
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "response missing a Binary 'result' column");
 		}
 		auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
 		if (binary_array->IsNull(0)) {
-			throw IOException("response 'result' column was null");
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "response 'result' column was null");
 		}
 		auto view = binary_array->GetView(0);
 		auto inner = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
@@ -299,7 +300,8 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 		// Validate against our own schema — the secret protocol deliberately does
 		// NOT enter the shared catalog schema registry.
 		if (!inner->schema()->Equals(*generated::SecretLookupResultSchema(), /*check_metadata=*/false)) {
-			throw IOException("response schema mismatch (expected %s, got %s)",
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation),
+			                  "response schema mismatch (expected %s, got %s)",
 			                  generated::SecretLookupResultSchema()->ToString(), inner->schema()->ToString());
 		}
 
@@ -336,9 +338,21 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 
 		return fr;
 	} catch (const std::exception &e) {
+		const auto raw_message = RawMessageOf(e);
 		VGI_LOG(*ctx, "secret.lookup",
-		        {{"endpoint", endpoint_}, {"type", type}, {"outcome", "error"}, {"error", e.what()}});
-		throw IOException("VGI remote secret lookup failed [endpoint: %s, type: %s]: %s", endpoint_, type, e.what());
+		        {{"endpoint", endpoint_}, {"type", type}, {"outcome", "error"}, {"error", raw_message}});
+		// The inner error's fields win, error_subtype included: an AUTH_REQUIRED /
+		// AUTH_FAILED / TRANSPORT_FAILURE from the RPC says what to do about it,
+		// which SECRET_LOOKUP_FAILED alone does not. SECRET_LOOKUP_FAILED is the
+		// subtype only when the inner error carried none. secret_type and url are
+		// added either way (Merge-style: only where missing).
+		auto info = ExtraInfoOf(e);
+		info.erase("stack_trace_pointers");
+		info.emplace(error_key::kErrorSubtype, error_subtype::kSecretLookupFailed);
+		info.emplace(error_key::kSecretType, type);
+		info.emplace(error_key::kUrl, RedactCredentials(endpoint_));
+		throw IOException(info, "VGI remote secret lookup failed [endpoint: %s, type: %s]: %s", endpoint_, type,
+		                  raw_message);
 	}
 }
 

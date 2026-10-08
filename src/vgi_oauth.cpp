@@ -20,6 +20,7 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 #include "duckdb/common/http_util.hpp"
 #include "yyjson.hpp"
 
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth_assets.hpp" // embedded logo artwork for the callback pages
 #include "vgi_oauth_store.hpp"
@@ -378,6 +379,78 @@ std::optional<OAuthChallenge> ParseWWWAuthenticate(const std::string &header) {
 // HTTP GET Helper
 //===--------------------------------------------------------------------===//
 
+// RAII wrapper for yyjson documents
+struct YyjsonDocGuard {
+	yyjson_doc *doc;
+	explicit YyjsonDocGuard(yyjson_doc *d) : doc(d) {}
+	~YyjsonDocGuard() { if (doc) yyjson_doc_free(doc); }
+	YyjsonDocGuard(const YyjsonDocGuard &) = delete;
+	YyjsonDocGuard &operator=(const YyjsonDocGuard &) = delete;
+};
+
+//===--------------------------------------------------------------------===//
+// Structured error context helpers
+//===--------------------------------------------------------------------===//
+
+// The RFC 6749 `error` code from an IdP JSON error body ("" when absent or
+// the body is not JSON). Only this short token is ever put in extra_info —
+// never the body itself.
+static std::string OAuthErrorCodeOf(const std::string &body) {
+	auto doc = yyjson_read(body.c_str(), body.size(), 0);
+	if (!doc) {
+		return std::string();
+	}
+	YyjsonDocGuard guard(doc);
+	auto root = yyjson_doc_get_root(doc);
+	if (!root || !yyjson_is_obj(root)) {
+		return std::string();
+	}
+	auto err_val = yyjson_obj_get(root, "error");
+	if (err_val && yyjson_is_str(err_val)) {
+		return yyjson_get_str(err_val);
+	}
+	return std::string();
+}
+
+// An IdP response body made safe for an exception message: a body that
+// carries tokens is withheld entirely, anything else is capped so a large
+// (or hostile) body cannot flood the message.
+static std::string SafeBodyForMessage(const std::string &body) {
+	// A plain substring test, not a JSON parse: token endpoints also answer
+	// form-encoded (`access_token=...&token_type=bearer`, GitHub's default),
+	// which a JSON-only check would pass through verbatim.
+	for (const char *field : {"access_token", "refresh_token", "id_token"}) {
+		if (body.find(field) != std::string::npos) {
+			return "<token response withheld>";
+		}
+	}
+	constexpr size_t kMaxBodyChars = 200;
+	if (body.size() > kMaxBodyChars) {
+		return body.substr(0, kMaxBodyChars) + "...";
+	}
+	return body;
+}
+
+// extra_info for an OAuth failure at `stage` against `endpoint`.
+static ErrorInfo OAuthInfo(const char *subtype, const char *stage, const std::string &endpoint = std::string()) {
+	ErrorInfo info(subtype);
+	info.Set(error_key::kOAuthStage, stage).Set(error_key::kOAuthEndpoint, RedactCredentials(endpoint));
+	return info;
+}
+
+// extra_info for an IdP endpoint that answered with a non-success status.
+static ErrorInfo OAuthHttpInfo(const char *stage, const std::string &endpoint, int status, const std::string &body) {
+	auto info = OAuthInfo(error_subtype::kOAuthFailed, stage, endpoint);
+	info.HttpStatus(status).Set(error_key::kOAuthError, OAuthErrorCodeOf(body));
+	return info;
+}
+
+static ErrorInfo DiscoveryInfo(const std::string &url) {
+	auto info = OAuthInfo(error_subtype::kOAuthDiscoveryFailed, "discovery");
+	info.Url(url);
+	return info;
+}
+
 std::string HttpGet(ClientContext &context, const std::string &url) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
@@ -397,21 +470,13 @@ std::string HttpGet(ClientContext &context, const std::string &url) {
 
 	auto response = http_util.Request(get_info);
 	if (!response->Success()) {
-		throw IOException("VGI OAuth: HTTP GET failed for %s (HTTP %d): %s",
-		                  url, static_cast<int>(response->status), response->GetError());
+		throw IOException(DiscoveryInfo(url).HttpStatus(static_cast<int>(response->status)),
+		                  "VGI OAuth: HTTP GET failed for %s (HTTP %d): %s", url,
+		                  static_cast<int>(response->status), response->GetError());
 	}
 
 	return response_body;
 }
-
-// RAII wrapper for yyjson documents
-struct YyjsonDocGuard {
-	yyjson_doc *doc;
-	explicit YyjsonDocGuard(yyjson_doc *d) : doc(d) {}
-	~YyjsonDocGuard() { if (doc) yyjson_doc_free(doc); }
-	YyjsonDocGuard(const YyjsonDocGuard &) = delete;
-	YyjsonDocGuard &operator=(const YyjsonDocGuard &) = delete;
-};
 
 //===--------------------------------------------------------------------===//
 // Metadata Discovery
@@ -424,10 +489,11 @@ static void EnforceHttpsUrl(const std::string &url, const std::string &context_n
 	// feeds an empty URL into the OAuth path, surface a readable message
 	// rather than the trailing-whitespace "must use HTTPS: " confusion.
 	if (url.empty()) {
-		throw IOException("VGI OAuth: %s URL is empty (no OAuth challenge from server)", context_name);
+		throw IOException(DiscoveryInfo(url), "VGI OAuth: %s URL is empty (no OAuth challenge from server)",
+		                  context_name);
 	}
 	if (url.substr(0, 8) != "https://" && !IsLoopbackHttpUrl(url)) {
-		throw IOException("VGI OAuth: %s URL must use HTTPS: %s", context_name, url);
+		throw IOException(DiscoveryInfo(url), "VGI OAuth: %s URL must use HTTPS: %s", context_name, url);
 	}
 }
 
@@ -451,7 +517,7 @@ OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::s
 
 	auto doc = yyjson_read(body.c_str(), body.size(), 0);
 	if (!doc) {
-		throw IOException("VGI OAuth: failed to parse resource metadata JSON from %s", url);
+		throw IOException(DiscoveryInfo(url), "VGI OAuth: failed to parse resource metadata JSON from %s", url);
 	}
 	YyjsonDocGuard guard(doc);
 
@@ -535,7 +601,7 @@ OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::s
 	}
 
 	if (meta.authorization_servers.empty()) {
-		throw IOException("VGI OAuth: resource metadata at %s has no authorization_servers", url);
+		throw IOException(DiscoveryInfo(url), "VGI OAuth: resource metadata at %s has no authorization_servers", url);
 	}
 
 	return meta;
@@ -554,7 +620,7 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 
 	auto doc = yyjson_read(body.c_str(), body.size(), 0);
 	if (!doc) {
-		throw IOException("VGI OAuth: failed to parse OpenID configuration JSON from %s", url);
+		throw IOException(DiscoveryInfo(url), "VGI OAuth: failed to parse OpenID configuration JSON from %s", url);
 	}
 	YyjsonDocGuard guard(doc);
 
@@ -593,7 +659,7 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 	}
 
 	if (meta.issuer.empty()) {
-		throw IOException("VGI OAuth: OpenID configuration at %s missing issuer", url);
+		throw IOException(DiscoveryInfo(url), "VGI OAuth: OpenID configuration at %s missing issuer", url);
 	}
 	EnforceHttpsUrl(meta.issuer, "OpenID issuer");
 	auto canonical_server = server_url;
@@ -601,14 +667,15 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 	while (!canonical_server.empty() && canonical_server.back() == '/') canonical_server.pop_back();
 	while (!canonical_issuer.empty() && canonical_issuer.back() == '/') canonical_issuer.pop_back();
 	if (canonical_server != canonical_issuer) {
-		throw IOException("VGI OAuth: discovered issuer '%s' does not match authorization server '%s'",
+		throw IOException(DiscoveryInfo(url).ExpectedActual(server_url, meta.issuer),
+		                  "VGI OAuth: discovered issuer '%s' does not match authorization server '%s'",
 		                  meta.issuer, server_url);
 	}
 	if (meta.token_endpoint.empty()) {
-		throw IOException("VGI OAuth: OpenID configuration at %s missing token_endpoint", url);
+		throw IOException(DiscoveryInfo(url), "VGI OAuth: OpenID configuration at %s missing token_endpoint", url);
 	}
 	if (meta.authorization_endpoint.empty() && meta.device_authorization_endpoint.empty()) {
-		throw IOException("VGI OAuth: OpenID configuration at %s has neither authorization_endpoint nor device_authorization_endpoint", url);
+		throw IOException(DiscoveryInfo(url), "VGI OAuth: OpenID configuration at %s has neither authorization_endpoint nor device_authorization_endpoint", url);
 	}
 
 	return meta;
@@ -785,8 +852,10 @@ static std::string PostTokenRequest(ClientContext &context,
 	auto response = http_util.Request(post);
 	if (!response->Success()) {
 		auto &error_body = post.buffer_out.empty() ? response->body : post.buffer_out;
-		throw IOException("VGI OAuth: %s failed (HTTP %d): %s",
-		                  error_context, static_cast<int>(response->status), error_body);
+		throw IOException(OAuthHttpInfo("token_exchange", token_endpoint, static_cast<int>(response->status),
+		                                error_body),
+		                  "VGI OAuth: %s failed (HTTP %d): %s", error_context,
+		                  static_cast<int>(response->status), SafeBodyForMessage(error_body));
 	}
 
 	return post.buffer_out.empty() ? response->body : post.buffer_out;
@@ -817,6 +886,7 @@ static OAuthTokenSet ExchangeCodeForTokens(ClientContext &context,
 		// fully redacted (length only) because IOException
 		// messages travel to log manager / telemetry / JDBC clients.
 		throw IOException(
+		    OAuthHttpInfo("token_exchange", token_endpoint, resp.status_code, resp.body),
 		    "VGI OAuth: token exchange failed (HTTP %d): %s\n"
 		    "  request:\n"
 		    "    token_endpoint=%s\n"
@@ -826,7 +896,7 @@ static OAuthTokenSet ExchangeCodeForTokens(ClientContext &context,
 		    "    code_verifier=%s\n"
 		    "    client_id=%s\n"
 		    "    client_secret=%s",
-		    resp.status_code, resp.body,
+		    resp.status_code, SafeBodyForMessage(resp.body),
 		    token_endpoint,
 		    DebugSecret(code),
 		    redirect_uri.empty() ? "<empty>" : redirect_uri,
@@ -957,8 +1027,10 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 
 	auto device_resp = PostTokenRequestRaw(context, server_meta.device_authorization_endpoint, device_body);
 	if (device_resp.status_code != 200) {
-		throw IOException("VGI OAuth: device authorization request failed (HTTP %d): %s",
-		                  device_resp.status_code, device_resp.body);
+		throw IOException(OAuthHttpInfo("device_code", server_meta.device_authorization_endpoint,
+		                                device_resp.status_code, device_resp.body),
+		                  "VGI OAuth: device authorization request failed (HTTP %d): %s",
+		                  device_resp.status_code, SafeBodyForMessage(device_resp.body));
 	}
 
 	// Parse device authorization response
@@ -1063,7 +1135,9 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 
 		// Check timeout
 		if (std::chrono::steady_clock::now() >= deadline) {
-			throw IOException("VGI OAuth: device code authentication timed out after %lld seconds", effective_timeout);
+			throw IOException(OAuthInfo(error_subtype::kOAuthTimeout, "device_poll", server_meta.token_endpoint),
+			                  "VGI OAuth: device code authentication timed out after %lld seconds",
+			                  effective_timeout);
 		}
 
 		// Periodic "still waiting" message
@@ -1083,10 +1157,13 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			// Network error — retry up to 3 times
 			network_retries++;
 			if (network_retries > max_network_retries) {
-				throw IOException("VGI OAuth: device code polling failed after %d network errors: %s",
-				                  max_network_retries, e.what());
+				throw IOException(OAuthInfo(error_subtype::kTransportFailure, "device_poll", server_meta.token_endpoint)
+				                      .Merge(ExtraInfoOf(e)),
+				                  "VGI OAuth: device code polling failed after %d network errors: %s",
+				                  max_network_retries, RawMessageOf(e));
 			}
-			VGI_STDERR_DEBUG("[VGI] oauth.device_poll network_error retry=%d: %s\n", network_retries, e.what());
+			VGI_STDERR_DEBUG("[VGI] oauth.device_poll network_error retry=%d: %s\n", network_retries,
+			                 RawMessageOf(e).c_str());
 			continue;
 		}
 
@@ -1103,8 +1180,9 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			// Server error — retry
 			network_retries++;
 			if (network_retries > max_network_retries) {
-				throw IOException("VGI OAuth: device code polling failed after %d server errors (HTTP %d): %s",
-				                  max_network_retries, resp.status_code, resp.body);
+				throw IOException(OAuthHttpInfo("device_poll", server_meta.token_endpoint, resp.status_code, resp.body),
+				                  "VGI OAuth: device code polling failed after %d server errors (HTTP %d): %s",
+				                  max_network_retries, resp.status_code, SafeBodyForMessage(resp.body));
 			}
 			VGI_STDERR_DEBUG("[VGI] oauth.device_poll server_error=%d retry=%d\n", resp.status_code, network_retries);
 			continue;
@@ -1142,17 +1220,20 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			VGI_STDERR_DEBUG("[VGI] oauth.device_poll slow_down new_interval=%lld\n", interval);
 			continue;
 		} else if (error_code == "expired_token") {
-			throw IOException("VGI OAuth: device code expired. Please try again.");
+			throw IOException(OAuthHttpInfo("device_poll", server_meta.token_endpoint, resp.status_code, resp.body),
+			                  "VGI OAuth: device code expired. Please try again.");
 		} else if (error_code == "access_denied") {
-			throw IOException("VGI OAuth: authentication was denied by the user.");
+			throw IOException(OAuthHttpInfo("device_poll", server_meta.token_endpoint, resp.status_code, resp.body),
+			                  "VGI OAuth: authentication was denied by the user.");
 		} else if (!error_code.empty()) {
-			throw IOException("VGI OAuth: device code authentication failed: %s - %s",
-			                  error_code, error_desc);
+			throw IOException(OAuthHttpInfo("device_poll", server_meta.token_endpoint, resp.status_code, resp.body),
+			                  "VGI OAuth: device code authentication failed: %s - %s", error_code, error_desc);
 		}
 
 		// Unexpected status code with no parseable error
-		throw IOException("VGI OAuth: unexpected response during device code polling (HTTP %d): %s",
-		                  resp.status_code, resp.body);
+		throw IOException(OAuthHttpInfo("device_poll", server_meta.token_endpoint, resp.status_code, resp.body),
+		                  "VGI OAuth: unexpected response during device code polling (HTTP %d): %s",
+		                  resp.status_code, SafeBodyForMessage(resp.body));
 	}
 }
 
@@ -1178,7 +1259,9 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 
 	// Validate setting
 	if (flow != "auto" && flow != "device_code" && flow != "pkce") {
-		throw InvalidInputException("vgi_oauth_flow must be 'auto', 'device_code', or 'pkce' (got '%s')", flow);
+		throw InvalidInputException(
+		    ErrorInfo().Set(error_key::kSetting, "vgi_oauth_flow").Set(error_key::kActual, flow),
+		    StringUtil::Format("vgi_oauth_flow must be 'auto', 'device_code', or 'pkce' (got '%s')", flow));
 	}
 
 	VGI_STDERR_DEBUG("[VGI] oauth.auth_flow flow=%s resource_metadata=%s\n",
@@ -1570,7 +1653,8 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 		char *err_ptr = duckdb_wasm_get_auth_error(0);
 		std::string err_msg = err_ptr ? std::string(err_ptr) : "authentication failed or cancelled";
 		if (err_ptr) free(err_ptr);
-		throw IOException("VGI OAuth: %s", err_msg);
+		throw IOException(OAuthInfo(error_subtype::kOAuthFailed, "authorize", server_meta.authorization_endpoint),
+		                  "VGI OAuth: %s", err_msg);
 	}
 
 	std::string code(code_ptr);
@@ -1633,8 +1717,9 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 			res.set_content(OAuthErrorPage(error_param + " — " + error_desc, resource_display), "text/html");
 			try {
 				code_promise.set_exception(std::make_exception_ptr(
-				    IOException("VGI OAuth: authorization failed: %s - %s",
-				                error_param, error_desc)));
+				    IOException(OAuthInfo(error_subtype::kOAuthFailed, "authorize").Set(error_key::kOAuthError,
+				                                                                          error_param),
+				                "VGI OAuth: authorization failed: %s - %s", error_param, error_desc)));
 			} catch (...) {} // promise already set
 			return;
 		}
@@ -1643,7 +1728,8 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 			res.set_content(OAuthErrorPage("State mismatch — this may be a forged request.", resource_display), "text/html");
 			try {
 				code_promise.set_exception(std::make_exception_ptr(
-				    IOException("VGI OAuth: state mismatch in callback")));
+				    IOException(OAuthInfo(error_subtype::kOAuthFailed, "authorize"),
+				                "VGI OAuth: state mismatch in callback")));
 			} catch (...) {}
 			return;
 		}
@@ -1652,7 +1738,8 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 			res.set_content(OAuthErrorPage("No authorization code was received.", resource_display), "text/html");
 			try {
 				code_promise.set_exception(std::make_exception_ptr(
-				    IOException("VGI OAuth: no authorization code in callback")));
+				    IOException(OAuthInfo(error_subtype::kOAuthFailed, "authorize"),
+				                "VGI OAuth: no authorization code in callback")));
 			} catch (...) {}
 			return;
 		}
@@ -1712,7 +1799,9 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 			auth_url += "&prompt=" + UrlEncode(prompt);
 		} else if (prompt != "none") {
 			throw InvalidInputException(
-			    "vgi_oauth_prompt must be 'none', 'login', 'select_account', or 'consent' (got '%s')", prompt);
+			    ErrorInfo().Set(error_key::kSetting, "vgi_oauth_prompt").Set(error_key::kActual, prompt),
+			    StringUtil::Format(
+			        "vgi_oauth_prompt must be 'none', 'login', 'select_account', or 'consent' (got '%s')", prompt));
 		}
 	}
 
@@ -1731,7 +1820,9 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 		if (wait_status == std::future_status::timeout) {
 			svr.stop();
 			server_thread.join();
-			throw IOException("VGI OAuth: authentication timed out after %lld seconds", timeout_seconds);
+			throw IOException(
+			    OAuthInfo(error_subtype::kOAuthTimeout, "authorize", server_meta.authorization_endpoint),
+			    "VGI OAuth: authentication timed out after %lld seconds", timeout_seconds);
 		}
 
 		auto code = code_future.get(); // may throw if error was set
@@ -1773,7 +1864,8 @@ std::string BearerTokenCatalogAuth::GetToken() {
 }
 
 std::string BearerTokenCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) {
-	throw IOException("VGI HTTP authentication failed (HTTP 401): bearer token was rejected by the server. "
+	throw IOException(ErrorInfo(error_subtype::kAuthFailed).HttpStatus(401).Set(error_key::kAttachOption, "bearer_token"),
+	                  "VGI HTTP authentication failed (HTTP 401): bearer token was rejected by the server. "
 	                  "The static bearer_token provided at ATTACH time is not valid or has expired.");
 }
 
@@ -1910,7 +2002,10 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 	Value oauth_enabled_val;
 	if (context.TryGetCurrentSetting("vgi_oauth_enabled", oauth_enabled_val)) {
 		if (!oauth_enabled_val.GetValue<bool>()) {
-			throw IOException("VGI HTTP authentication required (HTTP 401) but vgi_oauth_enabled is false. "
+			throw IOException(ErrorInfo(error_subtype::kAuthRequired)
+			                      .HttpStatus(401)
+			                      .Set(error_key::kSetting, "vgi_oauth_enabled"),
+			                  "VGI HTTP authentication required (HTTP 401) but vgi_oauth_enabled is false. "
 			                  "Set vgi_oauth_enabled=true to enable OAuth authentication.");
 		}
 	}
@@ -2002,7 +2097,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 				} catch (const std::exception &e) {
 					DUCKDB_LOG_WARNING(context,
 					    "VGI OAuth: failed to discover auth server metadata for token refresh, "
-					    "falling back to interactive auth: " + std::string(e.what()));
+					    "falling back to interactive auth: " + RawMessageOf(e));
 				}
 			}
 			if (!refresh_ctx.token_endpoint.empty()) {
@@ -2022,8 +2117,17 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					// This is critical for WASM/cupola where the origin isn't a
 					// registered OAuth client — falling through would mask the
 					// real error behind a misleading "token exchange failed" message.
-					std::string refresh_err = e.what();
-					const bool invalid_grant = refresh_err.find("invalid_grant") != std::string::npos;
+					std::string refresh_err = RawMessageOf(e);
+					// AttemptTokenRefresh tags an IdP rejection with the parsed
+					// RFC 6749 `oauth_error`; branch on that. The substring check
+					// is only a fallback for failures that don't carry the field
+					// (e.g. a non-JSON body that still names the error), since the
+					// cost of a miss is a refresh token that keeps failing.
+					const auto refresh_info = ExtraInfoOf(e);
+					const auto oauth_error_it = refresh_info.find(error_key::kOAuthError);
+					const bool invalid_grant = oauth_error_it != refresh_info.end()
+					                               ? oauth_error_it->second == "invalid_grant"
+					                               : refresh_err.find("invalid_grant") != std::string::npos;
 					if (!lock.owns_lock()) lock.lock();
 					if (WasCleared()) throw;
 					// Clear stale refresh token on invalid_grant
@@ -2064,7 +2168,8 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		} catch (const std::exception &e) {
 			if (!lock.owns_lock()) lock.lock();
 			if (WasCleared()) throw;
-			StoreFailed(e.what());
+			// Raw text: waiters re-wrap it, and e.what() is DuckDB's JSON form.
+			StoreFailed(RawMessageOf(e));
 			throw;
 		} catch (...) {
 			// Same hang-prevention as the refresh catch above.
@@ -2117,6 +2222,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			    return state->status != AuthState::Status::IN_PROGRESS;
 		    })) {
 			throw IOException(
+			    ErrorInfo(error_subtype::kOAuthTimeout),
 			    "VGI OAuth: timed out waiting for another thread to finish authenticating "
 			    "(waited %llds). The interactive flow may not have been completed.",
 			    static_cast<long long>(wait_budget.count()));
@@ -2128,7 +2234,9 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		if (state->status == AuthState::Status::IDLE) {
 			throw IOException("VGI OAuth: tokens were cleared during authentication, please retry");
 		}
-		throw IOException("VGI OAuth: authentication failed: %s", state->error_message);
+		// The leader's extra_info is not kept on AuthState; only its raw text.
+		throw IOException(ErrorInfo(error_subtype::kAuthFailed), "VGI OAuth: authentication failed: %s",
+		                  state->error_message);
 	}
 
 	case AuthState::Status::COMPLETE: {
@@ -2226,7 +2334,8 @@ OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, Clie
 
 	std::string client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
 	if (client_id.empty()) {
-		throw IOException("VGI OAuth: no client_id in challenge or resource metadata");
+		throw IOException(DiscoveryInfo(challenge.resource_metadata_url),
+		                  "VGI OAuth: no client_id in challenge or resource metadata");
 	}
 
 	auto server_meta = FetchAuthServerMetadata(context, resource_meta.authorization_servers[0]);
@@ -2273,6 +2382,7 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 		// travels to log manager / telemetry / JDBC clients, so a leaked
 		// refresh_token is a credential leak.
 		throw IOException(
+		    OAuthHttpInfo("refresh", ctx.token_endpoint, resp.status_code, resp.body),
 		    "VGI OAuth: token refresh failed (HTTP %d): %s\n"
 		    "  request:\n"
 		    "    token_endpoint=%s\n"
@@ -2283,7 +2393,7 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 		    "    scope=%s\n"
 		    "    resource_metadata_url=%s\n"
 		    "    use_id_token_as_bearer=%s",
-		    resp.status_code, resp.body,
+		    resp.status_code, SafeBodyForMessage(resp.body),
 		    ctx.token_endpoint,
 		    DebugSecret(refresh_token),
 		    ctx.client_id.empty() ? "<empty>" : ctx.client_id,
@@ -2296,7 +2406,8 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 	auto tokens = ParseTokenResponse(resp.body, "refresh token response");
 	tokens.use_id_token = ctx.use_id_token;
 	if (ctx.use_id_token && tokens.id_token.empty()) {
-		throw IOException("VGI OAuth: refresh response omitted id_token required by use_id_token_as_bearer; "
+		throw IOException(OAuthInfo(error_subtype::kOAuthFailed, "refresh", ctx.token_endpoint),
+		                  "VGI OAuth: refresh response omitted id_token required by use_id_token_as_bearer; "
 		                  "interactive authentication is required");
 	}
 	return tokens;

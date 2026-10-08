@@ -3,6 +3,7 @@
 #include "vgi_settings.hpp"
 #include <algorithm>
 #include "vgi_settings_defaults.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_location_policy.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -53,23 +54,30 @@ LogicalType Type(Kind kind) {
 	throw InternalException("Unknown VGI setting type");
 }
 
+// extra_info for a rejected VGI setting value.
+static vgi::ErrorInfo SettingErrorInfo(const Definition &d) {
+	vgi::ErrorInfo info;
+	info.Set(vgi::error_key::kSetting, d.name);
+	return info;
+}
+
 void Validate(const Definition &d, Value &value) {
 	if (value.IsNull()) {
-		throw InvalidInputException("%s must not be NULL", d.name);
+		throw InvalidInputException(SettingErrorInfo(d), StringUtil::Format("%s must not be NULL", d.name));
 	}
 	if (d.kind == Kind::BIGINT || d.kind == Kind::UBIGINT) {
 		bool negative = d.kind == Kind::BIGINT && value.GetValue<int64_t>() < 0;
 		auto number = negative ? uint64_t(0) : value.GetValue<uint64_t>();
 		if (negative || number < d.minimum || number > d.maximum) {
-			throw InvalidInputException("%s must be between %llu and %llu", d.name,
+			throw InvalidInputException(SettingErrorInfo(d), StringUtil::Format("%s must be between %llu and %llu", d.name,
 			                            static_cast<unsigned long long>(d.minimum),
-			                            static_cast<unsigned long long>(d.maximum));
+			                            static_cast<unsigned long long>(d.maximum)));
 		}
 	} else if (d.kind == Kind::VARCHAR && *d.choices) {
 		auto input = StringUtil::Lower(value.GetValue<string>());
 		auto choices = StringUtil::Split(d.choices, ',');
 		if (std::find(choices.begin(), choices.end(), input) == choices.end()) {
-			throw InvalidInputException("%s must be one of %s (got '%s')", d.name, d.choices, input);
+			throw InvalidInputException(SettingErrorInfo(d), StringUtil::Format("%s must be one of %s (got '%s')", d.name, d.choices, input));
 		}
 		value = Value(input);
 	} else if (d.kind == Kind::THRESHOLDS) {
@@ -77,14 +85,14 @@ void Validate(const Definition &d, Value &value) {
 		for (auto &entry : MapValue::GetChildren(value)) {
 			auto &pair = StructValue::GetChildren(entry);
 			if (pair[0].IsNull() || pair[1].IsNull()) {
-				throw InvalidInputException("%s keys and thresholds must not be NULL", d.name);
+				throw InvalidInputException(SettingErrorInfo(d), StringUtil::Format("%s keys and thresholds must not be NULL", d.name));
 			}
 			auto key = pair[0].GetValue<string>();
 			if (std::find(choices.begin(), choices.end(), key) == choices.end()) {
-				throw InvalidInputException("Unknown %s key '%s'; expected one of %s", d.name, key, d.choices);
+				throw InvalidInputException(SettingErrorInfo(d), StringUtil::Format("Unknown %s key '%s'; expected one of %s", d.name, key, d.choices));
 			}
 			if (pair[1].GetValue<int64_t>() < 0) {
-				throw InvalidInputException("%s threshold for '%s' must be nonnegative", d.name, key);
+				throw InvalidInputException(SettingErrorInfo(d), StringUtil::Format("%s threshold for '%s' must be nonnegative", d.name, key));
 			}
 		}
 	} else if (string(d.name) == "vgi_allowed_transports") {
@@ -96,7 +104,7 @@ template <Id ID>
 void Set(ClientContext &context, SetScope scope, Value &parameter) {
 	const auto &d = definitions[static_cast<size_t>(ID)];
 	if (d.global && scope != SetScope::GLOBAL && scope != SetScope::AUTOMATIC) {
-		throw InvalidInputException("%s can only be set globally (shared by connections to this database)", d.name);
+		throw InvalidInputException(SettingErrorInfo(d), StringUtil::Format("%s can only be set globally (shared by connections to this database)", d.name));
 	}
 	Validate(d, parameter);
 	if (ID == Id::ALLOWED_TRANSPORTS) {

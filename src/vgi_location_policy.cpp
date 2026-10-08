@@ -2,6 +2,7 @@
 #include "vgi_location_policy.hpp"
 #include "vgi_settings.hpp"
 
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_transport.hpp"
 
@@ -62,7 +63,9 @@ void CheckLocationPolicy(ClientContext &context, const std::string &location, Lo
 	auto transport = ClassifyLocationForPolicy(location, entry, refusal);
 	if (!transport) {
 		VGI_LOG(context, "location_policy.refused", {{"entry", LocationEntryPointName(entry)}, {"reason", "internal"}});
-		throw PermissionException(refusal);
+		// PermissionException has no extra_info constructor; nothing in VGI
+		// catches it by type, so the base Exception with PERMISSION is equivalent.
+		throw Exception(ErrorInfo(error_subtype::kUnsupported), ExceptionType::PERMISSION, refusal);
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto *policy = FindVgiLocationPolicy(db);
@@ -75,17 +78,27 @@ void CheckLocationPolicy(ClientContext &context, const std::string &location, Lo
 		        {{"entry", LocationEntryPointName(entry)},
 		         {"transport", PolicyTransportName(transport)},
 		         {"reason", "not_allowed"}});
-		throw PermissionException("vgi: LOCATION transport '%s' is not permitted by %s (allowed: %s)",
-		                          PolicyTransportName(transport), kSettingName, FormatAllowedTransports(allowed));
+		throw Exception(ErrorInfo(error_subtype::kTransportNotAllowed)
+		                    .Set(error_key::kTransport, PolicyTransportName(transport))
+		                    .Set(error_key::kAllowedTransports, FormatAllowedTransports(allowed))
+		                    .Set(error_key::kSetting, kSettingName),
+		                ExceptionType::PERMISSION,
+		                StringUtil::Format("vgi: LOCATION transport '%s' is not permitted by %s (allowed: %s)",
+		                                   PolicyTransportName(transport), kSettingName,
+		                                   FormatAllowedTransports(allowed)));
 	}
 	if ((transport & POLICY_LOCAL_TRANSPORTS) && !Settings::Get<EnableExternalAccessSetting>(DBConfig::GetConfig(db))) {
 		VGI_LOG(context, "location_policy.refused",
 		        {{"entry", LocationEntryPointName(entry)},
 		         {"transport", PolicyTransportName(transport)},
 		         {"reason", "external_access_disabled"}});
-		throw PermissionException("vgi: LOCATION transport '%s' is local (it can start a process or connect to "
-		                          "local IPC) and is not permitted while enable_external_access is false",
-		                          PolicyTransportName(transport));
+		throw Exception(ErrorInfo(error_subtype::kExternalAccessDisabled)
+		                    .Set(error_key::kTransport, PolicyTransportName(transport))
+		                    .Set(error_key::kSetting, "enable_external_access"),
+		                ExceptionType::PERMISSION,
+		                StringUtil::Format("vgi: LOCATION transport '%s' is local (it can start a process or connect "
+		                                   "to local IPC) and is not permitted while enable_external_access is false",
+		                                   PolicyTransportName(transport)));
 	}
 }
 

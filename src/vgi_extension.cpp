@@ -1753,7 +1753,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		} else if (lower_name == "oauth_profile") {
 			oauth_profile = value.ToString();
 			if (oauth_profile.empty()) {
-				throw BinderException("oauth_profile must not be empty");
+				throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "oauth_profile"), "oauth_profile must not be empty");
 			}
 		} else if (lower_name == "oauth_cache") {
 			oauth_cache_mode = StringUtil::Lower(value.ToString());
@@ -1768,7 +1768,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		} else if (lower_name == "tcp_proxy") {
 			tcp_proxy = value.ToString();
 			if (tcp_proxy.empty()) {
-				throw BinderException("tcp_proxy, if set, must not be empty");
+				throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "tcp_proxy"), "tcp_proxy, if set, must not be empty");
 			}
 		} else if (vgi::ApplyIrohOption(lower_name, value, iroh_options)) {
 			// iroh_* options: parsed by the shared helper (see vgi_iroh_config.hpp).
@@ -1779,14 +1779,15 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		} else if (lower_name == "launcher_idle_timeout") {
 			launcher_idle_timeout_seconds = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 			if (launcher_idle_timeout_seconds < 0) {
-				throw BinderException(
-				    "launcher_idle_timeout must be >= 0 (got %lld); use 0 for no timeout",
-				    static_cast<long long>(launcher_idle_timeout_seconds));
+				throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "launcher_idle_timeout"),
+				                      StringUtil::Format("launcher_idle_timeout must be >= 0 (got %lld); use 0 for "
+				                                         "no timeout",
+				                                         static_cast<long long>(launcher_idle_timeout_seconds)));
 			}
 		} else if (lower_name == "launcher_state_dir") {
 			launcher_state_dir = value.ToString();
 			if (launcher_state_dir.empty()) {
-				throw BinderException("launcher_state_dir, if set, must not be empty");
+				throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "launcher_state_dir"), "launcher_state_dir, if set, must not be empty");
 			}
 		} else {
 			// Collect for validation + forwarding to the worker. Assignment, not
@@ -1888,7 +1889,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	// Validate mutual exclusivity of auth options
 	if (!bearer_token.empty() && !oauth_refresh_token.empty()) {
-		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "bearer_token"), "Cannot specify both bearer_token and oauth_refresh_token");
 	}
 	// An attach ticket IS the catalog's options: the worker restores the sealed
 	// options and version specs and refuses anything beside it, so reject that
@@ -1924,8 +1925,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 	if (oauth_cache_mode != "auto" && oauth_cache_mode != "persistent" &&
 	    oauth_cache_mode != "memory" && oauth_cache_mode != "none") {
-		throw BinderException("oauth_cache must be auto, persistent, memory, or none (got '%s')",
-		                      oauth_cache_mode);
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "oauth_cache").Set(vgi::error_key::kActual, oauth_cache_mode),
+		                      StringUtil::Format("oauth_cache must be auto, persistent, memory, or none (got '%s')",
+		                                         oauth_cache_mode));
 	}
 
 	// Bare connection-string form: when no LOCATION was given and the path
@@ -1941,7 +1943,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 
 	if (worker_path.empty()) {
-		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "location"), "VGI ATTACH requires LOCATION option specifying the worker path");
 	}
 	// What the user typed as LOCATION, for vgi_export_session() (worker_path may
 	// be rewritten below, e.g. database:// into an internal artifact token).
@@ -1952,7 +1954,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	vgi::CheckLocationPolicy(context, worker_path, vgi::LocationEntryPoint::ATTACH);
 
 	if (!tcp_proxy.empty() && !vgi::IsTcpTransport(worker_path)) {
-		throw BinderException("tcp_proxy is only valid for tcp:// LOCATIONs");
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "tcp_proxy"), "tcp_proxy is only valid for tcp:// LOCATIONs");
 	}
 
 	const bool is_iroh_location = vgi::IsIrohTransport(worker_path) || vgi::IsHttpiTransport(worker_path);
@@ -1990,9 +1992,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	if ((launcher_idle_timeout_seconds >= 0 || !launcher_state_dir.empty()) &&
 	    !vgi::IsLaunchLocation(worker_path)) {
 		throw BinderException(
-		    "launcher_idle_timeout / launcher_state_dir are only valid for `launch:` "
-		    "LOCATIONs (got LOCATION=%s)",
-		    worker_path);
+		    vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, launcher_state_dir.empty() ? "launcher_idle_timeout" : "launcher_state_dir"),
+		    StringUtil::Format("launcher_idle_timeout / launcher_state_dir are only valid for `launch:` "
+		                       "LOCATIONs (got LOCATION=%s)",
+		                       worker_path));
 	}
 
 	// A struct-valued LOCATION carries container options, so it is only meaningful
@@ -2157,7 +2160,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	std::shared_ptr<vgi::CatalogAuth> auth;
 	if (!bearer_token.empty()) {
 		if (!vgi::IsHttpTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
-			throw BinderException("bearer_token is only valid for HTTP transport "
+			throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "bearer_token"),
+			                      "bearer_token is only valid for HTTP transport "
 			                      "(LOCATION must be an HTTP/HTTPS or httpi:// URL)");
 		}
 		auth = std::make_shared<vgi::BearerTokenCatalogAuth>(bearer_token);
@@ -2165,7 +2169,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		auto oauth_auth = std::make_shared<vgi::OAuthCatalogAuth>(oauth_profile, oauth_cache_mode);
 		if (!oauth_refresh_token.empty()) {
 			if (!vgi::IsHttpTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
-				throw BinderException("oauth_refresh_token is only valid for HTTP transport "
+				throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "oauth_refresh_token"),
+				                      "oauth_refresh_token is only valid for HTTP transport "
 				                      "(LOCATION must be an HTTP/HTTPS or httpi:// URL)");
 			}
 			oauth_auth->SeedRefreshToken(oauth_refresh_token);
@@ -2308,8 +2313,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			for (const auto &opt : attach_options) {
 				const auto *matching_spec = find_spec(opt.first);
 				if (!matching_spec) {
-					throw BinderException("Unknown ATTACH option '%s' for catalog '%s'. Accepted options: %s",
-					                      opt.first, catalog_name, build_accepted_list());
+					throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, opt.first).Set(vgi::error_key::kCatalog, catalog_name),
+					                      StringUtil::Format("Unknown ATTACH option '%s' for catalog '%s'. "
+					                                         "Accepted options: %s",
+					                                         opt.first, catalog_name, build_accepted_list()));
 				}
 
 				Value casted;
@@ -2317,11 +2324,19 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				if (!opt.second.DefaultTryCastAs(matching_spec->type, casted, &cast_error)) {
 					if (matching_spec->secret) {
 						// The cast error quotes the value; a credential's must not surface.
-						throw BinderException("Cannot cast ATTACH option '%s' to declared type %s",
-						                      matching_spec->name, matching_spec->type.ToString());
+						throw BinderException(
+						    vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, matching_spec->name)
+						        .Set(vgi::error_key::kCatalog, catalog_name)
+						        .Set(vgi::error_key::kExpected, matching_spec->type.ToString()),
+						    StringUtil::Format("Cannot cast ATTACH option '%s' to declared type %s",
+						                       matching_spec->name, matching_spec->type.ToString()));
 					}
-					throw BinderException("Cannot cast ATTACH option '%s' to declared type %s: %s",
-					                      matching_spec->name, matching_spec->type.ToString(), cast_error);
+					throw BinderException(
+					    vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, matching_spec->name)
+					        .Set(vgi::error_key::kCatalog, catalog_name)
+					        .Set(vgi::error_key::kExpected, matching_spec->type.ToString()),
+					    StringUtil::Format("Cannot cast ATTACH option '%s' to declared type %s: %s",
+					                       matching_spec->name, matching_spec->type.ToString(), cast_error));
 				}
 				if (matching_spec->secret) {
 					secret_option_names.insert(opt.first);
@@ -2447,9 +2462,14 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				throw BinderException("Failed to retrieve existing VGI setting '%s'", setting.name);
 			}
 			if (existing_option.type != setting.type) {
-				throw BinderException("VGI setting '%s' already exists with type %s, but catalog '%s' requires type %s",
-				                      setting.name, existing_option.type.ToString(), catalog_name,
-				                      setting.type.ToString());
+				throw BinderException(
+				    vgi::ErrorInfo()
+				        .Set(vgi::error_key::kSetting, setting.name)
+				        .Set(vgi::error_key::kCatalog, catalog_name)
+				        .ExpectedActual(setting.type.ToString(), existing_option.type.ToString()),
+				    StringUtil::Format(
+				        "VGI setting '%s' already exists with type %s, but catalog '%s' requires type %s",
+				        setting.name, existing_option.type.ToString(), catalog_name, setting.type.ToString()));
 			}
 			// Types match - setting is already registered, no need to add again
 		} else {
@@ -2663,8 +2683,13 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					SecretManager::Get(context).LoadSecretStorage(std::move(storage));
 				} catch (const std::exception &e) {
 					throw BinderException(
-					    "Failed to register VGI remote secret provider for catalog '%s' (endpoint %s): %s",
-					    catalog_name, secret_endpoint, e.what());
+					    vgi::ErrorInfo()
+					        .Set(vgi::error_key::kCatalog, catalog_name)
+					        .Url(secret_endpoint)
+					        .Merge(vgi::ExtraInfoOf(e)),
+					    StringUtil::Format(
+					        "Failed to register VGI remote secret provider for catalog '%s' (endpoint %s): %s",
+					        catalog_name, secret_endpoint, vgi::RawMessageOf(e)));
 				}
 				vgi_ext->RegisterSecretProvider(catalog_name, storage_ptr);
 			}
@@ -2858,21 +2883,44 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 						scheme = StringUtil::Lower(c.target.substr(0, colon));
 					}
 				}
+				// The target is commonly a DSN (`postgres:... password=...`), so it is
+				// only ever reported through RedactCredentials.
+				const std::string redacted_target = vgi::RedactCredentials(c.target);
 				if (scheme.empty() || kAllowedCompanionSchemes.find(scheme) == kAllowedCompanionSchemes.end()) {
-					throw BinderException(
-					    "VGI catalog '%s' advertised companion '%s' with target '%s' whose scheme '%s' is not "
-					    "permitted (allowed: ducklake, iceberg, postgres, mysql, duckdb, sqlite).",
-					    catalog_name, c.alias, c.target, scheme);
+					throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kCompanionAttachFailed)
+					                          .Set(vgi::error_key::kCatalog, catalog_name)
+					                          .Set(vgi::error_key::kCompanion, c.alias)
+					                          .Set(vgi::error_key::kActual, scheme),
+					                      StringUtil::Format(
+					                          "VGI catalog '%s' advertised companion '%s' with target '%s' whose "
+					                          "scheme '%s' is not permitted (allowed: ducklake, iceberg, postgres, "
+					                          "mysql, duckdb, sqlite).",
+					                          catalog_name, c.alias, redacted_target, scheme));
 				}
 
-				auto handle_failure = [&](const std::string &reason) {
+				auto handle_failure = [&](const std::string &raw_reason,
+				                          const vgi::ErrorInfo &inner_info = vgi::ErrorInfo()) {
+					// The attach error text can echo the DSN back; redact it too.
+					const std::string reason = vgi::RedactCredentials(raw_reason);
 					if (c.required) {
+						vgi::ErrorInfo info(vgi::error_subtype::kCompanionAttachFailed);
+						info.Set(vgi::error_key::kCatalog, catalog_name).Set(vgi::error_key::kCompanion, c.alias);
+						// Inner fields (e.g. from the companion extension) fill what
+						// we lack, but never a raw path/url that may hold the DSN.
+						for (const auto &kv : inner_info) {
+							if (kv.first == vgi::error_key::kErrorSubtype) {
+								continue;
+							}
+							info.emplace(kv.first, vgi::RedactCredentials(kv.second));
+						}
+						info.erase("stack_trace_pointers");
 						throw BinderException(
-						    "VGI catalog '%s' could not attach required companion '%s' (target '%s'): %s",
-						    catalog_name, c.alias, c.target, reason);
+						    info, StringUtil::Format(
+						              "VGI catalog '%s' could not attach required companion '%s' (target '%s'): %s",
+						              catalog_name, c.alias, redacted_target, reason));
 					}
 					VGI_LOG(context, "vgi.companion_attach.skipped",
-					        {{"alias", c.alias}, {"target", c.target}, {"reason", reason}});
+					        {{"alias", c.alias}, {"target", redacted_target}, {"reason", reason}});
 				};
 
 				std::string conflict_target;
@@ -2913,7 +2961,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					    },
 					    conflict_target);
 				} catch (const std::exception &e) {
-					handle_failure(e.what());
+					handle_failure(vgi::RawMessageOf(e), vgi::ExtraInfoOf(e));
 					continue;
 				}
 				if (outcome == VgiStorageExtension::CompanionOutcome::CONFLICT) {
@@ -2923,7 +2971,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				referenced.push_back(c.alias);
 				VGI_LOG(context, "vgi.companion_attach",
 				        {{"alias", c.alias},
-				         {"target", c.target},
+				         {"target", redacted_target},
 				         {"shared", outcome == VgiStorageExtension::CompanionOutcome::SHARED ? "true" : "false"}});
 			}
 			} catch (...) {

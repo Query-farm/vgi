@@ -3,6 +3,7 @@
 #include "vgi_oauth_store.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_sha256.hpp"
 
@@ -87,7 +88,8 @@ bool WantsPersistence(const std::string &mode) {
 	return mode == "auto" || mode == "persistent";
 #else
 	if (mode == "persistent") {
-		throw IOException("VGI OAuth: persistent credential storage is not available in this Linux build; "
+		throw IOException(ErrorInfo(error_subtype::kUnsupported).Set(error_key::kAttachOption, "oauth_cache"),
+		                  "VGI OAuth: persistent credential storage is not available in this Linux build; "
 		                  "use oauth_cache='memory' or install a build with Secret Service support");
 	}
 	return false; // conservative Linux auto: never fall back to plaintext
@@ -100,14 +102,14 @@ public:
 	explicit PosixLease(const std::string &key) {
 		std::string dir = "/tmp/queryfarm-vgi-oauth-" + std::to_string(static_cast<unsigned long long>(getuid()));
 		if (mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
-			throw IOException("VGI OAuth: could not create credential lock directory");
+			throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: could not create credential lock directory");
 		}
 		std::string path = dir + "/" + VgiSha256Hex(key) + ".lock";
 		fd_ = open(path.c_str(), O_CREAT | O_RDWR, 0600);
 		if (fd_ < 0 || flock(fd_, LOCK_EX) != 0) {
 			if (fd_ >= 0)
 				close(fd_);
-			throw IOException("VGI OAuth: could not acquire credential cache lease");
+			throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: could not acquire credential cache lease");
 		}
 	}
 	~PosixLease() override {
@@ -144,7 +146,7 @@ bool PlatformLoad(const std::string &key, std::string &data) {
 	if (status == errSecItemNotFound)
 		return false;
 	if (status != errSecSuccess || !result)
-		throw IOException("VGI OAuth: Keychain read failed (%d)", status);
+		throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: Keychain read failed (%d)", status);
 	auto bytes = reinterpret_cast<CFDataRef>(result);
 	data.assign(reinterpret_cast<const char *>(CFDataGetBytePtr(bytes)), CFDataGetLength(bytes));
 	CFRelease(result);
@@ -166,7 +168,7 @@ void PlatformStore(const std::string &key, const std::string &data) {
 	CFRelease(value);
 	CFRelease(query);
 	if (status != errSecSuccess)
-		throw IOException("VGI OAuth: Keychain write failed (%d)", status);
+		throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: Keychain write failed (%d)", status);
 }
 
 void PlatformDelete(const std::string &key) {
@@ -174,7 +176,7 @@ void PlatformDelete(const std::string &key) {
 	auto status = SecItemDelete(query);
 	CFRelease(query);
 	if (status != errSecSuccess && status != errSecItemNotFound) {
-		throw IOException("VGI OAuth: Keychain delete failed (%d)", status);
+		throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: Keychain delete failed (%d)", status);
 	}
 }
 
@@ -238,7 +240,7 @@ public:
 		if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
 			if (handle_)
 				CloseHandle(handle_);
-			throw IOException("VGI OAuth: could not acquire credential cache lease");
+			throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: could not acquire credential cache lease");
 		}
 	}
 	~WindowsLease() override {
@@ -255,7 +257,7 @@ private:
 std::filesystem::path StorePath(const std::string &key) {
 	const char *base = std::getenv("LOCALAPPDATA");
 	if (!base || !*base)
-		throw IOException("VGI OAuth: LOCALAPPDATA is unavailable");
+		throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: LOCALAPPDATA is unavailable");
 	auto dir = std::filesystem::path(base) / "QueryFarm" / "VGI" / "oauth";
 	std::filesystem::create_directories(dir);
 	return dir / (VgiSha256Hex(key) + ".bin");
@@ -269,7 +271,7 @@ bool PlatformLoad(const std::string &key, std::string &data) {
 	DATA_BLOB input {static_cast<DWORD>(encrypted.size()), reinterpret_cast<BYTE *>(encrypted.data())};
 	DATA_BLOB output {};
 	if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, 0, &output)) {
-		throw IOException("VGI OAuth: DPAPI credential decrypt failed");
+		throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: DPAPI credential decrypt failed");
 	}
 	data.assign(reinterpret_cast<char *>(output.pbData), output.cbData);
 	SecureZeroMemory(output.pbData, output.cbData);
@@ -282,7 +284,7 @@ void PlatformStore(const std::string &key, const std::string &data) {
 	DATA_BLOB output {};
 	if (!CryptProtectData(&input, L"Query Farm VGI OAuth", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN,
 	                      &output)) {
-		throw IOException("VGI OAuth: DPAPI credential encrypt failed");
+		throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: DPAPI credential encrypt failed");
 	}
 	auto path = StorePath(key);
 	auto temp = path;
@@ -292,7 +294,7 @@ void PlatformStore(const std::string &key, const std::string &data) {
 		out.write(reinterpret_cast<char *>(output.pbData), output.cbData);
 		if (!out) {
 			LocalFree(output.pbData);
-			throw IOException("VGI OAuth: DPAPI cache write failed");
+			throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: DPAPI cache write failed");
 		}
 	}
 	SecureZeroMemory(output.pbData, output.cbData);
@@ -305,14 +307,14 @@ void PlatformStore(const std::string &key, const std::string &data) {
 		std::filesystem::rename(temp, path, ec);
 	}
 	if (ec)
-		throw IOException("VGI OAuth: DPAPI cache replace failed");
+		throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: DPAPI cache replace failed");
 }
 
 void PlatformDelete(const std::string &key) {
 	std::error_code ec;
 	std::filesystem::remove(StorePath(key), ec);
 	if (ec) {
-		throw IOException("VGI OAuth: DPAPI cache delete failed (Windows error %d)", ec.value());
+		throw IOException(ErrorInfo(error_subtype::kCredentialStoreFailed), "VGI OAuth: DPAPI cache delete failed (Windows error %d)", ec.value());
 	}
 }
 
