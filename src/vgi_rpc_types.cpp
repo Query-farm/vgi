@@ -3,6 +3,8 @@
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_ipc.hpp"
+#include "vgi_batch_validation.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_schema_registry.hpp"
 
 // Generated request builders — exposes ``duckdb::vgi::generated::Build<Name>Params(...)``
@@ -15,6 +17,21 @@ namespace duckdb {
 namespace vgi {
 
 namespace {
+
+// Validate a nested payload decoded from IPC bytes. `what` names it in the
+// message ("[worker: nested IPC payload]", unchanged) but is not a worker
+// location, so it is reported as `field` rather than `worker_path`/`transport`.
+void ValidateNestedBatch(const arrow::RecordBatch *batch, WorkerBatchValidation level, const char *what) {
+	try {
+		ValidateWorkerBatch(batch, level, what);
+	} catch (const IOException &e) {
+		ErrorInfo info = ExtraInfoOf(e);
+		info.erase(error_key::kWorkerPath);
+		info.erase(error_key::kTransport);
+		info.Set(error_key::kField, what);
+		throw IOException(info, RawMessageOf(e));
+	}
+}
 
 // Helper to check Arrow status and throw on failure
 void CheckStatus(const arrow::Status &status, const char *operation) {
@@ -428,7 +445,7 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data,
 	if (!status.ok()) {
 		throw IOException("Failed to read batch from IPC bytes: %s", status.ToString());
 	}
-	ValidateWorkerBatch(batch.get(), validation, "nested IPC payload");
+	ValidateNestedBatch(batch.get(), validation, "nested IPC payload");
 	return batch;
 }
 
@@ -458,7 +475,7 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow:
 	if (!status.ok()) {
 		throw IOException("Failed to read batch from IPC bytes: %s", status.ToString());
 	}
-	ValidateWorkerBatch(batch.get(), validation, "nested IPC payload");
+	ValidateNestedBatch(batch.get(), validation, "nested IPC payload");
 	return batch;
 }
 
@@ -484,7 +501,7 @@ DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_
 		throw IOException("Failed to read batch from IPC bytes: %s", result.status().ToString());
 	}
 	auto bwm = result.ValueUnsafe();
-	ValidateWorkerBatch(bwm.batch.get(), validation, "nested IPC payload");
+	ValidateNestedBatch(bwm.batch.get(), validation, "nested IPC payload");
 	return {bwm.batch, bwm.custom_metadata};
 }
 

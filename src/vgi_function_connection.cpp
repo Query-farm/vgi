@@ -52,6 +52,38 @@
 namespace duckdb {
 namespace vgi {
 
+namespace {
+// `function_kind` token for a connection's function_type_ ("TABLE",
+// "SCALAR_FUNCTION", "TABLE_BUFFERING", ...).
+std::string FunctionKindToken(const std::string &function_type) {
+	std::string kind = function_type;
+	const std::string suffix = "_FUNCTION";
+	if (kind.size() > suffix.size() && kind.compare(kind.size() - suffix.size(), suffix.size(), suffix) == 0) {
+		kind.resize(kind.size() - suffix.size());
+	}
+	if (kind == "TABLE_BUFFERING") {
+		return "TABLE_IN_OUT";
+	}
+	return kind;
+}
+
+ErrorInfo FunctionInfo(const std::string &function_name, const std::string &function_type,
+                       const char *subtype = nullptr) {
+	ErrorInfo info = subtype ? ErrorInfo(subtype) : ErrorInfo();
+	info.Function(function_name, FunctionKindToken(function_type));
+	return info;
+}
+
+// ThrowVgiIOException plus the caller's extra_info (function context,
+// subtype). The message is built exactly as ThrowVgiIOException builds it.
+template <typename... ARGS>
+[[noreturn]] void ThrowFunctionIOException(ErrorInfo info, const std::string &msg, const std::string &worker_path,
+                                           pid_t worker_pid, const std::string &invocation_id_hex, ARGS... params) {
+	info.Worker(worker_path, worker_pid, invocation_id_hex);
+	throw IOException(info, BuildMessageWithContext(msg, worker_path), params...);
+}
+} // namespace
+
 // ============================================================================
 // FunctionConnectionParams Accessors (out-of-line, needs VgiAttachParameters)
 // ============================================================================
@@ -635,17 +667,17 @@ BindResult FunctionConnection::PerformBindRpc() {
 		}
 
 		if (!response.batch || response.batch->num_rows() == 0) {
-			ThrowVgiIOException("Empty bind response from worker", worker_path_, TransportPid(), "");
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Empty bind response from worker", worker_path_, TransportPid(), "");
 		}
 
 		auto result_col = response.batch->GetColumnByName("result");
 		if (!result_col) {
-			ThrowVgiIOException("Bind response missing 'result' column", worker_path_, TransportPid(), "");
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response missing 'result' column", worker_path_, TransportPid(), "");
 		}
 
 		auto bin_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
 		if (!bin_array || bin_array->IsNull(0)) {
-			ThrowVgiIOException("Bind response 'result' column is null", worker_path_, TransportPid(), "");
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response 'result' column is null", worker_path_, TransportPid(), "");
 		}
 
 		auto v = bin_array->GetView(0);
@@ -840,7 +872,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		auto sink = TransportOutput();
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, tick_schema_);
 		if (!writer_result.ok()) {
-			ThrowVgiIOException("Failed to create tick writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create tick writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    writer_result.status().ToString());
 		}
 		input_writer_ = writer_result.ValueUnsafe();
@@ -871,7 +903,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		auto write_status = first_tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
 		    : input_writer_->WriteRecordBatch(*tick_batch);
 		if (!write_status.ok()) {
-			ThrowVgiIOException("Failed to write initial tick batch: %s", worker_path_, TransportPid(),
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to write initial tick batch: %s", worker_path_, TransportPid(),
 			                    GetExecutionIdHex(), write_status.ToString());
 		}
 
@@ -880,7 +912,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		data_stream_ = TransportInput();
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
-			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
@@ -892,7 +924,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		auto sink = TransportOutput();
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 		if (!writer_result.ok()) {
-			ThrowVgiIOException("Failed to create input writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create input writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    writer_result.status().ToString());
 		}
 		input_writer_ = writer_result.ValueUnsafe();
@@ -937,7 +969,7 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	if (input_writer_ && !input_writer_closed_) {
 		auto close_status = input_writer_->Close();
 		if (!close_status.ok()) {
-			ThrowVgiIOException("Failed to close input writer for finalize: %s", worker_path_,
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer for finalize: %s", worker_path_,
 			                    TransportPid(), GetExecutionIdHex(), close_status.ToString());
 		}
 	}
@@ -962,7 +994,7 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 			}
 			// The next bytes cannot be assumed to begin FINALIZE when the
 			// preceding stateful stream failed before even yielding its schema.
-			ThrowVgiIOException("Failed to open Iroh output stream before finalize: %s", worker_path_,
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open Iroh output stream before finalize: %s", worker_path_,
 			                    TransportPid(), GetExecutionIdHex(), status.ToString());
 		}
 	}
@@ -979,7 +1011,7 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 			// failure before Arrow's explicit EOS marker leaves the next RPC
 			// boundary unknowable, so it cannot be treated as an empty drain.
 			if (iroh_config_) {
-				ThrowVgiIOException("Failed while draining Iroh output before finalize: %s", worker_path_,
+				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed while draining Iroh output before finalize: %s", worker_path_,
 				                    TransportPid(), GetExecutionIdHex(), status.ToString());
 			}
 			break;
@@ -1040,7 +1072,7 @@ void FunctionConnection::ResetForNextSplit() {
 			// Poison: the stream is in an unknown state, so the connection must not
 			// go back to the pool looking idle.
 			split_reset_failed_ = true;
-			ThrowVgiIOException("Failed to close input writer between splits: %s", worker_path_,
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer between splits: %s", worker_path_,
 			                    TransportPid(), GetExecutionIdHex(), close_status.ToString());
 		}
 	}
@@ -1060,7 +1092,7 @@ void FunctionConnection::ResetForNextSplit() {
 			}
 			if (iroh_config_) {
 				split_reset_failed_ = true;
-				ThrowVgiIOException("Failed while draining Iroh output between splits: %s", worker_path_,
+				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed while draining Iroh output between splits: %s", worker_path_,
 				                    TransportPid(), GetExecutionIdHex(), status.ToString());
 			}
 			break;
@@ -1105,13 +1137,13 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	// Lazily open data reader if not yet opened (exchange mode defers this)
 	if (!data_reader_) {
 		if (!TransportReady()) {
-			ThrowVgiIOException("FunctionConnection::ReadDataBatch transport is not connected", worker_path_, -1,
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "FunctionConnection::ReadDataBatch transport is not connected", worker_path_, -1,
 			                    GetExecutionIdHex());
 		}
 		data_stream_ = TransportInput();
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
-			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
@@ -1189,7 +1221,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			// Arrow IPC EOS marker; accepting Invalid here would silently return
 			// a truncated result and leave this stateful connection desynchronized.
 			if (iroh_config_) {
-				ThrowVgiIOException("Iroh data stream ended before the Arrow EOS marker: %s", worker_path_,
+				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Iroh data stream ended before the Arrow EOS marker: %s", worker_path_,
 				                    TransportPid(), GetExecutionIdHex(), status.ToString());
 			}
 			// Arrow's IPC stream uses an explicit EOS marker (0xFFFFFFFF +
@@ -1209,12 +1241,12 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 				int exit_status = 0;
 				if (proc_ && proc_->TryWait(&exit_status)) {
 					if (exit_status < 0) {
-						ThrowVgiIOException("Worker killed by signal %d before EOS marker; result was truncated: %s",
+						ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Worker killed by signal %d before EOS marker; result was truncated: %s",
 						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), -exit_status,
 						    status.ToString());
 					}
 					if (exit_status != 0) {
-						ThrowVgiIOException("Worker exited with status %d before EOS marker; result was truncated: %s",
+						ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Worker exited with status %d before EOS marker; result was truncated: %s",
 						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), exit_status,
 						    status.ToString());
 					}
@@ -1225,7 +1257,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 				data_finished_ = true;
 				return nullptr;
 			}
-			ThrowVgiIOException("Failed to read data batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to read data batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
 			                    GetExecutionIdHex(), status.ToString());
 		}
 		auto result = read_result.ValueUnsafe();
@@ -1245,11 +1277,11 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			int exit_status = 0;
 			if (proc_ && proc_->TryWait(&exit_status)) {
 				if (exit_status < 0) {
-					ThrowVgiIOException("Worker killed by signal %d before EOS marker; result was truncated",
+					ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Worker killed by signal %d before EOS marker; result was truncated",
 					    worker_path_, proc_->GetPid(), GetExecutionIdHex(), -exit_status);
 				}
 				if (exit_status != 0) {
-					ThrowVgiIOException("Worker exited with status %d before EOS marker; result was truncated",
+					ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Worker exited with status %d before EOS marker; result was truncated",
 					    worker_path_, proc_->GetPid(), GetExecutionIdHex(), exit_status);
 				}
 			}
@@ -1258,8 +1290,10 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		}
 
 		// Check for log/error batches via HandleBatchLogMessage
+		const auto log_error_context = FunctionInfo(function_name_, function_type_);
 		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, TransportPid(),
-		                          GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex())) {
+		                          GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
+		                          &log_error_context)) {
 			continue;  // Skip log batch, read next
 		}
 
@@ -1342,9 +1376,14 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 					last_partition_values_bytes_.resize(decoded_size);
 					Blob::FromBase64(b64_str, data_ptr_cast(last_partition_values_bytes_.data()), decoded_size);
 				} catch (const std::exception &e) {
-					throw IOException("VGI worker emitted invalid base64 payload in "
+					throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
+					                      .Function(function_name_, FunctionKindToken(function_type_))
+					                      .Worker(worker_path_, TransportPid(), GetExecutionIdHex())
+					                      .Set(error_key::kMetadataKey, "vgi_partition_values#b64")
+					                      .Merge(ExtraInfoOf(e)),
+					                  "VGI worker emitted invalid base64 payload in "
 					                  "vgi_partition_values#b64: %s [worker: %s, pid: %d]",
-					                  e.what(), worker_path_, proc_ ? proc_->GetPid() : 0);
+					                  RawMessageOf(e), worker_path_, proc_ ? proc_->GetPid() : 0);
 				}
 			}
 		}
@@ -1364,9 +1403,14 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 					last_parent_row_bytes_.resize(decoded_size);
 					Blob::FromBase64(b64_str, data_ptr_cast(last_parent_row_bytes_.data()), decoded_size);
 				} catch (const std::exception &e) {
-					throw IOException("VGI worker emitted invalid base64 payload in "
+					throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
+					                      .Function(function_name_, FunctionKindToken(function_type_))
+					                      .Worker(worker_path_, TransportPid(), GetExecutionIdHex())
+					                      .Set(error_key::kMetadataKey, "vgi_rpc.parent_row#b64")
+					                      .Merge(ExtraInfoOf(e)),
+					                  "VGI worker emitted invalid base64 payload in "
 					                  "vgi_rpc.parent_row#b64: %s [worker: %s, pid: %d]",
-					                  e.what(), worker_path_, proc_ ? proc_->GetPid() : 0);
+					                  RawMessageOf(e), worker_path_, proc_ ? proc_->GetPid() : 0);
 				}
 			}
 		}
@@ -1385,18 +1429,30 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 					size_t pos = 0;
 					uint64_t parsed = std::stoull(value, &pos);
 					if (pos != value.size()) {
-						throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+						throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
+						                      .Function(function_name_, FunctionKindToken(function_type_))
+						                      .Worker(worker_path_, TransportPid(), GetExecutionIdHex())
+						                      .Set(error_key::kMetadataKey, "vgi_batch_index"),
+						                  "VGI worker emitted invalid vgi_batch_index '%s' "
 						                  "(trailing characters; expected decimal uint64) "
 						                  "[worker: %s, pid: %d]",
 						                  value, worker_path_, proc_ ? proc_->GetPid() : 0);
 					}
 					last_batch_index_ = static_cast<idx_t>(parsed);
 				} catch (const std::invalid_argument &) {
-					throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+					throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
+					                      .Function(function_name_, FunctionKindToken(function_type_))
+					                      .Worker(worker_path_, TransportPid(), GetExecutionIdHex())
+					                      .Set(error_key::kMetadataKey, "vgi_batch_index"),
+					                  "VGI worker emitted invalid vgi_batch_index '%s' "
 					                  "(expected decimal uint64) [worker: %s, pid: %d]",
 					                  value, worker_path_, proc_ ? proc_->GetPid() : 0);
 				} catch (const std::out_of_range &) {
-					throw IOException("VGI worker emitted vgi_batch_index '%s' that exceeds "
+					throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
+					                      .Function(function_name_, FunctionKindToken(function_type_))
+					                      .Worker(worker_path_, TransportPid(), GetExecutionIdHex())
+					                      .Set(error_key::kMetadataKey, "vgi_batch_index"),
+					                  "VGI worker emitted vgi_batch_index '%s' that exceeds "
 					                  "uint64 range [worker: %s, pid: %d]",
 					                  value, worker_path_, proc_ ? proc_->GetPid() : 0);
 				}
@@ -1485,7 +1541,7 @@ void FunctionConnection::OpenInputWriter() {
 	auto sink = TransportOutput();
 	auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 	if (!writer_result.ok()) {
-		ThrowVgiIOException("Failed to create input stream writer: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create input stream writer: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
 		                    GetExecutionIdHex(), writer_result.status().ToString());
 	}
 	input_writer_ = writer_result.ValueUnsafe();
@@ -1566,7 +1622,7 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 	auto write_status = write_meta ? input_writer_->WriteRecordBatch(*to_write, write_meta)
 	                               : input_writer_->WriteRecordBatch(*to_write);
 	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write input batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to write input batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
 		                    GetExecutionIdHex(), write_status.ToString());
 	}
 
@@ -1629,7 +1685,7 @@ void FunctionConnection::CloseInputWriter() {
 	// Close the IPC stream writer (sends end-of-stream marker)
 	auto close_status = input_writer_->Close();
 	if (!close_status.ok()) {
-		ThrowVgiIOException("Failed to close input stream: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to close input stream: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
 		                    GetExecutionIdHex(), close_status.ToString());
 	}
 	input_writer_.reset();
@@ -1770,7 +1826,7 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, c
 	auto inner = DecodeOuterResponse(response, "table_buffering_process", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_process", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
-		ThrowVgiIOException("table_buffering_process response missing data", worker_path_, TransportPid(), "");
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_process response missing data", worker_path_, TransportPid(), "");
 	}
 	auto col = inner->GetColumnByName("state_id");
 	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
@@ -1792,7 +1848,7 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name, c
 	auto inner = DecodeOuterResponse(response, "table_buffering_combine", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_combine", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
-		ThrowVgiIOException("table_buffering_combine response missing data", worker_path_, TransportPid(), "");
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_combine response missing data", worker_path_, TransportPid(), "");
 	}
 	auto col = inner->GetColumnByName("finalize_state_ids");
 	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
@@ -2036,7 +2092,11 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 		int fd = TcpConnect(host, port, 10000, &connect_error,
 		                    attach_params ? attach_params->tcp_proxy() : std::string());
 		if (fd < 0) {
-			throw IOException("vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
+			throw IOException(ErrorInfo(error_subtype::kConnectFailed)
+			                      .Worker(worker_path)
+			                      .Set(error_key::kHost, host)
+			                      .Set(error_key::kPort, static_cast<int64_t>(port)),
+			                  "vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
 		}
 		auto worker = std::make_unique<UnixSocketWorker>(fd);
 		return std::make_unique<FunctionConnection>(std::move(worker), worker_path, function_name, arguments,
@@ -2053,7 +2113,11 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 		int fd = TcpConnect(host, port, 10000, &connect_error,
 		                    attach_params ? attach_params->tcp_proxy() : std::string());
 		if (fd < 0) {
-			throw IOException("vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
+			throw IOException(ErrorInfo(error_subtype::kConnectFailed)
+			                      .Worker(worker_path)
+			                      .Set(error_key::kHost, host)
+			                      .Set(error_key::kPort, static_cast<int64_t>(port)),
+			                  "vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
 		}
 		auto worker = std::make_unique<NamedPipeWorker>(fd);
 		return std::make_unique<FunctionConnection>(std::move(worker), worker_path, function_name, arguments,

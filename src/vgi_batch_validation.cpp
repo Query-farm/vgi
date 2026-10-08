@@ -61,21 +61,36 @@ void ValidateWireBatchTypes(const arrow::RecordBatch &batch,
                             const std::string &function) {
 	const auto &schema = *batch.schema();
 	if (static_cast<size_t>(schema.num_fields()) != expected.size()) {
-		ThrowVgiIOException("vgi: worker function '%s' sent a batch with %lld column(s) but its declared bind output "
-		                    "schema has %llu; the scan-time output disagrees with the bind schema",
-		                    worker, -1, "", function.c_str(), (long long)schema.num_fields(),
-		                    (unsigned long long)expected.size());
+		throw IOException(ErrorInfo(error_subtype::kSchemaMismatch)
+		                      .Function(function)
+		                      .Worker(worker)
+		                      .ExpectedActual(std::to_string(expected.size()) + " columns",
+		                                      std::to_string(schema.num_fields()) + " columns"),
+		                  BuildMessageWithContext("vgi: worker function '%s' sent a batch with %lld column(s) but its "
+		                                          "declared bind output schema has %llu; the scan-time output "
+		                                          "disagrees with the bind schema",
+		                                          worker),
+		                  function.c_str(), (long long)schema.num_fields(), (unsigned long long)expected.size());
 	}
 	for (size_t i = 0; i < expected.size(); i++) {
 		if (!expected[i] || !schema.field(static_cast<int>(i))->type()) {
 			continue;
 		}
 		if (!schema.field(static_cast<int>(i))->type()->Equals(*expected[i])) {
-			ThrowVgiIOException("vgi: worker function '%s' sent column %llu as type %s but declared %s at bind; "
-			                    "reading it as the declared type would misread memory",
-			                    worker, -1, "", function.c_str(), (unsigned long long)i,
-			                    schema.field(static_cast<int>(i))->type()->ToString().c_str(),
-			                    expected[i]->ToString().c_str());
+			const auto &field = schema.field(static_cast<int>(i));
+			const auto actual_type = field->type()->ToString();
+			const auto expected_type = expected[i]->ToString();
+			throw IOException(ErrorInfo(error_subtype::kSchemaMismatch)
+			                      .Function(function)
+			                      .Worker(worker)
+			                      .Set(error_key::kColumnIndex, static_cast<int64_t>(i))
+			                      .Set(error_key::kColumnName, field->name())
+			                      .ExpectedActual(expected_type, actual_type),
+			                  BuildMessageWithContext("vgi: worker function '%s' sent column %llu as type %s but "
+			                                          "declared %s at bind; reading it as the declared type would "
+			                                          "misread memory",
+			                                          worker),
+			                  function.c_str(), (unsigned long long)i, actual_type.c_str(), expected_type.c_str());
 		}
 	}
 }
@@ -109,8 +124,11 @@ void ValidateWorkerBatch(const arrow::RecordBatch *batch, WorkerBatchValidation 
 	}
 	auto status = level == WorkerBatchValidation::FULL ? batch->ValidateFull() : batch->Validate();
 	if (!status.ok()) {
-		ThrowVgiIOException("vgi: worker sent a malformed Arrow batch (%s validation): %s", worker, -1, "",
-		                    WorkerBatchValidationName(level), status.ToString());
+		throw IOException(ErrorInfo(error_subtype::kMalformedBatch)
+		                      .Worker(worker)
+		                      .Set(error_key::kValidationLevel, WorkerBatchValidationName(level)),
+		                  BuildMessageWithContext("vgi: worker sent a malformed Arrow batch (%s validation): %s", worker),
+		                  WorkerBatchValidationName(level), status.ToString());
 	}
 }
 

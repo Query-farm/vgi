@@ -83,7 +83,8 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 		                      invocation_id_hex, attach_opaque_data_digest,
 		                      transaction_opaque_data_digest, conn_id_hex);
 		// HandleBatchLogMessage throws for EXCEPTION level, but just in case:
-		throw IOException("VGI RPC error from worker [worker: %s]", worker_path);
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path, worker_pid, invocation_id_hex),
+		                  "VGI RPC error from worker [worker: %s]", worker_path);
 	}
 	case RpcBatchType::LOG: {
 		// Forward to logger
@@ -115,9 +116,11 @@ namespace {
 template <typename... ARGS>
 [[noreturn]] void ThrowWorkerStreamError(const WorkerStreamOptions &opts, const std::string &msg, ARGS... params) {
 	if (opts.http_messages) {
-		throw IOException(msg + " [url: %s]", params..., opts.worker);
+		throw IOException(BuildHttpExtraInfo(error_subtype::kProtocolViolation, opts.worker)
+		                      .Set(error_key::kInvocationId, opts.invocation_id_hex),
+		                  msg + " [url: %s]", params..., opts.worker);
 	}
-	ThrowVgiIOException(msg, opts.worker, opts.pid, std::string(), params...);
+	ThrowVgiIOException(msg, opts.worker, opts.pid, opts.invocation_id_hex, params...);
 }
 
 std::shared_ptr<arrow::ipc::RecordBatchStreamReader>

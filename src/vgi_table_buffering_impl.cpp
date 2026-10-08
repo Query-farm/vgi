@@ -4,6 +4,7 @@
 #include "vgi_batch_validation.hpp"
 
 #include <arrow/c/bridge.h>
+#include <exception>
 #include <arrow/util/byte_size.h> // TotalBufferSize — bound the whole-input RAM capture
 
 #include "duckdb/common/serializer/serializer.hpp"
@@ -223,11 +224,14 @@ public:
 	// here for execution_id to be published, then run their own secondary
 	// inits in parallel. `init_started` is the "someone is running init"
 	// latch; `init_done` flips to true once execution_id is publishable;
-	// `init_failed` lets waiters bail when the init runner threw.
+	// `init_failed` lets waiters bail when the init runner threw;
+	// `init_error` is what it threw, so waiters report the real cause.
+	// Both are written and read under init_mutex.
 	std::mutex init_mutex;
 	std::condition_variable init_cv;
 	bool init_started = false;
 	bool init_failed = false;
+	std::exception_ptr init_error;
 	std::atomic<bool> init_done {false};
 	std::vector<uint8_t> execution_id;
 
@@ -713,11 +717,14 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 				// refresh, etc.) doesn't leave peers hung indefinitely.
 				while (!gstate.init_done.load(std::memory_order_acquire) && !gstate.init_failed) {
 					if (context.client.interrupted) {
-						throw IOException("table_buffering init wait interrupted (query cancelled)");
+						throw InterruptException();
 					}
 					gstate.init_cv.wait_for(lk, std::chrono::milliseconds(250));
 				}
 				if (gstate.init_failed) {
+					if (gstate.init_error) {
+						std::rethrow_exception(gstate.init_error);
+					}
 					throw IOException("table_buffering init failed on peer thread");
 				}
 				exec_id = gstate.execution_id;
@@ -773,6 +780,7 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 				{
 					std::lock_guard<std::mutex> lk(gstate.init_mutex);
 					gstate.init_failed = true;
+					gstate.init_error = std::current_exception();
 				}
 				gstate.init_cv.notify_all();
 				throw;

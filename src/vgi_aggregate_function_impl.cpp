@@ -188,6 +188,14 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
 
 namespace vgi {
 
+// extra_info for a malformed aggregate RPC response.
+static ErrorInfo AggregateViolation(const VgiAggregateBindData &bind_data, const std::string &method_name) {
+	return std::move(ErrorInfo(error_subtype::kProtocolViolation)
+	                     .Rpc(method_name)
+	                     .Function(bind_data.function_name, "AGGREGATE")
+	                     .Worker(bind_data.attach_params->worker_path()));
+}
+
 // ============================================================================
 // Shared RPC envelope + invoker
 // ============================================================================
@@ -242,11 +250,13 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	if (response.batch && response.batch->num_rows() > 0) {
 		auto result_col = response.batch->GetColumnByName("result");
 		if (!result_col) {
-			throw IOException("Response missing 'result' column from %s [worker: %s]", method_name,
+			throw IOException(AggregateViolation(bind_data, method_name),
+			                  "Response missing 'result' column from %s [worker: %s]", method_name,
 			                  worker_path);
 		}
 		if (result_col->type()->id() != arrow::Type::BINARY) {
 			throw IOException(
+			    AggregateViolation(bind_data, method_name).ExpectedActual("binary", result_col->type()->ToString()),
 			    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
 			    method_name, result_col->type()->ToString(), worker_path);
 		}
@@ -257,8 +267,9 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 				inner = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()),
 				                                v.size(), GetWorkerBatchValidation(&context));
 			} catch (const std::exception &e) {
-				throw IOException("Failed to deserialize IPC response for %s [worker: %s]: %s",
-				                  method_name, worker_path, e.what());
+				throw IOException(AggregateViolation(bind_data, method_name).Merge(ExtraInfoOf(e)),
+				                  "Failed to deserialize IPC response for %s [worker: %s]: %s", method_name,
+				                  worker_path, RawMessageOf(e));
 			}
 		}
 	}
@@ -518,18 +529,18 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 
 	// Extract result_batch from response
 	if (!rpc_result.response_batch || rpc_result.response_batch->num_rows() == 0) {
-		throw IOException("VGI aggregate_finalize returned empty response for '%s'", bind_data.function_name);
+		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize returned empty response for '%s'", bind_data.function_name);
 	}
 
 	// The response is wrapped in the standard vgi_rpc format:
 	// { "result": binary } where result contains the serialized AggregateFinalizeResponse
 	auto response_result_col = rpc_result.response_batch->GetColumnByName("result");
 	if (!response_result_col) {
-		throw IOException("VGI aggregate_finalize response missing 'result' column for '%s'", bind_data.function_name);
+		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize response missing 'result' column for '%s'", bind_data.function_name);
 	}
 	auto response_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(response_result_col);
 	if (!response_binary || response_binary->IsNull(0)) {
-		throw IOException("VGI aggregate_finalize response has null result for '%s'", bind_data.function_name);
+		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize response has null result for '%s'", bind_data.function_name);
 	}
 	// Unwrap: result column contains the serialized AggregateFinalizeResponse dataclass
 	auto response_view = response_binary->GetView(0);
@@ -539,21 +550,24 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 	// AggregateFinalizeResponse has a "result_batch" binary column
 	auto rb_col = response_batch->GetColumnByName("result_batch");
 	if (!rb_col) {
-		throw IOException("VGI aggregate_finalize response missing 'result_batch' field for '%s'", bind_data.function_name);
+		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize response missing 'result_batch' field for '%s'", bind_data.function_name);
 	}
 	auto rb_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(rb_col);
 	if (!rb_binary || rb_binary->IsNull(0)) {
-		throw IOException("VGI aggregate_finalize response has null result_batch for '%s'", bind_data.function_name);
+		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize response has null result_batch for '%s'", bind_data.function_name);
 	}
 	auto rb_view = rb_binary->GetView(0);
 	auto result_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(),
 	                                            GetWorkerBatchValidation(&context));
 
 	if (!result_batch || result_batch->num_columns() != 1) {
-		throw IOException("VGI aggregate_finalize returned invalid result for '%s'", bind_data.function_name);
+		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize returned invalid result for '%s'", bind_data.function_name);
 	}
 	if (static_cast<idx_t>(result_batch->num_rows()) != count) {
-		throw IOException("VGI aggregate_finalize returned %d rows but expected %d for '%s'",
+		throw IOException(AggregateViolation(bind_data, "aggregate_finalize")
+		                      .ExpectedActual(std::to_string(count) + " rows",
+		                                      std::to_string(result_batch->num_rows()) + " rows"),
+		                  "VGI aggregate_finalize returned %d rows but expected %d for '%s'",
 		                  result_batch->num_rows(), count, bind_data.function_name);
 	}
 
@@ -857,7 +871,8 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 
 	// Verify execution_id was extracted — without it, all queries share FunctionStorage state
 	if (bind_data->exec_state->execution_id.empty()) {
-		throw IOException("VGI aggregate_bind did not return execution_id for '%s'", bind_data->function_name);
+		throw IOException(AggregateViolation(*bind_data, "aggregate_bind").Set(error_key::kField, "execution_id"),
+		                  "VGI aggregate_bind did not return execution_id for '%s'", bind_data->function_name);
 	}
 
 	return bind_data;

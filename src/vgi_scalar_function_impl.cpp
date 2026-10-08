@@ -5,6 +5,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_client_timing.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_exchange_cache_key.hpp" // per-value memo: static key + per-tuple hash + store
 #include "vgi_function_connection.hpp"
 #include "vgi_global_functions.hpp" // ResolveVgiGlobalBinding (system.main registrations)
@@ -758,17 +759,27 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			fresh = local_state.connection->ReadDataBatch();
 		}
 
+		auto scalar_violation = [&]() {
+			return ErrorInfo(error_subtype::kProtocolViolation)
+			    .Function(func_info.function_name, "SCALAR")
+			    .Worker(func_info.worker_path(), -1, local_state.connection->GetExecutionIdHex());
+		};
 		if (!fresh) {
-			throw IOException("VGI scalar function '%s' returned no output for %d input rows",
+			throw IOException(scalar_violation().ExpectedActual(std::to_string(ship_to_worker->size()) + " rows",
+			                                                    "no output"),
+			                  "VGI scalar function '%s' returned no output for %d input rows",
 			                  func_info.function_name, args.size());
 		}
 		if (static_cast<idx_t>(fresh->num_rows()) != ship_to_worker->size()) {
-			throw IOException("VGI scalar function '%s' returned %d rows but expected %d (1:1 mapping required)",
+			throw IOException(scalar_violation().ExpectedActual(std::to_string(ship_to_worker->size()) + " rows",
+			                                                    std::to_string(fresh->num_rows()) + " rows"),
+			                  "VGI scalar function '%s' returned %d rows but expected %d (1:1 mapping required)",
 			                  func_info.function_name, fresh->num_rows(),
 			                  static_cast<int64_t>(ship_to_worker->size()));
 		}
 		if (fresh->num_columns() != 1) {
-			throw IOException("VGI scalar function '%s' returned %d columns but expected 1",
+			throw IOException(scalar_violation().ExpectedActual("1 columns", std::to_string(fresh->num_columns()) + " columns"),
+			                  "VGI scalar function '%s' returned %d columns but expected 1",
 			                  func_info.function_name, fresh->num_columns());
 		}
 

@@ -175,8 +175,12 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
 		ArrowSchemaToDuckDBTypes(context, bind_data.bind_result.output_schema, bind_data.c_schema,
 		                         bind_data.arrow_table, return_types, names);
 	} catch (const std::exception &e) {
-		throw IOException("Failed to convert output schema for function '%s': %s",
-		                  bind_data.function_name, e.what());
+		throw IOException(ErrorInfo()
+		                      .Function(bind_data.function_name, "TABLE")
+		                      .Worker(bind_data.worker_path(), worker_pid)
+		                      .Merge(ExtraInfoOf(e)),
+		                  "Failed to convert output schema for function '%s': %s", bind_data.function_name,
+		                  RawMessageOf(e));
 	}
 
 	if (bind_data.rowid_worker_col_index >= 0) {
@@ -3336,21 +3340,32 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// local_state. Writing inside ReadDataBatch / VgiPrefetchTask::Execute
 	// would race with VgiGetPartitionData on the pipeline-executor thread.
 	const idx_t parsed_index = local_state.connection()->GetLastBatchIndex();
+	// extra_info for a worker that broke a wire-metadata contract.
+	auto metadata_violation = [&](const char *metadata_key) {
+		return ErrorInfo(error_subtype::kProtocolViolation)
+		    .Function(bind_data.function_name, "TABLE")
+		    .Worker(bind_data.worker_path(), -1, local_state.connection()->GetExecutionIdHex())
+		    .Set(error_key::kMetadataKey, metadata_key);
+	};
 	if (bind_data.supports_batch_index) {
 		if (parsed_index == DConstants::INVALID_INDEX) {
-			throw IOException("VGI function '%s' with supports_batch_index=true emitted a data "
+			throw IOException(metadata_violation("vgi_batch_index"),
+			                  "VGI function '%s' with supports_batch_index=true emitted a data "
 			                  "batch without vgi_batch_index metadata",
 			                  bind_data.function_name);
 		}
 		if (parsed_index >= VGI_BATCH_INDEX_CAP - 1) {
-			throw IOException("VGI function '%s' emitted vgi_batch_index %llu that exceeds DuckDB's "
+			throw IOException(metadata_violation("vgi_batch_index")
+			                      .Set(error_key::kLimit, static_cast<int64_t>(VGI_BATCH_INDEX_CAP - 1)),
+			                  "VGI function '%s' emitted vgi_batch_index %llu that exceeds DuckDB's "
 			                  "per-pipeline cap (%llu); choose a smaller index space",
 			                  bind_data.function_name, static_cast<unsigned long long>(parsed_index),
 			                  static_cast<unsigned long long>(VGI_BATCH_INDEX_CAP));
 		}
 		if (local_state.current_batch_index != DConstants::INVALID_INDEX &&
 		    parsed_index < local_state.current_batch_index) {
-			throw IOException("VGI function '%s' emitted vgi_batch_index %llu after %llu on the "
+			throw IOException(metadata_violation("vgi_batch_index"),
+			                  "VGI function '%s' emitted vgi_batch_index %llu after %llu on the "
 			                  "same stream — batch_index must be monotone non-decreasing per "
 			                  "worker / per stream",
 			                  bind_data.function_name, static_cast<unsigned long long>(parsed_index),
@@ -3370,7 +3385,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	if (bind_data.partition_kind != VgiPartitionKind::NotPartitioned) {
 		const std::string &pv_bytes = local_state.connection()->GetLastPartitionValuesBytes();
 		if (pv_bytes.empty()) {
-			throw IOException("VGI function '%s' with partition columns declared emitted a "
+			throw IOException(metadata_violation("vgi_partition_values#b64"),
+			                  "VGI function '%s' with partition columns declared emitted a "
 			                  "non-empty data batch without vgi_partition_values metadata",
 			                  bind_data.function_name);
 		}
@@ -3378,7 +3394,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		auto input = std::make_shared<arrow::io::BufferReader>(buf);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 		if (!reader_result.ok()) {
-			throw IOException("VGI function '%s' emitted invalid Arrow IPC payload in "
+			throw IOException(metadata_violation("vgi_partition_values#b64"),
+			                  "VGI function '%s' emitted invalid Arrow IPC payload in "
 			                  "vgi_partition_values#b64: %s",
 			                  bind_data.function_name,
 			                  reader_result.status().ToString());
@@ -3386,22 +3403,37 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		auto reader = reader_result.ValueUnsafe();
 		auto next_result = reader->ReadNext();
 		if (!next_result.ok() || !next_result.ValueUnsafe().batch) {
-			throw IOException("VGI function '%s' emitted empty IPC stream in "
+			throw IOException(metadata_violation("vgi_partition_values#b64"),
+			                  "VGI function '%s' emitted empty IPC stream in "
 			                  "vgi_partition_values#b64",
 			                  bind_data.function_name);
 		}
 		auto pv_batch = next_result.ValueUnsafe().batch;
-		ValidateWorkerBatch(&context, pv_batch.get(),
-		                    StringUtil::Format("function '%s' vgi_partition_values", bind_data.function_name));
+		try {
+			ValidateWorkerBatch(&context, pv_batch.get(),
+			                    StringUtil::Format("function '%s' vgi_partition_values", bind_data.function_name));
+		} catch (const IOException &e) {
+			// The label names the payload in the message (unchanged); report the
+			// real worker as worker_path and the payload as the metadata key.
+			ErrorInfo info = ExtraInfoOf(e);
+			info.erase(error_key::kWorkerPath);
+			info.erase(error_key::kTransport);
+			throw IOException(metadata_violation("vgi_partition_values#b64").Merge(info), RawMessageOf(e));
+		}
 		if (pv_batch->num_rows() != 2) {
-			throw IOException("VGI function '%s' emitted vgi_partition_values with %lld rows "
+			throw IOException(metadata_violation("vgi_partition_values#b64")
+			                      .ExpectedActual("2", std::to_string(pv_batch->num_rows())),
+			                  "VGI function '%s' emitted vgi_partition_values with %lld rows "
 			                  "(expected exactly 2: row 0 = min, row 1 = max)",
 			                  bind_data.function_name,
 			                  static_cast<long long>(pv_batch->num_rows()));
 		}
 		const auto &declared_indices = bind_data.partition_column_indices;
 		if (static_cast<idx_t>(pv_batch->num_columns()) != declared_indices.size()) {
-			throw IOException("VGI function '%s' emitted vgi_partition_values with %d columns "
+			throw IOException(metadata_violation("vgi_partition_values#b64")
+			                      .ExpectedActual(std::to_string(declared_indices.size()),
+			                                      std::to_string(pv_batch->num_columns())),
+			                  "VGI function '%s' emitted vgi_partition_values with %d columns "
 			                  "(expected %llu — one per partition-annotated bind-schema field)",
 			                  bind_data.function_name, pv_batch->num_columns(),
 			                  static_cast<unsigned long long>(declared_indices.size()));
@@ -3414,13 +3446,20 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			const auto &declared_field = bind_schema->field(declared_indices[i]);
 			const auto &pv_field = pv_batch->schema()->field(static_cast<int>(i));
 			if (pv_field->name() != declared_field->name()) {
-				throw IOException("VGI function '%s' vgi_partition_values column %llu name "
+				throw IOException(metadata_violation("vgi_partition_values#b64")
+				                      .Set(error_key::kColumnIndex, static_cast<int64_t>(i))
+				                      .ExpectedActual(declared_field->name(), pv_field->name()),
+				                  "VGI function '%s' vgi_partition_values column %llu name "
 				                  "mismatch: declared '%s', got '%s'",
 				                  bind_data.function_name, static_cast<unsigned long long>(i),
 				                  declared_field->name(), pv_field->name());
 			}
 			if (!pv_field->type()->Equals(*declared_field->type())) {
-				throw IOException("VGI function '%s' vgi_partition_values column '%s' type "
+				throw IOException(metadata_violation("vgi_partition_values#b64")
+				                      .Set(error_key::kColumnIndex, static_cast<int64_t>(i))
+				                      .Set(error_key::kColumnName, declared_field->name())
+				                      .ExpectedActual(declared_field->type()->ToString(), pv_field->type()->ToString()),
+				                  "VGI function '%s' vgi_partition_values column '%s' type "
 				                  "mismatch: declared %s, got %s",
 				                  bind_data.function_name, declared_field->name(),
 				                  declared_field->type()->ToString(),
@@ -3444,7 +3483,10 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			for (idx_t i = 0; i < local_state.current_partition_data.size(); ++i) {
 				const auto &entry = local_state.current_partition_data[i];
 				if (!Value::NotDistinctFrom(entry.min_val, entry.max_val)) {
-					throw IOException("VGI function '%s' SINGLE_VALUE_PARTITIONS contract "
+					throw IOException(metadata_violation("vgi_partition_values#b64")
+					                      .Set(error_key::kColumnName, bind_schema->field(declared_indices[i])->name())
+					                      .ExpectedActual(entry.min_val.ToString(), entry.max_val.ToString()),
+					                  "VGI function '%s' SINGLE_VALUE_PARTITIONS contract "
 					                  "violated on column '%s': min (%s) != max (%s)",
 					                  bind_data.function_name,
 					                  bind_schema->field(declared_indices[i])->name(),
@@ -4029,6 +4071,12 @@ static void ConvertCurrentBatch(const VgiTableFunctionBindData &bind_data,
 			}
 			if (static_cast<int64_t>(arrow_array_idx) >= n_children) {
 				throw IOException(
+				    ErrorInfo(error_subtype::kSchemaMismatch)
+				        .Function(bind_data.function_name, "TABLE")
+				        .Worker(bind_data.worker_path())
+				        .Set(error_key::kColumnIndex, static_cast<int64_t>(arrow_array_idx))
+				        .ExpectedActual(std::to_string(arrow_array_idx + 1) + "+ columns",
+				                        std::to_string(n_children) + " columns"),
 				    "VGI function '%s' emitted a batch with %lld column(s) but the scan needs column "
 				    "index %llu; the worker's scan-time output is inconsistent with its declared bind "
 				    "output schema",

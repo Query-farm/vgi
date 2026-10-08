@@ -31,6 +31,7 @@
 #include "vgi_arrow_ipc.hpp"          // SerializeRecordBatch
 #include "vgi_arrow_utils.hpp"        // BuildArrowSchemaFromDuckDB / ArrowSchemaToDuckDBTypes / DataChunkToArrow
 #include "vgi_cache_control.hpp"      // VgiCacheControl
+#include "vgi_exception.hpp"
 #include "vgi_exchange_cache_key.hpp" // exchange-mode result cache (M2)
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_input_dedup.hpp"        // input dedup (ship distinct tuples; expand back)
@@ -102,6 +103,13 @@ PhysicalOperator &LogicalVgiLateralBatch::CreatePlan(ClientContext &context, Phy
 // ============================================================================
 
 namespace {
+
+// extra_info for a worker that broke the batched-LATERAL contract.
+ErrorInfo LateralViolation(const VgiTableInOutBindData &bd) {
+	return std::move(ErrorInfo(error_subtype::kProtocolViolation)
+	                     .Function(bd.function_name, "TABLE_IN_OUT")
+	                     .Worker(bd.worker_path()));
+}
 
 struct VgiLateralBatchGlobalState : public GlobalOperatorState {
 	// Shared across this operator's parallel Execute threads; reported post-execution
@@ -231,6 +239,9 @@ std::vector<int32_t> DecodeParentRow(const std::string &raw, idx_t output_rows, 
 	if (raw.empty()) {
 		if (output_rows != input_rows) {
 			throw IOException(
+			    LateralViolation(bd)
+			        .Set(error_key::kMetadataKey, "vgi_rpc.parent_row#b64")
+			        .ExpectedActual(std::to_string(input_rows) + " rows", std::to_string(output_rows) + " rows"),
 			    "vgi_batch_lateral: worker '%s' function '%s' returned %llu output rows for %llu input rows "
 			    "without vgi_rpc.parent_row provenance; a fan-out (1->N) or filtering (1->0) blended LATERAL map "
 			    "must emit per-output-row parent indices",
@@ -246,11 +257,16 @@ std::vector<int32_t> DecodeParentRow(const std::string &raw, idx_t output_rows, 
 	// an enormous num_rows). output_rows this large can never be matched by a deliverable
 	// raw payload, so this fails closed with a clear error rather than wrapping.
 	if (output_rows > (std::numeric_limits<size_t>::max() / sizeof(int32_t))) {
-		throw IOException("vgi_batch_lateral: implausible output row count %llu from worker '%s' function '%s'",
+		throw IOException(LateralViolation(bd).Set(error_key::kActual, std::to_string(output_rows) + " rows"),
+		                  "vgi_batch_lateral: implausible output row count %llu from worker '%s' function '%s'",
 		                  (unsigned long long)output_rows, bd.worker_path(), bd.function_name);
 	}
 	if (raw.size() != output_rows * sizeof(int32_t)) {
-		throw IOException("vgi_batch_lateral: vgi_rpc.parent_row is %llu bytes for %llu output rows "
+		throw IOException(LateralViolation(bd)
+		                      .Set(error_key::kMetadataKey, "vgi_rpc.parent_row#b64")
+		                      .ExpectedActual(std::to_string(output_rows * sizeof(int32_t)) + " bytes",
+		                                      std::to_string(raw.size()) + " bytes"),
+		                  "vgi_batch_lateral: vgi_rpc.parent_row is %llu bytes for %llu output rows "
 		                  "(expected %llu); worker '%s' function '%s'",
 		                  (unsigned long long)raw.size(), (unsigned long long)output_rows,
 		                  (unsigned long long)(output_rows * sizeof(int32_t)), bd.worker_path(), bd.function_name);
@@ -259,7 +275,10 @@ std::vector<int32_t> DecodeParentRow(const std::string &raw, idx_t output_rows, 
 	std::memcpy(result.data(), raw.data(), raw.size()); // LE int32[] — DuckDB targets are little-endian
 	for (idx_t i = 0; i < output_rows; i++) {
 		if (result[i] < 0 || static_cast<idx_t>(result[i]) >= input_rows) {
-			throw IOException("vgi_batch_lateral: parent_row[%llu] = %d is out of range [0, %llu); "
+			throw IOException(LateralViolation(bd)
+			                      .Set(error_key::kMetadataKey, "vgi_rpc.parent_row#b64")
+			                      .ExpectedActual("[0, " + std::to_string(input_rows) + ")", std::to_string(result[i])),
+			                  "vgi_batch_lateral: parent_row[%llu] = %d is out of range [0, %llu); "
 			                  "worker '%s' function '%s'",
 			                  (unsigned long long)i, result[i], (unsigned long long)input_rows, bd.worker_path(),
 			                  bd.function_name);
@@ -312,7 +331,8 @@ std::shared_ptr<arrow::RecordBatch> TakeRecordBatch(const std::shared_ptr<arrow:
 	auto res = arrow::compute::Take(arrow::Datum(batch), arrow::Datum(indices),
 	                                arrow::compute::TakeOptions::NoBoundsCheck());
 	if (!res.ok()) {
-		throw IOException("vgi_batch_lateral: worker '%s' function '%s' output Take (dedup expansion) failed: %s",
+		throw IOException(ErrorInfo().Function(bd.function_name, "TABLE_IN_OUT").Worker(bd.worker_path()),
+		                  "vgi_batch_lateral: worker '%s' function '%s' output Take (dedup expansion) failed: %s",
 		                  bd.worker_path(), bd.function_name, res.status().ToString());
 	}
 	return res.ValueUnsafe().record_batch();
@@ -796,7 +816,8 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			// chunk with a data batch. A silent FINISHED here would drop the rest of the
 			// input; surface it. Drop the connection (never pool a mid-stream worker).
 			state.connection.reset();
-			throw IOException("vgi_batch_lateral: worker '%s' function '%s' returned end-of-stream "
+			throw IOException(LateralViolation(bd).ExpectedActual("1 output batch per input chunk", "end-of-stream"),
+			                  "vgi_batch_lateral: worker '%s' function '%s' returned end-of-stream "
 			                  "mid-exchange (expected one output batch per input chunk)",
 			                  bd.worker_path(), bd.function_name);
 		}

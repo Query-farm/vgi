@@ -54,6 +54,36 @@ namespace vgi {
 // ============================================================================
 namespace {
 
+// `function_kind` token for a connection's function_type_ ("TABLE",
+// "SCALAR_FUNCTION", "TABLE_BUFFERING", ...).
+std::string WebWorkerFunctionKindToken(const std::string &function_type) {
+	std::string kind = function_type;
+	const std::string suffix = "_FUNCTION";
+	if (kind.size() > suffix.size() && kind.compare(kind.size() - suffix.size(), suffix.size(), suffix) == 0) {
+		kind.resize(kind.size() - suffix.size());
+	}
+	if (kind == "TABLE_BUFFERING") {
+		return "TABLE_IN_OUT";
+	}
+	return kind;
+}
+
+ErrorInfo WebWorkerFunctionInfo(const std::string &function_name, const std::string &function_type,
+                                const char *subtype = nullptr) {
+	ErrorInfo info = subtype ? ErrorInfo(subtype) : ErrorInfo();
+	info.Function(function_name, WebWorkerFunctionKindToken(function_type));
+	return info;
+}
+
+// ThrowVgiIOException plus the caller's extra_info; the message is built
+// exactly as ThrowVgiIOException builds it.
+template <typename... ARGS>
+[[noreturn]] void ThrowWebWorkerIOException(ErrorInfo info, const std::string &msg, const std::string &worker_path,
+                                            pid_t worker_pid, const std::string &invocation_id_hex, ARGS... params) {
+	info.Worker(worker_path, worker_pid, invocation_id_hex);
+	throw IOException(info, BuildMessageWithContext(msg, worker_path), params...);
+}
+
 WorkerStreamOptions SabStreamOptions(ClientContext *context, const std::string &worker_path) {
 	WorkerStreamOptions opts;
 	opts.context = context;
@@ -649,11 +679,11 @@ void WebWorkerFunctionConnection::EnsureWorkerSpawned() {
 		// until the worker booted. On the native test the stub is a no-op (returns
 		// 0) — the in-process ring backend needs no spawn.
 		if (vgi_wasm_ensure_worker(location_.c_str(), region_offset_) != 0) {
-			ThrowVgiIOException("Failed to spawn/ready the VGI Web Worker", location_, -1, "");
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kConnectFailed), "Failed to spawn/ready the VGI Web Worker", location_, -1, "");
 		}
 		slot_ = vgi_wasm_slot_open(location_.c_str(), region_offset_);
 		if (slot_ < 0) {
-			ThrowVgiIOException("Failed to open SAB slot (channel exhausted)", location_, -1, "");
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kLimitExceeded), "Failed to open SAB slot (channel exhausted)", location_, -1, "");
 		}
 	}
 }
@@ -679,20 +709,20 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 		auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 		auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 		if (!write_status.ok()) {
-			ThrowVgiIOException("Failed to write bind request: %s", location_, -1, "", write_status.ToString());
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write bind request: %s", location_, -1, "", write_status.ToString());
 		}
 
 		auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_);
 		if (!response.batch || response.batch->num_rows() == 0) {
-			ThrowVgiIOException("Empty bind response from worker", location_, -1, "");
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Empty bind response from worker", location_, -1, "");
 		}
 		auto result_col = response.batch->GetColumnByName("result");
 		if (!result_col) {
-			ThrowVgiIOException("Bind response missing 'result' column", location_, -1, "");
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response missing 'result' column", location_, -1, "");
 		}
 		auto bin_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
 		if (!bin_array || bin_array->IsNull(0)) {
-			ThrowVgiIOException("Bind response 'result' column is null", location_, -1, "");
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response 'result' column is null", location_, -1, "");
 		}
 		auto v = bin_array->GetView(0);
 		auto bind_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
@@ -772,7 +802,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 		auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 		if (!write_status.ok()) {
-			ThrowVgiIOException("Failed to write init request: %s", location_, -1, GetExecutionIdHex(),
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write init request: %s", location_, -1, GetExecutionIdHex(),
 			                    write_status.ToString());
 		}
 	}
@@ -796,7 +826,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, tick_schema_);
 		if (!writer_result.ok()) {
-			ThrowVgiIOException("Failed to create tick writer: %s", location_, -1, GetExecutionIdHex(),
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create tick writer: %s", location_, -1, GetExecutionIdHex(),
 			                    writer_result.status().ToString());
 		}
 		input_writer_ = writer_result.ValueUnsafe();
@@ -821,7 +851,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		auto write_status = first_tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
 		                        : input_writer_->WriteRecordBatch(*tick_batch);
 		if (!write_status.ok()) {
-			ThrowVgiIOException("Failed to write initial tick batch: %s", location_, -1, GetExecutionIdHex(),
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write initial tick batch: %s", location_, -1, GetExecutionIdHex(),
 			                    write_status.ToString());
 		}
 
@@ -830,7 +860,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
-			ThrowVgiIOException("Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
 			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
@@ -840,7 +870,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 		if (!writer_result.ok()) {
-			ThrowVgiIOException("Failed to create input writer: %s", location_, -1, GetExecutionIdHex(),
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create input writer: %s", location_, -1, GetExecutionIdHex(),
 			                    writer_result.status().ToString());
 		}
 		input_writer_ = writer_result.ValueUnsafe();
@@ -878,7 +908,7 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	if (input_writer_ && !input_writer_closed_) {
 		auto close_status = input_writer_->Close();
 		if (!close_status.ok()) {
-			ThrowVgiIOException("Failed to close input writer for finalize: %s", location_, -1, GetExecutionIdHex(),
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer for finalize: %s", location_, -1, GetExecutionIdHex(),
 			                    close_status.ToString());
 		}
 	}
@@ -953,7 +983,7 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 			// transport is never pooled (ReleaseForPooling returns nullptr — the JS
 			// bridge owns worker lifecycle), so there is no later checkout to
 			// protect. The throw is the whole remedy.
-			ThrowVgiIOException("Failed to close input writer between splits: %s", location_, -1, GetExecutionIdHex(),
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer between splits: %s", location_, -1, GetExecutionIdHex(),
 			                    close_status.ToString());
 		}
 	}
@@ -1015,7 +1045,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
-			ThrowVgiIOException("Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
 			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
@@ -1094,7 +1124,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 				data_finished_ = true;
 				return nullptr;
 			}
-			ThrowVgiIOException("Failed to read data batch: %s", location_, -1, GetExecutionIdHex(), status.ToString());
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to read data batch: %s", location_, -1, GetExecutionIdHex(), status.ToString());
 		}
 		auto result = read_result.ValueUnsafe();
 
@@ -1111,8 +1141,10 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// (and its serve thread wedge) — close the input first (Arrow EOS + ring EOF)
 		// so the worker's drain returns and the slot frees, then rethrow.
 		try {
+			const auto log_error_context = WebWorkerFunctionInfo(function_name_, function_type_);
 			if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, location_, -1,
-			                          GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex())) {
+			                          GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
+			                          &log_error_context)) {
 				continue;
 			}
 		} catch (...) {
@@ -1141,7 +1173,9 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// this transport (a documented v1 limitation of worker:).
 		if (result.custom_metadata &&
 		    ClassifyBatch(result.batch, result.custom_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
-			throw IOException("VGI worker: external-location batches are not supported over the "
+			throw IOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kUnsupported)
+			                      .Worker(location_, -1, GetExecutionIdHex()),
+			                  "VGI worker: external-location batches are not supported over the "
 			                  "worker: (SAB) transport [worker: %s]",
 			                  location_);
 		}
@@ -1168,9 +1202,14 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 					last_partition_values_bytes_.resize(decoded_size);
 					Blob::FromBase64(b64_str, data_ptr_cast(last_partition_values_bytes_.data()), decoded_size);
 				} catch (const std::exception &e) {
-					throw IOException("VGI worker emitted invalid base64 payload in "
+					throw IOException(WebWorkerFunctionInfo(function_name_, function_type_,
+					                                        error_subtype::kProtocolViolation)
+					                      .Worker(location_, -1, GetExecutionIdHex())
+					                      .Set(error_key::kMetadataKey, "vgi_partition_values#b64")
+					                      .Merge(ExtraInfoOf(e)),
+					                  "VGI worker emitted invalid base64 payload in "
 					                  "vgi_partition_values#b64: %s [worker: %s]",
-					                  e.what(), location_);
+					                  RawMessageOf(e), location_);
 				}
 			}
 		}
@@ -1185,17 +1224,26 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 					size_t pos = 0;
 					uint64_t parsed = std::stoull(value, &pos);
 					if (pos != value.size()) {
-						throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+						throw IOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation)
+						                      .Worker(location_, -1, GetExecutionIdHex())
+						                      .Set(error_key::kMetadataKey, "vgi_batch_index"),
+						                  "VGI worker emitted invalid vgi_batch_index '%s' "
 						                  "(trailing characters; expected decimal uint64) [worker: %s]",
 						                  value, location_);
 					}
 					last_batch_index_ = static_cast<idx_t>(parsed);
 				} catch (const std::invalid_argument &) {
-					throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+					throw IOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation)
+					                      .Worker(location_, -1, GetExecutionIdHex())
+					                      .Set(error_key::kMetadataKey, "vgi_batch_index"),
+					                  "VGI worker emitted invalid vgi_batch_index '%s' "
 					                  "(expected decimal uint64) [worker: %s]",
 					                  value, location_);
 				} catch (const std::out_of_range &) {
-					throw IOException("VGI worker emitted vgi_batch_index '%s' that exceeds "
+					throw IOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation)
+					                      .Worker(location_, -1, GetExecutionIdHex())
+					                      .Set(error_key::kMetadataKey, "vgi_batch_index"),
+					                  "VGI worker emitted vgi_batch_index '%s' that exceeds "
 					                  "uint64 range [worker: %s]",
 					                  value, location_);
 				}
@@ -1271,7 +1319,7 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 	auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 	if (!writer_result.ok()) {
-		ThrowVgiIOException("Failed to create input stream writer: %s", location_, -1, GetExecutionIdHex(),
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create input stream writer: %s", location_, -1, GetExecutionIdHex(),
 		                    writer_result.status().ToString());
 	}
 	input_writer_ = writer_result.ValueUnsafe();
@@ -1305,7 +1353,7 @@ void WebWorkerFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::R
 
 	auto write_status = input_writer_->WriteRecordBatch(*reconciled);
 	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write input batch: %s", location_, -1, GetExecutionIdHex(),
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write input batch: %s", location_, -1, GetExecutionIdHex(),
 		                    write_status.ToString());
 	}
 
@@ -1350,7 +1398,7 @@ void WebWorkerFunctionConnection::CloseInputWriter() {
 	// Close the IPC stream writer (writes the Arrow EOS marker into the c2w ring).
 	auto close_status = input_writer_->Close();
 	if (!close_status.ok()) {
-		ThrowVgiIOException("Failed to close input stream: %s", location_, -1, GetExecutionIdHex(),
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to close input stream: %s", location_, -1, GetExecutionIdHex(),
 		                    close_status.ToString());
 	}
 	input_writer_.reset();
@@ -1389,7 +1437,7 @@ std::vector<uint8_t> WebWorkerFunctionConnection::RpcTableBufferingProcess(
 	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write table_buffering_process request: %s", location_, -1, GetExecutionIdHex(),
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write table_buffering_process request: %s", location_, -1, GetExecutionIdHex(),
 		                    write_status.ToString());
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
@@ -1397,7 +1445,7 @@ std::vector<uint8_t> WebWorkerFunctionConnection::RpcTableBufferingProcess(
 	auto inner = DecodeOuterResponse(response, "table_buffering_process", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_process", location_);
 	if (!inner || inner->num_rows() == 0) {
-		ThrowVgiIOException("table_buffering_process response missing data", location_, -1, "");
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_process response missing data", location_, -1, "");
 	}
 	auto col = inner->GetColumnByName("state_id");
 	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
@@ -1417,7 +1465,7 @@ WebWorkerFunctionConnection::RpcTableBufferingCombine(const std::string &functio
 	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write table_buffering_combine request: %s", location_, -1, GetExecutionIdHex(),
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write table_buffering_combine request: %s", location_, -1, GetExecutionIdHex(),
 		                    write_status.ToString());
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
@@ -1425,7 +1473,7 @@ WebWorkerFunctionConnection::RpcTableBufferingCombine(const std::string &functio
 	auto inner = DecodeOuterResponse(response, "table_buffering_combine", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_combine", location_);
 	if (!inner || inner->num_rows() == 0) {
-		ThrowVgiIOException("table_buffering_combine response missing data", location_, -1, "");
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_combine response missing data", location_, -1, "");
 	}
 	auto col = inner->GetColumnByName("finalize_state_ids");
 	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
@@ -1451,7 +1499,7 @@ void WebWorkerFunctionConnection::RpcTableBufferingDestructor(const std::string 
 	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write table_buffering_destructor request: %s", location_, -1,
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write table_buffering_destructor request: %s", location_, -1,
 		                    GetExecutionIdHex(), write_status.ToString());
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),

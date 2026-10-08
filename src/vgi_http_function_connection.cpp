@@ -25,13 +25,44 @@
 namespace duckdb {
 namespace vgi {
 
+// `function_kind` token for a connection's function_type_ ("TABLE",
+// "SCALAR_FUNCTION", "TABLE_BUFFERING", ...).
+static std::string HttpFunctionKindToken(const std::string &function_type) {
+	std::string kind = function_type;
+	const std::string suffix = "_FUNCTION";
+	if (kind.size() > suffix.size() && kind.compare(kind.size() - suffix.size(), suffix.size(), suffix) == 0) {
+		kind.resize(kind.size() - suffix.size());
+	}
+	if (kind == "TABLE_BUFFERING") {
+		return "TABLE_IN_OUT";
+	}
+	return kind;
+}
+
+// extra_info for an error on this connection: the transport-neutral subtype
+// (nullptr for none), `url` / `worker_path` and the function being run.
+static ErrorInfo HttpFunctionInfo(const char *subtype, const std::string &base_url, const std::string &function_name,
+                                  const std::string &function_type) {
+	ErrorInfo info;
+	if (IsHttpTransport(base_url)) {
+		info = BuildHttpExtraInfo(subtype ? subtype : "", base_url);
+		if (!subtype) {
+			info.erase(error_key::kErrorSubtype);
+		}
+	} else if (subtype) {
+		info = ErrorInfo(subtype);
+	}
+	info.Worker(base_url).Url(base_url).Function(function_name, HttpFunctionKindToken(function_type));
+	return info;
+}
+
 // Helper: parse ``vgi_batch_index`` off Arrow custom_metadata.
 // Returns INVALID_INDEX when the key is absent. Raises IOException
 // when present but un-parseable. The cap and monotonicity checks
 // live downstream in VgiTableFunctionImpl::InstallBatch — we only
 // extract the raw uint64 here.
 static idx_t ParseVgiBatchIndex(const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
-                                const std::string &base_url) {
+                                const std::string &base_url, const ErrorInfo &error_context) {
 	if (!custom_metadata) {
 		return DConstants::INVALID_INDEX;
 	}
@@ -44,17 +75,20 @@ static idx_t ParseVgiBatchIndex(const std::shared_ptr<arrow::KeyValueMetadata> &
 		size_t pos = 0;
 		uint64_t parsed = std::stoull(value, &pos);
 		if (pos != value.size()) {
-			throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+			throw IOException(ErrorInfo(error_context).Set(error_key::kMetadataKey, "vgi_batch_index"),
+			                  "VGI worker emitted invalid vgi_batch_index '%s' "
 			                  "(trailing characters; expected decimal uint64) [url: %s]",
 			                  value, base_url);
 		}
 		return static_cast<idx_t>(parsed);
 	} catch (const std::invalid_argument &) {
-		throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+		throw IOException(ErrorInfo(error_context).Set(error_key::kMetadataKey, "vgi_batch_index"),
+		                  "VGI worker emitted invalid vgi_batch_index '%s' "
 		                  "(expected decimal uint64) [url: %s]",
 		                  value, base_url);
 	} catch (const std::out_of_range &) {
-		throw IOException("VGI worker emitted vgi_batch_index '%s' that exceeds uint64 range "
+		throw IOException(ErrorInfo(error_context).Set(error_key::kMetadataKey, "vgi_batch_index"),
+		                  "VGI worker emitted vgi_batch_index '%s' that exceeds uint64 range "
 		                  "[url: %s]",
 		                  value, base_url);
 	}
@@ -66,7 +100,7 @@ static idx_t ParseVgiBatchIndex(const std::shared_ptr<arrow::KeyValueMetadata> &
 // IPC/int32 decode + validation happen downstream on the consumer thread.
 static std::string ParseVgiB64Bytes(
     const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
-    const char *key, const std::string &base_url) {
+    const char *key, const std::string &base_url, const ErrorInfo &error_context) {
 	if (!custom_metadata) {
 		return "";
 	}
@@ -83,7 +117,9 @@ static std::string ParseVgiB64Bytes(
 		Blob::FromBase64(b64_str, data_ptr_cast(out.data()), decoded_size);
 		return out;
 	} catch (const std::exception &e) {
-		throw IOException("VGI worker emitted invalid base64 payload in %s: %s [url: %s]", key, e.what(), base_url);
+		throw IOException(ErrorInfo(error_context).Set(error_key::kMetadataKey, key).Merge(ExtraInfoOf(e)),
+		                  "VGI worker emitted invalid base64 payload in %s: %s [url: %s]", key, RawMessageOf(e),
+		                  base_url);
 	}
 }
 
@@ -271,6 +307,9 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 	int64_t spike_data_batches = 0;
 	int64_t spike_log_batches = 0;
 	int64_t spike_external_batches = 0;
+	const auto violation =
+	    HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_);
+	const auto log_error_context = HttpFunctionInfo(nullptr, base_url_, function_name_, function_type_);
 	while (true) {
 		// A bundled response can hold many batches, each possibly an external
 		// location costing its own GET.
@@ -287,12 +326,14 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex());
-			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
+			                     &log_error_context);
+			throw IOException(violation, "VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
+			                     &log_error_context);
 			++spike_log_batches;
 			continue;
 		}
@@ -305,11 +346,11 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
 			                                         bwm.custom_metadata, &context_.interrupted);
 			buffered_batches_.push_back(resolved.batch);
-			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
+			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_, violation));
 			buffered_partition_values_bytes_.push_back(
-			    ParseVgiB64Bytes(resolved.metadata, "vgi_partition_values#b64", base_url_));
+			    ParseVgiB64Bytes(resolved.metadata, "vgi_partition_values#b64", base_url_, violation));
 			buffered_parent_row_bytes_.push_back(
-			    ParseVgiB64Bytes(resolved.metadata, "vgi_rpc.parent_row#b64", base_url_));
+			    ParseVgiB64Bytes(resolved.metadata, "vgi_rpc.parent_row#b64", base_url_, violation));
 			buffered_cache_controls_.push_back(ParseVgiCacheControl(resolved.metadata));
 			ExtractStreamState(resolved.batch, resolved.metadata);
 			++spike_external_batches;
@@ -323,11 +364,11 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 		// Extract stream_state from regular data batches.
 		ExtractStreamState(bwm.batch, bwm.custom_metadata);
 		buffered_batches_.push_back(bwm.batch);
-		buffered_batch_indexes_.push_back(ParseVgiBatchIndex(bwm.custom_metadata, base_url_));
+		buffered_batch_indexes_.push_back(ParseVgiBatchIndex(bwm.custom_metadata, base_url_, violation));
 		buffered_partition_values_bytes_.push_back(
-		    ParseVgiB64Bytes(bwm.custom_metadata, "vgi_partition_values#b64", base_url_));
+		    ParseVgiB64Bytes(bwm.custom_metadata, "vgi_partition_values#b64", base_url_, violation));
 		buffered_parent_row_bytes_.push_back(
-		    ParseVgiB64Bytes(bwm.custom_metadata, "vgi_rpc.parent_row#b64", base_url_));
+		    ParseVgiB64Bytes(bwm.custom_metadata, "vgi_rpc.parent_row#b64", base_url_, violation));
 		buffered_cache_controls_.push_back(ParseVgiCacheControl(bwm.custom_metadata));
 		++spike_data_batches;
 	}
@@ -388,15 +429,15 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		                             attach_params_ ? attach_params_->iroh() : nullptr);
 		PublishHarvestedCapabilities(b_caps);
 		if (!resp.batch || resp.batch->num_rows() == 0) {
-			throw IOException("Empty bind response from HTTP server [url: %s]", base_url_);
+			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Empty bind response from HTTP server [url: %s]", base_url_);
 		}
 		auto rcol = resp.batch->GetColumnByName("result");
 		if (!rcol) {
-			throw IOException("Bind response missing 'result' column [url: %s]", base_url_);
+			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Bind response missing 'result' column [url: %s]", base_url_);
 		}
 		auto bin_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(rcol);
 		if (!bin_arr || bin_arr->IsNull(0)) {
-			throw IOException("Bind response 'result' column is null [url: %s]", base_url_);
+			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Bind response 'result' column is null [url: %s]", base_url_);
 		}
 		return DeserializeFromIpcBytesZeroCopy(*bin_arr, 0);
 	};
@@ -730,14 +771,14 @@ std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseR
                                                               const std::string &method_name,
                                                               const std::string &base_url) {
 	if (!response.batch || response.batch->num_rows() == 0) {
-		throw IOException("Empty response from %s [url: %s]", method_name, base_url);
+		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Empty response from %s [url: %s]", method_name, base_url);
 	}
 	auto result_col = response.batch->GetColumnByName("result");
 	if (!result_col) {
-		throw IOException("Response missing 'result' column from %s [url: %s]", method_name, base_url);
+		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Response missing 'result' column from %s [url: %s]", method_name, base_url);
 	}
 	if (result_col->type()->id() != arrow::Type::BINARY) {
-		throw IOException("Response 'result' column has wrong type from %s [url: %s]", method_name, base_url);
+		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Response 'result' column has wrong type from %s [url: %s]", method_name, base_url);
 	}
 	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
 	if (bin->IsNull(0)) {
@@ -773,7 +814,9 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_process", base_url_);
 	if (!inner || inner->num_rows() == 0) {
-		throw IOException("table_buffering_process response missing data [url: %s]", base_url_);
+		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_)
+		                      .Rpc("table_buffering_process"),
+		                  "table_buffering_process response missing data [url: %s]", base_url_);
 	}
 	auto col = inner->GetColumnByName("state_id");
 	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
@@ -799,7 +842,9 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_combine", base_url_);
 	if (!inner || inner->num_rows() == 0) {
-		throw IOException("table_buffering_combine response missing data [url: %s]", base_url_);
+		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_)
+		                      .Rpc("table_buffering_combine"),
+		                  "table_buffering_combine response missing data [url: %s]", base_url_);
 	}
 	auto col = inner->GetColumnByName("finalize_state_ids");
 	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
@@ -979,6 +1024,9 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	}
 	auto reader = reader_result.ValueUnsafe();
 
+	const auto violation =
+	    HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_);
+	const auto log_error_context = HttpFunctionInfo(nullptr, base_url_, function_name_, function_type_);
 	std::shared_ptr<arrow::RecordBatch> output_batch;
 	std::string new_state_token;
 	// Reset batch_index + partition_values BEFORE the loop. The HTTP
@@ -1001,12 +1049,14 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex());
-			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
+			                     &log_error_context);
+			throw IOException(violation, "VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
+			                     &log_error_context);
 			continue;
 		}
 
@@ -1034,15 +1084,15 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		// clobber values parsed from the upstream data batch. Validation
 		// happens in VgiTableFunctionImpl::InstallBatch on the consumer.
 		{
-			const idx_t parsed = ParseVgiBatchIndex(bwm.custom_metadata, base_url_);
+			const idx_t parsed = ParseVgiBatchIndex(bwm.custom_metadata, base_url_, violation);
 			if (parsed != DConstants::INVALID_INDEX) {
 				last_batch_index_ = parsed;
 			}
-			std::string pv = ParseVgiB64Bytes(bwm.custom_metadata, "vgi_partition_values#b64", base_url_);
+			std::string pv = ParseVgiB64Bytes(bwm.custom_metadata, "vgi_partition_values#b64", base_url_, violation);
 			if (!pv.empty()) {
 				last_partition_values_bytes_ = std::move(pv);
 			}
-			last_parent_row_bytes_ = ParseVgiB64Bytes(bwm.custom_metadata, "vgi_rpc.parent_row#b64", base_url_);
+			last_parent_row_bytes_ = ParseVgiB64Bytes(bwm.custom_metadata, "vgi_rpc.parent_row#b64", base_url_, violation);
 			auto cc = ParseVgiCacheControl(bwm.custom_metadata);
 			if (cc.present) {
 				last_cache_control_ = cc;
