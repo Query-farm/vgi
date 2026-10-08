@@ -1,0 +1,27 @@
+# name: test/sql/vgi_error_info.test
+# description: structured error fields (extra_info) under errors_as_json; see docs/error_info.md
+# group: [vgi]
+
+require vgi
+
+# The exit-code classification is POSIX: a missing command is exit 127 there,
+# but MSVC's cmd.exe reports exit 1.
+require notwindows
+
+statement ok
+SET errors_as_json = true;
+
+statement error
+ATTACH 'x' AS x (TYPE vgi, LOCATION '/nonexistent/path/to/worker');
+----
+"error_subtype":"WORKER_NOT_FOUND"
+
+statement error
+ATTACH 'x' AS x (TYPE vgi, LOCATION '/nonexistent/path/to/worker');
+----
+"exit_code":"127"
+
+statement error
+ATTACH 'x' AS x (TYPE vgi, LOCATION '/nonexistent/path/to/worker');
+----
+"transport":"subprocess"

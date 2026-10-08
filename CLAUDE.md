@@ -290,6 +290,7 @@ the OS level and return no rows.
 | Topic | Doc |
 |-------|-----|
 | Settings, ATTACH options, LOCATION schemes, SQL diagnostic functions | `docs/reference.md` |
+| Structured error fields (`errors_as_json`, `error_subtype`, `extra_info` keys) | `docs/error_info.md` |
 | Source file / header map | `docs/source_map.md` |
 | Table-in-out: parallel fan-out, blended, buffered, batched LATERAL | `docs/table_in_out.md` |
 | Table-function result cache (memory/disk, partition, exchange-mode) | `docs/result_cache.md`, `docs/result_cache_compression.md`, `docs/result_cache_packed_store.md`, `docs/exchange_dedup_pervalue.md` |

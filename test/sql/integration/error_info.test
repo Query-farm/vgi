@@ -1,0 +1,39 @@
+# name: test/sql/integration/error_info.test
+# description: a worker-raised exception carries structured fields under errors_as_json (docs/error_info.md)
+# group: [vgi_integration]
+#
+# Runs unchanged against every SDK (make test_languages): each must report the
+# exception through vgi_rpc.log_level=EXCEPTION, so the client attaches the
+# same fields whatever the worker language. Only fields every SDK can supply
+# are asserted; worker_exception_type and traceback are SDK-specific.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET errors_as_json = true;
+
+statement error
+SELECT * FROM example.main.sequence(10, batch_size := 0);
+----
+"error_subtype":"WORKER_EXCEPTION"
+
+statement error
+SELECT * FROM example.main.sequence(10, batch_size := 0);
+----
+"exception_type":"Invalid Input"
+
+statement ok
+SET errors_as_json = false;
+
+# The human message is unchanged.
+statement error
+SELECT * FROM example.main.sequence(10, batch_size := 0);
+----
+VGI Worker Exception
