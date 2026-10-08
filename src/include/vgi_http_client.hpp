@@ -69,7 +69,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL,
                                      duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                                      ServerCapabilities *caps = nullptr,
-                                     const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
+                                     const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
+                                     const std::unordered_map<std::string, std::string> *error_fields = nullptr);
 
 // Small thread-safe pool of keep-alive HTTPClients for unary RPCs against ONE
 // base URL (a pool instance lives on a catalog's VgiAttachParameters, whose
@@ -152,7 +153,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                               ServerCapabilities *harvested_caps = nullptr,
                               const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
-                              const std::atomic<bool> *cancellation = nullptr);
+                              const std::atomic<bool> *cancellation = nullptr,
+                              const RpcErrorContext *error_context = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth

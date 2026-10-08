@@ -29,6 +29,20 @@ SELECT * FROM example.main.sequence(10, batch_size := 0);
 ----
 "exception_type":"Invalid Input"
 
+# An error raised mid-execution names the function execution and the function,
+# on every transport. Over HTTP the error comes back in the response body,
+# decoded apart from the connection that knows these, so this is the case
+# that once lost them.
+statement error
+SELECT * FROM example.generator_exception(2);
+----
+"execution_id":"
+
+statement error
+SELECT * FROM example.generator_exception(2);
+----
+"function_name":"generator_exception"
+
 statement ok
 SET errors_as_json = false;
 

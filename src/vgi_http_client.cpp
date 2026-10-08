@@ -312,7 +312,8 @@ static std::string HttpPostArrowIpcInternal(
     bool allow_codec_retry = true, duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                                              ServerCapabilities *harvested_caps = nullptr,
                                              const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
-                                             const std::atomic<bool> *cancellation = nullptr) {
+                                             const std::atomic<bool> *cancellation = nullptr,
+                                             const RpcErrorContext *error_context = nullptr) {
 	const bool is_httpi = IsHttpiTransport(url);
 	const uint64_t timeout_seconds = GetHttpTimeoutSeconds(context);
 	const int64_t accepted_max_response_bytes = GetAcceptedMaxResponseBytes(context);
@@ -539,7 +540,7 @@ static std::string HttpPostArrowIpcInternal(
 			return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar, out_response,
 			                                cached_http_params, alternate,
 			                                /*allow_codec_retry=*/false, client_holder, harvested_caps, iroh_config,
-			                                cancellation);
+			                                cancellation, error_context);
 		}
 	}
 
@@ -740,8 +741,14 @@ static std::string HttpPostArrowIpcInternal(
 			// header, returns without throwing, and loses the message to the
 			// generic throw below. DispatchErrorStreamsFromBuffer dispatches
 			// the error batch, which throws with the worker's own message.
+			//
+			// With a caller-supplied error context the errors name the worker,
+			// the execution and the function, and the worker's own log lines
+			// before the failure reach duckdb_logs, as on a subprocess stream.
+			// Without one (e.g. the cancel dispatcher's request, which runs off
+			// the query thread) nothing is logged, as before.
 			DispatchErrorStreamsFromBuffer(reinterpret_cast<const uint8_t *>(error_body.data()), error_body.size(),
-			                               nullptr, url);
+			                               error_context ? &context : nullptr, url, error_context);
 		}
 		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, url),
 		                  "VGI HTTP RPC error [url: %s]", url);
@@ -756,7 +763,7 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
                               const std::shared_ptr<HTTPParams> &cached_http_params,
                              duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *harvested_caps,
                              const std::shared_ptr<IrohClientConfig> &iroh_config,
-                             const std::atomic<bool> *cancellation) {
+                             const std::atomic<bool> *cancellation, const RpcErrorContext *error_context) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -772,7 +779,7 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 	std::unique_ptr<RpcHttpResponse> response;
 	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params,
 	                                       request_encoding, /*allow_codec_retry=*/true, client_holder, harvested_caps,
-	                                       iroh_config, cancellation);
+	                                       iroh_config, cancellation, error_context);
 
 	if (response->Status() != HTTPStatusCode::Unauthorized_401) {
 		return result;
@@ -845,7 +852,7 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
 	                                  harvested_caps ? ChooseRequestEncoding(*harvested_caps) : request_encoding,
 	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps, iroh_config,
-	                                  cancellation);
+	                                  cancellation, error_context);
 	if (response->Status() == HTTPStatusCode::Unauthorized_401) {
 		throw IOException(BuildHttpExtraInfo(http_error::kAuthFailed, url, 401),
 		                  "VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
@@ -865,7 +872,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
                                     const std::string &transaction_opaque_data_digest, const std::string &conn_id_hex,
                                      const VgiProtocolId &protocol,
                                     duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *caps,
-                                    const std::shared_ptr<IrohClientConfig> &iroh_config) {
+                                    const std::shared_ptr<IrohClientConfig> &iroh_config,
+                                    const std::unordered_map<std::string, std::string> *error_fields) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	// Route shape: {base}/{protocol}/{method}. The protocol segment is the
 	// projection of the vgi_rpc.protocol routing key the body also carries --
@@ -905,9 +913,21 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	}
 
 	// POST to the route built above, using the standard HTTP timeout
+	// A worker error answered in the body names the worker and this call, not
+	// just the request URL; the URL rides along as its own field.
+	RpcErrorContext error_context;
+	error_context.worker_path = base_url;
+	error_context.execution_id_hex = execution_id_hex;
+	error_context.attach_opaque_data_digest = attach_opaque_data_digest;
+	error_context.conn_id_hex = conn_id_hex;
+	if (error_fields) {
+		error_context.fields = *error_fields;
+	}
+	error_context.fields[error_key::kUrl] = RedactCredentials(url);
+	error_context.fields.emplace(error_key::kRpcMethod, method_name);
 	auto response_body =
 	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder,
-	                     effective_caps, iroh_config);
+	                     effective_caps, iroh_config, /*cancellation=*/nullptr, &error_context);
 
 	// Parse the Arrow IPC response. Move the body in — the string becomes the
 	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.

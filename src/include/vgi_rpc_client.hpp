@@ -8,6 +8,7 @@
 #include <memory>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -341,6 +342,19 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  const std::string &transaction_opaque_data_digest = "",
                                                  const std::string &conn_id_hex = "");
 
+// What a caller knows about the call an error belongs to, which the decoder of
+// a worker error body does not: the worker it is (as opposed to the request
+// URL), the function execution, and fields to attach to the error (function
+// name / kind). Carried to HandleBatchLogMessage so a worker error decoded
+// from an HTTP error body is reported like one read off a subprocess stream.
+struct RpcErrorContext {
+	std::string worker_path; // the worker's base location; empty = the request URL
+	std::string execution_id_hex;
+	std::string attach_opaque_data_digest;
+	std::string conn_id_hex;
+	std::unordered_map<std::string, std::string> fields;
+};
+
 // Dispatch every Arrow IPC stream concatenated in an error response body,
 // throwing on the first batch that carries error metadata.
 //
@@ -357,7 +371,7 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
 // instead of a generic transport failure. Safe for a unary body too, which is
 // simply one stream.
 void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientContext *context,
-                                    const std::string &url = "");
+                                    const std::string &url = "", const RpcErrorContext *call = nullptr);
 
 // Move-in overload: adopts the response body string as the owning Arrow buffer
 // (arrow::Buffer::FromString) instead of allocating + memcpying a copy of the

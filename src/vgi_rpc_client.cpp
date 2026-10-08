@@ -73,7 +73,8 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
                           const std::string &execution_id_hex = "",
                           const std::string &attach_opaque_data_digest = "",
                           const std::string &transaction_opaque_data_digest = "",
-                          const std::string &conn_id_hex = "") {
+                          const std::string &conn_id_hex = "",
+                          const std::unordered_map<std::string, std::string> *error_context = nullptr) {
 	auto type = ClassifyBatch(batch, custom_metadata);
 
 	switch (type) {
@@ -81,7 +82,7 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 		// Extract error details and throw
 		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, worker_pid,
 		                      execution_id_hex, attach_opaque_data_digest,
-		                      transaction_opaque_data_digest, conn_id_hex);
+		                      transaction_opaque_data_digest, conn_id_hex, error_context);
 		// HandleBatchLogMessage throws for EXCEPTION level, but just in case:
 		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path, worker_pid, execution_id_hex),
 		                  "VGI RPC error from worker [worker: %s]", worker_path);
@@ -90,7 +91,7 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 		// Forward to logger
 		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, worker_pid,
 		                      execution_id_hex, attach_opaque_data_digest,
-		                      transaction_opaque_data_digest, conn_id_hex);
+		                      transaction_opaque_data_digest, conn_id_hex, error_context);
 		return true; // Handled, caller should read next batch
 	}
 	case RpcBatchType::DATA:
@@ -507,7 +508,12 @@ static UnaryResponseResult ReadUnaryResponseFromOwnedBuffer(
 }
 
 void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientContext *context,
-                                    const std::string &url) {
+                                    const std::string &url, const RpcErrorContext *call) {
+	const std::string &worker = call && !call->worker_path.empty() ? call->worker_path : url;
+	// An init reply puts the worker-minted execution_id in its header stream
+	// and an error raised right after init in the next stream, so the caller
+	// cannot know the id yet. Adopt it from the header as the walk passes it.
+	std::string execution_id_hex = call ? call->execution_id_hex : std::string();
 	int64_t offset = 0;
 	const auto total = static_cast<int64_t>(len);
 	while (offset < total) {
@@ -529,8 +535,21 @@ void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientConte
 				break; // end of this stream
 			}
 			// Throws when the batch carries error metadata — the whole point.
-			DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata, context,
-			              url, -1);
+			if (call) {
+				const bool handled = DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
+				                                   context, worker, -1, execution_id_hex,
+				                                   call->attach_opaque_data_digest, "", call->conn_id_hex, &call->fields);
+				if (!handled && execution_id_hex.empty() && batch_with_metadata.batch->num_rows() > 0) {
+					auto exec = std::dynamic_pointer_cast<arrow::BinaryArray>(
+					    batch_with_metadata.batch->GetColumnByName("execution_id"));
+					if (exec && !exec->IsNull(0)) {
+						auto view = exec->GetView(0);
+						execution_id_hex = BytesToHex(std::vector<uint8_t>(view.begin(), view.end()));
+					}
+				}
+			} else {
+				DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata, context, url, -1);
+			}
 		}
 		auto pos = input->Tell();
 		if (!pos.ok() || pos.ValueUnsafe() <= 0) {
