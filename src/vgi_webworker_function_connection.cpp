@@ -79,8 +79,8 @@ ErrorInfo WebWorkerFunctionInfo(const std::string &function_name, const std::str
 // exactly as ThrowVgiIOException builds it.
 template <typename... ARGS>
 [[noreturn]] void ThrowWebWorkerIOException(ErrorInfo info, const std::string &msg, const std::string &worker_path,
-                                            pid_t worker_pid, const std::string &invocation_id_hex, ARGS... params) {
-	info.Worker(worker_path, worker_pid, invocation_id_hex);
+                                            pid_t worker_pid, const std::string &execution_id_hex, ARGS... params) {
+	info.Worker(worker_path, worker_pid, execution_id_hex);
 	throw IOException(info, BuildMessageWithContext(msg, worker_path), params...);
 }
 
@@ -95,12 +95,12 @@ WorkerStreamOptions SabStreamOptions(ClientContext *context, const std::string &
 // Read a unary response from the slot's response ring: dispatch log/error
 // until the first data batch, then drain to EOS.
 UnaryResponseResult SabReadUnaryResponse(int region_offset, int slot, ClientContext *context,
-                                         const std::string &worker_path, const std::string &invocation_id_hex = "",
+                                         const std::string &worker_path, const std::string &execution_id_hex = "",
                                          const std::string &attach_opaque_data_digest = "",
                                          const std::string &transaction_opaque_data_digest = "",
                                          const std::string &conn_id_hex = "") {
 	auto opts = SabStreamOptions(context, worker_path);
-	opts.invocation_id_hex = invocation_id_hex;
+	opts.execution_id_hex = execution_id_hex;
 	opts.attach_opaque_data_digest = attach_opaque_data_digest;
 	opts.transaction_opaque_data_digest = transaction_opaque_data_digest;
 	opts.conn_id_hex = conn_id_hex;

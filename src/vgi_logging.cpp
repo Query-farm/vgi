@@ -214,7 +214,7 @@ string VgiLogType::ConstructLogMessage(const string &event, const vector<pair<st
 // Returns true if the batch was a log message, false otherwise.
 bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
-                           const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex,
+                           const std::string &worker_path, pid_t worker_pid, const std::string &execution_id_hex,
                            const std::string &attach_opaque_data_digest, const std::string &transaction_opaque_data_digest,
                            const std::string &conn_id_hex,
                            const std::unordered_map<std::string, std::string> *error_context) {
@@ -328,7 +328,7 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		if (error_context) {
 			extra_info.Merge(*error_context);
 		}
-		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, invocation_id_hex, error_kind, error_code,
+		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, execution_id_hex, error_kind, error_code,
 		                           extra_info);
 	}
 
@@ -344,8 +344,8 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 			info.emplace_back("worker_pid", std::to_string(worker_pid));
 		}
 		info.emplace_back("level", log_level);
-		if (!invocation_id_hex.empty()) {
-			info.emplace_back("invocation_id", invocation_id_hex);
+		if (!execution_id_hex.empty()) {
+			info.emplace_back("execution_id", execution_id_hex);
 		}
 		if (!attach_opaque_data_digest.empty()) {
 			info.emplace_back("attach_opaque_data_sha256", attach_opaque_data_digest);

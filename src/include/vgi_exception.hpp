@@ -55,7 +55,7 @@ inline std::string OpaqueDigest(const std::vector<uint8_t> &bytes) {
 // Build the standard extra_info map for VGI exceptions
 inline std::unordered_map<std::string, std::string> BuildExtraInfo(const std::string &worker_path,
                                                                     pid_t worker_pid = -1,
-                                                                    const std::string &invocation_id_hex = "");
+                                                                    const std::string &execution_id_hex = "");
 
 // ============================================================================
 // Structured error context (extra_info)
@@ -76,7 +76,7 @@ inline constexpr const char *kErrorSubtype = "error_subtype"; // DuckDB's own ke
 inline constexpr const char *kTransport = "transport";        // PolicyTransportName token
 inline constexpr const char *kWorkerPath = "worker_path";
 inline constexpr const char *kWorkerPid = "worker_pid";
-inline constexpr const char *kInvocationId = "invocation_id";
+inline constexpr const char *kExecutionId = "execution_id";
 inline constexpr const char *kUrl = "url";
 inline constexpr const char *kHttpStatus = "http_status";
 inline constexpr const char *kContentType = "content_type";
@@ -278,7 +278,7 @@ public:
 		return *this;
 	}
 	ErrorInfo &Worker(const std::string &worker_path, pid_t worker_pid = -1,
-	                  const std::string &invocation_id_hex = std::string()) {
+	                  const std::string &execution_id_hex = std::string()) {
 		Set(error_key::kWorkerPath, RedactCredentials(worker_path));
 		if (find(error_key::kTransport) == end()) {
 			Set(error_key::kTransport, TransportNameForLocation(worker_path));
@@ -286,7 +286,7 @@ public:
 		if (worker_pid > 0) {
 			Set(error_key::kWorkerPid, static_cast<int64_t>(worker_pid));
 		}
-		return Set(error_key::kInvocationId, invocation_id_hex);
+		return Set(error_key::kExecutionId, execution_id_hex);
 	}
 	ErrorInfo &Url(const std::string &url) {
 		return Set(error_key::kUrl, RedactCredentials(url));
@@ -320,8 +320,8 @@ public:
 };
 
 inline std::unordered_map<std::string, std::string> BuildExtraInfo(const std::string &worker_path, pid_t worker_pid,
-                                                                    const std::string &invocation_id_hex) {
-	return std::move(ErrorInfo().Worker(worker_path, worker_pid, invocation_id_hex));
+                                                                    const std::string &execution_id_hex) {
+	return std::move(ErrorInfo().Worker(worker_path, worker_pid, execution_id_hex));
 }
 
 // extra_info for an HTTP-transport error. `http_status` < 0 means no status
@@ -382,20 +382,20 @@ inline std::string BuildMessageWithContext(const std::string &msg, const std::st
 }
 
 // Throw an IOException with worker context
-// Usage: ThrowVgiIOException("Failed to do X: %s", worker_path, pid, invocation_id_hex, error_msg);
+// Usage: ThrowVgiIOException("Failed to do X: %s", worker_path, pid, execution_id_hex, error_msg);
 // Note: worker_path is included in the message for CLI visibility, plus stored in extra_info
 template <typename... ARGS>
 [[noreturn]] void ThrowVgiIOException(const std::string &msg, const std::string &worker_path, pid_t worker_pid,
-                                      const std::string &invocation_id_hex, ARGS... params) {
-	auto extra_info = BuildExtraInfo(worker_path, worker_pid, invocation_id_hex);
+                                      const std::string &execution_id_hex, ARGS... params) {
+	auto extra_info = BuildExtraInfo(worker_path, worker_pid, execution_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path);
 	throw IOException(extra_info, full_msg, params...);
 }
 
 // Throw an IOException with worker context (no format args)
 [[noreturn]] inline void ThrowVgiIOException(const std::string &msg, const std::string &worker_path,
-                                             pid_t worker_pid, const std::string &invocation_id_hex = "") {
-	auto extra_info = BuildExtraInfo(worker_path, worker_pid, invocation_id_hex);
+                                             pid_t worker_pid, const std::string &execution_id_hex = "") {
+	auto extra_info = BuildExtraInfo(worker_path, worker_pid, execution_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path);
 	throw IOException(extra_info, full_msg);
 }
@@ -444,12 +444,12 @@ private:
 // state populated by previous update/combine calls) and also masks the real
 // user-code error behind a silent NULL result.
 [[noreturn]] inline void ThrowVgiUserException(const std::string &msg, const std::string &worker_path,
-                                                pid_t worker_pid, const std::string &invocation_id_hex = "",
+                                                pid_t worker_pid, const std::string &execution_id_hex = "",
                                                 const std::string &error_kind = "",
                                                 const std::string &error_code = "",
                                                 const ErrorInfo &context = ErrorInfo()) {
 	ErrorInfo extra_info = context;
-	extra_info.Worker(worker_path, worker_pid, invocation_id_hex)
+	extra_info.Worker(worker_path, worker_pid, execution_id_hex)
 	    .Set(error_key::kErrorKind, error_kind)
 	    .Set(error_key::kErrorCode, error_code);
 	auto full_msg = BuildMessageWithContext(msg, worker_path);
@@ -525,11 +525,11 @@ inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 //   worker stderr:
 //     <captured stderr tail>
 [[noreturn]] inline void ThrowVgiWorkerExitException(const std::string &msg, const std::string &worker_path,
-                                                     pid_t worker_pid, const std::string &invocation_id_hex,
+                                                     pid_t worker_pid, const std::string &execution_id_hex,
                                                      const std::string &worker_stderr,
                                                      const ErrorInfo &context = ErrorInfo()) {
 	ErrorInfo extra_info = context;
-	extra_info.Worker(worker_path, worker_pid, invocation_id_hex);
+	extra_info.Worker(worker_path, worker_pid, execution_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path) + FormatWorkerStderrSuffix(worker_stderr);
 	throw IOException(extra_info, full_msg);
 }
@@ -543,7 +543,7 @@ inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 // worker_stderr (typically StderrDrainer::CaptureStderrSnapshot()) is appended to
 // the message tail-capped so the user sees the worker's own error output.
 inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_path, const std::string &error_context,
-                                  const std::string &invocation_id_hex = "", const std::string &worker_stderr = "") {
+                                  const std::string &execution_id_hex = "", const std::string &worker_stderr = "") {
 	int exit_status = 0;
 	// Every caller reaches here from a *transport* failure (EPIPE on write, EOF /
 	// error on read), i.e. the worker's pipe end is already closed. A dying child
@@ -578,10 +578,10 @@ inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_pa
 	// appends, and so worker stderr containing '%' is never format-interpreted.
 	if (exit_status == 127) {
 		ThrowVgiWorkerExitException("VGI worker not found or not executable", worker_path, proc.GetPid(),
-		                            invocation_id_hex, worker_stderr,
+		                            execution_id_hex, worker_stderr,
 		                            ErrorInfo(error_subtype::kWorkerNotFound).Set(error_key::kExitCode, 127));
 	} else if (exit_status == 126) {
-		ThrowVgiWorkerExitException("VGI worker permission denied", worker_path, proc.GetPid(), invocation_id_hex,
+		ThrowVgiWorkerExitException("VGI worker permission denied", worker_path, proc.GetPid(), execution_id_hex,
 		                            worker_stderr,
 		                            ErrorInfo(error_subtype::kWorkerNotExecutable).Set(error_key::kExitCode, 126));
 	}
@@ -591,14 +591,14 @@ inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_pa
 	if (exit_status < 0 && exit_status != -1) {
 		ThrowVgiWorkerExitException("VGI worker " + error_context + " (killed by signal " +
 		                                std::to_string(-exit_status) + ")",
-		                            worker_path, proc.GetPid(), invocation_id_hex, worker_stderr,
+		                            worker_path, proc.GetPid(), execution_id_hex, worker_stderr,
 		                            ErrorInfo(error_subtype::kWorkerKilled)
 		                                .Set(error_key::kExitSignal, static_cast<int64_t>(-exit_status)));
 	}
 #endif
 	if (exit_status != 0) {
 		ThrowVgiWorkerExitException("VGI worker " + error_context + " (exit code " + std::to_string(exit_status) + ")",
-		                            worker_path, proc.GetPid(), invocation_id_hex, worker_stderr,
+		                            worker_path, proc.GetPid(), execution_id_hex, worker_stderr,
 		                            ErrorInfo(error_subtype::kWorkerExited)
 		                                .Set(error_key::kExitCode, static_cast<int64_t>(exit_status)));
 	}

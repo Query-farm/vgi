@@ -226,7 +226,7 @@ struct WorkerStreamOptions {
 	std::string noun;
 	// Called before every read: fd readiness + cancellation. Empty = none.
 	std::function<void()> before_read;
-	std::string invocation_id_hex;
+	std::string execution_id_hex;
 	std::string attach_opaque_data_digest;
 	std::string transaction_opaque_data_digest;
 	std::string conn_id_hex;
@@ -259,7 +259,7 @@ struct UnaryResponseResult {
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &worker_path = "",
                                       pid_t worker_pid = -1,
-                                      const std::string &invocation_id_hex = "",
+                                      const std::string &execution_id_hex = "",
                                       const std::string &attach_opaque_data_digest = "",
                                       const std::string &transaction_opaque_data_digest = "",
                                       const std::string &conn_id_hex = "");
@@ -271,7 +271,7 @@ UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStre
                                       ClientContext *context,
                                       const std::string &worker_path = "",
                                       pid_t worker_pid = -1,
-                                      const std::string &invocation_id_hex = "",
+                                      const std::string &execution_id_hex = "",
                                       const std::string &attach_opaque_data_digest = "",
                                       const std::string &transaction_opaque_data_digest = "",
                                       const std::string &conn_id_hex = "");
@@ -336,7 +336,7 @@ std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name,
 UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  ClientContext *context,
                                                  const std::string &url = "",
-                                                 const std::string &invocation_id_hex = "",
+                                                 const std::string &execution_id_hex = "",
                                                  const std::string &attach_opaque_data_digest = "",
                                                  const std::string &transaction_opaque_data_digest = "",
                                                  const std::string &conn_id_hex = "");
@@ -366,7 +366,7 @@ void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientConte
 UnaryResponseResult ReadUnaryResponseFromBuffer(std::string &&body,
                                                  ClientContext *context,
                                                  const std::string &url = "",
-                                                 const std::string &invocation_id_hex = "",
+                                                 const std::string &execution_id_hex = "",
                                                  const std::string &attach_opaque_data_digest = "",
                                                  const std::string &transaction_opaque_data_digest = "",
                                                  const std::string &conn_id_hex = "");

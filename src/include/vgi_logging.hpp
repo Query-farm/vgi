@@ -157,7 +157,7 @@ inline LogLevel ParseLogLevel(const string &level_str) {
 bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid = -1,
-                           const std::string &invocation_id_hex = "", const std::string &attach_opaque_data_digest = "",
+                           const std::string &execution_id_hex = "", const std::string &attach_opaque_data_digest = "",
                            const std::string &transaction_opaque_data_digest = "", const std::string &conn_id_hex = "",
                            const std::unordered_map<std::string, std::string> *error_context = nullptr);
 

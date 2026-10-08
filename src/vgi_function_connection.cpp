@@ -78,8 +78,8 @@ ErrorInfo FunctionInfo(const std::string &function_name, const std::string &func
 // subtype). The message is built exactly as ThrowVgiIOException builds it.
 template <typename... ARGS>
 [[noreturn]] void ThrowFunctionIOException(ErrorInfo info, const std::string &msg, const std::string &worker_path,
-                                           pid_t worker_pid, const std::string &invocation_id_hex, ARGS... params) {
-	info.Worker(worker_path, worker_pid, invocation_id_hex);
+                                           pid_t worker_pid, const std::string &execution_id_hex, ARGS... params) {
+	info.Worker(worker_path, worker_pid, execution_id_hex);
 	throw IOException(info, BuildMessageWithContext(msg, worker_path), params...);
 }
 } // namespace

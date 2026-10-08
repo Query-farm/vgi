@@ -165,7 +165,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		}
 		auto result = HttpInvokeUnary(
 		    opts.context, opts.worker_path, method_name, params, opts.auth, opts.cookie_jar, opts.cached_http_params,
-		                              /*invocation_id_hex=*/"", /*attach_opaque_data_digest=*/"",
+		                              /*execution_id_hex=*/"", /*attach_opaque_data_digest=*/"",
 		    /*transaction_opaque_data_digest=*/"", /*conn_id_hex=*/"", opts.protocol,
 		    opts.http_client_pool ? &pooled : nullptr, opts.server_caps ? &caps : nullptr, opts.iroh);
 		if (opts.server_caps) {

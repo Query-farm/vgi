@@ -66,9 +66,9 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Sta
 ----
 true
 
-# Check invocation_id is present in in-band messages
+# Check execution_id is present in in-band messages
 query I
-SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%invocation_id=%';
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%execution_id=%';
 ----
 true
 

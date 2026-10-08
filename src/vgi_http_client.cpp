@@ -861,7 +861,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
                                      const std::shared_ptr<CatalogAuth> &auth,
                                      const std::shared_ptr<SessionCookieJar> &cookie_jar,
                                      const std::shared_ptr<HTTPParams> &cached_http_params,
-                                    const std::string &invocation_id_hex, const std::string &attach_opaque_data_digest,
+                                    const std::string &execution_id_hex, const std::string &attach_opaque_data_digest,
                                     const std::string &transaction_opaque_data_digest, const std::string &conn_id_hex,
                                      const VgiProtocolId &protocol,
                                     duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *caps,
@@ -911,7 +911,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 
 	// Parse the Arrow IPC response. Move the body in — the string becomes the
 	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.
-	auto result = ReadUnaryResponseFromBuffer(std::move(response_body), &context, url, invocation_id_hex,
+	auto result = ReadUnaryResponseFromBuffer(std::move(response_body), &context, url, execution_id_hex,
 	                                          attach_opaque_data_digest, transaction_opaque_data_digest, conn_id_hex);
 
 	// Resolve external location pointer batches
@@ -977,14 +977,14 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, const s
 }
 
 UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::string &location_url,
-                                            const std::string &worker_path, const std::string &invocation_id_hex,
+                                            const std::string &worker_path, const std::string &execution_id_hex,
                                              const std::string &attach_opaque_data_digest,
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata,
                                              const std::atomic<bool> *cancellation) {
 	// The fetched URL is a pre-signed object, not the worker; name both.
 	auto location_error = [&](const char *error_subtype) {
 		auto extra_info = BuildHttpExtraInfo(error_subtype, location_url);
-		auto worker_info = BuildExtraInfo(worker_path, -1, invocation_id_hex);
+		auto worker_info = BuildExtraInfo(worker_path, -1, execution_id_hex);
 		extra_info.insert(worker_info.begin(), worker_info.end());
 		return extra_info;
 	};
@@ -1041,7 +1041,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 	opts.http_messages = true;
 	opts.lenient = true;
 	opts.noun = "external location";
-	opts.invocation_id_hex = invocation_id_hex;
+	opts.execution_id_hex = execution_id_hex;
 	opts.attach_opaque_data_digest = attach_opaque_data_digest;
 	auto result = ReadWorkerUnaryStream(std::make_shared<arrow::io::BufferReader>(owned), opts);
 	if (result.batch && ClassifyBatch(result.batch, result.metadata) == RpcBatchType::EXTERNAL_LOCATION) {

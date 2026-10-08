@@ -62,7 +62,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::shared_ptr<CatalogAuth> &auth = nullptr,
                                      const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
                                      const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
-                                     const std::string &invocation_id_hex = "",
+                                     const std::string &execution_id_hex = "",
                                      const std::string &attach_opaque_data_digest = "",
                                      const std::string &transaction_opaque_data_digest = "",
                                      const std::string &conn_id_hex = "",
@@ -162,14 +162,14 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url,
 
 // Resolve an external location pointer batch by fetching and parsing the URL.
 // Returns the resolved data batch. Throws on redirect loops or fetch failures.
-// worker_path, invocation_id_hex, attach_opaque_data_digest are passed to HandleBatchLogMessage
+// worker_path, execution_id_hex, attach_opaque_data_digest are passed to HandleBatchLogMessage
 // for any log batches embedded in the externalized IPC stream.
 // If pointer_metadata is provided and contains RPC_LOCATION_SHA256_KEY,
 // the fetched bytes are verified against the expected SHA-256 checksum.
 UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &location_url,
                                              const std::string &worker_path = "",
-                                             const std::string &invocation_id_hex = "",
+                                             const std::string &execution_id_hex = "",
                                              const std::string &attach_opaque_data_digest = "",
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata = nullptr,
                                              const std::atomic<bool> *cancellation = nullptr);
