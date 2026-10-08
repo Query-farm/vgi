@@ -20,6 +20,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_types.hpp"
 
@@ -257,7 +258,8 @@ void DeferDrop(Catalog &catalog, unique_ptr<CatalogEntry> entry) {
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
-		throw BinderException("Cannot CREATE TABLE in read-only VGI catalog '%s'", catalog.GetName());
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly).Set(vgi::error_key::kCatalog, catalog.GetName()).Set(vgi::error_key::kOperation, "CREATE TABLE"),
+		                      StringUtil::Format("Cannot CREATE TABLE in read-only VGI catalog '%s'", catalog.GetName()));
 	}
 
 	auto &create_info = info.base->Cast<CreateTableInfo>();
@@ -375,7 +377,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateIndex(CatalogTransaction transa
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
-		throw BinderException("Cannot CREATE VIEW in read-only VGI catalog '%s'", catalog.GetName());
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly).Set(vgi::error_key::kCatalog, catalog.GetName()).Set(vgi::error_key::kOperation, "CREATE VIEW"),
+		                      StringUtil::Format("Cannot CREATE VIEW in read-only VGI catalog '%s'", catalog.GetName()));
 	}
 
 	auto &context = transaction.GetContext();
@@ -435,7 +438,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateType(CatalogTransaction transac
 void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
-		throw BinderException("Cannot alter objects in read-only VGI catalog '%s'", catalog.GetName());
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly).Set(vgi::error_key::kCatalog, catalog.GetName()).Set(vgi::error_key::kOperation, "ALTER"),
+		                      StringUtil::Format("Cannot alter objects in read-only VGI catalog '%s'", catalog.GetName()));
 	}
 
 	auto &context = transaction.GetContext();
@@ -642,8 +646,9 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
-		throw BinderException("Cannot DROP %s in read-only VGI catalog '%s'",
-		                       EnumUtil::ToString(info.type), catalog.GetName());
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly).Set(vgi::error_key::kCatalog, catalog.GetName()).Set(vgi::error_key::kOperation, "DROP " + EnumUtil::ToString(info.type)),
+		                      StringUtil::Format("Cannot DROP %s in read-only VGI catalog '%s'",
+		                                         EnumUtil::ToString(info.type), catalog.GetName()));
 	}
 
 	bool ignore_not_found = (info.if_not_found == OnEntryNotFound::RETURN_NULL);

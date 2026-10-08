@@ -15,6 +15,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_global_functions.hpp"
 #include "vgi_scalar_function_impl.hpp"
 #include "vgi_worker_pool.hpp"
@@ -189,7 +190,11 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
 	for (auto &func_info : function_list) {
 		if (func_info.function_type != vgi::VgiFunctionType::Scalar) {
-			throw IOException("VGI worker returned '%s' function_type when 'scalar' was requested (function: %s)",
+			throw IOException(vgi::ErrorInfo(vgi::error_subtype::kProtocolViolation)
+			                      .Function(func_info.name, "SCALAR")
+			                      .Worker(attach_params->worker_path())
+			                      .ExpectedActual("scalar", vgi::VgiFunctionTypeToString(func_info.function_type)),
+			                  "VGI worker returned '%s' function_type when 'scalar' was requested (function: %s)",
 			                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 		}
 		functions_by_name[func_info.name].push_back(std::move(func_info));

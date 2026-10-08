@@ -192,6 +192,60 @@ std::shared_ptr<VgiHttpClientPool> VgiAttachParameters::GetOrInitHttpClientPool(
 // RPC-based Catalog API Helper
 // ============================================================================
 
+// extra_info for a worker that answered a catalog RPC but broke the protocol
+// (missing/empty/mis-shaped response).
+static ErrorInfo CatalogProtocolViolation(const std::string &method_name, const std::string &worker_path) {
+	return std::move(ErrorInfo(error_subtype::kProtocolViolation).Rpc(method_name).Worker(worker_path));
+}
+
+// Rethrow the in-flight exception with the catalog RPC's context (method,
+// catalog, entity) added to its extra_info. Must be called from inside a catch
+// block. Preserves the exception's concrete type and its message byte-for-byte;
+// fields the inner exception already carries win over the ones added here.
+//   - VgiRpcException is rebuilt as VgiRpcException: callers pattern-match on
+//     it (capability fallback, catalog_version probe, vgi_extension.cpp).
+//   - InterruptException passes through untouched.
+//   - Exception types ThrowTypedException cannot rebuild faithfully (HTTP,
+//     INTERNAL, PERMISSION, ...) and non-DuckDB exceptions pass through.
+[[noreturn]] static void RethrowWithCatalogRpcContext(const CatalogRpcContext &ctx, const std::string &method_name) {
+	auto context_info = [&]() {
+		ErrorInfo info;
+		info.Set(error_key::kRpcMethod, method_name);
+		if (ctx.params) {
+			info.Set(error_key::kCatalog, ctx.params->catalog_name());
+		}
+		info.Set(error_key::kEntityKind, ctx.entity_kind);
+		info.Set(error_key::kEntity, ctx.entity_qualifier);
+		return info;
+	};
+	try {
+		throw;
+	} catch (const VgiRpcException &e) {
+		ErrorData err(e);
+		auto info = context_info();
+		info.Merge(err.ExtraInfo());
+		throw VgiRpcException(info, err.RawMessage(), e.GetErrorKind());
+	} catch (const InterruptException &) {
+		throw;
+	} catch (const Exception &e) {
+		ErrorData err(e);
+		switch (err.Type()) {
+		case ExceptionType::IO:
+		case ExceptionType::INVALID_INPUT:
+		case ExceptionType::BINDER:
+		case ExceptionType::CATALOG:
+		case ExceptionType::NOT_IMPLEMENTED: {
+			auto info = context_info();
+			info.Merge(err.ExtraInfo());
+			ThrowTypedException(err.Type(), info, err.RawMessage());
+		}
+		default:
+			throw;
+		}
+	}
+	// Non-DuckDB exceptions propagate out of the try above unchanged.
+}
+
 // Invoke a unary RPC catalog method and return the raw unary response.
 // Delegates to InvokePooledUnaryRpc which handles pool acquire/release, stderr
 // draining (critical — without it, long-running catalogs hang when the worker
@@ -258,7 +312,7 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		// for triage. The full message goes in error_message; consumers that need
 		// the DuckDB ExceptionType can re-parse there.
 		instr.NoteException(typeid(e).name(), e.what());
-		throw;
+		RethrowWithCatalogRpcContext(ctx, method_name);
 	}
 }
 
@@ -271,7 +325,8 @@ static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
 	if (response.batch && response.batch->num_rows() != 0) {
 		auto result_col = response.batch->GetColumnByName("result");
 		if (!result_col) {
-			throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
+			throw IOException(CatalogProtocolViolation(method_name, worker_path).Set(error_key::kField, "result"),
+			                  "Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
 		}
 		// The outer envelope column must be Binary (not Utf8 or any other type).
 		// Use type-id comparison instead of dynamic_pointer_cast<BinaryArray>:
@@ -280,6 +335,9 @@ static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
 		// DeserializeFromIpcBytes — an invariant we must enforce here.
 		if (result_col->type()->id() != arrow::Type::BINARY) {
 			throw IOException(
+			    CatalogProtocolViolation(method_name, worker_path)
+			        .Set(error_key::kField, "result")
+			        .ExpectedActual("binary", result_col->type()->ToString()),
 			    "Response 'result' column from %s has type %s, expected Binary [worker: %s]. "
 			    "The vgi-rpc unary envelope must wrap the inner IPC payload in a Binary column.",
 			    method_name, result_col->type()->ToString(), worker_path);
@@ -292,9 +350,10 @@ static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
 				result = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
 			} catch (const std::exception &e) {
 				throw IOException(
+				    CatalogProtocolViolation(method_name, worker_path).Merge(ExtraInfoOf(e)),
 				    "Failed to deserialize IPC response for %s from worker [worker: %s]: %s. "
 				    "The worker likely returned a malformed or out-of-date response shape for this method.",
-				    method_name, worker_path, e.what());
+				    method_name, worker_path, RawMessageOf(e));
 			}
 		}
 	}
@@ -505,7 +564,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	auto response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_attach", worker_path);
 	if (!result_batch) {
-		throw IOException("Empty response from catalog_attach [worker: %s]", worker_path);
+		throw IOException(CatalogProtocolViolation("catalog_attach", worker_path), "Empty response from catalog_attach [worker: %s]", worker_path);
 	}
 	return ParseCatalogAttachResult(result_batch, worker_path, context);
 }
@@ -538,7 +597,8 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> ContentsItems(const VgiSchemaCo
 	auto &worker_path = contents.worker_path;
 	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(contents.rows->GetFieldByName(column));
 	if (!list_array || list_array->value_type()->id() != arrow::Type::BINARY) {
-		throw IOException("catalog_contents: SchemaContents field '%s' is missing or not list<binary> [worker: %s]",
+		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, column),
+		                  "catalog_contents: SchemaContents field '%s' is missing or not list<binary> [worker: %s]",
 		                  column, worker_path);
 	}
 	std::vector<std::shared_ptr<arrow::RecordBatch>> items;
@@ -593,7 +653,7 @@ VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientCon
 	// The registry validates the whole typed response, nested struct included.
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_contents", worker_path);
 	if (!result_batch || result_batch->num_rows() == 0) {
-		throw IOException("Empty response from catalog_contents [worker: %s]", worker_path);
+		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path), "Empty response from catalog_contents [worker: %s]", worker_path);
 	}
 
 	VgiCatalogContents result;
@@ -609,7 +669,8 @@ VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientCon
 	if (result.not_modified) {
 		// Only meaningful as the answer to a matching if_none_match.
 		if (!if_none_match || result.etag != if_none_match) {
-			throw IOException("catalog_contents answered not_modified without a matching if_none_match [worker: %s]",
+			throw IOException(CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, "not_modified"),
+			                  "catalog_contents answered not_modified without a matching if_none_match [worker: %s]",
 			                  worker_path);
 		}
 		return result;
@@ -642,16 +703,25 @@ VgiSchemaInfo DecodeContentsSchemaInfo(const VgiSchemaContents &contents) {
 	auto &worker_path = contents.worker_path;
 	auto schema_col = std::dynamic_pointer_cast<arrow::BinaryArray>(contents.rows->GetFieldByName("schema"));
 	if (!schema_col || schema_col->IsNull(contents.row)) {
-		throw IOException("catalog_contents: schema '%s' has no SchemaInfo [worker: %s]", contents.name, worker_path);
+		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path)
+		                      .Set(error_key::kField, "schema")
+		                      .Set(error_key::kEntityKind, "schema")
+		                      .Set(error_key::kEntity, contents.name),
+		                  "catalog_contents: schema '%s' has no SchemaInfo [worker: %s]", contents.name, worker_path);
 	}
 	auto batch = DeserializeFromIpcBytesZeroCopy(*schema_col, contents.row);
 	ValidateItemSchema(batch, "catalog_schemas", worker_path, static_cast<size_t>(contents.row));
 	auto info = ParseSchemaInfo(batch, worker_path);
 	if (info.path != contents.path) {
-		throw IOException("catalog_contents: SchemaContents.path [%s] differs from its SchemaInfo.path [%s] "
+		auto contents_path =
+		    StringUtil::Join(duckdb::vector<std::string>(contents.path.begin(), contents.path.end()), ".");
+		auto info_path = StringUtil::Join(duckdb::vector<std::string>(info.path.begin(), info.path.end()), ".");
+		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path)
+		                      .Set(error_key::kField, "path")
+		                      .ExpectedActual(contents_path, info_path),
+		                  "catalog_contents: SchemaContents.path [%s] differs from its SchemaInfo.path [%s] "
 		                  "[worker: %s]",
-		                  StringUtil::Join(duckdb::vector<std::string>(contents.path.begin(), contents.path.end()), "."),
-		                  StringUtil::Join(duckdb::vector<std::string>(info.path.begin(), info.path.end()), "."), worker_path);
+		                  contents_path, info_path, worker_path);
 	}
 	return info;
 }
@@ -876,7 +946,7 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
 	auto response = InvokeRpcMethod(ctx, "catalog_table_scan_function_get", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_function_get", worker_path);
 	if (!result_batch || result_batch->num_rows() == 0) {
-		throw IOException("Empty response from catalog_table_scan_function_get [worker: %s]", worker_path);
+		throw IOException(CatalogProtocolViolation("catalog_table_scan_function_get", worker_path), "Empty response from catalog_table_scan_function_get [worker: %s]", worker_path);
 	}
 	return ParseScanFunctionResult(context, result_batch, worker_path);
 }
@@ -927,7 +997,7 @@ VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
 		auto response = InvokeRpcMethod(ctx, "catalog_table_scan_branches_get", params, context);
 		auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_branches_get", worker_path);
 		if (!result_batch || result_batch->num_rows() == 0) {
-			throw IOException("Empty response from catalog_table_scan_branches_get [worker: %s]", worker_path);
+			throw IOException(CatalogProtocolViolation("catalog_table_scan_branches_get", worker_path), "Empty response from catalog_table_scan_branches_get [worker: %s]", worker_path);
 		}
 		auto parsed = ParseScanBranchesResult(context, result_batch, worker_path);
 		// Probe succeeded — pin the cache so future calls skip the legacy
@@ -977,7 +1047,7 @@ static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
 	auto response = InvokeRpcMethod(ctx, rpc_method, params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, rpc_method, worker_path);
 	if (!result_batch || result_batch->num_rows() == 0) {
-		throw IOException("Empty response from %s [worker: %s]", rpc_method, worker_path);
+		throw IOException(CatalogProtocolViolation(rpc_method, worker_path), "Empty response from %s [worker: %s]", rpc_method, worker_path);
 	}
 	return ParseScanFunctionResult(context, result_batch, worker_path);
 }
@@ -1020,10 +1090,22 @@ int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &contex
 		}
 		RecordBatchSingleRow row(result_batch, 0, "CatalogVersionResponse", worker_path);
 		return row["version"].value_not_null<int64_t>();
-	} catch (...) {
-		// RPC failure (e.g., older worker that doesn't implement catalog_version).
-		// Return 0 to signal unknown version — caller will clear cache as a safe fallback.
-		return 0;
+	} catch (const VgiRpcException &e) {
+		// Only a worker that does not implement catalog_version maps to 0
+		// ("unknown version": the caller clears its cache as a safe fallback).
+		// This used to be catch (...), which also swallowed interrupts, auth
+		// failures, transport errors and worker crashes, turning each into a
+		// silent cache clear. The narrowing is safe because the probe uses the
+		// same rule as the catalog_table_scan_branches_get fallback and the
+		// COPY-format discovery in vgi_extension.cpp: match the typed
+		// error_kind=method_not_implemented marker only. A worker too old to
+		// send that marker also fails the exact major.minor protocol_version
+		// check at dispatch, so it cannot get this far anyway. Every other
+		// failure now reaches the user.
+		if (e.GetErrorKind() == error_kind::kMethodNotImplemented) {
+			return 0;
+		}
+		throw;
 	}
 }
 
@@ -1325,7 +1407,8 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 			if (!list->IsNull(0)) {
 				auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
 				if (!values) {
-					throw IOException("VGI worker '%s' returned a plan whose 'splits' entries are not binary",
+					throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
+					                  "VGI worker '%s' returned a plan whose 'splits' entries are not binary",
 					                  worker_path);
 				}
 				const auto start = list->value_offset(0);
@@ -1346,12 +1429,14 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 					// milliseconds of dead time before the first reader started.
 					auto split_batch = DeserializeFromIpcBytesZeroCopy(*values, i);
 					if (!split_batch || split_batch->num_rows() == 0) {
-						throw IOException("VGI worker '%s' returned an unparseable ScanSplit", worker_path);
+						throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
+						                  "VGI worker '%s' returned an unparseable ScanSplit", worker_path);
 					}
 					auto token_col = split_batch->GetColumnByName("token");
 					auto token_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(token_col);
 					if (!token_arr || token_arr->IsNull(0)) {
 						throw IOException(
+						    CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "token"),
 						    "VGI worker '%s' returned a ScanSplit with no token; the framework stamps this, "
 						    "so an absent token means the worker bypassed it.",
 						    worker_path);
@@ -1490,6 +1575,12 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 		}
 		if (pages >= max_pages) {
 			throw IOException(
+			    ErrorInfo(error_subtype::kLimitExceeded)
+			        .Rpc("table_function_plan")
+			        .Function(function_name, "TABLE")
+			        .Worker(worker_path)
+			        .Set(error_key::kLimit, static_cast<int64_t>(max_pages))
+			        .Set(error_key::kSetting, "vgi_split_plan_max_pages"),
 			    "VGI worker '%s' function '%s' exceeded the scan-planning page cap (%llu pages) without "
 			    "exhausting its cursor; refusing to scan a partial split enumeration.",
 			    worker_path, function_name, static_cast<unsigned long long>(max_pages));
@@ -1525,7 +1616,12 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 		}
 
 		if (plan.splits.size() > kMaxSplits) {
-			throw IOException("VGI worker '%s' returned more than %llu splits for one scan; refusing to "
+			throw IOException(ErrorInfo(error_subtype::kLimitExceeded)
+			                      .Rpc("table_function_plan")
+			                      .Function(function_name, "TABLE")
+			                      .Worker(worker_path)
+			                      .Set(error_key::kLimit, static_cast<int64_t>(kMaxSplits)),
+			                  "VGI worker '%s' returned more than %llu splits for one scan; refusing to "
 			                  "buffer an unbounded split vector.",
 			                  worker_path, static_cast<unsigned long long>(kMaxSplits));
 		}
@@ -1775,10 +1871,14 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 	}
 	auto result_col = response.batch->GetColumnByName("result");
 	if (!result_col) {
-		throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
+		throw IOException(CatalogProtocolViolation(method_name, worker_path).Set(error_key::kField, "result"),
+		                  "Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
 	}
 	if (result_col->type()->id() != arrow::Type::BINARY) {
 		throw IOException(
+		    CatalogProtocolViolation(method_name, worker_path)
+		        .Set(error_key::kField, "result")
+		        .ExpectedActual("binary", result_col->type()->ToString()),
 		    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
 		    method_name, result_col->type()->ToString(), worker_path);
 	}
@@ -1836,10 +1936,14 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
 	}
 	auto result_col = response.batch->GetColumnByName("result");
 	if (!result_col) {
-		throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
+		throw IOException(CatalogProtocolViolation(method_name, worker_path).Set(error_key::kField, "result"),
+		                  "Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
 	}
 	if (result_col->type()->id() != arrow::Type::BINARY) {
 		throw IOException(
+		    CatalogProtocolViolation(method_name, worker_path)
+		        .Set(error_key::kField, "result")
+		        .ExpectedActual("binary", result_col->type()->ToString()),
 		    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
 		    method_name, result_col->type()->ToString(), worker_path);
 	}
@@ -1903,7 +2007,12 @@ template <typename T>
 static T RequireKnownEnum(std::optional<T> parsed, const std::string &raw, const char *field_name,
                           const std::string &worker_path, const std::string &fn_name) {
 	if (!parsed) {
-		throw IOException("VGI worker '%s' returned unknown %s '%s' for function '%s'", worker_path, field_name, raw,
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
+		                      .Worker(worker_path)
+		                      .Function(fn_name)
+		                      .Set(error_key::kField, field_name)
+		                      .Set(error_key::kActual, raw),
+		                  "VGI worker '%s' returned unknown %s '%s' for function '%s'", worker_path, field_name, raw,
 		                  fn_name);
 	}
 	return *parsed;
@@ -2142,7 +2251,7 @@ VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string 
 	// Deserialize the Setting RecordBatch
 	auto batch = DeserializeFromIpcBytes(bytes);
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty Setting batch from worker: %s", worker_path);
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty Setting batch from worker: %s", worker_path);
 	}
 
 	RecordBatchSingleRow row(batch, 0, "Setting", worker_path);
@@ -2194,7 +2303,7 @@ VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes, con
                                           ClientContext &context) {
 	auto batch = DeserializeFromIpcBytes(bytes);
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty AttachOptionSpec batch from worker: %s", worker_path);
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty AttachOptionSpec batch from worker: %s", worker_path);
 	}
 
 	RecordBatchSingleRow row(batch, 0, "AttachOptionSpec", worker_path);
@@ -2250,7 +2359,7 @@ VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::s
 	// Deserialize the SecretTypeSpec RecordBatch
 	auto batch = DeserializeFromIpcBytes(bytes);
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty SecretTypeSpec batch from worker: %s", worker_path);
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty SecretTypeSpec batch from worker: %s", worker_path);
 	}
 
 	RecordBatchSingleRow row(batch, 0, "SecretTypeSpec", worker_path);
@@ -2304,7 +2413,7 @@ VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::s
 static VgiAttachCatalogInfo ParseVgiAttachCatalog(const std::vector<uint8_t> &bytes, const std::string &worker_path) {
 	auto batch = DeserializeFromIpcBytes(bytes);
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty AttachCatalogInfo batch from worker: %s", worker_path);
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty AttachCatalogInfo batch from worker: %s", worker_path);
 	}
 	RecordBatchSingleRow row(batch, 0, "AttachCatalogInfo", worker_path);
 	VgiAttachCatalogInfo info;
@@ -2323,7 +2432,7 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	CatalogAttachResult result;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from catalog_attach");
+		throw IOException(CatalogProtocolViolation("catalog_attach", worker_path), "Empty response from catalog_attach");
 	}
 
 	RecordBatchSingleRow row(batch, 0, "CatalogAttachResult", worker_path);
@@ -2371,7 +2480,7 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	for (const auto &gf_bytes : global_function_bytes) {
 		auto gf_batch = DeserializeFromIpcBytes(gf_bytes);
 		if (!gf_batch || gf_batch->num_rows() == 0) {
-			throw IOException("Empty global-function FunctionInfo batch from worker: %s", worker_path);
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty global-function FunctionInfo batch from worker: %s", worker_path);
 		}
 		result.global_functions.push_back(ParseFunctionInfo(gf_batch, 0, worker_path));
 	}
@@ -2392,7 +2501,7 @@ VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, 
 	VgiSchemaInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from schema_get");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from schema_get");
 	}
 
 	RecordBatchSingleRow row(batch, 0, "SchemaInfo", worker_path);
@@ -2411,7 +2520,7 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 	VgiTableInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from table_get");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from table_get");
 	}
 
 	if (row_idx >= batch->num_rows()) {
@@ -2434,8 +2543,8 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 		auto &field = info.arrow_schema->field(i);
 		if (field->HasMetadata() && field->metadata()->FindKey(VGI_ROW_ID_METADATA_KEY) >= 0) {
 			if (info.row_id_column >= 0) {
-				throw InvalidInputException("Table '%s' has multiple is_row_id columns — at most one is allowed",
-				                            info.name);
+				throw InvalidInputException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kTable, info.name).Set(error_key::kField, "columns"),
+		                            StringUtil::Format("Table '%s' has multiple is_row_id columns — at most one is allowed", info.name));
 			}
 			info.row_id_column = i;
 		}
@@ -2480,31 +2589,37 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 	auto modes_column = row.batch()->GetColumnByName("write_result_modes");
 	auto modes_array = std::dynamic_pointer_cast<arrow::MapArray>(modes_column);
 	if (!modes_array || modes_array->IsNull(row.row_idx())) {
-		throw InvalidInputException("Table '%s' has a null or malformed write_result_modes map", info.name);
+		throw InvalidInputException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kTable, info.name).Set(error_key::kField, "write_result_modes"),
+		                            StringUtil::Format("Table '%s' has a null or malformed write_result_modes map", info.name));
 	}
 	auto mode_keys = std::dynamic_pointer_cast<arrow::StringArray>(modes_array->keys());
 	auto mode_values = std::dynamic_pointer_cast<arrow::StringArray>(modes_array->items());
 	if (!mode_keys || !mode_values) {
-		throw InvalidInputException("Table '%s' has a malformed write_result_modes map", info.name);
+		throw InvalidInputException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kTable, info.name).Set(error_key::kField, "write_result_modes"),
+		                            StringUtil::Format("Table '%s' has a malformed write_result_modes map", info.name));
 	}
 	std::set<std::string> seen_operations;
 	const auto mode_start = modes_array->value_offset(row.row_idx());
 	const auto mode_end = modes_array->value_offset(row.row_idx() + 1);
 	for (auto mode_idx = mode_start; mode_idx < mode_end; mode_idx++) {
 		if (mode_keys->IsNull(mode_idx) || mode_values->IsNull(mode_idx)) {
-			throw InvalidInputException("Table '%s' has a null write_result_modes key or value", info.name);
+			throw InvalidInputException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kTable, info.name).Set(error_key::kField, "write_result_modes"),
+		                            StringUtil::Format("Table '%s' has a null write_result_modes key or value", info.name));
 		}
 		auto operation = mode_keys->GetString(mode_idx);
 		auto mode = mode_values->GetString(mode_idx);
 		if (!seen_operations.insert(operation).second) {
-			throw InvalidInputException("Table '%s' declares duplicate write operation '%s'", info.name, operation);
+			throw InvalidInputException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kTable, info.name).Set(error_key::kField, "write_result_modes").Set(error_key::kOperation, operation),
+		                            StringUtil::Format("Table '%s' declares duplicate write operation '%s'", info.name, operation));
 		}
 		if (operation != "insert" && operation != "update" && operation != "delete") {
-			throw InvalidInputException("Table '%s' declares unknown write operation '%s'", info.name, operation);
+			throw InvalidInputException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kTable, info.name).Set(error_key::kField, "write_result_modes").Set(error_key::kOperation, operation),
+		                            StringUtil::Format("Table '%s' declares unknown write operation '%s'", info.name, operation));
 		}
 		if (mode != "count" && mode != "rows" && mode != "changes") {
-			throw InvalidInputException("Table '%s' declares unknown write result mode '%s' for %s", info.name, mode,
-			                            operation);
+			throw InvalidInputException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kTable, info.name).Set(error_key::kField, "write_result_modes").Set(error_key::kOperation, operation),
+		                            StringUtil::Format("Table '%s' declares unknown write result mode '%s' for %s", info.name, mode,
+			                            operation));
 		}
 		info.write_result_modes.emplace(std::move(operation), std::move(mode));
 	}
@@ -2571,9 +2686,13 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 	if ((info.write_result_modes.count("update") || info.write_result_modes.count("delete")) &&
 	    info.row_id_column < 0) {
 		throw InvalidInputException(
-		    "Table '%s' declares update/delete support but has no row ID column "
-		    "(mark a column with is_row_id metadata)",
-		    info.name);
+		    ErrorInfo(error_subtype::kProtocolViolation)
+		        .Worker(worker_path)
+		        .Set(error_key::kTable, info.name)
+		        .Set(error_key::kField, "write_result_modes"),
+		    StringUtil::Format("Table '%s' declares update/delete support but has no row ID column "
+		                       "(mark a column with is_row_id metadata)",
+		                       info.name));
 	}
 
 	return info;
@@ -2609,7 +2728,7 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 	VgiViewInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from view_get");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from view_get");
 	}
 
 	RecordBatchSingleRow row(batch, 0, "ViewInfo", worker_path);
@@ -2629,7 +2748,7 @@ VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const std::shared_ptr<arrow::Recor
 	VgiCopyFromFormatInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from catalog_copy_from_formats [worker: %s]", worker_path);
+		throw IOException(CatalogProtocolViolation("catalog_copy_from_formats", worker_path), "Empty response from catalog_copy_from_formats [worker: %s]", worker_path);
 	}
 
 	RecordBatchSingleRow row(batch, 0, "CopyFromFormatInfo", worker_path);
@@ -2657,7 +2776,7 @@ VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 	VgiMacroInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from macro_get");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from macro_get");
 	}
 
 	RecordBatchSingleRow row(batch, 0, "MacroInfo", worker_path);
@@ -2746,7 +2865,7 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std:
 	VgiScanFunctionResult result;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from table_scan_function_get");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from table_scan_function_get");
 	}
 
 	RecordBatchSingleRow row(batch, 0, "ScanFunctionResult", worker_path);
@@ -2782,7 +2901,8 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 	VgiScanBranchesResult result;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from table_scan_branches_get [worker: " + worker_path + "]");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path),
+		                  "Empty response from table_scan_branches_get [worker: " + worker_path + "]");
 	}
 
 	RecordBatchSingleRow row(batch, 0, "ScanBranchesResult", worker_path);
@@ -2798,7 +2918,8 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 	if (branch_blobs.empty()) {
 		// Loud-fail at parse time — workers must return at least one branch.
 		// Catches "worker bug returned empty" before silent zero-row queries.
-		throw BinderException("VGI table returned zero scan branches [worker: " + worker_path + "]");
+		throw BinderException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kField, "branches"),
+		                      "VGI table returned zero scan branches [worker: " + worker_path + "]");
 	}
 
 	result.branches.reserve(branch_blobs.size());
@@ -2806,7 +2927,8 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 	for (size_t i = 0; i < branch_blobs.size(); i++) {
 		auto branch_batch = DeserializeFromIpcBytes(branch_blobs[i]);
 		if (!branch_batch || branch_batch->num_rows() == 0) {
-			throw IOException("ScanBranch #" + std::to_string(i) + " is empty [worker: " + worker_path + "]");
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kBranchIndex, static_cast<int64_t>(i)),
+			                  "ScanBranch #" + std::to_string(i) + " is empty [worker: " + worker_path + "]");
 		}
 		RecordBatchSingleRow branch_row(branch_batch, 0, "ScanBranch", worker_path);
 
@@ -2820,22 +2942,35 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 		auto filter_opt = branch_row["branch_filter"].value_or(std::string{});
 		branch.branch_filter = filter_opt;
 		if (!branch.branch_filter.empty()) {
+			// Parse inside the try, validate outside it: the empty-result check
+			// below throws its own BinderException, which must not be re-wrapped
+			// as a "parse error".
+			duckdb::vector<duckdb::unique_ptr<ParsedExpression>> exprs;
 			try {
-				auto exprs = Parser::ParseExpressionList(branch.branch_filter);
-				if (exprs.empty()) {
-					throw BinderException("VGI branch_filter parsed to no expressions [worker: " + worker_path +
-					                       ", filter: " + branch.branch_filter + "]");
-				}
-				// If the worker supplied multiple comma-separated expressions,
-				// AND them together. (Single expression is the typical case.)
-				branch.parsed_branch_filter = std::move(exprs[0]);
-				// Multi-expression case: leave as a single expression by AND-ing.
-				// Skipped here for simplicity — typical worker emits one
-				// predicate; multi-AND can be added if it shows up in practice.
+				exprs = Parser::ParseExpressionList(branch.branch_filter);
 			} catch (const std::exception &e) {
-				throw BinderException("VGI branch_filter parse error [worker: " + worker_path +
-				                       ", filter: " + branch.branch_filter + "]: " + e.what());
+				throw BinderException(ErrorInfo(error_subtype::kProtocolViolation)
+				                          .Worker(worker_path)
+				                          .Set(error_key::kBranchIndex, static_cast<int64_t>(i))
+				                          .Set(error_key::kField, "branch_filter")
+				                          .Merge(ExtraInfoOf(e)),
+				                      "VGI branch_filter parse error [worker: " + worker_path +
+				                          ", filter: " + branch.branch_filter + "]: " + RawMessageOf(e));
 			}
+			if (exprs.empty()) {
+				throw BinderException(ErrorInfo(error_subtype::kProtocolViolation)
+				                          .Worker(worker_path)
+				                          .Set(error_key::kBranchIndex, static_cast<int64_t>(i))
+				                          .Set(error_key::kField, "branch_filter"),
+				                      "VGI branch_filter parsed to no expressions [worker: " + worker_path +
+				                          ", filter: " + branch.branch_filter + "]");
+			}
+			// If the worker supplied multiple comma-separated expressions,
+			// AND them together. (Single expression is the typical case.)
+			branch.parsed_branch_filter = std::move(exprs[0]);
+			// Multi-expression case: leave as a single expression by AND-ing.
+			// Skipped here for simplicity — typical worker emits one
+			// predicate; multi-AND can be added if it shows up in practice.
 		}
 
 		// writable flag is non-nullable on the wire — surface a loud error
@@ -2886,9 +3021,10 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 				DecodeScanArguments(context, opts_bytes, unused_positional, branch.format_options);
 				if (!unused_positional.empty()) {
 					throw BinderException(
-					    "VGI scan branch %d supplied POSITIONAL format_options; reader options are "
-					    "named arguments and must be keyed by name [worker: %s]",
-					    static_cast<int>(result.branches.size()), worker_path);
+					    ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kBranchIndex, static_cast<int64_t>(i)).Set(error_key::kField, "format_options"),
+					    StringUtil::Format("VGI scan branch %d supplied POSITIONAL format_options; reader options are "
+					                       "named arguments and must be keyed by name [worker: %s]",
+					                       static_cast<int>(result.branches.size()), worker_path));
 				}
 			}
 		}
@@ -2903,21 +3039,24 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 			                  static_cast<int>(!branch.format_name.empty());
 			if (kinds == 0) {
 				throw BinderException(
-				    "VGI scan branch %d declares none of function_name / source_table / format_name; "
-				    "a branch must name exactly one source [worker: %s]",
-				    static_cast<int>(result.branches.size()), worker_path);
+				    ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kBranchIndex, static_cast<int64_t>(i)),
+				    StringUtil::Format("VGI scan branch %d declares none of function_name / source_table / format_name; "
+				                       "a branch must name exactly one source [worker: %s]",
+				                       static_cast<int>(result.branches.size()), worker_path));
 			}
 			if (kinds > 1) {
 				throw BinderException(
-				    "VGI scan branch %d declares more than one of function_name / source_table / "
-				    "format_name; these are mutually exclusive branch kinds [worker: %s]",
-				    static_cast<int>(result.branches.size()), worker_path);
+				    ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kBranchIndex, static_cast<int64_t>(i)),
+				    StringUtil::Format("VGI scan branch %d declares more than one of function_name / source_table / "
+				                       "format_name; these are mutually exclusive branch kinds [worker: %s]",
+				                       static_cast<int>(result.branches.size()), worker_path));
 			}
 			if (branch.IsFormatBranch() && branch.format_locations.empty()) {
 				throw BinderException(
-				    "VGI scan branch %d is a format branch ('%s') but names no locations to read "
-				    "[worker: %s]",
-				    static_cast<int>(result.branches.size()), branch.format_name, worker_path);
+				    ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kBranchIndex, static_cast<int64_t>(i)).Set(error_key::kField, "format_locations"),
+				    StringUtil::Format("VGI scan branch %d is a format branch ('%s') but names no locations to read "
+				                       "[worker: %s]",
+				                       static_cast<int>(result.branches.size()), branch.format_name, worker_path));
 			}
 		}
 
@@ -2938,9 +3077,10 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 			ordinals_csv += std::to_string(writable_ordinals[i]);
 		}
 		throw BinderException(
-		    "VGI multi-branch table declared %d writable branches (ordinals: %s); "
-		    "exactly zero or one is allowed [worker: %s]",
-		    static_cast<int>(writable_ordinals.size()), ordinals_csv, worker_path);
+		    ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kField, "writable"),
+		    StringUtil::Format("VGI multi-branch table declared %d writable branches (ordinals: %s); "
+		                       "exactly zero or one is allowed [worker: %s]",
+		                       static_cast<int>(writable_ordinals.size()), ordinals_csv, worker_path));
 	}
 
 	return result;
@@ -3151,12 +3291,21 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	return create_info;
 }
 
+// extra_info for a FunctionInfo the worker sent that breaks the protocol.
+static ErrorInfo FunctionInfoViolation(const std::string &worker_path, const std::string &function_name,
+                                       const char *field) {
+	return std::move(ErrorInfo(error_subtype::kProtocolViolation)
+	                     .Worker(worker_path)
+	                     .Function(function_name)
+	                     .Set(error_key::kField, field));
+}
+
 VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
                                   const std::string &worker_path) {
 	VgiFunctionInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty response from function_get");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from function_get");
 	}
 
 	if (row_idx >= batch->num_rows()) {
@@ -3255,7 +3404,7 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		auto list = std::dynamic_pointer_cast<arrow::ListArray>(argument_monotonicity_column);
 		auto values = list ? std::dynamic_pointer_cast<arrow::StringArray>(list->values()) : nullptr;
 		if (!list || !values) {
-			throw IOException("Function '%s' argument_monotonicity has an invalid Arrow type", info.name);
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "argument_monotonicity"), "Function '%s' argument_monotonicity has an invalid Arrow type", info.name);
 		}
 		argument_monotonicity.emplace();
 		const auto start = list->value_offset(row_idx);
@@ -3263,20 +3412,20 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		argument_monotonicity->reserve(static_cast<idx_t>(end - start));
 		for (auto value_idx = start; value_idx < end; value_idx++) {
 			if (values->IsNull(value_idx)) {
-				throw IOException("Function '%s' argument_monotonicity contains a null entry", info.name);
+				throw IOException(FunctionInfoViolation(worker_path, info.name, "argument_monotonicity"), "Function '%s' argument_monotonicity contains a null entry", info.name);
 			}
 			argument_monotonicity->push_back(values->GetString(value_idx));
 		}
 	}
 	if (argument_monotonicity) {
 		if (info.function_type != VgiFunctionType::Scalar) {
-			throw IOException("Function '%s' declares argument_monotonicity but is not scalar", info.name);
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "argument_monotonicity"), "Function '%s' declares argument_monotonicity but is not scalar", info.name);
 		}
 		if (!info.arguments_schema) {
-			throw IOException("Function '%s' has argument_monotonicity without an arguments schema", info.name);
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "argument_monotonicity"), "Function '%s' has argument_monotonicity without an arguments schema", info.name);
 		}
 		if (argument_monotonicity->size() != static_cast<idx_t>(info.arguments_schema->num_fields())) {
-			throw IOException("Function '%s' argument_monotonicity has %llu entries, expected %d", info.name,
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "argument_monotonicity"), "Function '%s' argument_monotonicity has %llu entries, expected %d", info.name,
 			                  argument_monotonicity->size(), info.arguments_schema->num_fields());
 		}
 		std::vector<VgiArgumentMonotonicity> parsed;
@@ -3302,25 +3451,25 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	if (parameter_defaults) {
 		auto defaults_batch = DeserializeFromIpcBytes(parameter_defaults->data(), parameter_defaults->size());
 		if (!defaults_batch || defaults_batch->num_rows() != 1) {
-			throw IOException("Function '%s' parameter_default_values must contain exactly one row", info.name);
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' parameter_default_values must contain exactly one row", info.name);
 		}
 		if (!info.arguments_schema) {
-			throw IOException("Function '%s' has parameter_default_values without an arguments schema", info.name);
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' has parameter_default_values without an arguments schema", info.name);
 		}
 
 		int previous_argument_index = -1;
 		for (const auto &default_field : defaults_batch->schema()->fields()) {
 			const auto argument_index = info.arguments_schema->GetFieldIndex(default_field->name());
 			if (argument_index < 0) {
-				throw IOException("Function '%s' has a default for unknown parameter '%s'", info.name,
+				throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' has a default for unknown parameter '%s'", info.name,
 				                  default_field->name());
 			}
 			if (argument_index <= previous_argument_index) {
-				throw IOException("Function '%s' parameter defaults are not in signature order", info.name);
+				throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' parameter defaults are not in signature order", info.name);
 			}
 			const auto &argument_field = info.arguments_schema->field(argument_index);
 			if (!argument_field->type()->Equals(default_field->type())) {
-				throw IOException("Function '%s' default for parameter '%s' has type %s, expected %s", info.name,
+				throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' default for parameter '%s' has type %s, expected %s", info.name,
 				                  default_field->name(), default_field->type()->ToString(),
 				                  argument_field->type()->ToString());
 			}
@@ -3341,13 +3490,13 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 				}
 			}
 			if (default_count > fixed_parameter_count) {
-				throw IOException("Function '%s' has more defaults than parameters", info.name);
+				throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' has more defaults than parameters", info.name);
 			}
 			for (int default_index = 0; default_index < default_count; default_index++) {
 				const auto expected_parameter = fixed_parameter_count - default_count + default_index;
 				if (defaults_batch->schema()->field(default_index)->name() !=
 				    info.arguments_schema->field(expected_parameter)->name()) {
-					throw IOException("Function '%s' defaults must form a trailing parameter sequence", info.name);
+					throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' defaults must form a trailing parameter sequence", info.name);
 				}
 			}
 		}
@@ -3370,17 +3519,17 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		}
 		auto values = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
 		if (!values) {
-			throw IOException("Function '%s' additional_filter_functions must contain structs", info.name);
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "additional_filter_functions"), "Function '%s' additional_filter_functions must contain structs", info.name);
 		}
 		auto namespaces = std::dynamic_pointer_cast<arrow::StringArray>(values->GetFieldByName("namespace"));
 		auto names = std::dynamic_pointer_cast<arrow::StringArray>(values->GetFieldByName("name"));
 		auto versions = std::dynamic_pointer_cast<arrow::UInt64Array>(values->GetFieldByName("version"));
 		if (!namespaces || !names || !versions) {
-			throw IOException("Function '%s' additional_filter_functions has an invalid struct schema", info.name);
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "additional_filter_functions"), "Function '%s' additional_filter_functions has an invalid struct schema", info.name);
 		}
 		for (auto i = list_array->value_offset(row_idx); i < list_array->value_offset(row_idx + 1); i++) {
 			if (values->IsNull(i) || namespaces->IsNull(i) || names->IsNull(i) || versions->IsNull(i)) {
-				throw IOException("Function '%s' additional_filter_functions contains NULL", info.name);
+				throw IOException(FunctionInfoViolation(worker_path, info.name, "additional_filter_functions"), "Function '%s' additional_filter_functions contains NULL", info.name);
 			}
 			info.additional_filter_functions.push_back(
 			    {namespaces->GetString(i), names->GetString(i), versions->Value(i)});
@@ -3392,7 +3541,7 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		} else if (auto list_array = std::dynamic_pointer_cast<arrow::LargeListArray>(additional_functions)) {
 			extract_filter_functions(list_array);
 		} else {
-			throw IOException("Function '%s' additional_filter_functions must be a list", info.name);
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "additional_filter_functions"), "Function '%s' additional_filter_functions must be a list", info.name);
 		}
 	}
 

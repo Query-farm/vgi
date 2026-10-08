@@ -11,6 +11,7 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_types.hpp"
@@ -199,7 +200,11 @@ static void ValidateReturningSchema(const std::shared_ptr<arrow::Schema> &expect
 		                        op_name, table_name);
 	}
 	auto fail = [&](const string &reason) {
-		throw IOException("VGI worker emitted an incompatible RETURNING batch for %s on table '%s': %s. "
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
+		                      .Set(error_key::kTable, table_name)
+		                      .Set(error_key::kOperation, op_name)
+		                      .ExpectedActual(expected->ToString(), actual ? actual->ToString() : "<null>"),
+		                  "VGI worker emitted an incompatible RETURNING batch for %s on table '%s': %s. "
 		                  "Expected schema: %s. Actual schema: %s. "
 		                  "The worker must advertise at least result mode 'rows' for this operation.",
 		                  op_name, table_name, reason, expected->ToString(), actual ? actual->ToString() : "<null>");
@@ -232,17 +237,22 @@ static idx_t ReadCountFromBatch(const std::shared_ptr<arrow::RecordBatch> &batch
 	if (!schema || schema->num_fields() != 1 || schema->field(0)->name() != "count" ||
 	    schema->field(0)->type()->id() != arrow::Type::INT64 || schema->field(0)->nullable()) {
 		throw IOException(
+		    ErrorInfo(error_subtype::kProtocolViolation)
+		        .Set(error_key::kField, "count")
+		        .ExpectedActual("count: int64 not null", schema ? schema->ToString() : "<null>"),
 		    "VGI worker emitted an incompatible count result: expected exactly 'count: int64 not null', got %s",
 		    schema ? schema->ToString() : "<null>");
 	}
 	auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(batch->column(0));
 	if (!int_array) {
-		throw IOException("VGI worker emitted an incompatible count result array");
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kField, "count"),
+		                  "VGI worker emitted an incompatible count result array");
 	}
 	idx_t total = 0;
 	for (int64_t i = 0; i < int_array->length(); i++) {
 		if (int_array->IsNull(i)) {
-			throw IOException("VGI worker emitted a null count result");
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kField, "count"),
+			                  "VGI worker emitted a null count result");
 		}
 		total += NumericCast<idx_t>(int_array->Value(i));
 	}
@@ -397,10 +407,13 @@ static std::optional<std::string> RefuseInsertIfMultiBranchUnwritable(ClientCont
 		}
 	}
 	throw BinderException(
-	    "Multi-branch VGI table '%s.%s' is read-only — no branch declared writable=true. "
-	    "INSERT is not supported. (Set writable=true on exactly one branch in the worker's "
-	    "ScanBranchesResult to enable INSERT routing to that arm.)",
-	    table_entry.ParentSchema().name, table_entry.name);
+	    ErrorInfo(error_subtype::kUnsupported)
+	        .Set(error_key::kTable, table_entry.ParentSchema().name + "." + table_entry.name)
+	        .Set(error_key::kOperation, "INSERT"),
+	    StringUtil::Format("Multi-branch VGI table '%s.%s' is read-only — no branch declared writable=true. "
+	                       "INSERT is not supported. (Set writable=true on exactly one branch in the worker's "
+	                       "ScanBranchesResult to enable INSERT routing to that arm.)",
+	                       table_entry.ParentSchema().name, table_entry.name));
 }
 
 // UPDATE/DELETE/MERGE always refuse on multi-branch tables, regardless of
@@ -419,14 +432,17 @@ static void RefuseUpdateDeleteIfMultiBranch(ClientContext &context, VgiTableEntr
 		return; // single-branch path, unchanged (hint now populated)
 	}
 	throw BinderException(
-	    "%s is not supported on multi-branch VGI table '%s.%s' (%d branches). "
-	    "Issue the %s directly against the writable arm's underlying VGI table "
-	    "(declare it as a single-branch VGI table for write access). "
-	    "(UPDATE/DELETE/MERGE on multi-branch tables is not supported pending "
-	    "concrete customer requirements for cross-arm semantics — see "
-	    "docs/multi_branch.md.)",
-	    operation, table_entry.ParentSchema().name, table_entry.name,
-	    static_cast<int>(branches_result.branches.size()), operation);
+	    ErrorInfo(error_subtype::kUnsupported)
+	        .Set(error_key::kTable, table_entry.ParentSchema().name + "." + table_entry.name)
+	        .Set(error_key::kOperation, operation),
+	    StringUtil::Format("%s is not supported on multi-branch VGI table '%s.%s' (%d branches). "
+	                       "Issue the %s directly against the writable arm's underlying VGI table "
+	                       "(declare it as a single-branch VGI table for write access). "
+	                       "(UPDATE/DELETE/MERGE on multi-branch tables is not supported pending "
+	                       "concrete customer requirements for cross-arm semantics — see "
+	                       "docs/multi_branch.md.)",
+	                       operation, table_entry.ParentSchema().name, table_entry.name,
+	                       static_cast<int>(branches_result.branches.size()), operation));
 }
 
 unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext &context) const {

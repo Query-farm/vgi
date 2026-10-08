@@ -15,6 +15,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_multi_scan_rewriter.hpp"
 #include "vgi_table_function_impl.hpp"
@@ -412,10 +413,13 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		    (branches_result.branches.size() > 1 || !branches_result.branches[0].branch_filter.empty() ||
 		     branches_result.branches[0].IsCatalogTable() || branches_result.branches[0].IsFormatBranch())) {
 			throw BinderException(
-			    "AT (...) clauses are not supported on multi-branch VGI tables. "
-			    "Query a specific branch's underlying function directly. "
-			    "[table: %s.%s, branches: %d]",
-			    ParentSchema().name, name, static_cast<int>(branches_result.branches.size()));
+			    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+			        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+			        .Set(vgi::error_key::kOperation, "AT"),
+			    StringUtil::Format("AT (...) clauses are not supported on multi-branch VGI tables. "
+			                       "Query a specific branch's underlying function directly. "
+			                       "[table: %s.%s, branches: %d]",
+			                       ParentSchema().name, name, static_cast<int>(branches_result.branches.size())));
 		}
 
 		// A SINGLE branch still needs the rewriter when it carries anything the
@@ -439,11 +443,15 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			if (!context.TryGetCurrentSetting("vgi_multi_branch_scans", mb_enabled) ||
 			    mb_enabled.IsNull() || !mb_enabled.GetValue<bool>()) {
 				throw BinderException(
-				    "Multi-branch VGI table scan disabled via vgi_multi_branch_scans=false. "
-				    "Re-enable the setting or query a specific branch directly. "
-				    "[table: %s.%s, branches: %d]",
-				    ParentSchema().name, name,
-				    static_cast<int>(branches_result.branches.size()));
+				    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+				        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+				        .Set(vgi::error_key::kOperation, "SCAN")
+				        .Set(vgi::error_key::kSetting, "vgi_multi_branch_scans"),
+				    StringUtil::Format("Multi-branch VGI table scan disabled via vgi_multi_branch_scans=false. "
+				                       "Re-enable the setting or query a specific branch directly. "
+				                       "[table: %s.%s, branches: %d]",
+				                       ParentSchema().name, name,
+				                       static_cast<int>(branches_result.branches.size())));
 			}
 
 			vgi::RequireVgiOptimizerExtensions(
@@ -661,24 +669,37 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			const auto decl_count = decl_columns.LogicalColumnCount();
 			if (decl_count != return_names.size()) {
 				throw BinderException(
-				    "VGI native delegation for '%s.%s.%s' (function '%s'): catalog declares "
-				    "%llu column(s) but the native bind returned %llu. The catalog's columns "
-				    "must match exactly what the native function emits at scan time (positions "
-				    "+ names). Common cause: Hive-partition columns that read_parquet appends "
-				    "but the worker's schema source omitted.",
-				    catalog_.GetName(), ParentSchema().name, name, scan_result.function_name,
-				    static_cast<unsigned long long>(decl_count),
-				    static_cast<unsigned long long>(return_names.size()));
+				    vgi::ErrorInfo(vgi::error_subtype::kSchemaMismatch)
+				        .Set(vgi::error_key::kCatalog, catalog_.GetName())
+				        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+				        .Set(vgi::error_key::kFunctionName, scan_result.function_name)
+				        .Worker(attach_params->worker_path())
+				        .ExpectedActual(std::to_string(decl_count), std::to_string(return_names.size())),
+				    StringUtil::Format("VGI native delegation for '%s.%s.%s' (function '%s'): catalog declares "
+				                       "%llu column(s) but the native bind returned %llu. The catalog's columns "
+				                       "must match exactly what the native function emits at scan time (positions "
+				                       "+ names). Common cause: Hive-partition columns that read_parquet appends "
+				                       "but the worker's schema source omitted.",
+				                       catalog_.GetName(), ParentSchema().name, name, scan_result.function_name,
+				                       static_cast<unsigned long long>(decl_count),
+				                       static_cast<unsigned long long>(return_names.size())));
 			}
 			for (idx_t i = 0; i < decl_count; ++i) {
 				const auto &decl_name = decl_columns.GetColumn(LogicalIndex(i)).Name();
 				if (decl_name != return_names[i]) {
 					throw BinderException(
-					    "VGI native delegation for '%s.%s.%s' (function '%s'): catalog "
-					    "declared column %llu as '%s' but the native bind returned '%s'. "
-					    "Names must match by position.",
-					    catalog_.GetName(), ParentSchema().name, name, scan_result.function_name,
-					    static_cast<unsigned long long>(i), decl_name, return_names[i]);
+					    vgi::ErrorInfo(vgi::error_subtype::kSchemaMismatch)
+					        .Set(vgi::error_key::kCatalog, catalog_.GetName())
+					        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+					        .Set(vgi::error_key::kFunctionName, scan_result.function_name)
+					        .Worker(attach_params->worker_path())
+					        .Set(vgi::error_key::kColumnIndex, static_cast<int64_t>(i))
+					        .ExpectedActual(decl_name, return_names[i]),
+					    StringUtil::Format("VGI native delegation for '%s.%s.%s' (function '%s'): catalog "
+					                       "declared column %llu as '%s' but the native bind returned '%s'. "
+					                       "Names must match by position.",
+					                       catalog_.GetName(), ParentSchema().name, name, scan_result.function_name,
+					                       static_cast<unsigned long long>(i), decl_name, return_names[i]));
 				}
 			}
 		}
@@ -840,13 +861,19 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		}
 		if (names.size() < scannable_count) {
 			throw BinderException(
-			    "VGI worker returned a bind output_schema with %llu column(s) but the catalog "
-			    "advertises %llu for '%s.%s.%s' (function '%s'). The bind output schema must cover "
-			    "every column the table exposes. A mismatch usually means the worker's table listing "
-			    "and its scan bind disagree — e.g. a proxy narrowed one but not the other.",
-			    static_cast<unsigned long long>(names.size()),
-			    static_cast<unsigned long long>(scannable_count),
-			    catalog_.GetName(), ParentSchema().name, name, scan_result.function_name);
+			    vgi::ErrorInfo(vgi::error_subtype::kSchemaMismatch)
+			        .Set(vgi::error_key::kCatalog, catalog_.GetName())
+			        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+			        .Set(vgi::error_key::kFunctionName, scan_result.function_name)
+			        .Worker(attach_params->worker_path())
+			        .ExpectedActual(std::to_string(scannable_count), std::to_string(names.size())),
+			    StringUtil::Format("VGI worker returned a bind output_schema with %llu column(s) but the catalog "
+			                       "advertises %llu for '%s.%s.%s' (function '%s'). The bind output schema must "
+			                       "cover every column the table exposes. A mismatch usually means the worker's table "
+			                       "listing and its scan bind disagree — e.g. a proxy narrowed one but not the other.",
+			                       static_cast<unsigned long long>(names.size()),
+			                       static_cast<unsigned long long>(scannable_count),
+			                       catalog_.GetName(), ParentSchema().name, name, scan_result.function_name));
 		}
 	}
 

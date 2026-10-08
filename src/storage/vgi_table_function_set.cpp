@@ -15,6 +15,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_table_in_out_impl.hpp"
 
@@ -189,9 +190,13 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 				}
 				missing_list += missing_settings[i];
 			}
-			throw BinderException("Function '%s' requires the following settings to be set: %s. "
-			                      "Use SET <setting_name> = <value> before calling this function.",
-			                      bind_data->function_name, missing_list);
+			throw BinderException(
+			    vgi::ErrorInfo(vgi::error_subtype::kMissingSettings)
+			        .Set(vgi::error_key::kFunctionName, bind_data->function_name)
+			        .Set(vgi::error_key::kMissingSettings, missing_list),
+			    StringUtil::Format("Function '%s' requires the following settings to be set: %s. "
+			                       "Use SET <setting_name> = <value> before calling this function.",
+			                       bind_data->function_name, missing_list));
 		}
 	}
 
@@ -301,9 +306,13 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 				}
 				missing_list += missing_settings[i];
 			}
-			throw BinderException("Function '%s' requires the following settings to be set: %s. "
-			                      "Use SET <setting_name> = <value> before calling this function.",
-			                      params.function_name, missing_list);
+			throw BinderException(
+			    vgi::ErrorInfo(vgi::error_subtype::kMissingSettings)
+			        .Set(vgi::error_key::kFunctionName, params.function_name)
+			        .Set(vgi::error_key::kMissingSettings, missing_list),
+			    StringUtil::Format("Function '%s' requires the following settings to be set: %s. "
+			                       "Use SET <setting_name> = <value> before calling this function.",
+			                       params.function_name, missing_list));
 		}
 	}
 
@@ -569,7 +578,11 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 		// PhysicalVgiTableBufferingFunction) but not registration.
 		if (func_info.function_type != vgi::VgiFunctionType::Table &&
 		    func_info.function_type != vgi::VgiFunctionType::TableBuffering) {
-			throw IOException("VGI worker returned '%s' function_type when 'table' was requested (function: %s)",
+			throw IOException(vgi::ErrorInfo(vgi::error_subtype::kProtocolViolation)
+			                      .Function(func_info.name, "TABLE")
+			                      .Worker(attach_params->worker_path())
+			                      .ExpectedActual("table", vgi::VgiFunctionTypeToString(func_info.function_type)),
+			                  "VGI worker returned '%s' function_type when 'table' was requested (function: %s)",
 			                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 		}
 		functions_by_name[func_info.name].push_back(std::move(func_info));

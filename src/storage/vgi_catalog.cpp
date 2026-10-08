@@ -25,6 +25,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_companion_catalogs.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp" // BuildCatalogIdentityScope (per-identity disk flush)
 
@@ -48,11 +49,19 @@ static void RequireWriteResultMode(const VgiTableEntry &table, const string &ope
 	const auto &modes = table.GetTableInfo().write_result_modes;
 	auto entry = modes.find(operation);
 	if (entry == modes.end()) {
-		throw BinderException("Table '%s' does not support %s", table.name, StringUtil::Upper(operation));
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+		                          .Set(vgi::error_key::kTable, table.name)
+		                          .Set(vgi::error_key::kOperation, StringUtil::Upper(operation)),
+		                      StringUtil::Format("Table '%s' does not support %s", table.name,
+		                                         StringUtil::Upper(operation)));
 	}
 	if (WriteResultModeRank(entry->second) < WriteResultModeRank(requested)) {
-		throw BinderException("Table '%s' does not support result mode '%s' for %s (maximum is '%s')", table.name,
-		                      requested, StringUtil::Upper(operation), entry->second);
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+		                          .Set(vgi::error_key::kTable, table.name)
+		                          .Set(vgi::error_key::kOperation, StringUtil::Upper(operation))
+		                          .ExpectedActual(requested, entry->second),
+		                      StringUtil::Format("Table '%s' does not support result mode '%s' for %s (maximum is '%s')",
+		                                         table.name, requested, StringUtil::Upper(operation), entry->second));
 	}
 }
 
@@ -100,7 +109,10 @@ std::string VgiCatalog::GetDefaultSchema() const {
 
 optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	if (access_mode_ == AccessMode::READ_ONLY) {
-		throw BinderException("Cannot CREATE SCHEMA in read-only VGI catalog '%s'", GetName());
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly)
+		                          .Set(vgi::error_key::kCatalog, GetName())
+		                          .Set(vgi::error_key::kOperation, "CREATE SCHEMA"),
+		                      StringUtil::Format("Cannot CREATE SCHEMA in read-only VGI catalog '%s'", GetName()));
 	}
 
 	auto &context = transaction.GetContext();
@@ -264,14 +276,17 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 		    table_for_returning.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
 		if (branches_result.branches.size() > 1) {
 			throw BinderException(
-			    "MERGE is not supported on multi-branch VGI table '%s.%s' (%d branches). "
-			    "Issue the MERGE directly against the writable arm's underlying VGI table "
-			    "(declare it as a single-branch VGI table for write access). "
-			    "(MERGE on multi-branch tables is not supported pending concrete "
-			    "customer requirements for cross-arm semantics — see "
-			    "docs/multi_branch.md.)",
-			    table_for_returning.ParentSchema().name, table_for_returning.name,
-			    static_cast<int>(branches_result.branches.size()));
+			    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+			        .Set(vgi::error_key::kTable, table_for_returning.ParentSchema().name + "." + table_for_returning.name)
+			        .Set(vgi::error_key::kOperation, "MERGE"),
+			    StringUtil::Format("MERGE is not supported on multi-branch VGI table '%s.%s' (%d branches). "
+			                       "Issue the MERGE directly against the writable arm's underlying VGI table "
+			                       "(declare it as a single-branch VGI table for write access). "
+			                       "(MERGE on multi-branch tables is not supported pending concrete "
+			                       "customer requirements for cross-arm semantics — see "
+			                       "docs/multi_branch.md.)",
+			                       table_for_returning.ParentSchema().name, table_for_returning.name,
+			                       static_cast<int>(branches_result.branches.size())));
 		}
 	}
 
@@ -596,7 +611,10 @@ std::optional<bool> VgiCatalog::RevalidateContents(ClientContext &context, const
 
 void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	if (access_mode_ == AccessMode::READ_ONLY) {
-		throw BinderException("Cannot DROP SCHEMA in read-only VGI catalog '%s'", GetName());
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly)
+		                          .Set(vgi::error_key::kCatalog, GetName())
+		                          .Set(vgi::error_key::kOperation, "DROP SCHEMA"),
+		                      StringUtil::Format("Cannot DROP SCHEMA in read-only VGI catalog '%s'", GetName()));
 	}
 
 	bool ignore_not_found = (info.if_not_found == OnEntryNotFound::RETURN_NULL);
