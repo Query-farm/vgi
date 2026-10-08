@@ -287,6 +287,9 @@ template <class RESPONSE>
 static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response);
 template <class RESPONSE>
 static bool HasCapabilityHeaders(const RESPONSE &response);
+template <class RESPONSE>
+[[noreturn]] static void ThrowNotAVgiServer(const RESPONSE &response, int status, const std::string &body,
+                                            const std::string &url);
 
 // Internal: perform a single HTTP POST with optional auth header.
 //
@@ -451,41 +454,43 @@ static std::string HttpPostArrowIpcInternal(
 	// mandatory initial discovery),
 	// and — the reason this runs before the status handling below — a failure
 	// caused by a codec the server can't decode still tells us which codecs it
-	// can. Responses with no VGI capability header at all (a proxy error page,
-	// a non-VGI endpoint) are ignored rather than cached as "server advertises
-	// nothing", which would be indistinguishable from a real answer.
-	ServerCapabilities response_caps;
-	if (HasCapabilityHeaders(*out_response)) {
-		response_caps = ParseCapabilityHeaders(*out_response);
-		if (response_caps.max_response_bytes >= kMinAcceptedMaxResponseBytes) {
-			effective_max_response_bytes =
-			    std::min(effective_max_response_bytes, response_caps.max_response_bytes);
-		}
-		if (harvested_caps) {
-			// Optional capability fields refine the discovery snapshot; omission
-			// does not revoke a previously advertised hard bound. Exact support is
-			// intentionally not inherited because every response must prove it.
-			if (response_caps.max_response_bytes < 0) {
-				response_caps.max_response_bytes = harvested_caps->max_response_bytes;
-			}
-			if (response_caps.max_request_bytes < 0) {
-				response_caps.max_request_bytes = harvested_caps->max_request_bytes;
-			}
-			if (response_caps.max_upload_bytes < 0) {
-				response_caps.max_upload_bytes = harvested_caps->max_upload_bytes;
-			}
-			if (!response_caps.encodings_advertised && harvested_caps->encodings_advertised) {
-				response_caps.encodings_advertised = true;
-				response_caps.supported_encodings = harvested_caps->supported_encodings;
-			}
-			if (response_caps.cache_expires_at == std::chrono::steady_clock::time_point{}) {
-				response_caps.cache_expires_at = harvested_caps->cache_expires_at;
-			}
-			*harvested_caps = response_caps;
-		}
+	// can. A response with no VGI capability header at all (a proxy error page,
+	// a non-VGI endpoint) never came from a VGI server, so it is reported as
+	// that rather than parsed as "server advertises nothing".
+	if (!HasCapabilityHeaders(*out_response)) {
+		ThrowNotAVgiServer(*out_response, static_cast<int>(out_response->Status()), out_response->FallbackBody(),
+		                   url);
 	}
-	if (!response_caps.discovered || !response_caps.accept_max_response_bytes_support) {
-		throw IOException("VGI HTTP response does not advertise %s: true [url: %s]",
+	auto response_caps = ParseCapabilityHeaders(*out_response);
+	if (response_caps.max_response_bytes >= kMinAcceptedMaxResponseBytes) {
+		effective_max_response_bytes =
+		    std::min(effective_max_response_bytes, response_caps.max_response_bytes);
+	}
+	if (harvested_caps) {
+		// Optional capability fields refine the discovery snapshot; omission
+		// does not revoke a previously advertised hard bound. Exact support is
+		// intentionally not inherited because every response must prove it.
+		if (response_caps.max_response_bytes < 0) {
+			response_caps.max_response_bytes = harvested_caps->max_response_bytes;
+		}
+		if (response_caps.max_request_bytes < 0) {
+			response_caps.max_request_bytes = harvested_caps->max_request_bytes;
+		}
+		if (response_caps.max_upload_bytes < 0) {
+			response_caps.max_upload_bytes = harvested_caps->max_upload_bytes;
+		}
+		if (!response_caps.encodings_advertised && harvested_caps->encodings_advertised) {
+			response_caps.encodings_advertised = true;
+			response_caps.supported_encodings = harvested_caps->supported_encodings;
+		}
+		if (response_caps.cache_expires_at == std::chrono::steady_clock::time_point{}) {
+			response_caps.cache_expires_at = harvested_caps->cache_expires_at;
+		}
+		*harvested_caps = response_caps;
+	}
+	if (!response_caps.accept_max_response_bytes_support) {
+		throw IOException("VGI HTTP server does not advertise %s: true; it predates the response size budget "
+		                  "this client requires, so upgrade the worker [url: %s]",
 		                  kAcceptMaxResponseBytesSupportHeader, url);
 	}
 
@@ -861,7 +866,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 		*effective_caps = HttpDiscoverCapabilities(context, base_url, iroh_config);
 	}
 	if (!effective_caps->discovered || !effective_caps->accept_max_response_bytes_support) {
-		throw IOException("VGI HTTP server does not advertise %s: true [url: %s]",
+		throw IOException("VGI HTTP server does not advertise %s: true; it predates the response size budget "
+		                  "this client requires, so upgrade the worker [url: %s]",
 		                  kAcceptMaxResponseBytesSupportHeader, base_url);
 	}
 
@@ -1102,6 +1108,55 @@ static bool HasCapabilityHeaders(const RESPONSE &response) {
 	       response.HasHeader("VGI-Upload-URL-Support") || response.HasHeader("VGI-Max-Upload-Bytes");
 }
 
+// Printable, single-line, bounded preview of a response body for an error
+// message. Bodies here are usually an intermediary's HTML or plain-text page.
+static std::string BodyPreviewForError(const std::string &body) {
+	static constexpr size_t kMaxPreview = 200;
+	std::string out;
+	bool pending_space = false;
+	for (const char c : body) {
+		const auto byte = static_cast<unsigned char>(c);
+		if (byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r') {
+			pending_space = !out.empty();
+			continue;
+		}
+		if (pending_space) {
+			out += ' ';
+			pending_space = false;
+		}
+		out += (byte < 0x20 || byte == 0x7f) ? '?' : c;
+		if (out.size() >= kMaxPreview) {
+			out += "...";
+			break;
+		}
+	}
+	return out;
+}
+
+// A response carrying no VGI capability header did not come from a VGI server:
+// the middleware stamps them on every response, whatever its status. It is a
+// proxy or tunnel error page, a load balancer with no healthy backend, or the
+// wrong URL. Say so, and show what the response was, rather than naming a
+// protocol header the user has never heard of.
+template <class RESPONSE>
+[[noreturn]] static void ThrowNotAVgiServer(const RESPONSE &response, int status, const std::string &body,
+                                            const std::string &url) {
+	std::string detail = "HTTP " + std::to_string(status);
+	if (response.HasHeader("Content-Type")) {
+		const auto content_type = response.GetHeaderValue("Content-Type");
+		if (!content_type.empty()) {
+			detail += ", Content-Type: " + content_type;
+		}
+	}
+	const auto preview = BodyPreviewForError(body);
+	if (!preview.empty()) {
+		detail += ", body: \"" + preview + "\"";
+	}
+	throw IOException("VGI HTTP endpoint did not respond as a VGI server (%s). Check that the worker is running and "
+	                  "reachable at this URL [url: %s]",
+	                  detail, url);
+}
+
 template <class RESPONSE>
 static bool HasSingleResponseBudgetSupport(const RESPONSE &response) {
 	return response.HasHeader(kAcceptMaxResponseBytesSupportHeader) &&
@@ -1212,6 +1267,9 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 		    {{kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes)}}, nullptr, 0,
 		    GetHttpTimeoutSeconds(context), kMaxBufferedRepresentationBytes,
 		    static_cast<size_t>(accepted_max_response_bytes));
+		if (!HasCapabilityHeaders(response)) {
+			ThrowNotAVgiServer(response, static_cast<int>(response.Status()), response.FallbackBody(), url);
+		}
 		if (!response.Success()) {
 			throw IOException("VGI HTTPI capability discovery failed (HTTP %d) [url: %s]",
 			                  static_cast<int>(response.Status()), url);
@@ -1227,6 +1285,9 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 		    iroh_config, &context, "OPTIONS", parsed.path.empty() ? "/" : parsed.path,
 		    {{kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes)}}, nullptr, 0,
 		    static_cast<uint64_t>(accepted_max_response_bytes));
+		if (!HasCapabilityHeaders(response)) {
+			ThrowNotAVgiServer(response, static_cast<int>(response.Status()), response.FallbackBody(), url);
+		}
 		if (!response.Success()) {
 			throw IOException("VGI HTTPI capability discovery failed (HTTP %d) [url: %s]",
 			                  static_cast<int>(response.Status()), url);
@@ -1253,6 +1314,10 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 		throw IOException("VGI HTTP capability discovery returned no response [url: %s]", url);
 	}
 	const auto status = static_cast<int>(response->status);
+	if (!HasCapabilityHeaders(*response)) {
+		// HEAD carries no body; status and Content-Type are all there is to show.
+		ThrowNotAVgiServer(*response, status, std::string(), url);
+	}
 	if (status < 200 || status >= 300) {
 		throw IOException("VGI HTTP capability discovery failed (HTTP %d) [url: %s]", status, url);
 	}

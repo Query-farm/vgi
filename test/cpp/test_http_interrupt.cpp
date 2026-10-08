@@ -220,5 +220,5 @@ TEST_CASE("an unarmed POST still completes while the query is interrupted", "[ht
 	// It waited out the server's reply. The bare 200 is not a VGI response, which
 	// is the error it reports — the point is that it got that far.
 	REQUIRE(elapsed >= 0.9);
-	REQUIRE(error.find("does not advertise") != std::string::npos);
+	REQUIRE(error.find("did not respond as a VGI server") != std::string::npos);
 }
