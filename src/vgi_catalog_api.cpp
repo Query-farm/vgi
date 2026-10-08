@@ -382,30 +382,35 @@ std::shared_ptr<arrow::RecordBatch> InvokeProtocolUnary(const CatalogRpcContext 
 	auto response = InvokeRpcMethod(ctx, method_name, params, context, protocol);
 	const auto &worker_path = ctx.params->worker_path();
 	const std::string protocol_name(protocol.name);
+	auto reflection_violation = [&]() {
+		return ErrorInfo(error_subtype::kProtocolViolation).Rpc(protocol_name + "/" + method_name).Worker(worker_path);
+	};
 	if (!response.batch || response.batch->num_rows() == 0) {
-		throw IOException("Empty response from %s/%s [worker: %s]", protocol_name, method_name, worker_path);
+		throw IOException(reflection_violation(), "Empty response from %s/%s [worker: %s]", protocol_name, method_name,
+		                  worker_path);
 	}
 	// The ordinary unary envelope: a structured return rides as one serialized
 	// IPC batch in a binary `result` column.
 	auto result_col = response.batch->GetColumnByName("result");
 	if (!result_col || result_col->type()->id() != arrow::Type::BINARY) {
-		throw IOException("%s/%s reply carried no binary 'result' column [worker: %s]", protocol_name, method_name,
-		                  worker_path);
+		throw IOException(reflection_violation(), "%s/%s reply carried no binary 'result' column [worker: %s]",
+		                  protocol_name, method_name, worker_path);
 	}
 	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
 	if (binary_array->IsNull(0)) {
-		throw IOException("%s/%s reply carried a NULL 'result' [worker: %s]", protocol_name, method_name,
-		                  worker_path);
+		throw IOException(reflection_violation(), "%s/%s reply carried a NULL 'result' [worker: %s]", protocol_name,
+		                  method_name, worker_path);
 	}
 	std::shared_ptr<arrow::RecordBatch> payload;
 	try {
 		payload = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
 	} catch (const std::exception &e) {
-		throw IOException("Could not decode the %s/%s reply [worker: %s]: %s", protocol_name, method_name,
-		                  worker_path, e.what());
+		throw IOException(reflection_violation().Merge(ExtraInfoOf(e)), "Could not decode the %s/%s reply [worker: %s]: %s",
+		                  protocol_name, method_name, worker_path, RawMessageOf(e));
 	}
 	if (!payload || payload->num_rows() < 1) {
-		throw IOException("%s/%s reply carried no rows [worker: %s]", protocol_name, method_name, worker_path);
+		throw IOException(reflection_violation(), "%s/%s reply carried no rows [worker: %s]", protocol_name, method_name,
+		                  worker_path);
 	}
 	return payload;
 }
