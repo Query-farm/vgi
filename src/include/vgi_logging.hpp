@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
@@ -157,7 +158,8 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid = -1,
                            const std::string &invocation_id_hex = "", const std::string &attach_opaque_data_digest = "",
-                           const std::string &transaction_opaque_data_digest = "", const std::string &conn_id_hex = "");
+                           const std::string &transaction_opaque_data_digest = "", const std::string &conn_id_hex = "",
+                           const std::unordered_map<std::string, std::string> *error_context = nullptr);
 
 //! VGI_STDERR_DEBUG - lightweight stderr debug logging without requiring a ClientContext.
 //! Uses the same VGI_STDERR_LOG env var as VGI_LOG. A millisecond-precision timestamp

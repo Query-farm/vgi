@@ -216,7 +216,8 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex,
                            const std::string &attach_opaque_data_digest, const std::string &transaction_opaque_data_digest,
-                           const std::string &conn_id_hex) {
+                           const std::string &conn_id_hex,
+                           const std::unordered_map<std::string, std::string> *error_context) {
 	if (!batch || batch->num_rows() != 0) {
 		return false;
 	}
@@ -320,7 +321,15 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		// unsafe for stateful aggregate operations and masks the real error.
 		// When `error_kind` is set, throws the typed VgiRpcException subclass
 		// instead so capability-detection callers can pattern-match.
-		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, invocation_id_hex, error_kind, error_code);
+		// The traceback stays in the message for the CLI and is also its own
+		// field, so a caller can show the worker's message without it.
+		vgi::ErrorInfo extra_info(vgi::error_subtype::kWorkerException);
+		extra_info.Set(vgi::error_key::kExceptionType, exception_type).Set(vgi::error_key::kTraceback, traceback);
+		if (error_context) {
+			extra_info.Merge(*error_context);
+		}
+		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, invocation_id_hex, error_kind, error_code,
+		                           extra_info);
 	}
 
 	// For non-exception log levels, log to DuckDB if we have a context

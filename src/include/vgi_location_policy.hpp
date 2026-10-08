@@ -55,6 +55,8 @@ constexpr uint32_t POLICY_ALL_TRANSPORTS = POLICY_LOCAL_TRANSPORTS | POLICY_HTTP
 // same string can dispatch to a different transport at each.
 // VGI_PROTOCOLS (vgi_protocols(location)) resolves exactly as VGI_CATALOGS does.
 enum class LocationEntryPoint { ATTACH, VGI_CATALOGS, VGI_PROTOCOLS };
+// The SQL name of an entry point ("attach", "vgi_catalogs", "vgi_protocols").
+const char *LocationEntryPointName(LocationEntryPoint entry);
 
 // Classify `location` as the transport the dispatch code will ACTUALLY use for
 // it at `entry` on this build. Built from the same predicates, in the same
@@ -72,6 +74,12 @@ uint32_t ParseAllowedTransports(const std::string &value);
 // Canonical rendering: `all`, `none`, or the tokens in declaration order.
 std::string FormatAllowedTransports(uint32_t mask);
 const char *PolicyTransportName(uint32_t bit);
+// The policy transport name for a worker location as dispatch will use it,
+// for error reporting. Unlike ClassifyLocationForPolicy it accepts the
+// internal tokens ATTACH resolves locations into (`vgi-artifact:` is a
+// database:// package, `container-shared:` an oci:// container), so it is
+// safe on any worker_path seen at throw time. Empty for an empty location.
+const char *TransportNameForLocation(const std::string &location);
 
 // Per-database effective allowlist. Owned by the VGI storage extension; the
 // setting is only its input channel, so session shadowing or any path that sets

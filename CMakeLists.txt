@@ -320,6 +320,7 @@ src/vgi_attach_tickets.cpp
 src/vgi_reflection.cpp
 src/vgi_hosted_protocols.cpp
 src/vgi_location_policy.cpp
+src/vgi_location_classify.cpp
 src/vgi_batch_validation.cpp
 src/vgi_table_function_impl.cpp
 src/vgi_table_in_out_impl.cpp
@@ -511,6 +512,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_launcher_cache.cpp
     src/vgi_hosted_protocols.cpp
     src/vgi_transport.cpp
+    src/vgi_location_classify.cpp
     src/vgi_container_runtime.cpp
     src/vgi_subprocess.cpp
     src/vgi_unix_socket_worker.cpp)
