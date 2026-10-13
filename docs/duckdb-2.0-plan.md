@@ -1,14 +1,15 @@
 # VGI migration plan for DuckDB 2.0
 
-**Status:** implementation plan, October 13, 2026. Planning branch:
+**Status:** protocol preparation started on DuckDB 1.5.x, October 13, 2026. Planning branch:
 `codex/duckdb-2.0-plan`, starting at VGI `74015fc3cb0b`.
 
-Build VGI against Haybarn's DuckDB 2.0 branch and prepare **one broad, coordinated
-protocol release** for the catalog and execution capabilities we intend to
-support. Batch the wire changes across VGI implementations, then enable tested
-features through capabilities without another protocol migration. Keep the
-1.5.x release lane available throughout. This is a substantial C++ adapter port;
-the worker protocol already supplies much of the required functionality.
+Prepare **one broad, coordinated protocol release** for the catalog and
+execution capabilities we intend to support in DuckDB 2.0, while continuing to
+build and test the extension on the pinned Haybarn/DuckDB 1.5.x engine. Batch
+the wire changes across VGI implementations, then enable tested features
+through capabilities without another protocol migration. The later 2.0 C++
+adapter port is a separate implementation phase; it is not a prerequisite for
+engine-independent protocol and SDK work.
 
 The October 13 scope decision favors collecting the broader protocol changes
 before release. Schema/table options, nested field alteration, complete view
@@ -16,19 +17,69 @@ metadata, constraints, indexes, macros, triggers, and query execution belong in
 the same contract review. A feature's later engine implementation date is not
 by itself a reason to postpone its wire design to another version.
 
-The first deliverable is a reproducible native build with working ATTACH, catalog
-lookup, scalar execution, and table scans. Full parity, distribution, and new 2.0
-features have separate acceptance gates below. DuckDB's [release calendar](https://duckdb.org/release_calendar)
-currently targets October 21, 2026 for 2.0.0; that tentative date is not a VGI
-delivery commitment.
+The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
+plumbing, shared representations, complete contract inventory, and reference
+behavior. A reproducible 2.0 native build with ATTACH, catalog lookup, scalar
+execution, and table scans follows when the engine port begins. Full parity,
+distribution, and new 2.0 features have separate acceptance gates below; the
+upstream release schedule is not a VGI delivery commitment.
+
+### Active implementation phase: protocol preparation on 1.5.x
+
+- Keep the VGI engine submodule, build configuration, CI tooling, and companion
+  extension dependencies at their current 1.5.x pins. The refreshed Haybarn 2.0
+  checkout remains source evidence and a later port target.
+- Complete P0/P1 using engine-independent reference workers and the 1.5 client
+  for supported behavior. Use pinned 2.0 source/probes when semantics cannot be
+  established on 1.5; record that evidence separately from native qualification.
+- Implement reviewed SDK changes incrementally on development branches. Keep
+  collecting the full successor contract before its single public version
+  transition. Do not advertise a 2.0 capability merely because its wire types
+  are implemented.
+- The first code change forwards the existing `ClientCapabilities` offer from
+  the Python client through `Worker.catalog_attach` to the catalog hook, with
+  matching bundled catalog overrides. The source is the isolated sibling
+  `vgi-python-duckdb2` worktree, branch `codex/duckdb-2.0-protocol`, based on
+  `89e08530fe66`; the first increment is committed as `c345120`. This uses
+  existing 2.1.0 fields and does not change the wire schema. Custom Python
+  catalog overrides must accept the new optional keyword.
+- Test absent/limited offers, attachment isolation, reconnects, ticket
+  redemption, and existing 1.5 catalog behavior. Passing the offer is the first
+  step; successor capability selection and mandatory execution checks remain
+  explicit work before freeze.
+
+**First increment validation, macOS arm64:**
+
+- Python catalog, ticket, call-state, worker-page, generated C++ contract, and
+  hand-built record parity checks: **833 passed**. The final focused capability
+  run also passed all 10 behavioral cases plus its lint check. Ruff lint/format
+  checks passed; mypy passed for all 202 source files.
+- The existing native executable reports `v1.5.6-dev149`, source
+  `105edd31b5`, matching the pinned Haybarn commit. A direct ATTACH and schema
+  discovery probe verified that its complete capability offer reaches the
+  Python catalog hook, including native formats, companion catalogs,
+  `can_stream=false`, and `vgi.filters.v2`.
+- The regular 365-case SQL integration inventory was traversed in two
+  subprocess runs. The wrapper reached its 600-second limit after 268 case
+  entries completed without reported failures; its final skip summary was
+  unavailable. Restarting the interrupted case and the remaining 96 cases
+  passed **90 cases / 2,678 assertions**, with seven optional-fixture skips
+  (bad-protocol, malformed-batch, rules, bearer-token, and dedicated-worker
+  fixtures). This does not qualify those optional lanes. The wrapper's shell
+  status was zero despite its recorded inner `exit=124`; validation used the
+  captured inner status and logs, not the wrapper status alone.
+- Logs: `/tmp/vgi-duckdb2-capabilities-pytest.log`,
+  `/tmp/vgi-duckdb2-capabilities-focused.log`,
+  `/tmp/vgi-duckdb2-capabilities-native.log`, and
+  `/tmp/vgi-duckdb2-capabilities-integration-{first,rest}.log`.
 
 ## Baselines and existing work
 
 | Component | Inspected revision or configuration | Implication |
 | --- | --- | --- |
-| VGI engine submodule | Haybarn `105edd31b57fe7e6d32ee648efad562e45a9f908`, `haybarn-v1.5.5-rc1` | Preserve as the 1.5 comparison lane. |
+| VGI engine submodule | Haybarn `105edd31b57fe7e6d32ee648efad562e45a9f908`, `haybarn-v1.5.5-rc1` | Active build/test target throughout protocol preparation. |
 | Haybarn 2.0 starting point | `next-2.0` at `70c7bf7a06449a6a03e73893ed64db7b44b2d0c2` | Existing port, previously merged through upstream `dee7ed975e641ac18b6311a6835e992505d71734`. |
-| Refreshed Haybarn baseline | `e1784fa4231072d7152b8aaa20977bdb8ff4ace3` on local `next-2.0` | Completed upstream merge; use this exact revision for the first implementation lane. Not yet pushed. |
+| Refreshed Haybarn baseline | `e1784fa4231072d7152b8aaa20977bdb8ff4ace3` on local `next-2.0` | Completed upstream merge; source-audit baseline and later 2.0 build target. Not yet pushed. |
 | Merged upstream revision | `c65ca930b9fe39b2e8d8ed8821018dca650965f4`, October 12 upstream tip | 3,107 incoming commits since Haybarn's previous merge. |
 | Haybarn 2.0 extension tooling | `c583007af3506d8fac93e328c98dc16566cb4428` | Uses reusable `build.yml`; VGI currently calls the older `_extension_distribution.yml`. |
 | VGI protocol | `2.1.0` in [the generated version header](../src/generated/vgi_protocol_version.hpp) | DuckDB's version and VGI's protocol version are independent. An engine upgrade alone does not require a wire version bump. |
@@ -94,14 +145,15 @@ arm64 dependency flags, and no 1.5 Haybarn version define. It was not a configur
 2.0 VGI build, link, or runtime test; the engine qualification above is separate.
 Shared-header failures hide downstream errors. The existing release compilation
 database contains 98 unique VGI source
-units, so a complete compilation inventory remains the first implementation task.
+units, so a complete compilation inventory remains the first native port task.
 These diagnostics establish the first work items; they do not measure the full
 remaining port.
 
 ## Compatibility policy
 
-1. **Start with Haybarn 2.0.** Preserve Haybarn behavior on which VGI depends.
-   Treat stock DuckDB 2.0 as a later, explicitly tested target.
+1. **Prepare on Haybarn 1.5.x; port to Haybarn 2.0 later.** Preserve Haybarn
+   behavior on which VGI depends. Treat stock DuckDB 2.0 as a later, explicitly
+   tested target.
 2. **Keep a working 1.5 lane.** Use separate engine worktrees and build directories.
    Leave the released dependency pins in place until a 2.0 lane can stand alone.
 3. **Share engine-independent code.** Keep RPC, transports, caches, and generated
@@ -133,7 +185,8 @@ inconsistent operations, or removing legacy forms materially improves the
 contract, evaluate one major release instead. Do not lock in redundant legacy
 interfaces merely to preserve a minor version number. A major release would
 also need its matching routing name and a documented deployment transition.
-No protocol version or implementation is changed by this planning update.
+Protocol preparation begins with SDK plumbing using the existing contract;
+the published protocol remains 2.1.0 until the combined successor is ready.
 
 The current version rules are declared in `vgi-python/vgi/protocol.py`:
 new methods/defaulted optional fields are additive; changing existing
@@ -209,12 +262,31 @@ fields with unspecified meanings do not count as coverage.
 | P0 Collect and reconcile | One manifest mapping every audit field and existing proposal to methods, records, capabilities, SDK/generator inventories, and engine work | All areas above have a disposition; shared concepts are reconciled; no independent query/trigger/catalog release plan remains unaccounted for. |
 | P1 Specify and prove | Normative request/response/metadata schemas, defaults, enum semantics, capability rules, transaction/state transitions, errors, and executable examples | Design-required paths have focused reference implementations or feasibility evidence. New operations include readback/lifecycle contracts, not only request fields. Choose additive versus major version from the complete diff. |
 | P2 Freeze and port together | One contract snapshot, schema/hash fixtures, generated code, migration guide, and repository/version matrix | Python, Rust, Go, TypeScript, Java, C#, C++ adapters, and the generated browser client agree on the included shapes. No released implementation is left with a partial schema inventory. |
-| P3 Qualify and release | Cross-SDK conformance, engine/transport tests, matched artifacts, upgrade/rollback instructions, and capability support matrix | Each included capability has positive reference behavior and unsupported-path tests; each advertised implementation passes its semantic tests. Both engine lanes use the same new wire contract within their engine limits. Publish the package as one coordinated version transition. |
+| P3 Qualify and release | Cross-SDK conformance, tests for shipping engine/transport implementations, matched artifacts, upgrade/rollback instructions, and capability support matrix | Each included capability has positive reference behavior and unsupported-path tests; each advertised implementation passes its semantic tests. The protocol package can ship on 1.5.x once these gates pass. A later 2.0 adapter uses the same contract within its qualified capability limits. Publish the package as one coordinated version transition; qualify 2.0 engine artifacts separately under M4. |
 
-P0/P1 run alongside the native M0/M1 port. Local integration work may use a
-changing development contract, but it must not be published repeatedly under a
-stable version. Freeze the public contract once the complete package is ready;
-any later schema change must follow the version rules.
+P0/P1 start on the existing 1.5.x build, independently of the later native M0/M1
+port. Local integration work may use a changing development contract, but it
+must not be published repeatedly under a stable version. Freeze the public
+contract once the complete package is ready; any later schema change must
+follow the version rules. P2 can qualify common schemas/codecs and safe
+unsupported behavior on 1.5 before the 2.0 adapter exists. P3 qualifies the
+protocol and the implementations shipping with it; native 2.0 qualification
+and M4's 2.0 artifacts remain later gates. A successful 1.5 protocol release
+does not establish 2.0 engine support.
+
+### Senior review findings to resolve before freeze
+
+| Finding | Implementation/acceptance work |
+| --- | --- |
+| Capability offers stopped at the worker boundary | Forward the existing offer through Python client/catalog hooks first. Then specify successor capability selection, attachment-bound agreements, discovery/execution access, reconnects, and metadata cache scope. Test clients with different offers against one worker. |
+| Trigger-bearing tables need compatible writers | Require backend execution or worker-enforced rejection when a client cannot honor current trigger requirements. Include 1.5 clients, other SDKs, and a trigger created after another client has prepared a write. Effects execute once or the write rejects before mutation. Discovery-time capability checks alone are insufficient. |
+| Exact-version routing needs an operational transition | Decide during P1 between versioned deployments/endpoints with draining, an explicit coordinated outage, or an implemented version-aware routing layer. The current server cannot register two `vgi.v2` minors under one name. Prove active-transaction, reconnect, and rollback behavior, including catalog objects older clients cannot interpret. |
+| Remote-query typed parameters need a concrete carrier/lifecycle | Reuse an Arrow parameter batch: values in a row, types in its schema, and field metadata for additional logical distinctions. Specify placeholder mapping, metadata preservation/validation across SDKs, preparation versus execution binding, token reuse, typed NULLs, and rebinding. Extend the referenced proposal, whose executor currently accepts only a prepared token. |
+| Shared column paths omit existing required-filter metadata | Include `TableInfo.required_filters` in P0's raw-component path inventory. Preserve its AND-of-OR groups and prefix semantics while distinguishing column `"a.b"` from field `b` inside struct `a`. Decide the migration of existing dotted strings; Filter v2 already has distinct column/field references. |
+
+The broad release remains the intended unit. Resolve these findings within its
+design, with executable evidence for the difficult contracts before P2, rather
+than opening separate feature-specific protocol releases.
 
 All SDKs implement the common wire types and safe unsupported behavior in the
 coordinated release. Individual workers need only implement the capabilities
@@ -297,6 +369,10 @@ DuckDB catalog feature.
 
 ## Implementation milestones
 
+M0–M4 describe the later native engine port and its qualification. They remain
+in the plan but are not the active implementation order during 1.5.x protocol
+preparation. P0/P1 and engine-independent P2 work proceed first.
+
 ### M0 Establish the engine and build lane
 
 **Repositories:** Haybarn, haybarn-extension-ci-tools, VGI; httpfs as required.
@@ -313,9 +389,9 @@ DuckDB catalog feature.
   records every core DDL field and ALTER TABLE variant against the exact pin,
   separating new 2.0 requirements from existing VGI gaps. Use its acceptance
   gates when implementing the selected support scope.
-- Start P0/P1 for the combined protocol package alongside build work. Include
-  existing query/type/trigger proposals and all SDK generator inventories;
-  avoid publishing a catalog-only protocol increment during the port.
+- Carry the P0/P1 protocol decisions and reference evidence into the native
+  build work. Resolve remaining engine-dependent questions against the actual
+  2.0 adapter; avoid publishing a catalog-only protocol increment during the port.
 - Repin or port Haybarn httpfs and test its cancellation hooks. A temporary
   subprocess-only development build is useful, but HTTP is part of parity.
 - Record fixture SDK/RPC revisions, Arrow/vcpkg configuration, compiler, Rust
@@ -483,7 +559,7 @@ new worker APIs or VGI-specific SQL syntax.
 | Transport and cancellation | `make test_all`, `make test_cancel_dispatcher`, `make test_http_interrupt`, Iroh harness | Real HTTP/backend cancellation, disconnects, deadlines, pool reuse, partial batch failure, dedicated Iroh/container/database-worker fixtures. |
 | Writes and federation | `make test_writable`, `make test_companion`, `make test_iceberg` | Transactional rollback, RETURNING, COPY abort cleanup, versioned/multi-branch scans, dependency loading. |
 | SDK compatibility | `make test_languages` | Run for every wire/generator change; qualify ordinary existing workers on both engine lines. |
-| Combined protocol package | P0 manifest, P1 examples, generated inventories and schema/hash fixtures | Cover every included operation across SDK codecs; positive reference behavior, unsupported capabilities, matching/mismatched versions, mutation readback, and both engine adapters. No capability advertisement before semantic qualification. |
+| Combined protocol package | P0 manifest, P1 examples, `make schema_parity`, generated inventories and schema/hash fixtures | Cover every included operation across SDK codecs; positive reference behavior, unsupported capabilities, matching/mismatched versions, mutation readback, and both engine adapters. Release inventory checks must require every expected SDK artifact; skipped/missing generator targets do not count as success. No capability advertisement before semantic qualification. |
 | Browser | `test/support/wasm-worker/browser-e2e/` | SAB, errors, task cancellation, multiple threads, engine usability after failure. |
 | Packaging | Distribution workflow and clean install/load | Matching engine ABI, signed artifacts, wrong-engine rejection, host library dependencies. |
 
@@ -505,17 +581,23 @@ before advertising parity.
 
 ## First implementation changes
 
-1. Build the combined protocol manifest and settle shared representations,
-   semantics, reference tests, and additive-versus-major scope (P0/P1). Bring the
-   existing query execution and trigger/type proposals into this review now.
-2. In parallel, add the pinned VGI 2.0 build lane and complete the compiler
-   inventory (M0), then land catalog/function adaptations for M1 smoke tests.
-3. Freeze the combined contract and port all SDKs/generators and both engine
-   adapters together (P2). Continue filters/execution (M2) and complete schema
-   identity propagation (M3) against that contract.
-4. Qualify reference capabilities and every advertised implementation, then
-   release matched SDK/engine artifacts once (P3/M4). Enable additional tested
-   implementations of frozen capabilities without another protocol migration.
+1. Connect the existing capability offer through Python client/catalog hooks
+   and verify attachment isolation, ticket redemption, reconnects, and 1.5
+   regression coverage. Keep the engine pin and public wire version unchanged.
+2. Build the combined protocol manifest and settle shared representations,
+   semantics, reference tests, and additive-versus-major scope (P0/P1). Include
+   the senior review findings and existing query execution/trigger/type
+   proposals. Implement reviewed SDK groundwork on the 1.5 build throughout.
+3. Freeze the complete successor contract and port all SDKs/generators plus
+   the 1.5 adapter's supported and explicitly unsupported paths (P2). Do not
+   freeze unknown 2.0 semantics merely to finish before the engine port.
+4. When native 2.0 work starts, add the pinned lane/compiler inventory (M0),
+   restore binding/execution (M1/M2), and complete identity propagation (M3)
+   against the prepared contract. Qualify the 2.0 implementation separately.
+5. Qualify reference capabilities and every advertised implementation, then
+   release the combined protocol transition once (P3). Ship qualified engine
+   artifacts through M4; additional engine implementations of frozen
+   capabilities can follow without another protocol migration.
 
 Re-estimate the remaining work after M1, when hidden compilation and link
 failures are visible. The largest correctness risks are predicate or DDL-field
