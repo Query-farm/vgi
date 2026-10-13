@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "name": "adaptive_strings_partial_cache",
+      "family": "scalar_cache",
+      "cache": true,
+      "settings": ["SET vgi_exchange_input_dedup=true", "SET vgi_result_cache_per_value=true"],
+      "setup": [
+        "CREATE TABLE input_data AS SELECT i AS id, CASE WHEN i%11=0 THEN NULL ELSE repeat('x',65512)||lpad((CASE WHEN i=127 THEN 1 ELSE i END)::VARCHAR,24,'0') END AS s FROM range(128) t(i)",
+        "CREATE TABLE counter AS SELECT 1000 AS n"
+      ],
+      "before_each": [
+        "UPDATE input_data SET s=repeat('x',65512)||lpad((SELECT n FROM counter)::VARCHAR,24,'0') WHERE id=126",
+        "UPDATE counter SET n=n+1"
+      ],
+      "sql": "SELECT count(*) FILTER (WHERE upper(s) IS DISTINCT FROM bench.upper_case(s)) FROM input_data",
+      "expected": "0",
+      "verify": [
+        {"sql": "SELECT count(*) FILTER (WHERE upper(s) IS DISTINCT FROM bench.upper_case(s)) FROM input_data", "expected": "0"}
+      ],
+      "cleanup": ["DROP TABLE input_data", "DROP TABLE counter"]
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+# name: test/sql/integration/scalar/dedup_large_strings.test
+# description: Adaptive dedup preserves large strings and NULLs with both repeated and mostly unique inputs.
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', CACHE false);
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE input_data AS
+SELECT i, CASE WHEN i%11=0 THEN NULL ELSE repeat('x',65512)||lpad((CASE WHEN i=127 THEN 1 ELSE i END)::VARCHAR,24,'0') END AS s
+FROM range(128) t(i);
+
+# Adaptive bypass must not drop the occasional duplicate or confuse NULL with empty.
+query I
+SELECT count(*) FILTER (WHERE ex.upper_case(s) IS DISTINCT FROM upper(s)) FROM input_data;
+----
+0
+
+statement ok
+SET vgi_exchange_input_dedup=false;
+
+query I
+SELECT count(*) FILTER (WHERE ex.upper_case(s) IS DISTINCT FROM upper(s)) FROM input_data;
+----
+0
+
+statement ok
+SET vgi_exchange_input_dedup=true;
+
+# Periodic repeats would be missed by sampling every 32nd row without jitter.
+query I
+SELECT count(*) FILTER (WHERE ex.upper_case(s) IS DISTINCT FROM upper(s))
+FROM (SELECT repeat('x',65512)||lpad((i%64)::VARCHAR,24,'0') AS s FROM range(2048) t(i));
+----
+0
+
+statement ok
+DETACH ex;

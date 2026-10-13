@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>VGI performance — what we do next</title>
+  <style>
+    :root{--ink:#142c38;--muted:#536773;--paper:#f5f4ef;--card:#fff;--line:#d9e1df;--teal:#096d60;--pale:#e6f2ec;--amber:#98521a;--sand:#fff1df}
+    *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:24px}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    a{color:var(--teal);text-underline-offset:3px}a:hover{text-decoration-thickness:2px}button,a,summary{touch-action:manipulation}:focus-visible{outline:3px solid #c66b2d;outline-offset:4px}
+    .wrap{max-width:1200px;margin:auto;padding:0 32px}.masthead{display:flex;justify-content:space-between;gap:24px;padding:27px 0;border-bottom:1px solid var(--line);font-size:13px}.brand{font-weight:800;letter-spacing:.14em}.meta{color:var(--muted)}
+    .hero{padding:52px 0 36px;max-width:910px}.eyebrow{color:var(--teal);font-size:12px;letter-spacing:.12em;font-weight:800;text-transform:uppercase}h1{font-size:clamp(38px,5vw,62px);line-height:1.08;letter-spacing:-.045em;margin:13px 0 22px}h2{font-size:28px;line-height:1.2;letter-spacing:-.025em;margin:0 0 16px}h3{font-size:21px;line-height:1.3;margin:0 0 8px}p{margin:0 0 15px}.lede{font-size:21px;line-height:1.55;color:var(--muted);max-width:830px}.links{display:flex;gap:12px;flex-wrap:wrap;margin-top:24px}.button{display:inline-block;background:var(--ink);color:white;text-decoration:none;border:1px solid var(--ink);border-radius:8px;padding:10px 16px;font-size:14px;font-weight:650}.button.secondary{background:transparent;color:var(--ink);border-color:#acbbb9}
+    .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:0 0 42px}.stat{padding:21px;background:var(--card);border:1px solid var(--line);border-radius:12px}.number{display:block;font-size:31px;font-weight:750;letter-spacing:-.04em;line-height:1.3}.stat .label{display:block;font-size:13px;color:var(--muted);margin-top:8px}.stat .context{font-size:12px;color:var(--teal)}
+    .layout{display:grid;grid-template-columns:190px minmax(0,1fr);gap:44px}aside{align-self:start;position:sticky;top:24px;font-size:14px}nav a{display:block;padding:8px 0;text-decoration:none;color:var(--muted)}nav a:hover{color:var(--teal)}.aside-note{font-size:12px;color:var(--muted);border-top:1px solid var(--line);padding-top:18px;margin-top:20px}section{margin-bottom:46px}.intro-box{background:var(--ink);color:white;padding:28px 30px;border-radius:13px}.intro-box h2{font-size:24px}.intro-box p{color:#dae5e6}.intro-box p:last-child{margin-bottom:0}.intro-box strong{color:white}.small{font-size:14px;color:var(--muted)}
+    .filters{display:flex;gap:8px;flex-wrap:wrap;margin:22px 0 10px}.filter,.expand{font:inherit;font-size:13px;border:1px solid #b9c7c4;border-radius:30px;background:transparent;padding:7px 14px;cursor:pointer;color:var(--ink)}.filter[aria-pressed="true"]{background:var(--ink);color:white;border-color:var(--ink)}.expand{margin-left:auto;border-radius:6px}.count{font-size:12px;color:var(--muted);margin-bottom:18px}
+    .step{border:1px solid var(--line);border-radius:12px;background:var(--card);padding:25px 27px;margin:0 0 16px}.step[hidden]{display:none}.step-top{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:15px}.step-number{color:var(--muted);font-size:12px;font-weight:750;letter-spacing:.08em}.badge{font-size:11px;font-weight:750;border-radius:5px;padding:3px 9px;background:#eaf0f4;color:#355267;white-space:nowrap}.badge.done{background:var(--pale);color:var(--teal)}.badge.experiment{background:var(--sand);color:var(--amber)}.step p:last-child{margin-bottom:0}.gate{border-left:3px solid var(--teal);background:#f2f7f4;padding:11px 14px;font-size:14px;margin:17px 0 0}.gate b{color:var(--teal)}details{border-top:1px solid var(--line);margin-top:18px;padding-top:13px}summary{cursor:pointer;font-size:14px;font-weight:650;color:var(--teal)}details .detail{padding-top:15px;font-size:14px}ul,ol{padding-left:21px;margin:0 0 14px}li{margin-bottom:8px}code{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#edf1ef;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}pre{overflow:auto;white-space:pre;background:#edf1ef;padding:17px;border-radius:8px;font-size:12px;line-height:1.7}pre code{padding:0;background:none}.caution{color:var(--amber)}
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px;background:white}table{border-collapse:collapse;width:100%;min-width:590px;font-size:14px}td,th{padding:14px 16px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:#edf2ee;font-size:12px;font-weight:750}tr:last-child td{border-bottom:0}td:first-child{font-weight:650;width:24%}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px}.note{background:white;border:1px solid var(--line);padding:23px;border-radius:11px}.note h3{font-size:18px}.note p{font-size:14px;color:var(--muted)}.note p:last-child{margin-bottom:0}.evidence{border-left:3px solid #b4c9c2;padding-left:18px;margin:24px 0}.evidence p{font-size:14px;color:var(--muted)}.sources a{display:inline-block;margin-right:16px;margin-bottom:8px;font-size:14px}footer{border-top:1px solid var(--line);padding:25px 0 36px;margin-top:40px;font-size:12px;color:var(--muted)}
+    @media(max-width:850px){.layout{grid-template-columns:1fr;gap:0}aside{position:static;margin-bottom:30px}nav{display:flex;gap:18px;flex-wrap:wrap}.aside-note{display:none}.stats{grid-template-columns:repeat(2,1fr)}.hero{padding-top:35px}.two-col{grid-template-columns:1fr}}
+    @media(max-width:520px){.wrap{padding:0 18px}.masthead{display:block}.meta{margin-top:8px}.lede{font-size:18px}.stats{gap:9px}.stat{padding:16px}.number{font-size:26px}.step{padding:21px 19px}.step-top{align-items:flex-start}.expand{margin-left:0}.intro-box{padding:23px}}
+    @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+    @media print{body{background:white;font-size:11pt}.wrap{max-width:none;padding:0}.hero{padding:24px 0}h1{font-size:34pt}.layout{display:block}aside,.filters,.count,.links{display:none}.step[hidden]{display:block}.step,.stat,.note{break-inside:avoid}.stats{gap:8px}.intro-box{background:#eef3f1;color:var(--ink)}.intro-box p,.intro-box strong{color:var(--ink)}a{color:inherit}.number{font-size:23pt}section{margin-bottom:26px}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead"><span class="brand">VGI / ENGINEERING</span><span class="meta">Memory &amp; CPU roadmap · Research: October 13, 2026</span></header>
+  <div class="hero">
+    <div class="eyebrow">Research complete · implementation priorities</div>
+    <h1>What we do next.</h1>
+    <p class="lede">The schema leak fix is on main. Next, make large-string deduplication selective, use compact LATERAL arguments, and bring Rust's decoded-partition reuse in line with Python.</p>
+    <div class="links"><a class="button" href="#roadmap">Read the implementation plan ↓</a><a class="button secondary" href="../benchmark-results/function-memory-20261013/function-overview.html">Open measured results ↗</a></div>
+  </div>
+  <div class="stats" aria-label="Key measured findings">
+    <div class="stat"><span class="number">75 KiB → 0</span><span class="label">Leaked Arrow bytes per query</span><span class="context">Buffered schema fix validated</span></div>
+    <div class="stat"><span class="number">76–93 MiB</span><span class="label">Extra host peak with deduplication</span><span class="context">Unique 64-KiB strings</span></div>
+    <div class="stat"><span class="number">791 → 106</span><span class="label">Host peak RSS, MiB</span><span class="context">Compact LATERAL argument</span></div>
+    <div class="stat"><span class="number">333 / 336</span><span class="label">Research trials passed</span><span class="context">Three recorded Rust timeouts</span></div>
+  </div>
+  <div class="layout">
+    <aside>
+      <nav aria-label="Page sections"><a href="#recommendation">The recommendation</a><a href="#roadmap">Order of work</a><a href="#validation">How we validate</a><a href="#frameworks">Framework comparison</a><a href="#evidence">Evidence &amp; limits</a></nav>
+      <p class="aside-note">Edit locally.<br>Build and test on EC2.<br>Use isolated directories.<br>Keep every result reproducible.</p>
+    </aside>
+    <main>
+      <section id="recommendation" class="intro-box">
+        <h2>Deduplication and decoded-partition reuse are implemented.</h2>
+        <p>Changes validated on EC2 reduce host peak RSS by <strong>119–148 MiB</strong> in the tested large-string cases. Rust's 32-MiB window improves from <strong>56.4 to 0.66 seconds</strong>, with worker peak RSS increasing from 171 to 202 MiB. The decoded cache defaults to a 256-MiB retention budget, measured using backing capacity rather than logical payload. See <a href="FUNCTION_FINDINGS.md">implementation results and validation</a>.</p>
+        <p><strong>Scope update:</strong> subprocess worker multiplication is excluded from this optimization work; it does not characterize server transports that handle multiple streams in one process. Window materialization changes are deferred. The compact LATERAL argument experiment remains relevant.</p>
+      </section>
+
+      <section id="roadmap">
+        <div class="eyebrow">Proposed sequence</div>
+        <h2 style="margin-top:9px">Small changes, explicit acceptance criteria.</h2>
+        <p class="small">The schema-release fix is committed and pushed to main as 30846e0. The remaining items are proposed work. Expand a step for the implementation approach and the cases to rerun.</p>
+        <div class="filters" role="group" aria-label="Filter roadmap by area">
+          <button class="filter" data-area="all" aria-pressed="true">All work</button>
+          <button class="filter" data-area="extension" aria-pressed="false">Extension</button>
+          <button class="filter" data-area="query" aria-pressed="false">Queries</button>
+          <button class="filter" data-area="sdk" aria-pressed="false">Frameworks</button>
+          <button class="expand" id="expand" aria-expanded="false">Expand details</button>
+        </div>
+        <p class="count" id="count" aria-live="polite">Showing all 5 steps.</p>
+
+        <article class="step" data-area="extension">
+          <div class="step-top"><span class="step-number">01 / PRESERVE THE FIX</span><span class="badge done">Pushed to main · 30846e0</span></div>
+          <h3>Release the old schema before exporting the next one.</h3>
+          <p>The fix in <code>src/vgi_arrow_utils.cpp</code> is on main. This was a proven ownership bug: buffered output reused a schema wrapper and lost its previous release callback. The diagnostic regression harness remains local benchmark work.</p>
+          <div class="gate"><b>Acceptance:</b> repeated queries leave zero live Arrow bytes after database close; the replacement-schema test passes; ordinary builds exclude the diagnostic hook.</div>
+          <details><summary>Evidence and next action</summary><div class="detail">
+            <p>The original four-column, 100,000-row workload leaked 76,800 bytes per query. The fix passed 120 repeated query checks across both reference workers, including nested/null values, dictionaries, large batches and cached replay. All 17 harness tests passed. A normal build without the probe passed another 24 query checks.</p>
+            <p><b>Next:</b> preserve the original and fixed artifacts and retain the allocator regression with the benchmark setup. Collect a fresh quiet-host baseline from the normal build before assessing future performance changes.</p>
+            <p class="small">Cases: <code>buffered_t1</code>, <code>buffered_t4</code>, <code>schema_nested</code>, <code>schema_dictionary</code>, <code>schema_large_output</code>, <code>schema_cached</code>.</p>
+          </div></details>
+        </article>
+
+        <article class="step" data-area="query">
+          <div class="step-top"><span class="step-number">02 / APPLY THE QUERY IMPROVEMENT</span><span class="badge">Demonstrated experiment</span></div>
+          <h3>Pass compact values into LATERAL functions.</h3>
+          <p>Precompute the small function argument before the correlated join. In the measured query this changed the correlation key from a 16-KiB string to an integer, reducing Python host peak from 791 to 106 MiB.</p>
+          <div class="gate"><b>Acceptance:</b> identical results and row counts; the saved physical plan uses the compact key; the memory reduction repeats across fresh processes.</div>
+          <details><summary>Query pattern and scope</summary><div class="detail">
+            <p>Use the demonstrated rewrite where the function only needs the derived integer. Check that the projected argument has equivalent evaluation semantics, especially for volatile expressions.</p>
+            <p>There are two mappings: VGI already uses <code>vgi_rpc.parent_row</code> batch-local integer indices to associate worker outputs with inputs. DuckDB's enclosing delim/hash join separately correlates values. The experiment shrank that second key to the actual function argument. A unique row ID would be a different planner change, with different reuse behavior.</p>
+            <pre><code>WITH t AS (
+  SELECT c0,
+         16 + CAST(substr(c0, 16361, 20) AS BIGINT) % 2 AS fanout
+  FROM input_data
+)
+SELECT sum(length(c0))
+FROM t, LATERAL bench.blended_explode(t.fanout) r;</code></pre>
+            <p><b>Deliverable:</b> update relevant query examples and retain a plan/memory comparison. Evaluate an automatic planner rewrite separately after proving where it is semantically valid.</p>
+            <p class="small">Cases: <code>lateral_fanout16</code>, <code>lateral_precomputed</code>, <code>lateral_native</code>. The native control also had a large peak, locating much of this cost in join materialization.</p>
+          </div></details>
+        </article>
+
+        <article class="step" data-area="extension">
+          <div class="step-top"><span class="step-number">03 / LARGE-STRING COST</span><span class="badge">Implemented and tested</span></div>
+          <h3>Make deduplication sensitive to payload and cardinality.</h3>
+          <p>VARCHAR/BLOB grouping now hashes existing buffers, verifies exact equality and samples large inputs before the full pass. Byte-work and comparison limits safely fall back to the original rows. Repeated strings retain their reduction in worker traffic; unique strings now approach the dedup-disabled memory control.</p>
+          <div class="gate"><b>Acceptance:</b> unique large inputs approach the dedup-disabled memory control, while repeated inputs retain reduced worker traffic and memory. Equality and null semantics stay exact.</div>
+          <details><summary>Implementation approach and checks</summary><div class="detail">
+            <ol>
+              <li>Read value lengths without copying their payload and estimate key cost before constructing canonical keys. Use a bounded, dispersed sample to estimate whether duplicates justify the work.</li>
+              <li>For the existing canonical-key path, avoid the second owned copy by referencing its key buffer for the lifetime of the lookup.</li>
+              <li>Evaluate a VARCHAR/BLOB path that hashes existing input buffers and stores representative row indices. Resolve hash collisions with exact value comparison; retain the canonical fallback for other types.</li>
+              <li>Keep temporary-memory and comparison-work budgets. If the strategy becomes too costly, return the identity mapping and send the original batch. Preserve per-value cache behavior explicitly; do not toggle the global dedup setting as a shortcut.</li>
+              <li>Test unique, highly repeated and mixed-cardinality inputs, including nulls, multiple columns and collision/equality edge cases.</li>
+            </ol>
+            <p>Also benchmark a byte budget for outgoing string batches. Smaller RPC batches help only if upstream chunks, conversion buffers and queued batches stop keeping the original payload alive. Shorter table-in/out lifetimes remain an experiment, separate from the schema leak.</p>
+            <p class="small">Cases: all <code>scalar_dedup</code> cases, <code>scalar_strings_b64_vgi</code>, <code>scalar_strings_b2048_vgi</code>, plus <code>suites/string_batches.json</code> and <code>suites/string_length.json</code>.</p>
+          </div></details>
+        </article>
+
+        <article class="step" data-area="sdk">
+          <div class="step-top"><span class="step-number">04 / REFERENCE-WORKER COST</span><span class="badge">Decoded cache implemented</span></div>
+          <h3>Reuse decoded partitions and clean up execution metadata.</h3>
+          <p>Rust now reuses decoded partitions across both window handlers, with persistent storage fallback, byte/entry limits and local destructor invalidation. Tests cover cache misses in another dispatcher, eviction, disabled caching and cleanup. The small durable argument records and ordinary listagg state updates remain separate follow-ups.</p>
+          <div class="gate"><b>Acceptance:</b> partition decoding scales with initialization/cache misses rather than every row; caches obey a byte budget; completed and cancelled executions release owned state.</div>
+          <details><summary>Implementation approach and checks</summary><div class="detail">
+            <ul>
+              <li>Follow Python: populate a cache keyed by execution/partition at initialization, use it for both window handlers, reload from persistent storage on a miss, and evict on partition/execution destruction. Use shared Arrow buffers in Rust.</li>
+              <li>Add a byte budget as well as an entry cap. Python currently caps 256 entries; that is not a predictable byte limit for large partitions. Measure worker peak alongside decode counts and CPU.</li>
+              <li>Make the ordinary listagg fixture append efficiently. The append control still took about 165 seconds for 16,384 × 4-KiB values, so profile state serialization and SQLite access next.</li>
+              <li>Address the small retained <code>aggargs</code> records at execution end. Ten completed window queries plus EXPLAIN left 2,904 bytes of arguments after payload cleanup.</li>
+              <li>Do not clear an execution's arguments when just one partition finishes; other partitions can still need them.</li>
+            </ul>
+            <p class="small">Keep extension and SDK changes in separate comparisons with the other side's binary fixed. This step improves reference-worker behavior before using these workloads to rank frameworks.</p>
+          </div></details>
+        </article>
+
+        <article class="step" data-area="extension">
+          <div class="step-top"><span class="step-number">05 / IDLE MEMORY POLICY</span><span class="badge experiment">Later experiment</span></div>
+          <h3>Evaluate reclamation as a latency–memory tradeoff.</h3>
+          <p>Arrow kept reusable pages after producer queries. In one retention test, releasing the pool after database close reduced host RSS from about 311 to 50 MiB while live Arrow allocations were already zero.</p>
+          <div class="gate"><b>Acceptance:</b> any idle-reclamation policy lowers retained RSS with an acceptable measured next-query cost. It must not conceal live allocation growth.</div>
+          <details><summary>What to measure first</summary><div class="detail">
+            <p>Compare no reclamation with explicit idle pressure or a carefully scoped idle trigger. Record RSS/PSS, live allocations, release duration and the latency of the next query. Avoid making per-batch global trimming the default without evidence.</p>
+            <p>The residual memory associated with unique-string deduplication is not fully attributed to an allocator yet. Resolve that ownership separately before classifying it as a second leak or assuming Arrow reclamation will fix it.</p>
+          </div></details>
+        </article>
+      </section>
+
+      <section id="validation">
+        <div class="eyebrow">The measurement contract</div><h2 style="margin-top:9px">Know what improved before moving on.</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Check</th><th>How we run it</th><th>What we retain</th></tr></thead>
+          <tbody>
+            <tr><td>Correctness</td><td>Identical inputs, full payload checksums, nested/null values, cache replay, error and cancellation recovery.</td><td>SQL, plans, expected/actual results, logs.</td></tr>
+            <tr><td>Peak memory</td><td>At least three fresh processes per case; identical sampling and CPU affinity; host and workers observed separately.</td><td>RSS, worker PSS, active worker count, logical batch bytes, allocation peaks.</td></tr>
+            <tr><td>Allocation &amp; release</td><td>Extend the current ten-query checks to 100 cycles for the paths being changed. Observe result release, cache flush, pool flush and database close.</td><td>Live allocation trend, retained RSS, temporary storage and residual worker state.</td></tr>
+            <tr><td>CPU</td><td>Quiet-host before/after runs with a fixed worker; normal builds for timing and separate symbolized profile runs.</td><td>Cold versus warm time, CPU seconds and call stacks. Calibrate a regression threshold from repeatability.</td></tr>
+            <tr><td>Compatibility</td><td>One/four threads, concurrent queries and cancellation. Cross-SDK conformance for any wire change.</td><td>Binary/source hashes, worker versions, build settings, failures and explicit unsupported cases.</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small" style="margin-top:14px">Continue editing locally and building/testing only in a separate EC2 workspace. Freeze a new baseline after the schema fix; compare each optimization against it with the same harness and worker. Keep diagnostic allocator builds separate from production timing builds.</p>
+      </section>
+
+      <section id="frameworks">
+        <div class="eyebrow">Next phase</div><h2 style="margin-top:9px">Then assess all seven frameworks.</h2>
+        <p>Once the extension baseline is stable, hold that binary fixed and run Python, Rust, C#, Java, Go, TypeScript and C++ through the same workload contract.</p>
+        <div class="two-col">
+          <div class="note"><h3>Make workloads comparable</h3><p>Check fixture algorithms, null semantics, batch sizes and output equality first. Separate worker startup from warm execution, account for JIT warmup where relevant, and make unsupported capabilities explicit. Use equivalent algorithms for cross-language conclusions.</p></div>
+          <div class="note"><h3>Explain each runtime's memory</h3><p>Pair the shared host/worker accounting with runtime heap and CPU profiles. Distinguish live data, GC heaps, native Arrow allocations and idle runtime memory. Change one SDK at a time and retain its previous binary as the control.</p></div>
+        </div>
+        <p class="small" style="margin-top:15px">The current measurements use owned subprocess workers over stdio. Add other transports as distinct comparisons after equivalent worker behavior is established.</p>
+      </section>
+
+      <section id="evidence">
+        <div class="eyebrow">Grounded in the completed investigation</div><h2 style="margin-top:9px">Evidence, with its limits intact.</h2>
+        <div class="evidence"><p><b>336 research trials; 1,023 completed measured query operations.</b> Three large Rust window/listagg cases timed out at 300 seconds. Timeouts are preserved as failures. The shared EC2 host had unrelated compilation activity, so existing timings are diagnostic rather than CPU regression gates.</p><p>RSS is resident process memory; adding worker RSS counts shared pages more than once. PSS apportions those pages and better estimates combined physical memory. Live Arrow counters cover Arrow's pool, not every allocator. The 75-KiB leak figure is specific to the tested buffered workload.</p></div>
+        <div class="sources">
+          <a href="FUNCTION_FINDINGS.md">Full research notes</a>
+          <a href="../benchmark-results/function-memory-20261013/function-overview.html">Filterable measurements</a>
+          <a href="../benchmark-results/function-memory-20261013/figures/function-memory-findings.svg">Research charts</a>
+          <a href="../benchmark-results/function-memory-20261013/coverage.json">Coverage record</a>
+          <a href="README.md">Reproduction guide</a>
+        </div>
+      </section>
+    </main>
+  </div>
+  <footer>VGI performance investigation · EC2 52.90.218.118 · /home/ec2-user/vgi-performance-20261013<br>Local roadmap. Proposed acceptance criteria describe future work; measured findings are linked above.</footer>
+</div>
+<script>
+  const steps = [...document.querySelectorAll('.step')];
+  const filters = [...document.querySelectorAll('.filter')];
+  filters.forEach(button => button.addEventListener('click', () => {
+    filters.forEach(other => other.setAttribute('aria-pressed', String(other === button)));
+    let shown = 0;
+    steps.forEach(step => {
+      step.hidden = button.dataset.area !== 'all' && step.dataset.area !== button.dataset.area;
+      if (!step.hidden) shown++;
+    });
+    document.querySelector('#count').textContent = button.dataset.area === 'all' ? `Showing all ${steps.length} steps.` : `Showing ${shown} of ${steps.length} steps. Original sequence numbers are preserved.`;
+  }));
+  const expand = document.querySelector('#expand');
+  expand.addEventListener('click', () => {
+    const visibleDetails = steps.filter(step => !step.hidden).map(step => step.querySelector('details'));
+    const open = !visibleDetails.every(detail => detail.open);
+    visibleDetails.forEach(detail => { detail.open = open; });
+  });
+  function updateExpand() {
+    const open = steps.filter(step => !step.hidden).every(step => step.querySelector('details').open);
+    expand.textContent = open ? 'Collapse details' : 'Expand details';
+    expand.setAttribute('aria-expanded', String(open));
+  }
+  document.querySelectorAll('details').forEach(detail => detail.addEventListener('toggle', updateExpand));
+  filters.forEach(button => button.addEventListener('click', updateExpand));
+</script>
+</body>
+</html>

@@ -58,16 +58,27 @@ wall-clock, cross-row accumulator) must not advertise cacheability and must not 
 A pure compute transform at each operator's exchange boundary, independent of any cache.
 
 **Shared helper `vgi_input_dedup.{hpp,cpp}`** — `BuildInputDedup(chunk, worker_col_ids) → InputDedup`:
-- Canonical per-row NULL-aware key over the **worker-input columns only** (the args passed to the
-  function — NOT the correlated/outer columns) via `CreateSortKeyHelpers::CreateSortKey`, hashed into
-  a group id. Reuses the same machinery as `HashInputChunkUnordered`.
+- NULL-aware equality over the **worker-input columns only** (the arguments passed to the
+  function). VARCHAR and BLOB values are hashed and compared directly in their input buffers;
+  the lookup stores row indices, without copying string payloads into keys. Other columns use
+  `CreateSortKeyHelpers::CreateSortKey` to preserve numeric and nested-type equality.
+  Hash matches always require exact equality, including when hashes collide.
 - Produces:
   - `distinct` — a `SelectionVector` picking one representative original row per distinct tuple
     (length `K`), used to build the K-row deduped input to ship.
   - `orig_to_distinct[n]` — for each of the N original rows, the index `d ∈ [0,K)` of its tuple.
   - `groups[d]` — the list of original row indices sharing distinct tuple `d` (the inverse map).
-- `K == N` (all-distinct) is the no-op fast path — return a trivial identity and skip dedup so
-  high-cardinality data pays only the hash, not a pointless regroup.
+- `K == N` is an identity mapping, either because all rows are unique or because adaptive
+  deduplication was bypassed. An identity mapping can therefore contain duplicate values.
+  Both callers and per-value memoization must preserve their original multiplicity.
+
+For batches exceeding 4 MiB of logical VARCHAR/BLOB payload, up to 64 stratified, jittered
+rows are sampled. Full deduplication proceeds only when at least one eighth of sampled rows
+repeat. Sampling is limited to 8 MiB of hash/comparison work; the full pass is limited to
+512 MiB of work and 65,536 comparisons. Exceeding a budget discards partial groups and returns
+the complete identity mapping. These internal defaults affect efficiency, never results.
+The limits bound string hashing/comparison work, not total query memory: canonical encoding of
+nested values and independently enabled result-cache keys can still allocate large buffers.
 
 ### 3.1 Scatter mechanics — per shape
 

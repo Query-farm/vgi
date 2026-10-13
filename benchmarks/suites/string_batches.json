@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "description": "Same string payload and row count, exact source chunk sizes. Compare native and echo with unchanged production binaries. SQL cases retain the original expression control.",
+  "cases": [
+    {"name": "strings64k_sql", "shape": "varchar", "rows": 10000, "columns": 1, "value_bytes": 65536, "modes": ["native", "echo"]},
+    {"name": "strings64k_b32", "shape": "varchar", "rows": 10000, "columns": 1, "value_bytes": 65536, "source": "batch", "batch_rows": 32, "modes": ["native", "echo"]},
+    {"name": "strings64k_b64", "shape": "varchar", "rows": 10000, "columns": 1, "value_bytes": 65536, "source": "batch", "batch_rows": 64, "modes": ["native", "echo"]},
+    {"name": "strings64k_b256", "shape": "varchar", "rows": 10000, "columns": 1, "value_bytes": 65536, "source": "batch", "batch_rows": 256, "modes": ["native", "echo"]},
+    {"name": "strings64k_b512", "shape": "varchar", "rows": 10000, "columns": 1, "value_bytes": 65536, "source": "batch", "batch_rows": 512, "modes": ["native", "echo"]},
+    {"name": "strings64k_b2048", "shape": "varchar", "rows": 10000, "columns": 1, "value_bytes": 65536, "source": "batch", "batch_rows": 2048, "modes": ["native", "echo"]},
+    {"name": "wide_strings_sql", "shape": "varchar", "rows": 10000, "columns": 128, "value_bytes": 256, "modes": ["native", "echo"]},
+    {"name": "wide_strings_b32", "shape": "varchar", "rows": 10000, "columns": 128, "value_bytes": 256, "source": "batch", "batch_rows": 32, "modes": ["native", "echo"]},
+    {"name": "wide_strings_b128", "shape": "varchar", "rows": 10000, "columns": 128, "value_bytes": 256, "source": "batch", "batch_rows": 128, "modes": ["native", "echo"]},
+    {"name": "wide_strings_b512", "shape": "varchar", "rows": 10000, "columns": 128, "value_bytes": 256, "source": "batch", "batch_rows": 512, "modes": ["native", "echo"]},
+    {"name": "wide_strings_b2048", "shape": "varchar", "rows": 10000, "columns": 128, "value_bytes": 256, "source": "batch", "batch_rows": 2048, "modes": ["native", "echo"]}
+  ]
+}

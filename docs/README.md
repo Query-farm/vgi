@@ -214,6 +214,11 @@ cache when the server suggests no TTL. The remote service speaks a separate, ind
 versioned protocol (`VgiSecretProtocol`); the reference server is `vgi-secret-serve` in
 vgi-python. See [the design notes](remote_secret_provider_plan.md) for the full architecture.
 
+## Performance benchmarks
+
+For repeatable CPU/memory measurements, wide/long table workloads, allocation
+profiles and remote EC2 runs, see [the benchmark guide](../benchmarks/README.md).
+
 ## License
 
 This project is licensed under the **Query Farm Source-Available License, Version 1.0**

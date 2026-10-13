@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "description": "Fixed 4 MiB source batches while logical table size grows 100x, from 62.5 MiB to 6.1 GiB.",
+  "cases": [
+    {"name": "strings64k_rows1k", "shape": "varchar", "rows": 1000, "columns": 1, "value_bytes": 65536, "source": "batch", "batch_rows": 64, "modes": ["native", "echo"]},
+    {"name": "strings64k_rows10k", "shape": "varchar", "rows": 10000, "columns": 1, "value_bytes": 65536, "source": "batch", "batch_rows": 64, "modes": ["native", "echo"]},
+    {"name": "strings64k_rows100k", "shape": "varchar", "rows": 100000, "columns": 1, "value_bytes": 65536, "source": "batch", "batch_rows": 64, "modes": ["native", "echo"]}
+  ]
+}

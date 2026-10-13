@@ -10,6 +10,18 @@ VCPKG_TOOLCHAIN_PATH ?= $(wildcard ${PROJ_DIR}vcpkg/scripts/buildsystems/vcpkg.c
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
+# Resource benchmarks run on Linux. See benchmarks/README.md for the isolated
+# EC2 workflow, repeatable baselines, and CPU/allocation profiles.
+.PHONY: benchmark_build benchmark_test benchmark benchmark_compare
+benchmark_build:
+	bash benchmarks/build.sh $(BENCH_CMAKE_ARGS)
+benchmark_test:
+	VGI_BENCH_DRIVER="$(PROJ_DIR)build/benchmark/extension/vgi/vgi_bench_driver" python3 -m unittest discover -s benchmarks -v
+benchmark:
+	python3 benchmarks/bench.py run $(BENCH_ARGS)
+benchmark_compare:
+	python3 benchmarks/bench.py compare $(BENCH_ARGS)
+
 # VGI test worker (subprocess transport)
 VGI_TEST_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-worker
 

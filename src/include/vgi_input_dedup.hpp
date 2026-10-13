@@ -21,9 +21,9 @@ class DataChunk;
 namespace vgi {
 
 struct InputDedup {
-	idx_t n = 0;    // original row count
-	idx_t k = 0;    // distinct worker-input tuple count (<= n)
-	bool trivial = true; // k == n (all rows distinct) → dedup is a no-op; caller skips it
+	idx_t n = 0;         // original row count
+	idx_t k = 0;         // worker-input group count (<= n)
+	bool trivial = true; // identity mapping: all unique, or optimization bypassed
 
 	// Length k: a representative ORIGINAL row index for each distinct tuple. Use with a
 	// DataChunk slice to build the k-row deduped input to ship to the worker.
@@ -37,11 +37,23 @@ struct InputDedup {
 	std::vector<std::vector<idx_t>> groups;
 };
 
-// Build the dedup grouping keyed on `key_cols` (indices into `chunk`). A NULL-aware
-// canonical per-row sort key (CreateSortKey) defines tuple identity, so nulls and all
-// nested types group correctly. `key_cols` empty or a 0-row chunk yields a trivial
-// (identity) result.
-InputDedup BuildInputDedup(DataChunk &chunk, const std::vector<column_t> &key_cols);
+// Internal work limits; bypassing returns a complete identity mapping.
+struct InputDedupOptions {
+	idx_t large_input_bytes = 4 * 1024 * 1024;
+	idx_t sample_work_bytes = 8 * 1024 * 1024;
+	idx_t max_work_bytes = 512 * 1024 * 1024;
+	idx_t max_comparisons = 65536;
+};
+
+// VARCHAR/BLOB input buffers are hashed and compared without payload copies.
+// Large inputs are sampled before full-batch hashing. Exact equality is always
+// required after hash matches. Other types retain the canonical-key semantics.
+// Poor sampled reduction or exhausted work budgets return an identity mapping.
+// Only `key_cols` (indices into `chunk`) participate. NULLs group together; nested
+// and numeric types use CreateSortKey. An identity result may contain duplicates:
+// callers must preserve all original rows when the optimization is bypassed.
+InputDedup BuildInputDedup(DataChunk &chunk, const std::vector<column_t> &key_cols,
+                           const InputDedupOptions &options = InputDedupOptions());
 
 } // namespace vgi
 } // namespace duckdb

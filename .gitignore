@@ -30,3 +30,4 @@ duckdb.old
 # Tooling output
 .playwright-mcp/
 __pycache__/
+/benchmark-results/

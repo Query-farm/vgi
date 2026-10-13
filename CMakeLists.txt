@@ -38,6 +38,29 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
+option(BUILD_VGI_BENCHMARKS "Build the Linux CPU/memory benchmark host" OFF)
+option(VGI_BENCH_ARROW_PROBE "Expose Arrow allocator diagnostics in the benchmark extension only" OFF)
+if(BUILD_VGI_BENCHMARKS)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "VGI benchmarks require Linux resource accounting")
+  endif()
+  add_executable(vgi_bench_driver benchmarks/driver.cpp)
+  target_include_directories(vgi_bench_driver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include)
+  target_link_libraries(vgi_bench_driver duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS} ${CMAKE_DL_LIBS})
+  link_threads(vgi_bench_driver "")
+  link_extension_libraries(vgi_bench_driver "")
+  # Independent tests for the shared scalar/LATERAL input grouping. The second
+  # executable forces hash collisions without altering the extension build.
+  foreach(dedup_test vgi_dedup_tests vgi_dedup_collision_tests)
+    add_executable(${dedup_test} test/cpp/test_main.cpp test/cpp/test_input_dedup.cpp src/vgi_input_dedup.cpp)
+    target_include_directories(${dedup_test} PRIVATE src/include duckdb/src/include duckdb/third_party/catch)
+    target_link_libraries(${dedup_test} duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+    link_threads(${dedup_test} "")
+    link_extension_libraries(${dedup_test} "")
+  endforeach()
+  target_compile_definitions(vgi_dedup_collision_tests PRIVATE VGI_DEDUP_TEST_HASH_COLLISIONS)
+endif()
+
 # Native Iroh is compiled into the DuckDB extension as a Rust static library.
 # Emscripten keeps using the application-owned browser adapter. Release builds
 # build from pinned source; local developers may point at a sibling checkout or
@@ -394,6 +417,13 @@ endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+if(VGI_BENCH_ARROW_PROBE)
+  if(NOT BUILD_VGI_BENCHMARKS)
+    message(FATAL_ERROR "VGI_BENCH_ARROW_PROBE requires BUILD_VGI_BENCHMARKS")
+  endif()
+  target_sources(${LOADABLE_EXTENSION_NAME} PRIVATE benchmarks/arrow_probe.cpp)
+endif()
 
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})

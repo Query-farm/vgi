@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "description": "Width, length, variable-size payloads, buffering, caching and repeated release. Logical bytes exclude Arrow metadata/offsets/validity.",
+  "cases": [
+    {"name": "narrow", "shape": "int64", "rows": 100000, "columns": 1, "modes": ["native", "echo"]},
+    {"name": "long", "shape": "int64", "rows": 10000000, "columns": 4, "modes": ["native", "echo"]},
+    {"name": "wide32", "shape": "int64", "rows": 100000, "columns": 32, "modes": ["native", "echo"]},
+    {"name": "wide128", "shape": "int64", "rows": 100000, "columns": 128, "modes": ["native", "echo"]},
+    {"name": "wide512", "shape": "int64", "rows": 100000, "columns": 512, "modes": ["native", "echo"]},
+    {"name": "strings1k", "shape": "varchar", "rows": 100000, "columns": 4, "value_bytes": 1024, "modes": ["native", "echo"]},
+    {"name": "strings64k", "shape": "varchar", "rows": 10000, "columns": 1, "value_bytes": 65536, "modes": ["native", "echo"]},
+    {"name": "wide_strings", "shape": "varchar", "rows": 10000, "columns": 128, "value_bytes": 256, "modes": ["native", "echo"]},
+    {"name": "nullable", "shape": "int64", "rows": 1000000, "columns": 32, "null_every": 7, "modes": ["native", "echo"]},
+    {"name": "buffered_release", "shape": "varchar", "rows": 100000, "columns": 4, "value_bytes": 256, "release_each": true, "modes": ["buffer_input"]},
+    {"name": "cache_release", "shape": "varchar", "rows": 100000, "columns": 4, "value_bytes": 256, "release_each": true, "modes": ["cached_echo"]}
+  ]
+}
