@@ -259,11 +259,51 @@ profile; it does not yet expose these operations through SQL. Native enforcement
 object requirements, mixed write guarantees, full lifecycle qualification and the
 2.0 adapter port remain required.
 
+### Table options and layout: reference implementation
+
+The next unpublished increment adds table creation comments/tags, typed options,
+option-definition discovery and SET/RESET, plus partition/sort layout create,
+alter, and readback. `SqlExpression`, `SortKey`, `TableLayout`, and
+`TableLayoutChange` preserve raw owner paths, explicit direction/NULL order, and
+NULL-versus-empty replacement lists. Separate capabilities distinguish future
+writes from an existing-data rewrite; neither grants scan ordering guarantees.
+The development method inventory is now **77**, with hash
+`880e67e755301062698475d23ae8922a6b868d8d0b70ddb195edd96f6be385a4`.
+
+The persistent Python reference actually partitions/sorts fixture rows, checks
+retained expression profiles during partial alterations, and rejects failed
+rewrites before changing data, metadata, or catalog versions. Public RPC tests
+cover readback, typed NULL/RESET, nested owner identity, capability-specific
+etags, transaction rollback/commit conflicts, reconnects, and MetaWorker routes.
+The limited scalar-expression profile still needs full type/NULL/grammar review
+and engine qualification before publication.
+
+The shared IPC corpus and generated surfaces cover all SDKs. Validation includes
+**703** focused Python checks, **17** table-layout reference cases (including two
+added afterward), and the generation/documentation checks. SDK unit/codec suites
+passed: Go (all VGI packages), Rust **481 passed / 4 ignored**, TypeScript **596 /
+68 skipped** plus five Flechette codec cases, Java **612 / 2 skipped**, C# **592**,
+and C++ **68 CTest targets**. Ruff, mypy (210 sources), strict regeneration, and
+TypeScript bundle builds passed. The native 1.5 release build and Python lane
+passed (**344 cases, 33 skipped**, including two crash/recovery probes). The other
+native SDK integration lanes have not been rerun for this increment. Exact
+validation and dependency limits are recorded in the Python manifest's
+`table_layout_validation`. A nullable-map decoder defect discovered
+by the Go corpus is fixed in an isolated RPC-Go worktree; its dependency must be
+coordinated with publication. The broader RPC-Go suite also encounters an
+unrelated macOS shared-memory name-length failure, recorded separately.
+
+These changes remain unpublished preparation on the pinned 1.5 engine. They do
+not enable the new SQL syntax in the native adapter or complete any P0–P3/M0–M4
+gate. All **137** unresolved scope/capability/field reviews remain tracked across
+**151** audit rows and **20** areas. The other catalog families, query/type/
+optimizer contracts, version freeze, rollout, and native 2.0 port remain open.
+
 | Gate | Current status | Work still required |
 | --- | --- | --- |
 | P0 | In progress; inventory coverage checked | Resolve scope, capability, and field mappings across the full package. |
-| P1 | In progress; typed schema options and attachment negotiation have reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
-| P2 | Shared records and schema-option surfaces generated across SDKs; snapshot remains open | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
+| P1 | In progress; schema/table options, layout, and attachment negotiation have reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
+| P2 | Shared records and schema/table surfaces generated across SDKs; snapshot remains open | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
 | P3 | Not qualified or released | Full capability conformance, transport tests, coordinated deployment/rollback proof, and matched publication. |
 | M0 | Haybarn refresh and source audit prepared | Establish the pinned VGI 2.0 build/CI lane and complete native diagnostics. |
 | M1–M4 | Native port remains | Binding, execution/write semantics, nested identities, platform/browser qualification, and distribution. |

@@ -1501,6 +1501,15 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
 	// transaction_opaque_data: binary (nullable)
 	arrays.push_back(BuildBinaryScalar(transaction_opaque_data));
 
+	// The 1.5 adapter has not selected table metadata/options/layout profiles.
+	for (const char *name : {"comment", "tags", "options", "layout"}) {
+		auto nulls = arrow::MakeArrayOfNull(batch_schema->GetFieldByName(name)->type(), 1);
+		if (!nulls.ok()) {
+			throw InternalException("Could not build optional table metadata: %s", nulls.status().ToString());
+		}
+		arrays.push_back(nulls.ValueUnsafe());
+	}
+
 	return arrow::RecordBatch::Make(batch_schema, 1, arrays);
 }
 
