@@ -384,6 +384,7 @@ struct VgiViewInfo {
 	std::string schema_name;
 	std::string definition; // SQL query defining the view
 	std::vector<std::string> aliases; // Ordered raw output identifiers
+	std::string security; // regular or barrier; 1.5 accepts only regular
 	std::string comment;
 	std::map<std::string, std::string> tags;
 	// Per-column comments keyed by the view's output column name. Fed into

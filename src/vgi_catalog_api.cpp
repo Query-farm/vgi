@@ -1310,7 +1310,7 @@ void InvokeCatalogViewCreate(
     const std::string &definition, const std::vector<std::string> &aliases, const std::string &on_conflict,
     ClientContext &context) {
 	auto params = generated::BuildCatalogViewCreateParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
-	                                                      view_name, definition, on_conflict, OptTxn(ctx), aliases);
+	                                                      view_name, definition, on_conflict, OptTxn(ctx), aliases, "regular");
 	InvokeVoidRpc(ctx, "catalog_view_create", params, context);
 }
 
@@ -2798,6 +2798,19 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 	info.name = row["name"].value_not_null<std::string>();
 	info.schema_name =
 	    SchemaNameFromPath(row["schema_path"].value_not_null<std::vector<std::string>>(), "ViewInfo.schema_path");
+	// Check before parsing, binding, or caching the SELECT. DuckDB 1.5 cannot
+	// enforce a view optimization barrier; ignoring this field would weaken it.
+	auto security = std::dynamic_pointer_cast<arrow::StringArray>(batch->GetColumnByName("security"));
+	if (!security || security->IsNull(0)) {
+		throw IOException(CatalogProtocolViolation("ViewInfo", worker_path), "ViewInfo.security must be a non-null string");
+	}
+	info.security = security->GetString(0);
+	if (info.security == "barrier") {
+		throw NotImplementedException("DuckDB 1.5 cannot enforce ViewInfo.security=barrier");
+	}
+	if (info.security != "regular") {
+		throw IOException(CatalogProtocolViolation("ViewInfo", worker_path), "Unknown ViewInfo.security mode: %s", info.security);
+	}
 	info.definition = row["definition"].value_not_null<std::string>();
 	auto aliases = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("aliases"));
 	if (!aliases || aliases->IsNull(0)) {

@@ -72,3 +72,186 @@ aliases
 statement ok
 DETACH bad;
 
+
+statement ok
+SET vgi_eager_load_threshold = MAP {'view': 0};
+
+# Security mode missing through get metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=missing VGI_VIEW_METADATA_PATH=get ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode missing through listing metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=missing VGI_VIEW_METADATA_PATH=listing ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM duckdb_views() WHERE database_name = 'bad';
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode missing through bulk metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=missing VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode null through get metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=null VGI_VIEW_METADATA_PATH=get ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode null through listing metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=null VGI_VIEW_METADATA_PATH=listing ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM duckdb_views() WHERE database_name = 'bad';
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode null through bulk metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=null VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode wrong_type through get metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=wrong_type VGI_VIEW_METADATA_PATH=get ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode wrong_type through listing metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=wrong_type VGI_VIEW_METADATA_PATH=listing ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM duckdb_views() WHERE database_name = 'bad';
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode wrong_type through bulk metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=wrong_type VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode barrier through get metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=barrier VGI_VIEW_METADATA_PATH=get ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode barrier through listing metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=barrier VGI_VIEW_METADATA_PATH=listing ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM duckdb_views() WHERE database_name = 'bad';
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode barrier through bulk metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=barrier VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode unknown through get metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=unknown VGI_VIEW_METADATA_PATH=get ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode unknown through listing metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=unknown VGI_VIEW_METADATA_PATH=listing ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM duckdb_views() WHERE database_name = 'bad';
+----
+security
+
+statement ok
+DETACH bad;
+
+# Security mode unknown through bulk metadata.
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=unknown VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+security
+
+statement ok
+DETACH bad;

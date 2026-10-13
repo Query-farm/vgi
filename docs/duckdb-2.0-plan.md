@@ -435,11 +435,56 @@ Its seven shared-corpus codec tests pass; these do not qualify that transport.
 The standard TypeScript Arrow JS native lane above passes. This transport gap
 remains P2/P3 work and is recorded in `logs/views-native-ts-flechette.log`.
 
-The current 77-method reflection hash is
+The alias increment used the 77-method reflection hash
 `9e1ed05cdcc6e812f9a6cfda36ecaa699005e30680e511489109180251ee6872`.
-No version is being released. Secure-view flags/barrier enforcement, create
-comments/tags, view-column comment mutation, query resolution, dependencies,
-and durable view transaction qualification remain open.
+
+The **view security increment** adds required non-null `ViewInfo.security`
+(`regular` or `barrier`) and the matching CREATE parameter across the seven
+SDKs. The SELECT-only definition and ordered aliases are retained. The barrier
+maps to DuckDB 2's optimization barrier, not DEFINER/INVOKER privileges.
+Missing, NULL, wrongly typed and unknown security metadata cannot become an
+ordinary native view. The pinned 1.5 adapter always rejects `barrier` before
+binding and continues emitting `regular` for ordinary CREATE VIEW.
+
+Python implements the attachment-scoped `vgi.view.barrier.read.v1` and
+`vgi.view.barrier.create.v1` profiles. Create requires read support; transactional
+barrier DDL also requires the DDL transaction profile. Get, listing and whole
+catalog snapshots reject incapable/stale agreements, including ETag revalidation.
+Mutation preflights prevent an unaware caller from replacing a barrier with the
+ordinary default. They do not replace provider concurrency/authorization checks.
+The ordinary bundled providers reject unsupported barrier creation before
+mutation, including IGNORE/REPLACE.
+
+The durable SQLite metadata reference preserves flags/aliases over the public
+HTTP client, reconnects, rollback/commit, replacement, rename and comments. This
+qualifies metadata persistence only. Native 2.0 optimizer behavior, dependent
+queries, cache refresh/rebinding and production provider concurrency still need
+qualification. Full profile selection/enforcement in the other SDKs remains P2
+work. The operation contract and exact evidence are in the Python worktree's
+`docs/protocol/view-security.md` and manifest `view_security_validation` entry.
+
+EC2 qualification passes **758 Python checks**, all SDK unit suites, the native
+1.5 build, and **218 assertions in the three reference cases**. Native fixtures
+assert the get/list/bulk route so a fallback cannot satisfy the security test.
+The standard native language cases are qualified: Python **345 / 33 skipped**,
+Go **337 / 40**, Rust **324 / 42**, TypeScript **329 / 46**, Java **325 / 37**, and
+C# **329 / 37**. C++ covers **325 cases / 12,065 assertions / 47 skips** plus two
+HTTP bearer cases. Python/Java totals include their two separate crash probes.
+
+The original matrix and C++ runs failed only the shared SQL reflection test's
+stale expected hash. Updating that expectation and rerunning it on Python/C++,
+plus Python's crash probes, completes this increment's qualification; the original
+nonzero run exits remain recorded. SDK units pass (Go 13 packages, Rust 486 with
+4 ignored, TypeScript 602 with 68 skipped, Java 658 with 2 skipped, C# 596, and
+C++ 68 CTests). Eight Flechette codec checks also pass; the previously recorded
+stdio transport gap remains open. Final strict generation, 74 overlapping
+contract/manifest checks, Ruff and mypy pass. No release gate is closed.
+
+The current 77-method reflection hash is
+`b1db9b01e3c78a746e627fe18a4e0e0c191389dce42f15368427067f071cdecc`.
+Creation comments/tags/column comments, view-column comment mutation, query
+resolution, dependencies and complete engine qualification remain in the same
+coordinated release. No version is being released.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
