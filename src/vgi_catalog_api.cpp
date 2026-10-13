@@ -1353,7 +1353,7 @@ void InvokeCatalogSchemaCreate(
 	// the field, but the value is always absent until we plumb it through DDL parsing.
 	auto params =
 	    generated::BuildCatalogSchemaCreateParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name), on_conflict,
-	                                              /*comment=*/std::nullopt, /*tags=*/std::nullopt, OptTxn(ctx));
+	                                              /*comment=*/std::nullopt, /*tags=*/std::nullopt, OptTxn(ctx), /*options=*/std::nullopt);
 	InvokeVoidRpc(ctx, "catalog_schema_create", params, context);
 }
 
