@@ -1,0 +1,307 @@
+# name: test/sql/duckdb2/required_filter_paths.test
+# description: Exact required path identities and fail-closed successor metadata on DuckDB 1.5
+# group: [vgi_duckdb2_protocol]
+
+require-env VGI_REQUIRED_FILTER_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'paths' AS w (TYPE vgi, LOCATION '${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM w.main.literal;
+----
+requires WHERE filters
+
+statement error
+SELECT count(*) FROM w.main.nested;
+----
+requires WHERE filters
+
+statement error
+SELECT count(*) FROM w.main.both_paths;
+----
+requires WHERE filters
+
+statement error
+SELECT count(*) FROM w.main.parent_path;
+----
+requires WHERE filters
+
+statement error
+SELECT count(*) FROM w.main.deep_path;
+----
+requires WHERE filters
+
+statement error
+SELECT count(*) FROM w.main.quoted_path;
+----
+requires WHERE filters
+
+query I
+SELECT count(*) FROM w.main.literal WHERE "a.b" = 1;
+----
+1
+
+statement error
+SELECT count(*) FROM w.main.literal WHERE a.b = 1;
+----
+requires WHERE filters
+
+statement error
+SELECT count(*) FROM w.main.nested WHERE "a.b" = 1;
+----
+requires WHERE filters
+
+query I
+SELECT count(*) FROM w.main.nested WHERE a.b = 1;
+----
+1
+
+statement error
+SELECT count(*) FROM w.main.both_paths WHERE "a.b" = 1;
+----
+requires WHERE filters
+
+statement error
+SELECT count(*) FROM w.main.both_paths WHERE a.b = 1;
+----
+requires WHERE filters
+
+query I
+SELECT count(*) FROM w.main.both_paths WHERE "a.b" = 1 AND a.b = 1;
+----
+1
+
+statement error
+SELECT count(*) FROM w.main.parent_path WHERE a.b = 1;
+----
+requires WHERE filters
+
+statement error
+SELECT count(*) FROM w.main.parent_path WHERE a.deep.leaf = 1;
+----
+requires WHERE filters
+
+query I
+SELECT count(*) FROM w.main.parent_path WHERE a IS NOT NULL;
+----
+1
+
+query I
+SELECT count(*) FROM w.main.nested WHERE a IS NOT NULL;
+----
+1
+
+statement error
+SELECT count(*) FROM w.main.deep_path WHERE a.deep.other = 1;
+----
+requires WHERE filters
+
+query I
+SELECT count(*) FROM w.main.deep_path WHERE a.deep.leaf = 1;
+----
+1
+
+query I
+SELECT count(*) FROM w.main.deep_path WHERE a.deep IS NOT NULL;
+----
+1
+
+query I
+SELECT count(*) FROM w.main.deep_path WHERE a IS NOT NULL;
+----
+1
+
+statement error
+SELECT count(*) FROM w.main.deep_path WHERE abs(a.deep.other) = 1;
+----
+requires WHERE filters
+
+query I
+SELECT count(*) FROM w.main.deep_path WHERE abs(a.deep.leaf) = 1;
+----
+1
+
+query I
+SELECT count(*) FROM w.main.deep_path WHERE struct_extract_at(a.deep, 1) = 1;
+----
+1
+
+statement error
+SELECT count(*) FROM w.main.deep_path WHERE struct_extract_at(a.deep, 2) = 1;
+----
+requires WHERE filters
+
+query I
+SELECT count(*) FROM w.main.quoted_path WHERE a."q.""uote" = 1;
+----
+1
+
+statement error
+SELECT count(*) FROM w.main.quoted_path WHERE a.b = 1;
+----
+requires WHERE filters
+
+query I
+SELECT count(*) FROM w.main.case_path WHERE abs(a.mixedcase) = 1;
+----
+1
+
+statement error
+SELECT count(*) FROM w.main.case_path WHERE abs(a.b) = 1;
+----
+requires WHERE filters
+
+query T
+SELECT tags['vgi_required_filters'] FROM duckdb_tables() WHERE database_name = 'w' AND table_name = 'both_paths';
+----
+[[["a.b"]],[["a","b"]]]
+
+statement ok
+DETACH w;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=missing ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+RPC item schema mismatch
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=legacy ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+RPC item schema mismatch
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=null ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=null_group ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=empty_group ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=null_path ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=empty_path ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=null_component ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=empty_component ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=nul_component ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=missing_component ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=scalar_parent ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=duplicate_path ${VGI_REQUIRED_FILTER_WORKER}');
+
+statement error
+SELECT count(*) FROM bad.main.literal;
+----
+Invalid required_filters
+
+statement ok
+DETACH bad;
+

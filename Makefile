@@ -585,6 +585,7 @@ test_python:
 	        --allow-skip 'require-env VGI_TEST_DEDICATED_WORKER' \
 	        "test/*" \
 	        "~test/sql/duckdb2/column_paths.test" \
+	        "~test/sql/duckdb2/required_filter_paths.test" \
 	        "~test/sql/integration/writable/*" \
 	        "~test/sql/vgi_worker_pool.test"
 	@$(MAKE) test_python_crash

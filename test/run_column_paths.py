@@ -21,9 +21,13 @@ def main() -> int:
             "uv", "--directory", str(python), "run", "--no-sync",
             "python", "-m", "tests.catalog.column_native_reference",
         ])
+        env["VGI_REQUIRED_FILTER_WORKER"] = shlex.join([
+            "uv", "--directory", str(python), "run", "--no-sync",
+            "python", "-m", "tests.catalog.required_filters_native",
+        ])
         return subprocess.call([
             str(build / "test/unittest"), "--test-config", "test/configs/no_error_skip.json",
-            "test/sql/duckdb2/column_paths.test",
+            "test/sql/duckdb2/column_paths.test,test/sql/duckdb2/required_filter_paths.test",
         ], cwd=native, env=env)
 
 

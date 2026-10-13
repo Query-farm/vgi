@@ -40,6 +40,8 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/function/scalar/struct_utils.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
@@ -496,7 +498,7 @@ private:
 // ============================================================================
 // Walks the plan post-FilterPushdown. For each LogicalGet whose underlying
 // table is a VgiTableEntry with a non-empty `required_filters`,
-// collects the dotted-path column references touched by any filter expression
+// collects the raw component paths of column references touched by any filter expression
 // in scope (the LogicalGet's table_filters plus any parent LogicalFilter
 // expressions referencing this LogicalGet's table_index). Throws
 // BinderException listing any required path that is not satisfied (prefix-
@@ -515,53 +517,43 @@ public:
 	}
 
 private:
-	// Append a dotted path to the present set.
-	static void EmitPath(unordered_set<std::string> &out, const std::string &top,
-	                     const std::string &suffix) {
-		if (suffix.empty()) {
-			out.insert(top);
-		} else {
-			out.insert(top + "." + suffix);
-		}
-	}
+	using ColumnPath = std::vector<std::string>;
+	using PresentPaths = std::set<ColumnPath>;
+	using RequiredGroups = std::vector<std::vector<ColumnPath>>;
 
-	// Recursive walk over a TableFilter sub-tree, emitting dotted paths for
-	// every column reference. `top_col` is the LogicalGet column name; `suffix`
-	// grows as we descend into StructFilters. Mirrors the iteration shape of
-	// VgiSerializeFilters' JSON walker in vgi_table_function_impl.cpp:572+ but
-	// emits strings instead of building JSON.
-	static void WalkTableFilter(const TableFilter &filter, const std::string &top_col,
-	                            const std::string &suffix, unordered_set<std::string> &out) {
+	// Preserve components through every struct extraction.
+	static void WalkTableFilter(const TableFilter &filter, const ColumnPath &path, PresentPaths &out) {
 		switch (filter.filter_type) {
 		case TableFilterType::CONSTANT_COMPARISON:
 		case TableFilterType::IS_NULL:
 		case TableFilterType::IS_NOT_NULL:
 		case TableFilterType::IN_FILTER:
 		case TableFilterType::EXPRESSION_FILTER:
-			EmitPath(out, top_col, suffix);
+			out.insert(path);
 			return;
 
 		case TableFilterType::CONJUNCTION_AND: {
 			auto &conj = filter.Cast<ConjunctionAndFilter>();
 			for (auto &child : conj.child_filters) {
-				WalkTableFilter(*child, top_col, suffix, out);
+				WalkTableFilter(*child, path, out);
 			}
 			return;
 		}
 		case TableFilterType::CONJUNCTION_OR: {
 			auto &conj = filter.Cast<ConjunctionOrFilter>();
 			for (auto &child : conj.child_filters) {
-				WalkTableFilter(*child, top_col, suffix, out);
+				WalkTableFilter(*child, path, out);
 			}
 			return;
 		}
 		case TableFilterType::STRUCT_EXTRACT: {
 			auto &sf = filter.Cast<StructFilter>();
-			std::string deeper = suffix.empty() ? sf.child_name : (suffix + "." + sf.child_name);
+			auto deeper = path;
+			deeper.push_back(sf.child_name);
 			if (sf.child_filter) {
-				WalkTableFilter(*sf.child_filter, top_col, deeper, out);
+				WalkTableFilter(*sf.child_filter, deeper, out);
 			} else {
-				EmitPath(out, top_col, deeper);
+				out.insert(deeper);
 			}
 			return;
 		}
@@ -585,7 +577,7 @@ private:
 			if (vgi::VgiContainsDynamicFilter(*opt.child_filter)) {
 				return;
 			}
-			WalkTableFilter(*opt.child_filter, top_col, suffix, out);
+			WalkTableFilter(*opt.child_filter, path, out);
 			return;
 		}
 		case TableFilterType::DYNAMIC_FILTER:
@@ -593,13 +585,13 @@ private:
 			// Values aren't known at optimize time, but the column reference
 			// is — count it as presence so that join-derived filters satisfy
 			// requirements as the user intends.
-			EmitPath(out, top_col, suffix);
+			out.insert(path);
 			return;
 		}
 		default:
 			// Unknown future filter type — treat as presence so we don't
 			// over-reject the user.
-			EmitPath(out, top_col, suffix);
+			out.insert(path);
 			return;
 		}
 	}
@@ -625,104 +617,90 @@ private:
 		return static_cast<int64_t>(orig);
 	}
 
-	// Walk an Expression for column refs whose binding resolves to the given
-	// LogicalGet. Emit top-level column names (or `col.subfield` for the
-	// `struct_extract(col, 'subfield')` shape that DuckDB uses to lower
-	// `col.sub` in expressions). `col_ids` and `names` come from the
-	// LogicalGet — `binding.column_index` is post-projection and must be
-	// resolved through `col_ids` before indexing `names`.
-	static void WalkExpression(const Expression &expr, idx_t target_table_index,
-	                           const vector<ColumnIndex> &col_ids,
-	                           const vector<std::string> &names,
-	                           unordered_set<std::string> &out) {
-		// Detect `struct_extract(<col_ref>, '<subfield>')`. DuckDB exposes this
-		// either as a BoundFunctionExpression with function name "struct_extract"
-		// (children = [col_ref, constant subfield index]) or as
-		// BoundExtractFunction wrapper. We match by name on
-		// BoundFunctionExpression and read the second child's constant value.
-		if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-			auto &fn = expr.Cast<BoundFunctionExpression>();
-			if (fn.function.name == "struct_extract" && fn.children.size() >= 2) {
-				auto &col_arg = *fn.children[0];
-				auto &sub_arg = *fn.children[1];
-				if (col_arg.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-				    sub_arg.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-					auto &cref = col_arg.Cast<BoundColumnRefExpression>();
-					if (cref.binding.table_index == target_table_index) {
-						auto orig = ResolveOrigIndex(cref.binding.column_index, col_ids, names.size());
-						if (orig >= 0) {
-							auto &const_expr = sub_arg.Cast<BoundConstantExpression>();
-							if (!const_expr.value.IsNull() &&
-							    const_expr.value.type().id() == LogicalTypeId::VARCHAR) {
-								out.insert(names[orig] + "." +
-								           const_expr.value.GetValue<std::string>());
-								// Don't descend into children — we already
-								// captured the dotted path.
-								return;
-							}
-						}
-					}
-				}
-			}
-		}
+	// Resolve a chain to the engine's canonical field names. Using bound
+	// indexes handles nested extracts and SQL case resolution without changing
+	// the raw, case-preserving wire identity. Do not also emit its parent path.
+	static bool ResolveExpressionPath(const Expression &expr, idx_t target_table_index,
+	                                  const vector<ColumnIndex> &col_ids,
+	                                  const vector<std::string> &names, ColumnPath &path) {
 		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			auto &cref = expr.Cast<BoundColumnRefExpression>();
-			if (cref.binding.table_index == target_table_index) {
-				auto orig = ResolveOrigIndex(cref.binding.column_index, col_ids, names.size());
-				if (orig >= 0) {
-					out.insert(names[orig]);
-				}
+			if (cref.binding.table_index != target_table_index) {
+				return false;
 			}
+			auto orig = ResolveOrigIndex(cref.binding.column_index, col_ids, names.size());
+			if (orig < 0) {
+				return false;
+			}
+			path.push_back(names[orig]);
+			return true;
+		}
+		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return false;
+		}
+		auto &fn = expr.Cast<BoundFunctionExpression>();
+		if ((fn.function.name != "struct_extract" && fn.function.name != "struct_extract_at") ||
+		    fn.children.empty() || !fn.bind_info || fn.children[0]->return_type.id() != LogicalTypeId::STRUCT) {
+			return false;
+		}
+		auto &bound = fn.bind_info->Cast<StructExtractBindData>();
+		auto &children = StructType::GetChildTypes(fn.children[0]->return_type);
+		if (bound.index >= children.size() ||
+		    !ResolveExpressionPath(*fn.children[0], target_table_index, col_ids, names, path)) {
+			return false;
+		}
+		path.push_back(children[bound.index].first);
+		return true;
+	}
+
+	static void WalkExpression(const Expression &expr, idx_t target_table_index,
+	                           const vector<ColumnIndex> &col_ids,
+	                           const vector<std::string> &names, PresentPaths &out) {
+		ColumnPath path;
+		if (ResolveExpressionPath(expr, target_table_index, col_ids, names, path)) {
+			out.insert(std::move(path));
+			return;
 		}
 		ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
 			WalkExpression(child, target_table_index, col_ids, names, out);
 		});
 	}
 
-	// Prefix-satisfaction: a required path is satisfied if itself OR any
-	// shorter dotted prefix of it is in `present`. So a present `"bbox"`
-	// satisfies all of `"bbox.xmin"`, `"bbox.xmax"`, etc. — the parent struct
-	// filter is at least as constraining as the four-corner conjunction.
-	static bool IsSatisfied(const std::string &required,
-	                        const unordered_set<std::string> &present) {
-		if (present.count(required)) {
-			return true;
-		}
-		auto dot = required.rfind('.');
-		while (dot != std::string::npos) {
-			if (present.count(required.substr(0, dot))) {
+	static bool IsSatisfied(const ColumnPath &required, const PresentPaths &present) {
+		ColumnPath prefix;
+		for (const auto &component : required) {
+			prefix.push_back(component);
+			if (present.count(prefix)) {
 				return true;
 			}
-			if (dot == 0) {
-				break;
-			}
-			dot = required.rfind('.', dot - 1);
 		}
 		return false;
 	}
 
-	static std::string JoinPaths(const std::vector<std::string> &v) {
+	static std::string RenderPath(const ColumnPath &path) {
 		std::string out;
-		for (size_t i = 0; i < v.size(); ++i) {
-			if (i) {
-				out += ", ";
+		for (const auto &part : path) {
+			if (!out.empty()) {
+				out += ".";
 			}
-			out += v[i];
+			out += KeywordHelper::WriteOptionallyQuoted(part);
 		}
 		return out;
 	}
 
-	// Render one OR-group for an error message: a singleton group as the bare
-	// path (`ticker`); a multi-member group as `one of (ticker, cik)`.
-	static std::string RenderGroup(const std::vector<std::string> &group) {
-		if (group.size() == 1) {
-			return group[0];
+	static std::string RenderGroup(const std::vector<ColumnPath> &group) {
+		std::string out;
+		for (const auto &path : group) {
+			if (!out.empty()) {
+				out += ", ";
+			}
+			out += RenderPath(path);
 		}
-		return "one of (" + JoinPaths(group) + ")";
+		return group.size() == 1 ? out : "one of (" + out + ")";
 	}
 
 	// Join rendered groups with ", " for the required / missing lists.
-	static std::string JoinGroups(const std::vector<std::vector<std::string>> &groups) {
+	static std::string JoinGroups(const RequiredGroups &groups) {
 		std::string out;
 		for (size_t i = 0; i < groups.size(); ++i) {
 			if (i) {
@@ -764,7 +742,7 @@ private:
 			return;
 		}
 
-		unordered_set<std::string> present;
+		PresentPaths present;
 
 		// Source 1: filters pushed into the LogicalGet itself.
 		// At post-optimize time a TableFilterSet is keyed by the *original*
@@ -784,7 +762,7 @@ private:
 				// Virtual column (rowid etc.) — never a required path.
 				continue;
 			}
-			WalkTableFilter(*kv.second, get.names[kv.first], "", present);
+			WalkTableFilter(*kv.second, {get.names[kv.first]}, present);
 		}
 
 		// Source 2: dynamic_filters (Top-N / runtime). The public API doesn't
@@ -806,7 +784,7 @@ private:
 
 		// Compute unsatisfied groups: a group is satisfied when any one of its
 		// member paths has a filter present; every group must be satisfied.
-		std::vector<std::vector<std::string>> missing;
+		RequiredGroups missing;
 		for (const auto &group : required) {
 			bool satisfied = false;
 			for (const auto &member : group) {

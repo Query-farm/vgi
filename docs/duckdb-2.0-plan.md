@@ -355,13 +355,45 @@ local-authored, task-only libsodium 1.0.21 overlay with the upstream ARM/GCC
 Repository dependency pins remain unchanged. The full RPC-Go suite now also
 passes on Linux ARM64, including the shared-memory case that failed on macOS.
 Shared expression migration,
-generated columns, complete column attributes/dependencies, and required-filter
-operation migration remain open. These tests do not close a protocol or native
-migration gate.
+generated columns and complete column attributes/dependencies remain open.
+The required-filter metadata migration is covered by the increment below. These
+tests do not close a protocol or native migration gate.
 
 The coordinated SDK commits are Python `4449f2b`, Go `029e087`, Rust
 `554c976`, TypeScript `fabd487`, Java `5c6348b`, C# `927ac7c`, and C++
 `dde72f5`. They remain unpublished on the isolated development branches.
+
+The **required-filter path increment** now carries `TableInfo.required_filters`
+as AND-of-OR groups of raw component paths throughout all seven SDKs and the
+native 1.5 adapter. A literal column `"a.b"` remains distinct from nested field
+`a.b`. The native parser rejects malformed metadata and resolves every path
+against the complete Arrow schema. Predicate matching follows component
+prefixes through nested extracts, including canonical field names from SQL
+binding, without treating a child reference as a filter on its parent. The
+`vgi_required_filters` table tag exposes the same three-level JSON structure.
+Legacy dotted strings require explicit, unambiguous migration through the
+schema; there is no automatic wire fallback.
+
+Current EC2 evidence for this increment: **912 Python checks passed**, Ruff and
+mypy over **210 sources** passed, and the six other SDK unit suites passed. The
+native 1.5 release build and **153 SQL assertions** passed, including **71**
+required-path assertions with literal dots, quotes, nested siblings, component
+prefix direction, bound case resolution, and **13 malformed metadata modes**.
+All native SDK lanes passed: Python **344 / 33 skipped**, Go **336 / 40**,
+Rust **323 / 42**, TypeScript **328 / 46**, Java **324 / 37**, and C# **328 / 37**.
+Python/Java totals include two separate crash probes each. The first matrix
+run caught one shared SQL expectation that needed the newly quoted
+`"wrapper".mid.leaf` diagnostic; full Python/Go/Rust reruns passed after the
+expectation was corrected. The C++ harness also passed **324 cases / 12,042
+assertions / 47 skips**, plus **two HTTP bearer cases / 13 assertions**.
+Strict all-SDK generation and the final manifest/corpus checks passed. No
+protocol or native migration gate is closed by this increment.
+
+`TableInfo` travels as nested IPC inside a binary RPC result, so this payload
+schema change alone does not alter the reflection hash. The generated schema
+inventory and shared IPC corpus detect it; the combined release still requires
+the coordinated major-version transition below. Native 2.0 filter bindings and
+remaining column metadata/dependency behavior are still open.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major

@@ -372,21 +372,10 @@ struct VgiTableInfo {
 	// functions whose bind output is a pure function of `cls.FIXED_SCHEMA`).
 	std::optional<std::vector<uint8_t>> bind_result;
 
-	// Required WHERE-filter groups in conjunctive normal form: the outer vector
-	// is an AND of groups, each inner vector is an OR of dotted-path column
-	// references. A group is satisfied when any one of its paths has a filter;
-	// every group must be satisfied. So `{{"accession_number"}, {"ticker",
-	// "cik"}}` means "accession_number AND one of (ticker, cik)". Paths are
-	// top-level column names (`"country"`) or struct subfields (`"bbox.xmin"`).
-	// Empty means no enforcement — the zero-cost fast path for every existing
-	// table.
-	//
-	// Satisfaction is prefix-based: a present filter on a shorter dotted path
-	// satisfies any required path it's a prefix of. A whole-struct filter on
-	// `bbox` therefore satisfies every required `"bbox.*"` path.
-	// `VgiRequiredFiltersOptimizer` consults these groups at post-optimize time
-	// and throws `BinderException` listing any unsatisfied groups.
-	std::vector<std::vector<std::string>> required_filters;
+	// AND-of-OR groups of raw column paths. Dots and quotes are literal.
+	// A present path satisfies a required path only when it is a component
+	// prefix; a child does not satisfy a requirement on its parent.
+	std::vector<std::vector<std::vector<std::string>>> required_filters;
 };
 
 // View metadata from the worker

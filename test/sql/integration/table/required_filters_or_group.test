@@ -42,7 +42,7 @@ query T
 SELECT tags['vgi_required_filters'] FROM duckdb_tables()
 WHERE database_name = 'example' AND table_name = 'rff_or';
 ----
-[["a","b"]]
+[[["a"],["b"]]]
 
 statement ok
 DETACH example;

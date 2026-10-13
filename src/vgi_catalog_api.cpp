@@ -2682,12 +2682,68 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 		    bind_bytes.empty() ? std::nullopt : std::make_optional(std::move(bind_bytes));
 	}
 
-	// Parse required_filters (optional — missing column or empty list means no
-	// enforcement). CNF: an AND (outer) of OR-groups (inner) of dotted paths.
-	// The optimizer extension VgiRequiredFiltersOptimizer reads these from the
-	// cached VgiTableInfo at bind/optimize time.
-	info.required_filters =
-	    row["required_filters"].value_or(std::vector<std::vector<std::string>>{});
+	// Required filters are mandatory successor metadata, including an explicit
+	// empty outer list. Reject malformed/legacy values rather than disabling
+	// enforcement through value_or()'s missing/type-mismatch fallback.
+	auto fail_required = [&](const std::string &reason) {
+		throw InvalidInputException(
+		    ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path)
+		        .Set(error_key::kTable, info.name).Set(error_key::kField, "required_filters"),
+		    StringUtil::Format("Invalid required_filters for table '%s': %s", info.name, reason));
+	};
+	auto outer = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("required_filters"));
+	auto groups = outer ? std::dynamic_pointer_cast<arrow::ListArray>(outer->values()) : nullptr;
+	auto paths = groups ? std::dynamic_pointer_cast<arrow::ListArray>(groups->values()) : nullptr;
+	auto components = paths ? std::dynamic_pointer_cast<arrow::StringArray>(paths->values()) : nullptr;
+	if (!components || outer->IsNull(row_idx)) {
+		fail_required("expected non-null list<list<list<utf8>>>");
+	}
+	for (int64_t i = outer->value_offset(row_idx); i < outer->value_offset(row_idx + 1); ++i) {
+		if (groups->IsNull(i) || groups->value_length(i) == 0) {
+			fail_required("groups must be non-null and nonempty");
+		}
+		std::vector<std::vector<std::string>> group;
+		for (int64_t j = groups->value_offset(i); j < groups->value_offset(i + 1); ++j) {
+			if (paths->IsNull(j) || paths->value_length(j) == 0) {
+				fail_required("paths must be non-null and nonempty");
+			}
+			std::vector<std::string> path;
+			auto fields = info.arrow_schema->fields();
+			for (int64_t k = paths->value_offset(j); k < paths->value_offset(j + 1); ++k) {
+				if (components->IsNull(k)) {
+					fail_required("components must be non-null");
+				}
+				auto component = components->GetString(k);
+				if (component.empty() || component.find('\0') != std::string::npos) {
+					fail_required("components must be nonempty and contain no NUL");
+				}
+				std::shared_ptr<arrow::Field> resolved;
+				for (const auto &field : fields) {
+					if (field->name() == component) {
+						if (resolved) {
+							fail_required("ambiguous component: " + component);
+						}
+						resolved = field;
+					}
+				}
+				if (!resolved) {
+					fail_required("unknown component: " + component);
+				}
+				if (k + 1 < paths->value_offset(j + 1)) {
+					if (resolved->type()->id() != arrow::Type::STRUCT) {
+						fail_required("non-struct parent: " + component);
+					}
+					fields = resolved->type()->fields();
+				}
+				path.push_back(std::move(component));
+			}
+			if (std::find(group.begin(), group.end(), path) != group.end()) {
+				fail_required("duplicate path in group");
+			}
+			group.push_back(std::move(path));
+		}
+		info.required_filters.push_back(std::move(group));
+	}
 
 	// Validate: UPDATE/DELETE require a row ID column
 	if ((info.write_result_modes.count("update") || info.write_result_modes.count("delete")) &&
@@ -3098,16 +3154,20 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 // ============================================================================
 
 // Render required_filters (CNF: an AND of OR-groups) as a compact JSON array of
-// arrays of strings, e.g. [["accession_number"],["ticker","cik"]]. Surfaced on
+// arrays of raw paths, e.g. [[["accession_number"]],[["ticker"],["cik"]]]. Surfaced on
 // the extension-injected `vgi_required_filters` table tag so callers can discover
 // the requirement via duckdb_tables().tags before hitting the BinderException.
-static std::string RenderRequiredFiltersJson(const std::vector<std::vector<std::string>> &groups) {
+static std::string RenderRequiredFiltersJson(const std::vector<std::vector<std::vector<std::string>>> &groups) {
 	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
 	yyjson_mut_val *outer = yyjson_mut_arr(doc);
 	for (const auto &group : groups) {
 		yyjson_mut_val *inner = yyjson_mut_arr(doc);
 		for (const auto &path : group) {
-			yyjson_mut_arr_append(inner, yyjson_mut_strncpy(doc, path.c_str(), path.size()));
+			yyjson_mut_val *parts = yyjson_mut_arr(doc);
+			for (const auto &part : path) {
+				yyjson_mut_arr_append(parts, yyjson_mut_strncpy(doc, part.c_str(), part.size()));
+			}
+			yyjson_mut_arr_append(inner, parts);
 		}
 		yyjson_mut_arr_append(outer, inner);
 	}
