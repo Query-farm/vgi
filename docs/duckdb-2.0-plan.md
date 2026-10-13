@@ -115,7 +115,21 @@ through DuckDB binding, the VGI catalog/table hook, RPC encoding, worker behavio
 and metadata returned afterward. A parsed statement or a matching C++ signature
 does not establish support for the operation.
 
-The October 13 audit establishes the following starting matrix. It includes
+The completed October 13 [field-by-field catalog audit](duckdb-2.0-catalog-audit.md)
+traces the creation, alteration, drop, attachment, and capability fields,
+including all 18 non-INVALID `AlterTableType` variants. It separates carried
+information, engine-managed fields, explicit rejection, information loss, and
+missing contracts. Its source-based 2.0 findings are distinct from runtime
+checks on the current 1.5 release build.
+
+Three existing losses were confirmed: explicit view output aliases disappear,
+generated columns are reconstructed as ordinary columns, and ADD COLUMN omits
+the default from the worker payload. The audit also identifies missing
+secure-view security flags, new nested column paths, and expanded ADD COLUMN
+operations as 2.0 correctness gates. Five focused existing cases passed with
+187 assertions; that does not establish a working VGI 2.0 runtime.
+
+The following matrix summarizes the implementation scope. It includes
 existing 1.5 gaps that need an explicit support decision, as well as new 2.0
 features; these must not all be reported as 2.0 regressions.
 
@@ -124,12 +138,14 @@ features; these must not all be reported as 2.0 regressions.
 | Nested `CREATE SCHEMA`, qualified object names, lookup and enumeration | `SupportsNestedSchemas()`, `SchemaCatalogEntry` parent/path helpers, schema-tree scans, and `EntryLookupInfo`. VGI currently builds a flat schema set. | Implement child schema entries and full-path create/lookup/drop/scan. Qualify default schema, search paths, quoted names, conflict handling, dependencies, and cascading operations. Cache identity is one consequence of this larger change. |
 | `CREATE SCHEMA ... WITH (...)` | New `CreateSchemaInfo.options` and `Catalog::SupportsCreateSchema()`. VGI's schema-create request contains path, conflict policy, comment, tags, and transaction data; no general options field. | Define supported option names, types, expression evaluation, and worker capabilities. Supporting options requires a protocol/SDK extension; otherwise reject them explicitly. Do not confuse arbitrary options with string-valued tags. |
 | `ALTER SCHEMA ... SET/RESET (...)` | New `AlterSchemaInfo` variants and `Catalog::AlterSchema()`. No corresponding schema-option operation exists in VGI's generated requests. | Add negotiated RPC operations, persistence and metadata refresh for supporting workers. Test SET versus RESET, IF EXISTS, transaction rollback, and nested targets. |
-| Table creation and alteration clauses | `SupportsCreateTable()`, `CreateTableInfo`, `BoundCreateTableInfo`, `AlterTableInfo`, and `BindAlterAddIndex()`. VGI handles selected columns/defaults/constraints and a subset of ALTER operations. Partition/sort clauses, table options, nested-field ALTER, and index/constraint changes need explicit classification; many already exist in the pinned 1.5 engine. | Inventory every field and ALTER variant against the RPCs. Port existing behavior; implement negotiated additions or produce operation-specific errors. Test that clauses cannot be accepted and silently omitted from the request. Audit generated columns and constraint enforcement separately from metadata advertisement. |
+| Table creation and alteration clauses | Inherited `SupportsCreateTable()` rejects partition/sort clauses and table WITH options. VGI carries selected constraints and ALTER operations but loses generated expressions and ADD defaults. New `column_path` vectors replace flat targets for type/default/nullability changes. | Repair or reject lost column metadata. Support one-component targets explicitly until nested-path contracts exist. Add selected options/field/constraint operations with negotiated worker behavior; verify enforcement separately from metadata advertisement. |
 | Schema/table/view comments, tags, and definitions | VGI can read metadata and handle some comment changes, but `InvokeCatalogSchemaCreate` currently sends absent comment/tags even though the wire accepts them. Views send a rendered SQL definition. | Distinguish readable metadata from writable DDL. Carry supported metadata and view definition details through create/alter, preserving name resolution and dependencies; reject unsupported details. |
+| View aliases and secure views | Explicit aliases are omitted from the SELECT-only create payload. New `CreateViewInfo.security_type` establishes an optimization barrier; current create/read contracts cannot preserve it. | Fix alias round trips. Preserve the security flag through storage/discovery/rebinding or reject secure view creation before mutation. Sending full CREATE VIEW SQL is not compatible with the existing SELECT-only read contract. |
+| Expanded ADD COLUMN | The 2.0 transformer can generate ADD, UPDATE, SET DEFAULT, SET NOT NULL, and ADD CONSTRAINT operations. VGI currently rejects ADD CONSTRAINT. | Check support for the complete operation and qualify rollback across the sequence. Reject unsupported shapes before remote mutation; carrying parser flags in one RPC alone would miss the execution path. |
 | `CREATE/DROP TRIGGER` and triggered writes | Haybarn's `TableCatalogEntry` exposes create/get/scan/drop trigger hooks and event selection. VGI does not implement trigger catalog storage. | Decide ownership and persistence, implement dependency/drop behavior and metadata enumeration, then qualify OLD/NEW, RETURNING, atomicity, and single execution. Remains a feature addition after basic write parity. |
 | Multiple DML CTEs, CTAS, MERGE/UPDATE/DELETE and RETURNING | `SupportsMultipleDMLCTEs()` is an explicit catalog opt-in. Physical planning hooks and bound table metadata must match the new execution plans. | Qualify each statement shape with shared worker transaction state. Enable the capability only for workers that can meet the semantics, and test multi-write failures and rollback. Existing write support alone is insufficient evidence. |
 | `CONNECT` and remote query/statement dispatch | `Supports(RemoteCapability)`, `RemoteExecute(...)`, and `SupportsPushdown(...)`. VGI has no 2.0 implementations. | Define an optional SQL-capable worker profile. Keep individual remote capabilities separate; ordinary function/catalog workers need not implement a SQL engine. |
-| Other catalog object kinds | VGI currently rejects creation of indexes, sequences, types, collations, and several function kinds, even on writable attachments. These are existing limitations. | Record discovery/create/alter/drop support separately for each kind, including coordinate-system entries where applicable. Replace misleading blanket "read-only" errors with accurate capability errors. Supporting a new kind may require protocol/SDK work. |
+| Other catalog object kinds | VGI rejects native index/macro creation although their RPCs already exist; index lookup/scan is not wired into the schema entry. Sequences, types, collations, and several function kinds are also rejected. These are existing limitations. | Integrate existing requests where sufficient; qualify index option types and macro overload/default contracts. Replace misleading blanket "read-only" errors with accurate capability errors. New kinds may require protocol/SDK work. |
 
 Evidence: upstream [catalog hooks](https://github.com/duckdb/duckdb/blob/c65ca930b9fe39b2e8d8ed8821018dca650965f4/src/include/duckdb/catalog/catalog.hpp),
 [schema entry](https://github.com/duckdb/duckdb/blob/c65ca930b9fe39b2e8d8ed8821018dca650965f4/src/include/duckdb/catalog/catalog_entry/schema_catalog_entry.hpp),
@@ -163,8 +179,10 @@ DuckDB catalog feature.
   `duckdb_version` in the current distribution job is insufficient.
 - Produce a complete compile/link diagnostic inventory. Separate missing build
   dependencies from API changes; track remaining failures by subsystem.
-- Expand the catalog/SQL matrix above into a field-and-hook inventory against
-  the exact engine pin, separating new 2.0 features from existing VGI gaps.
+- **Completed preparation:** the [catalog field inventory](duckdb-2.0-catalog-audit.md)
+  records every core DDL field and ALTER TABLE variant against the exact pin,
+  separating new 2.0 requirements from existing VGI gaps. Use its acceptance
+  gates when implementing the selected support scope.
 - Repin or port Haybarn httpfs and test its cancellation hooks. A temporary
   subprocess-only development build is useful, but HTTP is part of parity.
 - Record fixture SDK/RPC revisions, Arrow/vcpkg configuration, compiler, Rust
@@ -187,6 +205,8 @@ extension dependencies or test binaries.
   Own `ColumnList` in `VgiTableEntry` and implement the now-pure `GetColumns()`.
 - Audit capability defaults and creation/alteration validation hooks so a
   successful port cannot advertise unimplemented DDL or discard parsed options.
+- Repair or reject the audited column/view information losses. Add explicit
+  secure-view and nested-column guards until their semantics can round-trip.
 - Port scalar/aggregate signatures, bind inputs, immutable function definitions,
   table callbacks, typed keyword options, and Arrow name conversion. Audit
   bind-time mutation and copied functions for ownership changes. Account for
@@ -225,6 +245,9 @@ is an integration checkpoint, not the supported release feature set.
   result-cache behavior. Preserve ordering and batch-index contracts.
 - Adapt COPY FROM/TO callbacks and rotation/finalization/abort behavior. Port
   writable-table planning, row IDs, CTAS, INSERT/UPDATE/DELETE/MERGE, and RETURNING.
+- Qualify the expanded ADD COLUMN sequences, including nonconstant default
+  materialization and follow-up constraints. Inject failures between operations
+  and prove rollback or preflight rejection for incapable workers.
 - Update interruption and operator metrics APIs. Preserve execution IDs,
   structured errors, log context, remote-secret precedence, and DETACH lifetimes.
 - Audit vector sizes and DataChunk cardinality when converting Arrow batches.
@@ -342,7 +365,8 @@ before advertising parity.
 ## First implementation changes
 
 1. Add a pinned VGI 2.0 build lane using the refreshed Haybarn baseline and
-   complete the compiler and catalog/SQL coverage inventories (M0).
+   complete the compiler inventory (M0); use the completed catalog field audit
+   to select implementation and explicit rejection paths.
 2. Land naming/catalog ownership and function API adaptations until the M1
    fixture smoke tests run.
 3. Port filters and planner/execution clusters in reviewable changes (M2),
@@ -350,6 +374,7 @@ before advertising parity.
 4. Qualify dependencies, transports, platforms, and packaging (M4).
 
 Re-estimate the remaining work after M1, when hidden compilation and link
-failures are visible. The largest correctness risks are predicate loss, catalog
-identity collisions, bind-data lifetime, cancellation deadlocks, and remote write
-replay/rollback. Each has an explicit test gate above.
+failures are visible. The largest correctness risks are predicate or DDL-field
+loss, secure-view flag loss, catalog identity collisions, bind-data lifetime,
+cancellation deadlocks, and remote write replay/rollback. Each has an explicit
+test gate above or in the field audit.
