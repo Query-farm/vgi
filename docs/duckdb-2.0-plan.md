@@ -3,6 +3,10 @@
 **Status:** protocol preparation started on DuckDB 1.5.x, October 13, 2026. Planning branch:
 `codex/duckdb-2.0-plan`, starting at VGI `74015fc3cb0b`.
 
+**Overall completion: incomplete.** No P0–P3 or M0–M4 exit gate is marked
+complete. The tested groundwork below is partial implementation, not completion
+of the broader protocol or the native DuckDB 2.0 port.
+
 Prepare **one broad, coordinated protocol release** for the catalog and
 execution capabilities we intend to support in DuckDB 2.0, while continuing to
 build and test the extension on the pinned Haybarn/DuckDB 1.5.x engine. Batch
@@ -135,6 +139,76 @@ upstream release schedule is not a VGI delivery commitment.
   `/tmp/vgi-duckdb2-typed-values-languages.log`, and
   `/tmp/vgi-duckdb2-typed-values-typescript.log`. Machine-readable totals are
   in `/tmp/vgi-duckdb2-typed-values-validation.json`.
+
+### Combined inventory and shared catalog representations
+
+The combined manifest is in the isolated Python worktree at
+`docs/protocol/duckdb-2.0-manifest.json`. Its validator,
+`scripts/check_duckdb2_manifest.py`, compares all 151 field-audit rows and all
+19 target/candidate areas directly with this plan and the audit, plus a shared
+identity area. Removing a candidate that has no catalog-field row still fails
+the inventory check. Coverage is not readiness: `--require-decisions` rejects
+the 137 outstanding scope, capability, and field reviews.
+
+The normal SDK modules now define `OptionChanges`, `OptionState`, raw
+`ColumnPath`, and `RequiredFilterPaths`. Typed options distinguish SET NULL,
+omission, and RESET, retain explicit-override readback, and validate the whole
+candidate before producing a new state. Raw paths retain dots and quotes inside
+components; required-filter groups retain their AND-of-OR and structural-prefix
+semantics. Legacy dotted filters migrate only when the table schema proves an
+unambiguous identity. The detailed contract is in the Python worktree's
+`docs/protocol/shared-catalog-values.md`.
+
+These records have generated schemas and typed models across all six SDKs and
+C++ schema factories. A shared Python-written IPC corpus exercises populated
+and empty records through each SDK's actual codec, with byte-for-byte retention
+of the embedded Arrow value payloads. Go tests its reflection codec through
+HTTP; TypeScript tests both Arrow implementations. Java's generator now handles
+recursive list types already supported by its RPC codec, with nullability and
+child-name checks at every level. The five other SDKs have isolated
+`vgi-<language>-duckdb2` worktrees on `codex/duckdb-2.0-protocol`.
+
+This increment is committed as Python `7e61efa` (shared records) and `13f000f`
+(inventory), Go `983e34b`, Rust `b6283c3`, TypeScript `4d6ff3e`, Java `96ca66c`,
+and C# `5ad2026`. Validation:
+
+- Ruff and mypy pass (206 sources); strict generation checks find every
+  expected checkout/artifact and report no drift. Python's focused generator,
+  shared-record, and inventory run passed 232 checks; the subsequent expanded
+  manifest guard passed 11 checks and both new documentation examples execute.
+- Real generated-schema checks and populated IPC corpus tests pass in all six
+  SDKs. Java passed 71 checks and C# 227; Rust passed its schema check and two
+  corpus tests; Go passed schema derivation and six HTTP echo cases; TypeScript
+  passed three corpus tests under each Arrow implementation and its build.
+  The generated C++ header passes a separate compile check against Arrow 21.0.0.
+- `make test_languages` exited zero using the isolated worktrees: Python 344,
+  Go 336, Rust 323, TypeScript 328, Java 324, and C# 328 passed. Expected skips
+  are respectively 33, 40, 42, 46, 37, and 37; they are not passes. TypeScript's
+  separate HTTP suite passed 311 with 53 environment/transport skips.
+- Native integration used the existing 1.5 release test binary. These results
+  qualify common codecs and protect existing 2.1 behavior; they do not qualify
+  new catalog operations or a native 2.0 adapter. Exact SDK/RPC revisions and
+  limits are recorded in the manifest's `preparation_validation` and
+  `sdk_inventory`. Logs use `/tmp/vgi-duckdb2-shared-*`, including
+  `languages.log`, `typescript-launcher.log`, `typescript-http-details.log`,
+  `codegen-tests.log`, and `validation.json`.
+
+Existing catalog RPCs, flat column parameters, and dotted
+`TableInfo.required_filters` have not yet switched to these representations.
+Provider option-definition discovery, operation integration, capability
+selection, durable atomicity/rollback, and native enforcement remain required.
+Opaque-byte preservation does not qualify every SDK's interpretation of
+logical-type annotations. The engine pin and public protocol version remain
+1.5.x and `vgi.v2` / `2.1.0` during this preparation.
+
+| Gate | Current status | Work still required |
+| --- | --- | --- |
+| P0 | In progress; inventory coverage checked | Resolve scope, capability, and field mappings across the full package. |
+| P1 | In progress; shared value/path reference behavior tested | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
+| P2 | Common-record codec preparation only | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
+| P3 | Not qualified or released | Full capability conformance, transport tests, coordinated deployment/rollback proof, and matched publication. |
+| M0 | Haybarn refresh and source audit prepared | Establish the pinned VGI 2.0 build/CI lane and complete native diagnostics. |
+| M1–M4 | Native port remains | Binding, execution/write semantics, nested identities, platform/browser qualification, and distribution. |
 
 ## Baselines and existing work
 
