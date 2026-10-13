@@ -16,6 +16,40 @@
 
 namespace duckdb {
 
+// DuckDB 1.5's BindView stores SELECT-derived names until a SELECT binds the
+// view as a table reference. Column comments must use the exposed names even
+// when discovery or COMMENT is the first operation after loading the view.
+class VgiViewCatalogEntry final : public ViewCatalogEntry {
+public:
+	using ViewCatalogEntry::ViewCatalogEntry;
+
+	void BindView(ClientContext &context, BindViewAction action = BindViewAction::BIND_IF_UNBOUND) override {
+		ViewCatalogEntry::BindView(context, action);
+		auto columns = ViewCatalogEntry::GetColumnInfo();
+		if (!columns || aliases.empty()) {
+			return;
+		}
+		for (idx_t i = 0; i < aliases.size() && i < columns->names.size(); i++) {
+			if (columns->names[i] != aliases[i]) {
+				UpdateBinding(columns->types, columns->names);
+				return;
+			}
+		}
+	}
+
+	void UpdateBinding(const vector<LogicalType> &types, const vector<string> &names) override {
+		if (aliases.empty()) {
+			ViewCatalogEntry::UpdateBinding(types, names);
+			return;
+		}
+		auto exposed_names = names;
+		for (idx_t i = 0; i < aliases.size() && i < exposed_names.size(); i++) {
+			exposed_names[i] = aliases[i];
+		}
+		ViewCatalogEntry::UpdateBinding(types, exposed_names);
+	}
+};
+
 // Returns nullptr if the view's SQL fails to parse or is not a SELECT.
 // ViewCatalogEntry derefs info.query in DuckDB's binder, so registering an
 // entry whose query is null crashes any subsequent SELECT * FROM v. Skipping
@@ -26,8 +60,8 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 	info.view_name = view_info.name;
 	info.sql = view_info.definition;
 	info.aliases.assign(view_info.aliases.begin(), view_info.aliases.end());
-	if (!view_info.comment.empty()) {
-		info.comment = Value(view_info.comment);
+	if (view_info.comment) {
+		info.comment = Value(*view_info.comment);
 	}
 	for (auto &[key, val] : view_info.tags) {
 		info.tags[key] = val;
@@ -54,7 +88,7 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 		VGI_STDERR_DEBUG("[VGI] view.skipped name=%s parse_error=unknown\n", view_info.name.c_str());
 		return nullptr;
 	}
-	return make_uniq<ViewCatalogEntry>(catalog, schema, info);
+	return make_uniq<VgiViewCatalogEntry>(catalog, schema, info);
 }
 
 VgiViewSet::VgiViewSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet(catalog, &schema), schema_(schema) {

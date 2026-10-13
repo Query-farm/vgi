@@ -2,6 +2,7 @@
 #include "storage/vgi_schema_entry.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
@@ -373,6 +374,20 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 		definition = info.query->ToString();
 	}
 
+	std::optional<std::string> comment;
+	if (!info.comment.IsNull()) {
+		comment = info.comment.ToString();
+	}
+	std::map<std::string, std::string> tags;
+	for (const auto &tag : info.tags) {
+		tags.emplace(tag.first, tag.second);
+	}
+	std::map<std::string, std::string> column_comments;
+	for (const auto &entry : info.column_comments_map) {
+		if (!entry.second.IsNull()) {
+			column_comments.emplace(entry.first, entry.second.ToString());
+		}
+	}
 	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
 
 	// Get transaction ID
@@ -383,7 +398,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	auto &attach_result = vgi_catalog.attach_result();
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	vgi::InvokeCatalogViewCreate(rpc_ctx, name, info.view_name, definition, std::vector<std::string>(info.aliases.begin(), info.aliases.end()),
-	                             on_conflict, context);
+	                             on_conflict, comment, tags, column_comments, context);
 
 	// Invalidate view cache
 	DeferDrop(catalog, views_.HarvestEntries());
@@ -461,9 +476,37 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto &col_comment = info.Cast<SetColumnCommentInfo>();
 		bool is_null = col_comment.comment_value.IsNull();
 		auto comment_str = is_null ? "" : col_comment.comment_value.ToString();
-		vgi::InvokeCatalogTableColumnCommentSet(rpc_ctx, name, col_comment.name, col_comment.column_name,
-		                                         comment_str, is_null, false, context);
-		DeferDrop(catalog, tables_.HarvestEntry(col_comment.name));
+		if (col_comment.catalog_entry_type == CatalogType::VIEW_ENTRY) {
+			auto entry = views_.GetEntry(context, col_comment.name);
+			if (!entry) {
+				throw BinderException("View \"%s\" does not exist", col_comment.name);
+			}
+			auto &view = entry->Cast<ViewCatalogEntry>();
+			view.BindView(context);
+			auto columns = view.GetColumnInfo();
+			bool found = false;
+			if (columns) {
+				for (const auto &column : columns->names) {
+					if (column == col_comment.column_name) {
+						found = true;
+						break;
+					}
+				}
+			}
+			if (!found) {
+				throw BinderException("View \"%s\" does not have a column with name \"%s\"",
+				                      col_comment.name, col_comment.column_name);
+			}
+			vgi::InvokeCatalogViewColumnCommentSet(rpc_ctx, name, col_comment.name, col_comment.column_name,
+			                                    comment_str, is_null, false, context);
+			DeferDrop(catalog, views_.HarvestEntry(col_comment.name));
+		} else if (col_comment.catalog_entry_type == CatalogType::TABLE_ENTRY) {
+			vgi::InvokeCatalogTableColumnCommentSet(rpc_ctx, name, col_comment.name, col_comment.column_name,
+			                                     comment_str, is_null, false, context);
+			DeferDrop(catalog, tables_.HarvestEntry(col_comment.name));
+		} else {
+			throw BinderException("COMMENT ON COLUMN is not supported for this VGI object kind");
+		}
 		return;
 	}
 

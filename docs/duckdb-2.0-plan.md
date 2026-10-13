@@ -480,11 +480,44 @@ C++ 68 CTests). Eight Flechette codec checks also pass; the previously recorded
 stdio transport gap remains open. Final strict generation, 74 overlapping
 contract/manifest checks, Ruff and mypy pass. No release gate is closed.
 
-The current 77-method reflection hash is
+The view-security increment used the 77-method reflection hash
 `b1db9b01e3c78a746e627fe18a4e0e0c191389dce42f15368427067f071cdecc`.
-Creation comments/tags/column comments, view-column comment mutation, query
-resolution, dependencies and complete engine qualification remain in the same
-coordinated release. No version is being released.
+
+The **view metadata increment** adds creation `comment`, `tags` and
+`column_comments`, plus `catalog_view_column_comment_set` with one raw output
+identifier. All seven SDKs preserve metadata through ordinary CREATE/IGNORE/
+REPLACE and comment mutations. NULL and empty comments remain distinct. The
+durable Python reference exercises regular/barrier metadata through HTTP,
+reconnect, commit and rollback. Metadata-only providers still do not bind SQL.
+
+The native 1.5 adapter forwards creation metadata, routes view-column comments
+separately from table-column comments, validates output existence, and invalidates
+the view cache. Its view entry normalizes explicit aliases during initial
+binding, so comments work before the first SELECT. `COPY FROM DATABASE ...
+(SCHEMA)` exercises creation comments on the existing engine. The two shared
+view SQL cases pass on all seven SDKs: **56 assertions per SDK**. The existing
+column/required-filter/view-security reference suite passes **218 assertions**.
+All seven SDKs also pass the same public RPC metadata lifecycle, including
+unchanged catalog versions after rejected requests. The full native language
+matrix passes: Python **346 / 33 skipped**, Go **338 / 40**, Rust **325 / 42**,
+TypeScript **330 / 46**, Java **326 / 37**, and C# **330 / 37**. Python/Java
+counts include two separate crash probes each. C++ passes **326 cases / 12,098
+assertions / 47 skips**, plus two HTTP bearer cases. SDK unit suites, strict
+all-SDK generation, Ruff, mypy and **784 Python checks** pass. The separately
+configured seven-SDK RPC run passes eight checks, including its environment
+check; it is skipped in the ordinary Python run. Eight Flechette codec checks
+pass; its previously recorded stdio limitation remains open. Detailed evidence
+is in the manifest's `view_metadata_validation` entry.
+
+The native runtime registry now includes all 78 protocol methods, including the
+five earlier schema/table option and layout methods. An inventory test checks
+both request and response registration; registration alone enables no capability.
+The current reflection hash is
+`18fc1d304bafc3ea667bc77e20dbbd0028444ec7587cca7f03a428067942a4f7`.
+See `vgi-python-duckdb2/docs/protocol/view-metadata.md` for the contract and limits.
+Full capability negotiation, query resolution, dependencies, output contracts,
+concurrent lifecycle semantics and native 2.0 qualification remain open. No
+version is being released.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major

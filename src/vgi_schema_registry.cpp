@@ -73,8 +73,11 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    "catalog_transaction_rollback",
 		    "catalog_schema_create",
 		    "catalog_schema_drop",
+		    "catalog_schema_alter_options",
 		    "catalog_table_create",
 		    "catalog_table_drop",
+		    "catalog_table_alter_options",
+		    "catalog_table_alter_layout",
 		    "catalog_table_rename",
 		    "catalog_table_comment_set",
 		    "catalog_table_column_comment_set",
@@ -90,6 +93,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    "catalog_view_drop",
 		    "catalog_view_rename",
 		    "catalog_view_comment_set",
+		    "catalog_view_column_comment_set",
 		    "catalog_macro_create",
 		    "catalog_macro_drop",
 		    "catalog_index_create",
@@ -102,6 +106,10 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		// --- Strictly-typed single-struct responses -----------------------
 		m["catalog_attach"] = ResponseSchema{CatalogAttachResultSchema(), nullptr, false, nullptr};
 		m["catalog_version"] = ResponseSchema{CatalogVersionResultSchema(), nullptr, false, nullptr};
+		m["catalog_schema_option_definitions"] =
+		    ResponseSchema{CatalogSchemaOptionDefinitionsResultSchema(), nullptr, false, nullptr};
+		m["catalog_table_option_definitions"] =
+		    ResponseSchema{CatalogTableOptionDefinitionsResultSchema(), nullptr, false, nullptr};
 		// Typed result; `schemas` is list<struct<SchemaContents>> (validated as
 		// part of the result schema), whose binary fields are per-kind items.
 		m["catalog_contents"] = ResponseSchema{CatalogContentsResultSchema(), nullptr, false, nullptr};
@@ -190,6 +198,8 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_contents", &CatalogContentsParamsSchema},
 		    {"catalog_schema_get", &CatalogSchemaGetParamsSchema},
 		    {"catalog_schema_create", &CatalogSchemaCreateParamsSchema},
+		    {"catalog_schema_alter_options", &CatalogSchemaAlterOptionsParamsSchema},
+		    {"catalog_schema_option_definitions", &CatalogSchemaOptionDefinitionsParamsSchema},
 		    {"catalog_schema_drop", &CatalogSchemaDropParamsSchema},
 		    {"catalog_schema_contents_tables", &CatalogSchemaContentsTablesParamsSchema},
 		    {"catalog_schema_contents_views", &CatalogSchemaContentsViewsParamsSchema},
@@ -199,6 +209,9 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_schema_contents_indexes", &CatalogSchemaContentsIndexesParamsSchema},
 		    {"catalog_table_get", &CatalogTableGetParamsSchema},
 		    {"catalog_table_create", &CatalogTableCreateParamsSchema},
+		    {"catalog_table_alter_options", &CatalogTableAlterOptionsParamsSchema},
+		    {"catalog_table_alter_layout", &CatalogTableAlterLayoutParamsSchema},
+		    {"catalog_table_option_definitions", &CatalogTableOptionDefinitionsParamsSchema},
 		    {"catalog_table_drop", &CatalogTableDropParamsSchema},
 		    {"catalog_table_rename", &CatalogTableRenameParamsSchema},
 		    {"catalog_table_scan_function_get", &CatalogTableScanFunctionGetParamsSchema},
@@ -222,6 +235,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_view_drop", &CatalogViewDropParamsSchema},
 		    {"catalog_view_rename", &CatalogViewRenameParamsSchema},
 		    {"catalog_view_comment_set", &CatalogViewCommentSetParamsSchema},
+		    {"catalog_view_column_comment_set", &CatalogViewColumnCommentSetParamsSchema},
 		    {"catalog_macro_get", &CatalogMacroGetParamsSchema},
 		    {"catalog_macro_create", &CatalogMacroCreateParamsSchema},
 		    {"catalog_macro_drop", &CatalogMacroDropParamsSchema},

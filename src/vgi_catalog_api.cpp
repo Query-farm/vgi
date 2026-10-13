@@ -1308,9 +1308,13 @@ void InvokeCatalogViewCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name,
     const std::string &definition, const std::vector<std::string> &aliases, const std::string &on_conflict,
+    const std::optional<std::string> &comment, const std::map<std::string, std::string> &tags,
+    const std::map<std::string, std::string> &column_comments,
     ClientContext &context) {
 	auto params = generated::BuildCatalogViewCreateParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
-	                                                      view_name, definition, on_conflict, OptTxn(ctx), aliases, "regular");
+	                                                              view_name, definition, on_conflict, OptTxn(ctx), aliases, "regular", comment,
+	                                                              std::vector<std::pair<std::string, std::string>>(tags.begin(), tags.end()),
+	                                                              std::vector<std::pair<std::string, std::string>>(column_comments.begin(), column_comments.end()));
 	InvokeVoidRpc(ctx, "catalog_view_create", params, context);
 }
 
@@ -1332,6 +1336,17 @@ void InvokeCatalogViewRename(
 	auto params = generated::BuildCatalogViewRenameParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
 	                                                      view_name, new_name, ignore_not_found, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_view_rename", params, context);
+}
+
+void InvokeCatalogViewColumnCommentSet(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &view_name, const std::string &column_name,
+    const std::string &comment, bool comment_is_null, bool ignore_not_found,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogViewColumnCommentSetParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), view_name, {column_name},
+	    OptStrNullable(comment, comment_is_null), ignore_not_found, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_view_column_comment_set", params, context);
 }
 
 void InvokeCatalogViewCommentSet(
@@ -2830,7 +2845,7 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 		}
 		info.aliases.push_back(std::move(alias));
 	}
-	info.comment = row["comment"].value_or("");
+	info.comment = row["comment"].as<std::string>();
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 	info.column_comments = row["column_comments"].value_not_null<std::map<std::string, std::string>>();
 

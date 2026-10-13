@@ -367,6 +367,8 @@ void InvokeCatalogViewCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name,
     const std::string &definition, const std::vector<std::string> &aliases, const std::string &on_conflict,
+    const std::optional<std::string> &comment, const std::map<std::string, std::string> &tags,
+    const std::map<std::string, std::string> &column_comments,
     ClientContext &context);
 
 // Invoke catalog_view_drop: drop a view from the catalog.
@@ -384,6 +386,12 @@ void InvokeCatalogViewRename(
     ClientContext &context);
 
 // Set or clear the comment on a view
+void InvokeCatalogViewColumnCommentSet(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &view_name, const std::string &column_name,
+    const std::string &comment, bool comment_is_null, bool ignore_not_found,
+    ClientContext &context);
+
 void InvokeCatalogViewCommentSet(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name,

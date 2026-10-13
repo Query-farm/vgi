@@ -1,0 +1,107 @@
+# name: test/sql/integration/view/view_metadata.test
+# description: View creation and column comments retain empty values and raw names.
+# group: [vgi_integration_view]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'contents_reval' AS metadata (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CREATE VIEW metadata.main.v ("a.b", "with""quote") AS SELECT 11 AS x, 22 AS y;
+
+statement ok
+COMMENT ON VIEW metadata.main.v IS '';
+
+query I
+SELECT comment = '' FROM duckdb_views() WHERE database_name = 'metadata' AND view_name = 'v';
+----
+true
+
+statement ok
+COMMENT ON COLUMN metadata.main.v."a.b" IS 'first';
+
+statement ok
+COMMENT ON COLUMN metadata.main.v."with""quote" IS '';
+
+query II
+SELECT column_name, comment FROM duckdb_columns() WHERE database_name = 'metadata' AND table_name = 'v' ORDER BY column_index;
+----
+a.b	first
+with"quote	(empty)
+
+statement error
+COMMENT ON COLUMN metadata.main.v.absent IS 'bad';
+----
+does not have a column
+
+statement ok
+COMMENT ON COLUMN metadata.main.v."a.b" IS NULL;
+
+statement ok
+COMMENT ON VIEW metadata.main.v IS NULL;
+
+query I
+SELECT comment IS NULL FROM duckdb_views() WHERE database_name = 'metadata' AND view_name = 'v';
+----
+true
+
+query II
+SELECT column_name, comment IS NULL FROM duckdb_columns() WHERE database_name = 'metadata' AND table_name = 'v' ORDER BY column_index;
+----
+a.b	true
+with"quote	false
+
+# Copying an existing local view exercises CreateViewInfo's metadata on 1.5.
+statement ok
+ATTACH ':memory:' AS metadata_source;
+
+statement ok
+CREATE VIEW metadata_source.main.copied ("a.b") AS SELECT 7 AS "a.b";
+
+statement ok
+COMMENT ON VIEW metadata_source.main.copied IS '';
+
+statement ok
+COMMENT ON COLUMN metadata_source.main.copied."a.b" IS 'copied comment';
+
+statement ok
+COPY FROM DATABASE metadata_source TO metadata (SCHEMA);
+
+query I
+SELECT "a.b" FROM metadata.main.copied;
+----
+7
+
+query I
+SELECT comment = '' FROM duckdb_views() WHERE database_name = 'metadata' AND view_name = 'copied';
+----
+true
+
+query II
+SELECT column_name, comment FROM duckdb_columns() WHERE database_name = 'metadata' AND table_name = 'copied';
+----
+a.b	copied comment
+
+statement ok
+CREATE OR REPLACE VIEW metadata.main.copied AS SELECT 8 AS z;
+
+query I
+SELECT comment IS NULL FROM duckdb_views() WHERE database_name = 'metadata' AND view_name = 'copied';
+----
+true
+
+query II
+SELECT column_name, comment IS NULL FROM duckdb_columns() WHERE database_name = 'metadata' AND table_name = 'copied';
+----
+z	true
+
+statement ok
+DETACH metadata_source;
+
+statement ok
+DETACH metadata;
