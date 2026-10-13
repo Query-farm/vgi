@@ -1,7 +1,8 @@
 # VGI migration plan for DuckDB 2.0
 
 **Status:** protocol preparation started on DuckDB 1.5.x, October 13, 2026. Planning branch:
-`codex/duckdb-2.0-plan`, starting at VGI `74015fc3cb0b`.
+`codex/duckdb-2.0-plan`, starting at VGI `74015fc3cb0b`. Implementation continues
+on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
 
 **Overall completion: incomplete.** No P0–P3 or M0–M4 exit gate is marked
 complete. The tested groundwork below is partial implementation, not completion
@@ -193,19 +194,76 @@ and C# `5ad2026`. Validation:
   `languages.log`, `typescript-launcher.log`, `typescript-http-details.log`,
   `codegen-tests.log`, and `validation.json`.
 
-Existing catalog RPCs, flat column parameters, and dotted
-`TableInfo.required_filters` have not yet switched to these representations.
-Provider option-definition discovery, operation integration, capability
-selection, durable atomicity/rollback, and native enforcement remain required.
-Opaque-byte preservation does not qualify every SDK's interpretation of
-logical-type annotations. The engine pin and public protocol version remain
-1.5.x and `vgi.v2` / `2.1.0` during this preparation.
+### Negotiated schema options and coordinated SDK update
+
+The next increment adds attachment-scoped `CatalogCapabilities`, provider option
+definitions, optional typed creation values, SET/RESET changes, and option
+readback in `SchemaInfo`. Capability selection is sealed into attachment state,
+validated against current provider support before effects, and bound to the
+request's authenticated identity. Metadata projection and etags distinguish
+clients with different selected profiles. Legacy providers advertise no new
+profile and reject nonempty new option payloads before mutation.
+
+The Python HTTP reference exercises required values, typed NULL, RESET defaults,
+read-only options, invalid mixed changes, nested targets, MetaWorker routing,
+reconnects, transaction-local visibility, rollback, idempotent completion and
+commit conflicts. Its SQLite-backed schema state survives a fresh worker. This
+is evidence for these schema operations; mixed DDL/DML atomicity and object-level
+secure-view/trigger requirements still need their own implementation and tests.
+
+The normal generator now covers the separate C++ SDK's public headers and
+registry as well as the native adapter, Go, Rust, TypeScript, Java, C#, and the
+browser client. The shared IPC corpus includes capability and option-definition
+records. The development snapshot has **74 RPC methods** and hash
+`98309fc84d6bdb9c01c70986a3ddc53596a9dfaba4325297be22f601e3a4e6a2`.
+It is **unpublished**: retained local `vgi.v2` / `2.1.0` labels must not be used
+to republish a changed stable contract. The combined version decision and freeze
+remain outstanding.
+
+Validation on macOS arm64, pinned 1.5 engine:
+
+- **675** Python catalog/protocol/generation/documentation checks passed; Ruff
+  lint/format, mypy (**209 sources**), and strict regeneration passed.
+- Final native integration lanes passed: Python **344**, Go **336**, Rust **323**,
+  TypeScript **328**, Java **324**, C# **328**. Their respective skips were
+  **33, 40, 42, 46, 37, 37**, recorded separately. Python and Java counts include
+  two separate subprocess crash/recovery probes.
+- TypeScript HTTP: **311 passed, 53 skipped**. Separate C++ worker SDK:
+  **68/68 CTest targets passed**, including the new shared corpus.
+- The first matrix run found a native cancellation lifetime cycle and an unsafe
+  detached shutdown path. Native commit `d24f085` releases the bot context when
+  the last user connection closes and waits for active work before destruction.
+  All **9** dispatcher tests pass (**37 assertions**), including database-release,
+  reopen and interruption regressions; the fixed 1.5 release build and SDK reruns
+  passed. Browser shutdown still needs its platform qualification.
+- Java 21 stalled because Arrow's stream adapters pinned virtual-thread carriers
+  while idle. Isolated RPC commit `a1676f5` replaces those adapters with locks
+  that permit virtual-thread suspension. The regression fails before the fix
+  and passes after it; the Java21 RPC suite has **605 passed, 3 skipped**, and
+  the VGI Java integration lane passes using that dependency.
+- The earlier full Python run encountered four subsequently corrected harness/
+  inventory/documentation issues and an unrelated old global HTTP access log
+  containing obsolete request payload records. The focused checks above are
+  green; they are not a claim that the full Python suite has been requalified.
+
+Exact SDK revisions and logs are recorded in the Python manifest's
+`schema_options_validation`. All work is on isolated `*-duckdb2` worktrees.
+Native protocol alignment is `ae56db3`, still using engine `105edd31b5`.
+The Python capability/schema-option implementation is committed as `64976c7`.
+
+Flat column parameters and dotted `TableInfo.required_filters` still need their
+operation-level migration. Table/layout, view, constraint/index, macro, trigger,
+query, logical-type and optimizer contracts remain in scope for the same
+coordinated release. The native 1.5 client currently offers no new schema-option
+profile; it does not yet expose these operations through SQL. Native enforcement,
+object requirements, mixed write guarantees, full lifecycle qualification and the
+2.0 adapter port remain required.
 
 | Gate | Current status | Work still required |
 | --- | --- | --- |
 | P0 | In progress; inventory coverage checked | Resolve scope, capability, and field mappings across the full package. |
-| P1 | In progress; shared value/path reference behavior tested | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
-| P2 | Common-record codec preparation only | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
+| P1 | In progress; typed schema options and attachment negotiation have reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
+| P2 | Shared records and schema-option surfaces generated across SDKs; snapshot remains open | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
 | P3 | Not qualified or released | Full capability conformance, transport tests, coordinated deployment/rollback proof, and matched publication. |
 | M0 | Haybarn refresh and source audit prepared | Establish the pinned VGI 2.0 build/CI lane and complete native diagnostics. |
 | M1–M4 | Native port remains | Binding, execution/write semantics, nested identities, platform/browser qualification, and distribution. |
