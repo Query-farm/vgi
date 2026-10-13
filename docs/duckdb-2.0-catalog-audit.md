@@ -476,6 +476,13 @@ real constraint behavior is required for release qualification.
 
 ## Implementation order and acceptance
 
+The [coordinated protocol release plan](duckdb-2.0-plan.md#coordinated-protocol-release)
+groups the broader catalog, trigger, query, type, and execution contracts into
+one release review. The priorities below describe implementation and semantic
+qualification; they are not a sequence of separate protocol releases. Specify
+later-enabled capabilities before the shared freeze wherever the contract can
+be made concrete and proven.
+
 | Priority | Work | Completion evidence |
 | --- | --- | --- |
 | 1 | Repair or reject existing semantic losses: generated columns, view aliases, ADD defaults, view-column comments; validate all supplied metadata | Payload inspection plus metadata/data round trips. Unsupported cases fail before worker mutation. Useful in both engine lanes. |
@@ -487,11 +494,12 @@ real constraint behavior is required for release qualification.
 
 Protocol work belongs in **vgi-python's source definitions and generators**,
 followed by regenerated C++ and cross-SDK conformance. Do not hand-edit
-`src/generated/`. Required new contract candidates include schema options and
-alteration, nested column targets, secure-view persistence, and any selected
-table/trigger lifecycle features. Existing schema paths, constraint requests,
-index/macro operations, and Arrow metadata should be reused where they already
-express the intended semantics.
+`src/generated/`. The combined release targets schema and table options/layout,
+nested column targets, complete view metadata/security, constraint/index/macro
+extensions, dependencies, transaction guarantees, and trigger/query profiles,
+alongside the type and optimizer decisions in the plan. Existing schema paths,
+constraint requests, index/macro operations, and Arrow metadata should be reused
+where they already express the intended semantics.
 
 For each advertised operation, test read-only rejection, missing/existing
 targets, conflict policies, SQL NULL versus absent values, transaction failure,

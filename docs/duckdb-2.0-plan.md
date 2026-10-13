@@ -3,10 +3,18 @@
 **Status:** implementation plan, October 13, 2026. Planning branch:
 `codex/duckdb-2.0-plan`, starting at VGI `74015fc3cb0b`.
 
-Build VGI against Haybarn's DuckDB 2.0 branch, restore the existing function and
-catalog behavior, then add features that benefit from the new engine. Keep the
+Build VGI against Haybarn's DuckDB 2.0 branch and prepare **one broad, coordinated
+protocol release** for the catalog and execution capabilities we intend to
+support. Batch the wire changes across VGI implementations, then enable tested
+features through capabilities without another protocol migration. Keep the
 1.5.x release lane available throughout. This is a substantial C++ adapter port;
 the worker protocol already supplies much of the required functionality.
+
+The October 13 scope decision favors collecting the broader protocol changes
+before release. Schema/table options, nested field alteration, complete view
+metadata, constraints, indexes, macros, triggers, and query execution belong in
+the same contract review. A feature's later engine implementation date is not
+by itself a reason to postpone its wire design to another version.
 
 The first deliverable is a reproducible native build with working ATTACH, catalog
 lookup, scalar execution, and table scans. Full parity, distribution, and new 2.0
@@ -101,11 +109,133 @@ remaining port.
    behind one compatibility boundary. Use separate engine-specific catalog or
    filter implementations if their semantics differ substantially. Assess the
    cost after the first build instead of spreading version checks everywhere.
-4. **Preserve protocol 2.1 compatibility.** Continue using existing schema-path
-   and Filter v2 contracts. Any new protocol fields go through vgi-python's
-   generators and cross-SDK conformance; do not edit `src/generated/` by hand.
+4. **Coordinate one protocol migration.** Keep released `vgi.v2` / `2.1.0`
+   artifacts available while developing the combined successor. Collect all
+   included wire changes before freezing and publishing it. Both the 1.5 and
+   2.0 adapters should implement the successor contract, with engine-specific
+   capability limits. Exact major/minor matching means additive changes alone
+   do not make mixed 2.1/new-version deployments interoperable.
 5. **Ship distinct binaries.** Each artifact must identify its engine revision,
    platform, and build identity. A 1.5 extension binary is not a 2.0 artifact.
+
+## Coordinated protocol release
+
+The unit of rollout is the combined contract, generated schemas, SDK surfaces,
+conformance fixtures, and matching engine adapters. Development can proceed in
+reviewable changes on integration branches, but publishing a narrow catalog
+increment followed by separate table-layout, trigger, or query increments would
+repeat the implementation migration this plan is intended to avoid.
+
+The initial candidate remains **`vgi.v2` / `2.2.0`** if the package is additive.
+Select the final version only after reviewing the entire schema diff. If
+replacing flat column parameters, changing existing types, consolidating
+inconsistent operations, or removing legacy forms materially improves the
+contract, evaluate one major release instead. Do not lock in redundant legacy
+interfaces merely to preserve a minor version number. A major release would
+also need its matching routing name and a documented deployment transition.
+No protocol version or implementation is changed by this planning update.
+
+The current version rules are declared in `vgi-python/vgi/protocol.py`:
+new methods/defaulted optional fields are additive; changing existing
+parameter types or adding required parameters is breaking. The RPC dispatcher
+enforces exact major/minor equality. Retain that check unless a separate,
+implemented compatibility design is included in the same release; optional
+fields and capability flags do not bypass it.
+
+### Target contract package
+
+The following areas are **target scope for the same release**. Exact record and
+method names will be settled in the protocol specification. “Design required”
+means work before the shared freeze, rather than an automatic later release.
+
+| Area | Contract work to bundle | Required semantics before freeze |
+| --- | --- | --- |
+| Catalog and client capabilities | Structured attachment capabilities, per-object restrictions where needed, client support for catalog/type semantics, and operation-specific unsupported errors | Distinguish read/materialize support, DDL support, data-write support, and transaction guarantees. A read-only worker may consume the same schema while advertising no mutations. An incapable client must reject a secure view, not ignore its security field. |
+| Schema lifecycle and options | Creation options, SET/RESET operations, option readback in `SchemaInfo`, and complete schema comment/tag mutations | Typed values, supported option names, expression policy, NULL versus absent versus RESET, nested targets, conflict policy, version changes, and rollback. Existing path/comment/tag create fields are reused. |
+| Table creation and layout | Complete create metadata; table options and SET/RESET; partition and sort definitions on create, alter, and discovery | Preserve sort expression/direction/null order and distinguish desired layout from guarantees about scan output. Define whether alteration rewrites existing data, affects future writes, or rejects the change. |
+| Columns and nested fields | Raw component `ColumnPath`; add/drop/rename/type/default/nullability operations; defaults, generated expressions, comments, tags, and supported compression policy | Consistent create/alter/read representation, USING expression semantics, generated dependencies, quoted dotted names, and complete validation before mutation. Keep existing Arrow metadata keys where sufficient. |
+| Views | Ordered aliases, security mode, create/read metadata, column comments and their mutation | Preserve the SELECT-definition contract or explicitly version its replacement. Security barriers must survive create/discovery/refresh/rebind; define name resolution, replacement, dependencies, and unsupported-reader behavior. |
+| Constraints and indexes | Constraint addition and supported mutation/discovery; full native integration of existing index RPCs; typed index options if string values are insufficient | Worker enforcement versus metadata-only declaration, existing-data validation, logical column identity, FK target paths, dependent objects, and atomic changes. Do not promise SQL constraint forms the selected engine itself rejects. |
+| Macros | Overload collections, declared parameter types, expression/default representation, documentation, and owner-relative definitions | Reconcile the existing single-definition request and typed-value defaults with engine overloads and expression defaults. Define resolution and stable round trips; do not introduce a function overload handle just to mirror DuckDB internals. |
+| Dependencies and catalog consistency | Shared qualified object references; explicit ownership/drop/alter dependency semantics; mutation visibility and metadata-version rules | Settle worker versus engine authority, RESTRICT/CASCADE, rename effects, transaction-local reads, committed versions/etags, and retained entries. Include dependency records where enforcement across clients requires them; no DuckDB pointers or OIDs on the wire. |
+| Transactions and write replay | Explicit DDL rollback and mixed DDL/DML atomicity guarantees; operation identity/deduplication if retry support is included | Expanded ADD COLUMN, CTAS, multi-DML CTEs, and triggers use coherent transaction state. Reuse begin/commit/rollback and OLD/NEW `changes` mode. Define ambiguous commit/reply-loss behavior; never retry side effects just because transport failed. No distributed atomicity claim across independent catalogs. |
+| Triggers — design required | Table-owned identity, list/get/create/drop and metadata mutation, event/timing/granularity, UPDATE OF, transition aliases, action definition, dependencies, and execution mode | Prefer worker authority for persistent definitions. Distinguish engine-executed from backend-executed triggers so they cannot fire twice. Define SQL dialect, ordering, supported row/statement forms, OLD/NEW requirements, rollback, detach/reconnect, and cross-client discovery. |
+| Catalog query execution — existing design to consolidate | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
+| Logical type preservation — design required | Recursive type annotations/capabilities for ambiguous Arrow mappings, particularly TUPLE and VARIANT | Verify actual import/export at the selected engine pin. Define nested round trips, missing versus NULL, numeric/time identity, and SDK metadata preservation. Reject opaque aggregate-state layouts unless a portable state contract is proven. |
+| Optimizer and observability additions — design required | Projection expressions and result mapping, repeatability, typed metrics, and any necessary partition-selection/parallelism additions | Reuse Filter v2 and existing split/partition/ordering metadata first. Define decline and local residual behavior, type/NULL semantics, query-scoped repeatability, metric units/lifetime, and selected-partition identity. Existing monotonicity and runtime-filter fields are not new additions. |
+
+For options, prefer a shared typed-value representation, such as the existing
+one-row Arrow record pattern, over independently stringifying values for each
+object kind. Use one expression convention wherever SQL expressions are needed:
+declare the dialect/profile, name-resolution context, supported forms, and
+evaluation location. Defaults, generated expressions, CHECK, USING, partition
+expressions, macro bodies, and trigger actions must not each invent incompatible
+rules. Reuse a proven expression format where appropriate; do not transmit
+DuckDB's private AST or bound-plan serialization.
+
+Design references in the inspected vgi-python baseline:
+[earlier protocol survey](https://github.com/Query-farm/vgi-python/blob/89e08530fe665649753e2ac36b837227f1cf80d0/docs/protocol/vgi-protocol-proposed-changes.md)
+and [catalog query execution proposal](https://github.com/Query-farm/vgi-python/blob/89e08530fe665649753e2ac36b837227f1cf80d0/docs/protocol/vgi-catalog-query-pushdown-design.md).
+Their proposed release sequences must be consolidated with this package;
+historical “later protocol” labels are not scope decisions for this release.
+Recheck engine-specific claims against the refreshed pin before making them
+normative.
+
+### Additional candidates to resolve before freeze
+
+These also receive a decision during this release design, so they cannot become
+unexamined reasons for an immediate follow-up protocol version.
+
+| Candidate | Work needed for an inclusion decision |
+| --- | --- |
+| Sequences and user-defined types | Define discovery/create/alter/drop, sequence allocation/concurrency/rollback rules, and portable enum/type definitions. Separate transferable metadata from engine constructor callbacks. |
+| Collations and coordinate systems | Determine which descriptions can be shared and which execution semantics require engine-local implementation; qualify equality/order behavior before advertising a collation. |
+| Standalone window functions | Inventory 2.0 registration and execution separately from existing aggregate-window support; establish whether a portable request/lifecycle can be included now. |
+| Raw SQL CONNECT and statement execution | Review alongside read-query preparation, but specify writes/DDL, session state, result kinds, transaction effects, and retry rules separately. The read-query contract does not imply these capabilities. |
+| Multiple relational inputs | Review the [existing engine proposal](multi_input_table_functions.md) for per-input identity/schema, ordering, backpressure, completion, cancellation, and transaction semantics. Include a wire contract only after the execution model has a working feasibility test. |
+| Existing protocol cleanup | Review inconsistent names/types, scalar default-schema absence, duplicate operations, and weak metadata conventions together. Decide whether a clean major change is preferable to parallel legacy/new forms. Nested default search paths are not an upstream capability at the current pin. |
+
+Every target or candidate needs a recorded outcome: included with a concrete
+contract; satisfied by existing fields; engine-only; or explicitly deferred
+with its unresolved design/feasibility issue and the cost of another release.
+Deferral is a deliberate scope tradeoff, not the default for a feature whose
+DuckDB implementation will arrive later. Empty extension bags or reserved
+fields with unspecified meanings do not count as coverage.
+
+### Freeze and rollout gates
+
+| Gate | Deliverable | Exit condition |
+| --- | --- | --- |
+| P0 Collect and reconcile | One manifest mapping every audit field and existing proposal to methods, records, capabilities, SDK/generator inventories, and engine work | All areas above have a disposition; shared concepts are reconciled; no independent query/trigger/catalog release plan remains unaccounted for. |
+| P1 Specify and prove | Normative request/response/metadata schemas, defaults, enum semantics, capability rules, transaction/state transitions, errors, and executable examples | Design-required paths have focused reference implementations or feasibility evidence. New operations include readback/lifecycle contracts, not only request fields. Choose additive versus major version from the complete diff. |
+| P2 Freeze and port together | One contract snapshot, schema/hash fixtures, generated code, migration guide, and repository/version matrix | Python, Rust, Go, TypeScript, Java, C#, C++ adapters, and the generated browser client agree on the included shapes. No released implementation is left with a partial schema inventory. |
+| P3 Qualify and release | Cross-SDK conformance, engine/transport tests, matched artifacts, upgrade/rollback instructions, and capability support matrix | Each included capability has positive reference behavior and unsupported-path tests; each advertised implementation passes its semantic tests. Both engine lanes use the same new wire contract within their engine limits. Publish the package as one coordinated version transition. |
+
+P0/P1 run alongside the native M0/M1 port. Local integration work may use a
+changing development contract, but it must not be published repeatedly under a
+stable version. Freeze the public contract once the complete package is ready;
+any later schema change must follow the version rules.
+
+All SDKs implement the common wire types and safe unsupported behavior in the
+coordinated release. Individual workers need only implement the capabilities
+they advertise. A reference implementation proves the semantics of each
+included capability; enabling that same frozen capability in another worker
+later can be a package release without a protocol version change. New fields,
+methods, or changed semantics still require the normal version decision.
+
+Capability defaults must be conservative. Distinguish safely ignorable metadata
+from required semantics: an unknown security mode, transaction requirement, or
+type encoding cannot silently fall back to an ordinary view, nontransactional
+write, or different logical type. Test capability absence, partial support, and
+negative responses as carefully as the fully capable path.
+
+Generate from vgi-python source definitions using `scripts/regen_generated.py`;
+do not edit `src/generated/` or vendored browser output manually. Expand the
+generator inventory tests to cover every new nested record and operation. Run
+the shared conformance corpus across the six worker SDKs, check protocol names,
+versions, reflection/hash/schema agreement, and test the exact-major/minor
+mismatch path. Freeze the supporting vgi-rpc dependency versions too if this
+package needs framework behavior beyond existing framing and transactions.
 
 ## Catalog and SQL coverage audit
 
@@ -142,9 +272,9 @@ features; these must not all be reported as 2.0 regressions.
 | Schema/table/view comments, tags, and definitions | VGI can read metadata and handle some comment changes, but `InvokeCatalogSchemaCreate` currently sends absent comment/tags even though the wire accepts them. Views send a rendered SQL definition. | Distinguish readable metadata from writable DDL. Carry supported metadata and view definition details through create/alter, preserving name resolution and dependencies; reject unsupported details. |
 | View aliases and secure views | Explicit aliases are omitted from the SELECT-only create payload. New `CreateViewInfo.security_type` establishes an optimization barrier; current create/read contracts cannot preserve it. | Fix alias round trips. Preserve the security flag through storage/discovery/rebinding or reject secure view creation before mutation. Sending full CREATE VIEW SQL is not compatible with the existing SELECT-only read contract. |
 | Expanded ADD COLUMN | The 2.0 transformer can generate ADD, UPDATE, SET DEFAULT, SET NOT NULL, and ADD CONSTRAINT operations. VGI currently rejects ADD CONSTRAINT. | Check support for the complete operation and qualify rollback across the sequence. Reject unsupported shapes before remote mutation; carrying parser flags in one RPC alone would miss the execution path. |
-| `CREATE/DROP TRIGGER` and triggered writes | Haybarn's `TableCatalogEntry` exposes create/get/scan/drop trigger hooks and event selection. VGI does not implement trigger catalog storage. | Decide ownership and persistence, implement dependency/drop behavior and metadata enumeration, then qualify OLD/NEW, RETURNING, atomicity, and single execution. Remains a feature addition after basic write parity. |
+| `CREATE/DROP TRIGGER` and triggered writes | Haybarn's `TableCatalogEntry` exposes create/get/scan/drop trigger hooks and event selection. VGI does not implement trigger catalog storage. | Include definition/lifecycle/execution-mode contracts in the combined release design. Implement native execution after its write prerequisites; qualify OLD/NEW, RETURNING, atomicity, and single execution before advertising support. |
 | Multiple DML CTEs, CTAS, MERGE/UPDATE/DELETE and RETURNING | `SupportsMultipleDMLCTEs()` is an explicit catalog opt-in. Physical planning hooks and bound table metadata must match the new execution plans. | Qualify each statement shape with shared worker transaction state. Enable the capability only for workers that can meet the semantics, and test multi-write failures and rollback. Existing write support alone is insufficient evidence. |
-| `CONNECT` and remote query/statement dispatch | `Supports(RemoteCapability)`, `RemoteExecute(...)`, and `SupportsPushdown(...)`. VGI has no 2.0 implementations. | Define an optional SQL-capable worker profile. Keep individual remote capabilities separate; ordinary function/catalog workers need not implement a SQL engine. |
+| `CONNECT` and remote query/statement dispatch | `Supports(RemoteCapability)`, `RemoteExecute(...)`, and `SupportsPushdown(...)`. VGI has no 2.0 implementations; a read-query preparation design already exists. | Bundle read-query contract work in the combined release. Resolve raw SQL/statement capability scope before freeze; keep their semantics separate from reads. Ordinary function/catalog workers need not implement a SQL engine. |
 | Other catalog object kinds | VGI rejects native index/macro creation although their RPCs already exist; index lookup/scan is not wired into the schema entry. Sequences, types, collations, and several function kinds are also rejected. These are existing limitations. | Integrate existing requests where sufficient; qualify index option types and macro overload/default contracts. Replace misleading blanket "read-only" errors with accurate capability errors. New kinds may require protocol/SDK work. |
 
 Evidence: upstream [catalog hooks](https://github.com/duckdb/duckdb/blob/c65ca930b9fe39b2e8d8ed8821018dca650965f4/src/include/duckdb/catalog/catalog.hpp),
@@ -183,6 +313,9 @@ DuckDB catalog feature.
   records every core DDL field and ALTER TABLE variant against the exact pin,
   separating new 2.0 requirements from existing VGI gaps. Use its acceptance
   gates when implementing the selected support scope.
+- Start P0/P1 for the combined protocol package alongside build work. Include
+  existing query/type/trigger proposals and all SDK generator inventories;
+  avoid publishing a catalog-only protocol increment during the port.
 - Repin or port Haybarn httpfs and test its cancellation hooks. A temporary
   subprocess-only development build is useful, but HTTP is part of parity.
 - Record fixture SDK/RPC revisions, Arrow/vcpkg configuration, compiler, Rust
@@ -286,13 +419,14 @@ SQLite fixture intentionally does not establish transaction correctness.
 same identity end to end, with fixtures proving requests use the intended paths.
 Nested schema paths themselves use the existing wire contract. General schema
 options and SET/RESET operations are concrete missing contracts identified in
-the catalog/SQL matrix; supporting them requires a separate negotiated
-protocol/SDK extension.
+the catalog/SQL matrix; they belong to the coordinated protocol package above,
+along with table layout and the other selected DDL extensions.
 
 ### M4 Qualify and distribute
 
 **Repositories:** VGI, Haybarn packaging, companion extensions, WASM host.
-**Depends on:** M2 and M3.
+**Depends on:** M2, M3, and P2 for artifacts using the successor protocol;
+coordinate the release with P3.
 
 - Run the native platform matrix and matching static/loadable configurations.
   Exercise extension install/load/version rejection using the actual packaged
@@ -310,24 +444,30 @@ protocol/SDK extension.
   transport must actually run with its required fixture; a skip is not a pass.
 - Publish a support matrix tying engine, VGI artifact, worker protocol/SDK,
   Arrow/dependency versions, and platform together. Keep 1.5 artifacts available.
+- Release matched SDKs and both engine adapters for the frozen protocol package.
+  Document that retaining the `vgi.v2` routing name does not make 2.1 and 2.2
+  peers compatible; use the final chosen major/minor and transition policy.
 
 **Exit:** native parity is established, each advertised platform has executed
 qualification results, and signed installation/load tests pass. A native preview
 can precede WASM only if its documented support scope explicitly says so.
 
-## Features to add after parity
+## Feature enablement after native parity
 
-These can be developed independently once their prerequisite adapter is stable.
-They are not reasons to delay a compatible 2.0 build.
+The timing below concerns engine/worker feature enablement. Wire additions for
+these features are reviewed and, where specified and proven, frozen in the
+combined protocol release above. A later runtime implementation should consume
+that contract rather than trigger another planned schema migration. An internal
+2.0 build can run basic smoke tests before all optional profiles are enabled.
 
 | Priority | Feature | Work and acceptance gate |
 | --- | --- | --- |
 | First | Scalar monotonicity and optimizer metadata | Connect existing `argument_monotonicity` metadata to 2.0 argument properties. Prove both plan benefit and result equivalence, including decreasing functions and NULL behavior. |
 | First | Async split scans and table-in/out | Split scans currently disable async prefetch. Give each split correct task/connection ownership and backpressure. Audit/extend the engine's table-in/out blocking/resume contract for both Execute and FinalExecute; test cancellation and bounded memory. Source-side `AsyncResult` alone does not establish this capability. |
-| Next | DML in CTEs and custom-table triggers | Qualify existing write operators in the new plans. Use the trigger hooks already in Haybarn, define storage/lifetime of local trigger definitions, and prove OLD/NEW, RETURNING, rollback, and single execution. Reject unsupported atomicity; do not assume arbitrary workers provide distributed transactions. |
-| Next | Lossless VARIANT | Specify a portable Arrow representation after checking the selected engine's import/export behavior. Test missing versus NULL, nested values, numeric identity, timestamps, and every SDK. Avoid DuckDB-private vector layouts on the wire. |
-| Separate engine project | Multiple relational inputs | Follow [the existing proposal](multi_input_table_functions.md). Requires binder/operator scheduling plus per-input stream identity, completion, and cancellation semantics in the protocol/SDKs. Inputs must share the caller's transaction semantics. |
-| Optional capability | Whole-query remote execution | Use only for workers advertising a SQL backend. Define capability negotiation, parameter/result encoding, transaction behavior, and safe fallback before integrating 2.0 remote-catalog planning. |
+| Next | DML in CTEs and custom-table triggers | Consume the frozen transaction/trigger contracts; cache worker-authoritative persistent definitions locally. Qualify the selected execution mode, OLD/NEW, RETURNING, rollback, and single execution. Reject unsupported atomicity; do not assume arbitrary workers provide distributed transactions. |
+| Next | Lossless VARIANT and TUPLE | Enable the agreed recursive Arrow/type contract after engine import/export qualification. Test missing versus NULL, nested values, numeric identity, timestamps, and every SDK. Avoid DuckDB-private vector layouts on the wire. |
+| Separate engine project | Multiple relational inputs | Follow [the existing proposal](multi_input_table_functions.md). Resolve inclusion of its wire model during P0/P1; binder/operator scheduling may follow later. Inputs must share the caller's transaction semantics. |
+| Optional capability | Whole-query remote execution | Implement the consolidated read-query contract, including explicit queries on 1.5 and qualified automatic pushdown on 2.0. Enable raw SQL/statement execution only under its separately specified capability if included. |
 
 General engine optimizations, storage format changes, and parser improvements
 need compatibility tests where they touch VGI. They do not automatically require
@@ -343,6 +483,7 @@ new worker APIs or VGI-specific SQL syntax.
 | Transport and cancellation | `make test_all`, `make test_cancel_dispatcher`, `make test_http_interrupt`, Iroh harness | Real HTTP/backend cancellation, disconnects, deadlines, pool reuse, partial batch failure, dedicated Iroh/container/database-worker fixtures. |
 | Writes and federation | `make test_writable`, `make test_companion`, `make test_iceberg` | Transactional rollback, RETURNING, COPY abort cleanup, versioned/multi-branch scans, dependency loading. |
 | SDK compatibility | `make test_languages` | Run for every wire/generator change; qualify ordinary existing workers on both engine lines. |
+| Combined protocol package | P0 manifest, P1 examples, generated inventories and schema/hash fixtures | Cover every included operation across SDK codecs; positive reference behavior, unsupported capabilities, matching/mismatched versions, mutation readback, and both engine adapters. No capability advertisement before semantic qualification. |
 | Browser | `test/support/wasm-worker/browser-e2e/` | SAB, errors, task cancellation, multiple threads, engine usability after failure. |
 | Packaging | Distribution workflow and clean install/load | Matching engine ABI, signed artifacts, wrong-engine rejection, host library dependencies. |
 
@@ -364,14 +505,17 @@ before advertising parity.
 
 ## First implementation changes
 
-1. Add a pinned VGI 2.0 build lane using the refreshed Haybarn baseline and
-   complete the compiler inventory (M0); use the completed catalog field audit
-   to select implementation and explicit rejection paths.
-2. Land naming/catalog ownership and function API adaptations until the M1
-   fixture smoke tests run.
-3. Port filters and planner/execution clusters in reviewable changes (M2),
-   alongside complete schema identity propagation (M3).
-4. Qualify dependencies, transports, platforms, and packaging (M4).
+1. Build the combined protocol manifest and settle shared representations,
+   semantics, reference tests, and additive-versus-major scope (P0/P1). Bring the
+   existing query execution and trigger/type proposals into this review now.
+2. In parallel, add the pinned VGI 2.0 build lane and complete the compiler
+   inventory (M0), then land catalog/function adaptations for M1 smoke tests.
+3. Freeze the combined contract and port all SDKs/generators and both engine
+   adapters together (P2). Continue filters/execution (M2) and complete schema
+   identity propagation (M3) against that contract.
+4. Qualify reference capabilities and every advertised implementation, then
+   release matched SDK/engine artifacts once (P3/M4). Enable additional tested
+   implementations of frozen capabilities without another protocol migration.
 
 Re-estimate the remaining work after M1, when hidden compilation and link
 failures are visible. The largest correctness risks are predicate or DDL-field
