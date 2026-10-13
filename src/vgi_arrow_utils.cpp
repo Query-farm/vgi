@@ -74,6 +74,12 @@ std::shared_ptr<arrow::Array> MakeSingleBinaryArrayOrNull(const std::vector<uint
 // ============================================================================
 
 void ExportSchema(const std::shared_ptr<arrow::Schema> &schema, ArrowSchemaWrapper &out) {
+	// A wrapper can be reused while draining a multi-batch stream. Arrow's
+	// exporter initializes the C struct; it does not release a previous export.
+	// Release that ownership before its callback/private_data are overwritten.
+	if (out.arrow_schema.release) {
+		out.arrow_schema.release(&out.arrow_schema);
+	}
 	auto status = arrow::ExportSchema(*schema, &out.arrow_schema);
 	if (!status.ok()) {
 		throw IOException("Failed to export Arrow schema to C ABI: %s", status.ToString());
