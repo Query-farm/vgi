@@ -58,8 +58,8 @@ void VgiSchemaEntry::EnsureSchemaInfo() {
 	}
 	schema_info_ = vgi::DecodeContentsSchemaInfo(*info_source_);
 	estimated_counts_ = ObjectCountsFromMap(schema_info_.estimated_object_count, /*default_value=*/1);
-	if (!schema_info_.comment.empty()) {
-		comment = Value(schema_info_.comment);
+	if (schema_info_.comment.has_value()) {
+		comment = Value(*schema_info_.comment);
 	}
 	for (auto &tag : schema_info_.tags) {
 		tags[tag.first] = tag.second;

@@ -124,7 +124,12 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
 
 	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
-	vgi::InvokeCatalogSchemaCreate(rpc_ctx, info.schema, on_conflict, context);
+	std::optional<std::string> comment;
+	if (!info.comment.IsNull()) {
+		comment = info.comment.GetValue<std::string>();
+	}
+	std::map<std::string, std::string> tags(info.tags.begin(), info.tags.end());
+	vgi::InvokeCatalogSchemaCreate(rpc_ctx, info.schema, on_conflict, comment, tags, context);
 
 	// Invalidate schema cache so re-fetch picks up the new schema. Use the
 	// deferred path so any bound query holding a CatalogEntry* doesn't

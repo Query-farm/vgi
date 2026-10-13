@@ -186,7 +186,7 @@ struct VgiCatalogInfo {
 struct VgiSchemaInfo {
 	std::string name;
 	std::vector<std::string> path;
-	std::string comment;
+	std::optional<std::string> comment;
 	std::map<std::string, std::string> tags;
 	// Approximate population per object kind, keyed by VgiCatalogSet::CacheKindName()
 	// ("table", "view", "scalar_function", "aggregate_function", "table_function",

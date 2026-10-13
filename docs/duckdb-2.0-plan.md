@@ -519,6 +519,26 @@ Full capability negotiation, query resolution, dependencies, output contracts,
 concurrent lifecycle semantics and native 2.0 qualification remain open. No
 version is being released.
 
+The **schema creation metadata increment** reuses existing comment/tag/conflict
+fields. Native 1.5 now forwards comments and tags and preserves NULL versus empty
+comments in both cache paths. Go and C++ mutable providers retain schema tags;
+Go's wire comment is nullable. TypeScript forwards tags and conflict policy, and
+Python exposes the existing conflict argument in its public client and fixture.
+The same public RPC lifecycle covers all seven SDKs, including literal dotted
+versus nested paths, metadata readback, ERROR/IGNORE and empty-schema REPLACE.
+The durable schema-option reference also preserves metadata over option changes,
+reconnect, commit and rollback. Native parsed CREATE and SQL database-copy tests
+cover the metadata fields without relying on unsupported 1.5 COMMENT ON SCHEMA
+syntax: **99 assertions per SDK** pass across all seven SDKs. The shared RPC
+schema/view lifecycles pass **15 checks**; **769 Python checks**, Go's 13 packages,
+602 TypeScript checks (68 skipped), 68 CTests and all four TypeScript bundles
+also pass. Strict generation, Ruff, mypy and the 23 overlapping manifest/corpus/
+native-inventory checks pass. Rust/Java/C# unit suites were unchanged and were
+not rerun for this increment. See `schema_metadata_validation` for exact evidence.
+Schema comment/tag mutation, replacement/deletion dependencies, descendant
+semantics and native 2.0 qualification remain open. The 78-method wire hash is
+unchanged; no release gate is closed.
+
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
 protocol transition, including the matching routing name and migration guide;

@@ -68,8 +68,8 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 	for (auto &schema_info : vgi::InvokeCatalogSchemas(rpc_ctx, context)) {
 		CreateSchemaInfo info;
 		info.schema = schema_info.name;
-		if (!schema_info.comment.empty()) {
-			info.comment = Value(schema_info.comment);
+		if (schema_info.comment.has_value()) {
+			info.comment = Value(*schema_info.comment);
 		}
 		for (auto &[key, val] : schema_info.tags) {
 			info.tags[key] = val;

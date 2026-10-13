@@ -1364,13 +1364,12 @@ void InvokeCatalogViewCommentSet(
 void InvokeCatalogSchemaCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &on_conflict,
+    const std::optional<std::string> &comment, const std::map<std::string, std::string> &tags,
     ClientContext &context) {
-	// CREATE SCHEMA ... TAGS (...) is not yet exposed by the C++ extension; we
-	// always send std::nullopt for tags. catalog_schema_create's wire shape requires
-	// the field, but the value is always absent until we plumb it through DDL parsing.
 	auto params =
 	    generated::BuildCatalogSchemaCreateParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name), on_conflict,
-	                                              /*comment=*/std::nullopt, /*tags=*/std::nullopt, OptTxn(ctx), /*options=*/std::nullopt);
+	                                              comment, std::vector<std::pair<std::string, std::string>>(tags.begin(), tags.end()),
+	                                              OptTxn(ctx), /*options=*/std::nullopt);
 	InvokeVoidRpc(ctx, "catalog_schema_create", params, context);
 }
 
@@ -2529,7 +2528,7 @@ VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, 
 	RecordBatchSingleRow row(batch, 0, "SchemaInfo", worker_path);
 	info.path = row["path"].value_not_null<std::vector<std::string>>();
 	info.name = SchemaNameFromPath(info.path, "SchemaInfo.path");
-	info.comment = row["comment"].value_or("");
+	info.comment = row["comment"].as<std::string>();
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 	// nullable map — workers may omit it entirely; downstream defaults missing keys to 1
 	info.estimated_object_count = row["estimated_object_count"].value_or(std::map<std::string, int64_t>{});
@@ -2794,7 +2793,7 @@ std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBa
 		VgiSchemaInfo info;
 		info.path = row["path"].value_not_null<std::vector<std::string>>();
 		info.name = SchemaNameFromPath(info.path, "SchemaInfo.path");
-		info.comment = row["comment"].value_or("");
+		info.comment = row["comment"].as<std::string>();
 		info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 		schemas.push_back(std::move(info));
 	}

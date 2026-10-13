@@ -403,6 +403,7 @@ void InvokeCatalogViewCommentSet(
 void InvokeCatalogSchemaCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &on_conflict,
+    const std::optional<std::string> &comment, const std::map<std::string, std::string> &tags,
     ClientContext &context);
 
 // Invoke catalog_schema_drop: drop a schema from the catalog.

@@ -635,3 +635,22 @@ if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS
     duckdb_static
     dummy_static_extension_loader)
 endif()
+
+# Catalog metadata fields exist in CreateInfo even where the pinned SQL parser
+# has no syntax to set them. Exercise parsed CREATE and the real worker RPCs.
+option(BUILD_VGI_CATALOG_TESTS "Build catalog metadata integration tests" OFF)
+if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
+  add_executable(vgi_catalog_tests
+    test/cpp/test_main.cpp
+    test/cpp/test_schema_metadata.cpp)
+  target_include_directories(vgi_catalog_tests PRIVATE
+    src/include
+    duckdb/src/include
+    duckdb/extension/core_functions/include
+    duckdb/third_party/catch)
+  target_link_libraries(vgi_catalog_tests
+    ${EXTENSION_NAME}
+    duckdb_static
+    core_functions_extension
+    dummy_static_extension_loader)
+endif()
