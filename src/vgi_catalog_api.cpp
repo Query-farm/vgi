@@ -1307,10 +1307,10 @@ void InvokeCatalogTableNotNullDrop(
 void InvokeCatalogViewCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name,
-    const std::string &definition, const std::string &on_conflict,
+    const std::string &definition, const std::vector<std::string> &aliases, const std::string &on_conflict,
     ClientContext &context) {
 	auto params = generated::BuildCatalogViewCreateParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
-	                                                      view_name, definition, on_conflict, OptTxn(ctx));
+	                                                      view_name, definition, on_conflict, OptTxn(ctx), aliases);
 	InvokeVoidRpc(ctx, "catalog_view_create", params, context);
 }
 
@@ -2799,6 +2799,24 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 	info.schema_name =
 	    SchemaNameFromPath(row["schema_path"].value_not_null<std::vector<std::string>>(), "ViewInfo.schema_path");
 	info.definition = row["definition"].value_not_null<std::string>();
+	auto aliases = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("aliases"));
+	if (!aliases || aliases->IsNull(0)) {
+		throw IOException(CatalogProtocolViolation("ViewInfo", worker_path), "ViewInfo.aliases must be a non-null list");
+	}
+	auto alias_values = std::dynamic_pointer_cast<arrow::StringArray>(aliases->values());
+	if (!alias_values) {
+		throw IOException(CatalogProtocolViolation("ViewInfo", worker_path), "ViewInfo.aliases must contain strings");
+	}
+	for (auto i = aliases->value_offset(0); i < aliases->value_offset(1); i++) {
+		if (alias_values->IsNull(i)) {
+			throw IOException(CatalogProtocolViolation("ViewInfo", worker_path), "ViewInfo.aliases contains a null identifier");
+		}
+		auto alias = alias_values->GetString(i);
+		if (alias.empty() || alias.find('\0') != std::string::npos) {
+			throw IOException(CatalogProtocolViolation("ViewInfo", worker_path), "ViewInfo.aliases contains an empty or NUL identifier");
+		}
+		info.aliases.push_back(std::move(alias));
+	}
 	info.comment = row["comment"].value_or("");
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 	info.column_comments = row["column_comments"].value_not_null<std::map<std::string, std::string>>();

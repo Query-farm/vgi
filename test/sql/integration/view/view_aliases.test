@@ -1,0 +1,90 @@
+# name: test/sql/integration/view/view_aliases.test
+# description: Explicit raw view aliases survive CREATE, discovery and cache refresh.
+# group: [vgi_integration_view]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'contents_reval' AS aliases (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CREATE VIEW aliases.main.v ("a.b", "with""quote") AS SELECT 11 AS original, 22 AS second;
+
+query II
+SELECT "a.b", "with""quote" FROM aliases.main.v;
+----
+11	22
+
+query I
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'aliases' AND table_name = 'v' ORDER BY column_index;
+----
+a.b
+with"quote
+
+# Catalog revalidation after unrelated DDL must keep the aliases.
+statement ok
+CREATE TABLE aliases.main.t (n INTEGER);
+
+query II
+SELECT "a.b", "with""quote" FROM aliases.main.v;
+----
+11	22
+
+# Partial alias lists rename only leading outputs.
+statement ok
+CREATE VIEW aliases.main.partial ("first.out") AS SELECT 3 AS x, 4 AS unchanged;
+
+query II
+SELECT "first.out", unchanged FROM aliases.main.partial;
+----
+3	4
+
+# IF NOT EXISTS must not replace an existing definition or its aliases.
+statement ok
+CREATE VIEW IF NOT EXISTS aliases.main.v (other) AS SELECT 99;
+
+query II
+SELECT "a.b", "with""quote" FROM aliases.main.v;
+----
+11	22
+
+# OR REPLACE must replace aliases together with the query, invalidating caches.
+statement ok
+CREATE OR REPLACE VIEW aliases.main.v ("new.name") AS SELECT 33 AS x;
+
+query I
+SELECT "new.name" FROM aliases.main.v;
+----
+33
+
+statement error
+SELECT "a.b" FROM aliases.main.v;
+----
+not found
+
+# No explicit aliases resets to the SELECT-derived names.
+statement ok
+CREATE OR REPLACE VIEW aliases.main.v AS SELECT 44 AS implicit_name;
+
+query I
+SELECT implicit_name FROM aliases.main.v;
+----
+44
+
+# Binder validation must reject excess aliases before the worker mutates storage.
+statement error
+CREATE OR REPLACE VIEW aliases.main.v (x, y) AS SELECT 55;
+----
+More VIEW aliases than columns
+
+query I
+SELECT implicit_name FROM aliases.main.v;
+----
+44
+
+statement ok
+DETACH aliases;

@@ -366,7 +366,7 @@ void InvokeCatalogTableNotNullDrop(
 void InvokeCatalogViewCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name,
-    const std::string &definition, const std::string &on_conflict,
+    const std::string &definition, const std::vector<std::string> &aliases, const std::string &on_conflict,
     ClientContext &context);
 
 // Invoke catalog_view_drop: drop a view from the catalog.

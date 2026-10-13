@@ -586,6 +586,7 @@ test_python:
 	        "test/*" \
 	        "~test/sql/duckdb2/column_paths.test" \
 	        "~test/sql/duckdb2/required_filter_paths.test" \
+	        "~test/sql/duckdb2/view_alias_metadata.test" \
 	        "~test/sql/integration/writable/*" \
 	        "~test/sql/vgi_worker_pool.test"
 	@$(MAKE) test_python_crash

@@ -1,0 +1,74 @@
+# name: test/sql/duckdb2/view_alias_metadata.test
+# description: Raw aliases from discovery remain ordered; malformed lists fail closed.
+# group: [vgi_duckdb2_protocol]
+
+require-env VGI_VIEW_ALIAS_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'views' AS v (TYPE vgi, LOCATION '${VGI_VIEW_ALIAS_WORKER}');
+
+query II
+SELECT "a.b", "with""quote" FROM v.main.v;
+----
+11	22
+
+statement ok
+DETACH v;
+
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_ALIAS_MODE=missing ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+aliases
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_ALIAS_MODE=null ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+aliases
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_ALIAS_MODE=null_item ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+aliases
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_ALIAS_MODE=empty ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+aliases
+
+statement ok
+DETACH bad;
+
+statement ok
+ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_ALIAS_MODE=nul ${VGI_VIEW_ALIAS_WORKER}');
+
+statement error
+SELECT * FROM bad.main.v;
+----
+aliases
+
+statement ok
+DETACH bad;
+

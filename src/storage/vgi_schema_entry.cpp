@@ -382,7 +382,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
-	vgi::InvokeCatalogViewCreate(rpc_ctx, name, info.view_name, definition, on_conflict, context);
+	vgi::InvokeCatalogViewCreate(rpc_ctx, name, info.view_name, definition, std::vector<std::string>(info.aliases.begin(), info.aliases.end()),
+	                             on_conflict, context);
 
 	// Invalidate view cache
 	DeferDrop(catalog, views_.HarvestEntries());

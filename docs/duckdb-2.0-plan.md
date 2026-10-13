@@ -9,6 +9,8 @@ source changes to `ec2-user@52.90.218.118` and build/test there. This task owns
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
 Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
+Synchronize by content and give changed remote inputs fresh timestamps so a
+local edit made during a remote build cannot leave stale objects undetected.
 The implementation goal is active. Preparing this remote workspace does not
 qualify any protocol/native migration gate.
 
@@ -394,6 +396,50 @@ schema change alone does not alter the reflection hash. The generated schema
 inventory and shared IPC corpus detect it; the combined release still requires
 the coordinated major-version transition below. Native 2.0 filter bindings and
 remaining column metadata/dependency behavior are still open.
+
+The **view alias increment** preserves ordered raw output names across create,
+get, schema listing, catalog snapshots, replacement and native cache reloads.
+`ViewInfo.aliases` is a required list; the create RPC accepts an optional list
+whose absent/empty value retains the SELECT-derived names. Partial lists rename
+only the leading outputs. Identifiers containing literal dots or quotes remain
+unchanged. The SELECT-only definition contract remains in place. The pinned
+1.5 binder rejects excess aliases before dispatch, and the native metadata
+reader rejects missing/NULL lists, NULL items, empty names and embedded NUL.
+
+All seven SDKs now carry aliases through their public metadata/provider paths,
+and their bundled mutable catalogs retain aliases alongside the definition.
+Python rename/comment updates also preserve existing column comments; the Go
+single-view reader now retains column comments like its listing path. The older
+Python transactor fixture explicitly rejects nonempty aliases until its view
+reader can preserve them; it remains unqualified with the current 1.5 pin.
+
+EC2 qualification passed for the native 1.5 build, **732 Python checks**, Ruff,
+mypy over **210 sources**, all seven SDK unit suites and strict all-SDK generation.
+The three reference cases passed **172 assertions**, including five malformed
+view metadata modes. Shared codec vectors cover explicit/implicit aliases in
+every SDK. The standard native SDK lanes passed: Python **345 / 33 skipped**,
+Go **337 / 40**, Rust **324 / 42**, TypeScript **329 / 46**, Java **325 / 37**, and
+C# **329 / 37**. Python/Java include two crash probes each. C++ passed **325 cases /
+12,065 assertions / 47 skips**, plus **two HTTP bearer cases / 13 assertions**.
+
+The first matrix run exposed TypeScript's undecoded `on_conflict` dictionary;
+after correcting the handler, its complete native lane passed. The Rust replay
+checks cover both pre-alias event logs and newly persisted aliases. A separate
+Rust size-test failure was traced to Arrow's 64-byte IPC padding; the corrected
+constant-bound assertion and the full Rust suite pass. Logs and exact SDK
+counts are in the manifest's `view_aliases_validation` entry.
+
+An additional TypeScript Flechette stdio probe remains **unqualified**: ATTACH
+fails in the RPC layer's Binary-type comparison before any view operation.
+Its seven shared-corpus codec tests pass; these do not qualify that transport.
+The standard TypeScript Arrow JS native lane above passes. This transport gap
+remains P2/P3 work and is recorded in `logs/views-native-ts-flechette.log`.
+
+The current 77-method reflection hash is
+`9e1ed05cdcc6e812f9a6cfda36ecaa699005e30680e511489109180251ee6872`.
+No version is being released. Secure-view flags/barrier enforcement, create
+comments/tags, view-column comment mutation, query resolution, dependencies,
+and durable view transaction qualification remain open.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major

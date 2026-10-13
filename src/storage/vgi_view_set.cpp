@@ -25,6 +25,7 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 	CreateViewInfo info;
 	info.view_name = view_info.name;
 	info.sql = view_info.definition;
+	info.aliases.assign(view_info.aliases.begin(), view_info.aliases.end());
 	if (!view_info.comment.empty()) {
 		info.comment = Value(view_info.comment);
 	}
