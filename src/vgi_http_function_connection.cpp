@@ -1210,7 +1210,8 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 	// Best-effort: dispatcher catches any thrown exception.
 	(void)HttpPostArrowIpc(live_context, exchange_url, body, c_auth,
 	                        /*cookie_jar=*/nullptr, c_cached_params, nullptr, nullptr,
-	                        attach_params_ ? attach_params_->iroh() : nullptr);
+	                        attach_params_ ? attach_params_->iroh() : nullptr,
+	                        &live_context.interrupted);
 }
 
 } // namespace vgi

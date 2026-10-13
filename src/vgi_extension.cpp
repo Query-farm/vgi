@@ -22,6 +22,8 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/connection_manager.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/database_path_and_type.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -1243,6 +1245,25 @@ private:
 	};
 	mutable std::mutex companion_mutex_;
 	std::map<std::string, CompanionRecord> companion_catalogs_;
+};
+
+// ConnectionManager invokes these callbacks under its lock. The dispatcher
+// uses an unregistered ClientContext so waiting for it cannot reenter that lock.
+class VgiConnectionLifecycle : public ExtensionCallback {
+public:
+	explicit VgiConnectionLifecycle(shared_ptr<VgiStorageExtension> storage) : storage_(std::move(storage)) {
+	}
+	void OnConnectionOpened(ClientContext &) override {
+		storage_->GetCancelDispatcher().Resume();
+	}
+	void OnConnectionClosed(ClientContext &context) override {
+		// Called before this connection is removed from the count.
+		if (ConnectionManager::Get(*context.db).GetConnectionCount() == 1) {
+			storage_->GetCancelDispatcher().Suspend();
+		}
+	}
+private:
+	shared_ptr<VgiStorageExtension> storage_;
 };
 
 namespace vgi {
@@ -3664,6 +3685,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	auto vgi_storage = make_shared_ptr<VgiStorageExtension>(loader.GetDatabaseInstance());
 	StorageExtension::Register(config, "vgi", vgi_storage);
+	ExtensionCallback::Register(config, make_shared_ptr<VgiConnectionLifecycle>(vgi_storage));
 #ifdef __EMSCRIPTEN__
 	// Start the cancel dispatcher's thread now, on the main runtime thread
 	// (haybarn-wasm runs LOAD single-threaded). Creating it lazily, from the

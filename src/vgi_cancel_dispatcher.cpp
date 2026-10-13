@@ -16,72 +16,42 @@
 namespace duckdb {
 namespace vgi {
 
-namespace {
-
-constexpr auto kShutdownJoinDeadline = std::chrono::seconds(2);
-
-} // namespace
-
 VgiCancelDispatcher::VgiCancelDispatcher(DatabaseInstance &db, VgiCancelWorkerStart start)
     : db_(db), start_(start), queue_(1024), streaming_close_queue_(1024) {
 }
 
 VgiCancelDispatcher::~VgiCancelDispatcher() {
-	// Signal the worker (if it ever started) and drop any remaining
-	// requests. We intentionally don't try to finish a long queue —
-	// HTTP tokens TTL-expire, subprocess workers die with the parent.
 	shutdown_.store(true, std::memory_order_release);
+	Suspend();
+	cv_.notify_all();
+	// Never detach a thread that accesses this dispatcher. In-flight I/O must
+	// finish (or observe the bot's interrupt) before its context/queues die.
+	if (worker_.joinable()) {
+		worker_.join();
+	}
+}
+
+void VgiCancelDispatcher::Suspend() {
+	accepting_.store(false, std::memory_order_release);
 	{
-		std::lock_guard<std::mutex> lock(cv_mutex_);
-		cv_.notify_all();
-	}
-
-	bool detached = false;
-	if (worker_started_.load(std::memory_order_acquire) && worker_.joinable()) {
-		// Detached join with a short deadline: if the worker is stuck
-		// on a slow HTTP call we'd rather drop the cancel than hang
-		// DatabaseInstance teardown. std::thread doesn't expose a
-		// timed join, so we use a helper thread.
-		std::atomic<bool> joined{false};
-		std::thread joiner([&]() {
-			worker_.join();
-			joined.store(true, std::memory_order_release);
-		});
-		auto deadline = std::chrono::steady_clock::now() + kShutdownJoinDeadline;
-		while (!joined.load(std::memory_order_acquire) &&
-		       std::chrono::steady_clock::now() < deadline) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
-		if (joined.load(std::memory_order_acquire)) {
-			joiner.join();
-		} else {
-			// Worker still blocked; detach both. Process is shutting
-			// down so leaked thread is acceptable.
-			worker_.detach();
-			joiner.detach();
-			detached = true;
+		std::lock_guard<std::mutex> lock(conn_mutex_);
+		if (context_) {
+			context_->Interrupt();
 		}
 	}
-
+	std::lock_guard<std::mutex> processing_lock(processing_mutex_);
 	std::lock_guard<std::mutex> conn_lock(conn_mutex_);
-	if (!detached) {
-		// Worker has exited — safe to close the bot connection.
-		conn_.reset();
-	} else {
-		// The detached worker is still inside ProcessOne -> CancelStream ->
-		// HttpPostArrowIpc, which dereferences *conn_->context (and the
-		// DatabaseInstance that ClientContext pins). Freeing conn_ here would
-		// pull that context out from under the running worker — a use-after-free
-		// that crashes in DBConfig::GetHTTPUtil. The process is shutting down,
-		// so intentionally leak the bot connection to keep its context valid for
-		// the detached worker's lifetime. Bounded and benign (matches the
-		// already-leaked worker thread).
-		(void)conn_.release();
+	context_.reset();
+}
+
+void VgiCancelDispatcher::Resume() {
+	if (!shutdown_.load(std::memory_order_acquire)) {
+		accepting_.store(true, std::memory_order_release);
 	}
 }
 
 bool VgiCancelDispatcher::Enqueue(CancelRequest req) noexcept {
-	if (shutdown_.load(std::memory_order_acquire)) {
+	if (shutdown_.load(std::memory_order_acquire) || !accepting_.load(std::memory_order_acquire)) {
 		return false;
 	}
 
@@ -97,10 +67,11 @@ bool VgiCancelDispatcher::Enqueue(CancelRequest req) noexcept {
 		return false;
 	}
 
+	pending_count_.fetch_add(1, std::memory_order_relaxed);
 	if (!queue_.try_enqueue(std::move(req))) {
+		pending_count_.fetch_sub(1, std::memory_order_relaxed);
 		return false;
 	}
-	pending_count_.fetch_add(1, std::memory_order_relaxed);
 
 	{
 		std::lock_guard<std::mutex> lock(cv_mutex_);
@@ -110,7 +81,7 @@ bool VgiCancelDispatcher::Enqueue(CancelRequest req) noexcept {
 }
 
 bool VgiCancelDispatcher::EnqueueStreamingClose(StreamingCloseRequest req) noexcept {
-	if (shutdown_.load(std::memory_order_acquire)) {
+	if (shutdown_.load(std::memory_order_acquire) || !accepting_.load(std::memory_order_acquire)) {
 		return false;
 	}
 	try {
@@ -120,10 +91,11 @@ bool VgiCancelDispatcher::EnqueueStreamingClose(StreamingCloseRequest req) noexc
 	} catch (...) {
 		return false;
 	}
+	pending_count_.fetch_add(1, std::memory_order_relaxed);
 	if (!streaming_close_queue_.try_enqueue(std::move(req))) {
+		pending_count_.fetch_sub(1, std::memory_order_relaxed);
 		return false;
 	}
-	pending_count_.fetch_add(1, std::memory_order_relaxed);
 	{
 		std::lock_guard<std::mutex> lock(cv_mutex_);
 		cv_.notify_one();
@@ -169,17 +141,15 @@ void VgiCancelDispatcher::StartWorker() {
 	worker_started_.store(true, std::memory_order_release);
 }
 
-duckdb::Connection &VgiCancelDispatcher::BotConnection() {
-	// Kept alive for the dispatcher's lifetime so context.db is always valid
-	// on the worker thread. Opened here rather than in StartWorker, which on
-	// WASM runs during extension load, before the database is ready for one.
-	// The reference stays valid after the lock is released: only the
-	// destructor drops conn_, after joining the worker, or leaks it.
+shared_ptr<ClientContext> VgiCancelDispatcher::BotContext() {
 	std::lock_guard<std::mutex> lock(conn_mutex_);
-	if (!conn_) {
-		conn_ = std::make_unique<duckdb::Connection>(db_);
+	if (shutdown_.load(std::memory_order_acquire) || !accepting_.load(std::memory_order_acquire)) {
+		return nullptr;
 	}
-	return *conn_;
+	if (!context_) {
+		context_ = make_shared_ptr<ClientContext>(db_.shared_from_this());
+	}
+	return context_;
 }
 
 void VgiCancelDispatcher::WorkerLoop() {
@@ -206,6 +176,7 @@ void VgiCancelDispatcher::WorkerLoop() {
 }
 
 void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
+	std::lock_guard<std::mutex> lock(processing_mutex_);
 	try {
 		if (!req.connection) {
 			return;
@@ -214,7 +185,10 @@ void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
 		// context_ references the originating query's ClientContext, which is
 		// typically destroyed by the time we run here (off-thread). Using it
 		// would use-after-free its Logger inside CancelStream's VGI_LOG.
-		req.connection->CancelStream(req.state_token, *BotConnection().context);
+		auto context = BotContext();
+		if (context) {
+			req.connection->CancelStream(req.state_token, *context);
+		}
 	} catch (const std::exception &e) {
 		// Best-effort; log and move on. Never propagate.
 		try {
@@ -230,12 +204,13 @@ void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
 }
 
 void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noexcept {
+	std::lock_guard<std::mutex> lock(processing_mutex_);
 	try {
 		if (!req.attach_params) {
 			return;
 		}
-		auto &bot = BotConnection();
-		if (!bot.context) {
+		auto context = BotContext();
+		if (!context) {
 			return;
 		}
 		// Synthesise the minimum bind data InvokeAggregateRpc needs:
@@ -252,7 +227,7 @@ void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noex
 		session.execution_id = std::move(req.execution_id);
 		session.attach_opaque_data = std::move(req.attach_opaque_data);
 
-		VgiAggregateStreamingClose(*bot.context, synth_bind, session,
+		VgiAggregateStreamingClose(*context, synth_bind, session,
 		                            /*enable_logging=*/false);
 	} catch (const std::exception &e) {
 		try {

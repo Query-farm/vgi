@@ -16,6 +16,8 @@
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_worker_pool.hpp"
+#include "vgi_extension.hpp"
+#include "duckdb/main/connection_manager.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -231,7 +233,7 @@ TEST_CASE("destroying the dispatcher with requests queued neither hangs nor cras
 			(void)dispatcher.Enqueue(MakeRequest(log));
 		}
 	}
-	// Well inside the destructor's 2s join deadline: the worker exits promptly.
+	// An idle worker exits promptly without a detached shutdown thread.
 	REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
 }
 
@@ -240,4 +242,65 @@ TEST_CASE("an unstarted dispatcher is destroyed without a worker or bot connecti
 	{ VgiCancelDispatcher dispatcher(*db.instance, VgiCancelWorkerStart::kExplicitOnly); }
 	{ VgiCancelDispatcher dispatcher(*db.instance, VgiCancelWorkerStart::kOnFirstUse); }
 	SUCCEED();
+}
+
+TEST_CASE("closing the last user connection releases the dispatcher database reference", "[cancel-dispatcher]") {
+	weak_ptr<DatabaseInstance> database;
+	{
+		DuckDB db(nullptr);
+		db.LoadStaticExtension<VgiExtension>();
+		database = db.instance;
+		auto dispatcher = FindVgiCancelDispatcher(*db.instance);
+		REQUIRE(dispatcher);
+		auto log = std::make_shared<CancelLog>();
+		{
+			Connection first(db);
+			{
+				Connection second(db);
+				REQUIRE(dispatcher->Enqueue(MakeRequest(log)));
+				REQUIRE(WaitFor([&] { return log->cancels.load() == 1; }));
+				// The bot must not count as a user connection.
+				REQUIRE(ConnectionManager::Get(*db.instance).GetConnectionCount() == 2);
+			}
+			REQUIRE(dispatcher->Enqueue(MakeRequest(log)));
+			REQUIRE(WaitFor([&] { return log->cancels.load() == 2; }));
+		}
+		REQUIRE_FALSE(dispatcher->Enqueue(MakeRequest(log)));
+		// Reopening uses the same worker, including WASM's explicit-start mode.
+		{
+			Connection reopened(db);
+			REQUIRE(dispatcher->Enqueue(MakeRequest(log)));
+			REQUIRE(WaitFor([&] { return log->cancels.load() == 3; }));
+		}
+	}
+	REQUIRE(database.expired());
+}
+
+TEST_CASE("suspension interrupts and waits for an active cancellation", "[cancel-dispatcher]") {
+	struct SlowCancel : FakeConnection {
+		SlowCancel(std::shared_ptr<CancelLog> log, std::atomic<bool> &entered, std::atomic<bool> &finished)
+		    : FakeConnection(std::move(log)), entered(entered), finished(finished) {
+		}
+		void CancelStream(const std::vector<uint8_t> &, ClientContext &context) override {
+			entered.store(true);
+			while (!context.interrupted.load()) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			// Suspend must wait for this call to finish after interrupting it.
+			std::this_thread::sleep_for(std::chrono::milliseconds(30));
+			finished.store(context.db != nullptr);
+		}
+		std::atomic<bool> &entered;
+		std::atomic<bool> &finished;
+	};
+	DuckDB db(nullptr);
+	VgiCancelDispatcher dispatcher(*db.instance);
+	std::atomic<bool> entered{false}, finished{false};
+	CancelRequest req;
+	req.connection = std::make_unique<SlowCancel>(std::make_shared<CancelLog>(), entered, finished);
+	REQUIRE(dispatcher.Enqueue(std::move(req)));
+	REQUIRE(WaitFor([&] { return entered.load(); }));
+	dispatcher.Suspend();
+	REQUIRE(finished.load());
+	REQUIRE_FALSE(dispatcher.Enqueue(MakeRequest(std::make_shared<CancelLog>())));
 }

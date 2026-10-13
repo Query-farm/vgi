@@ -16,6 +16,7 @@
 namespace duckdb {
 
 class DatabaseInstance;
+class ClientContext;
 
 namespace vgi {
 
@@ -69,8 +70,9 @@ constexpr VgiCancelWorkerStart kDefaultCancelWorkerStart = VgiCancelWorkerStart:
 // Process-wide (per-DatabaseInstance) background thread that drains
 // CancelRequests from destructors. See plan file for rationale: keeps
 // std::bad_alloc and TLS/HTTPS exceptions off the destructor stack,
-// and owns a bot duckdb::Connection so HTTPUtil::Get(*context.db)
-// remains valid for the dispatcher's lifetime.
+// and owns an unregistered bot ClientContext while user connections are open.
+// The last connection closing suspends work and releases that context, breaking
+// the DatabaseInstance -> dispatcher -> context -> DatabaseInstance cycle.
 class VgiCancelDispatcher {
 public:
 	explicit VgiCancelDispatcher(DatabaseInstance &db,
@@ -97,6 +99,12 @@ public:
 	// the main runtime thread at extension load (see EnsureWorkerStarted).
 	void StartWorker();
 
+	// Called by connection lifecycle callbacks. Suspend rejects new work,
+	// interrupts/waits for an in-flight cancel and releases the bot context.
+	// Keep the worker thread alive so WASM never has to recreate it off-main.
+	void Suspend();
+	void Resume();
+
 	// Test-only: synchronously drain pending work on the caller's
 	// thread. Does not interact with the worker thread.
 	void DrainForTesting();
@@ -115,7 +123,7 @@ public:
 
 private:
 	bool EnsureWorkerStarted();
-	duckdb::Connection &BotConnection();
+	shared_ptr<ClientContext> BotContext();
 	void WorkerLoop();
 	void ProcessOne(CancelRequest &req) noexcept;
 	void ProcessStreamingClose(StreamingCloseRequest &req) noexcept;
@@ -123,12 +131,13 @@ private:
 	DatabaseInstance &db_;
 	const VgiCancelWorkerStart start_;
 
-	// Bot connection. Opened lazily by the first request processed, on the
-	// thread processing it, so a process that never cancels pays zero
-	// startup cost. Guarded by conn_mutex_: the worker opens it while
-	// DrainForTesting or the destructor's detach path may touch it.
+	// Serialize processing with Suspend; conn_mutex_ separately lets Suspend
+	// interrupt the live context while a request is executing. The bot is not
+	// registered with ConnectionManager: lifecycle callbacks hold its lock.
+	std::mutex processing_mutex_;
 	std::mutex conn_mutex_;
-	std::unique_ptr<duckdb::Connection> conn_;
+	shared_ptr<ClientContext> context_;
+	std::atomic<bool> accepting_{true};
 
 	duckdb_moodycamel::ConcurrentQueue<CancelRequest> queue_;
 	duckdb_moodycamel::ConcurrentQueue<StreamingCloseRequest> streaming_close_queue_;
