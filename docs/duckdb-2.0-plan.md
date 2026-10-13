@@ -73,6 +73,69 @@ upstream release schedule is not a VGI delivery commitment.
   `/tmp/vgi-duckdb2-capabilities-native.log`, and
   `/tmp/vgi-duckdb2-capabilities-integration-{first,rest}.log`.
 
+**Second increment: shared typed values in the normal Python SDK**
+
+- Implemented `vgi.typed_values.TypedValueBatch` and integrated it with the
+  existing `Arguments` codec. The separate prototype package was removed;
+  implementation continues on `codex/duckdb-2.0-protocol` in the isolated
+  `vgi-python-duckdb2` worktree. The carrier/argument changes are committed as
+  `9180ec2`; the generator release check is committed as `e1b25d4`.
+- `Arguments.from_batch()` / `to_batch()` and optional `argument_schema=`
+  preserve field order, nullability, recursive field metadata, and schema
+  metadata. Bind/init requests and the public HTTP bind path retain these
+  annotations. Typed NULL remains distinct from an absent argument.
+- The shared one-row carrier validates names, cardinality, and nested
+  nullability; decoding rejects extra batches and trailing data. Schema
+  comparison includes metadata and does not cast. The argument decoder retains
+  DuckDB 1.5's null empty-struct representation for an empty argument set.
+- Added `scripts/regen_generated.py --check --require-all`: a coordinated
+  release check now rejects missing SDK checkouts as well as stale/missing
+  artifacts. Normal local generation can still skip absent repositories.
+- This is common carrier groundwork, not the remote-query API or an agreed
+  TUPLE/VARIANT encoding. Placeholder mapping, parameter bind timing and reuse,
+  typed catalog options, capability selection, and all-SDK preservation of
+  required logical-type annotations remain P0/P1/P2 work. No new capability is
+  advertised; the existing argument wire layout, `2.1.0` protocol version, and
+  1.5 engine pin remain unchanged.
+
+**Second increment validation, macOS arm64:**
+
+- Python argument/carrier/generator-focused checks: **171 passed**, including
+  nested and encoded Arrow types, typed NULLs, malformed payloads, bind/init,
+  and public HTTP binding. Broader client/catalog/scalar/table-in-out and
+  schema/inventory regression checks passed **1,216 cases**; these runs overlap
+  and must not be added together. Documentation examples: **14 passed**.
+- Ruff lint/format and mypy passed (203 sources). The complete generated
+  inventory passed `scripts/regen_generated.py --check --require-all` with
+  every SDK checkout present and no changed generated artifacts.
+- The first native Python run exposed the 1.5 null empty-struct convention.
+  After fixing it, a fresh-worker run passed **342 cases**, with **33 expected
+  optional skips**; the separate subprocess crash/recovery lane passed both
+  cases. The initial `make test_languages` command exited 2 because of that
+  first Python failure; the corrected Python result is in its separate final
+  log. The five unchanged SDK lanes did not need a second run.
+- Cross-SDK checks use the existing 1.5 native binary and each SDK's conformance
+  inventory. All six final lanes pass. These establish existing-wire
+  compatibility; they do not yet qualify logical-type annotation preservation
+  in every SDK. Counts exclude skipped tests:
+
+  | SDK | Passed | Expected skips |
+  | --- | ---: | ---: |
+  | Python | 342 + 2 crash/recovery | 33 |
+  | Go | 336 | 40 |
+  | Rust | 323 | 42 |
+  | TypeScript | 328 | 46 |
+  | Java | 322 + 2 crash/recovery | 37 |
+  | C# | 328 | 37 |
+- Tested SDK revisions: Python `e1b25d497135`, Go `5a9022e3bfde`, Rust
+  `f73752737ed2`, TypeScript `ccd5f957f1ba`, Java `95706d515cd2`, and C#
+  `d7b580f50465`. Engine source remains `105edd31b5`.
+- Logs: `/tmp/vgi-duckdb2-typed-values-{final-focused,regression,docs,codegen}.log`,
+  `/tmp/vgi-duckdb2-typed-values-native-python.log`,
+  `/tmp/vgi-duckdb2-typed-values-languages.log`, and
+  `/tmp/vgi-duckdb2-typed-values-typescript.log`. Machine-readable totals are
+  in `/tmp/vgi-duckdb2-typed-values-validation.json`.
+
 ## Baselines and existing work
 
 | Component | Inspected revision or configuration | Implication |
