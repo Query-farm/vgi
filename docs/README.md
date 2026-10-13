@@ -164,6 +164,9 @@ The build produces:
 ./build/release/extension/vgi/vgi.duckdb_extension        # the loadable extension
 ```
 
+For the DuckDB 2.0 port, see the [migration plan](duckdb-2.0-plan.md), including
+the Haybarn baseline, implementation milestones, and qualification gates.
+
 ## Testing
 
 The extension supports two transports; subprocess is the faster default. Tests prefer the
