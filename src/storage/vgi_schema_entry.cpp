@@ -265,24 +265,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	auto &create_info = info.base->Cast<CreateTableInfo>();
 	auto &context = transaction.GetContext();
 
-	// Convert DuckDB columns to Arrow schema, then enrich with default expressions
+	// The shared encoder preserves defaults for both CREATE and ADD COLUMN.
 	auto columns_schema = vgi::DuckDBColumnsToArrowSchema(context, create_info.columns);
-	{
-		arrow::FieldVector enriched_fields;
-		idx_t col_idx = 0;
-		for (auto &col : create_info.columns.Logical()) {
-			auto field = columns_schema->field(static_cast<int>(col_idx));
-			if (col.HasDefaultValue()) {
-				auto default_str = col.DefaultValue().ToString();
-				auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
-				metadata->Append("default", default_str);
-				field = field->WithMetadata(metadata);
-			}
-			enriched_fields.push_back(field);
-			col_idx++;
-		}
-		columns_schema = arrow::schema(enriched_fields);
-	}
 
 	// Extract constraints
 	std::vector<int> not_null_constraints;

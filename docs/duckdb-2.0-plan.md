@@ -4,6 +4,14 @@
 `codex/duckdb-2.0-plan`, starting at VGI `74015fc3cb0b`. Implementation continues
 on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
 
+**Build/test workflow:** edit the isolated worktrees locally, then synchronize
+source changes to `ec2-user@52.90.218.118` and build/test there. This task owns
+`/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
+Keep source copies, build outputs, logs, and test state inside that unique
+directory. Record the synchronized revisions and local changes with each run.
+The implementation goal is active. Preparing this remote workspace does not
+qualify any protocol/native migration gate.
+
 **Overall completion: incomplete.** No P0–P3 or M0–M4 exit gate is marked
 complete. The tested groundwork below is partial implementation, not completion
 of the broader protocol or the native DuckDB 2.0 port.
@@ -299,11 +307,73 @@ gate. All **137** unresolved scope/capability/field reviews remain tracked acros
 **151** audit rows and **20** areas. The other catalog families, query/type/
 optimizer contracts, version freeze, rollout, and native 2.0 port remain open.
 
+The **column-path increment** replaces flat targets in the
+nine existing column RPCs with raw component paths, including explicit targets
+for ADD and type changes. One literal component remains the 1.5 adapter's
+supported path; nested operations require per-operation capabilities. The
+persistent reference covers actual nested row edits, defaults, nullability,
+comments, type conversion, rollback/conflicts, metadata preservation, and NULL
+parent structs. Metadata-only edits preserve existing physical partitions when
+a layout change applies only to future writes. The CLI retains literal flat
+column arguments and encodes each as one component.
+
+Current EC2 evidence: **977 Python checks passed / 30 skipped**, followed by
+**21 column/reference and manifest checks** after the final reference edits
+(overlapping counts). Ruff and mypy over 210 sources pass, as does strict
+all-SDK generation verification. SDK suites pass: Go's 13 tested packages,
+Rust **482 / 4 ignored**, TypeScript **599 / 68 skipped** plus eight checks with
+the second Arrow implementation and bundle builds, Java **654 / 2 skipped**,
+and C# **593**. The C++ SDK release build and all **68 CTests** also pass. The final native
+`make test_languages` exited zero with the updated C++ adapter: Python **344 /
+33 skipped**, Go **336 / 40**, Rust **323 / 42**, TypeScript **328 / 46**, Java
+**324 / 37**, and C# **328 / 37**. Python/Java totals include their two separate
+crash probes. The C++ SDK's separate native harness passes **324 cases /
+12,042 assertions**, with **47 skips**, plus **two HTTP bearer cases / 13
+assertions**. That harness also includes six slow cases, so its inventory
+differs from the six-language matrix.
+
+The native **1.5 release build passes**, and `make test_column_paths` passes
+**82 assertions** through the C++ adapter and durable Python reference. This
+covers ADD defaults for existing rows, future inserts, literal dotted names,
+USING conversion, comment/default/nullability readback, failed NOT NULL
+validation, and rollback of a schema change together with appended rows.
+The tests exposed and now cover two native cache fixes: rollback discards
+metadata fetched from the aborted transaction, and invalidating a single
+entry marks the catalog listing incomplete so metadata scans reload it.
+
+All nine column requests are in the shared IPC corpus, each with literal and
+nested targets. TypeScript's public client/handler checks include its raw RPC
+Arrow list scalars, not just the ASD decoder's arrays. The C# bad-enum fixture
+now delegates the updated signatures. The SQL reference uses baseline count
+INSERT; the older transactor still requires fork-only cursor APIs absent from
+the pinned Python engine, despite its separate startup annotation fix.
+
+Remote evidence lives under the task workspace's `logs/`; `state/sources.json`
+records revisions and source hashes. The C++ SDK dependency build uses a
+local-authored, task-only libsodium 1.0.21 overlay with the upstream ARM/GCC
+[compile fix](https://github.com/jedisct1/libsodium/commit/6702f69bef6044163acc7715e6ac7e430890ce78).
+Repository dependency pins remain unchanged. The full RPC-Go suite now also
+passes on Linux ARM64, including the shared-memory case that failed on macOS.
+Shared expression migration,
+generated columns, complete column attributes/dependencies, and required-filter
+operation migration remain open. These tests do not close a protocol or native
+migration gate.
+
+The coordinated SDK commits are Python `4449f2b`, Go `029e087`, Rust
+`554c976`, TypeScript `fabd487`, Java `5c6348b`, C# `927ac7c`, and C++
+`dde72f5`. They remain unpublished on the isolated development branches.
+
+Changing existing parameter types and adding required column targets makes the
+current combined wire diff **breaking**. If retained, it requires a major
+protocol transition, including the matching routing name and migration guide;
+the earlier additive 2.2 candidate no longer fits this diff. Development version
+strings remain unpublished placeholders until the complete contract is frozen.
+
 | Gate | Current status | Work still required |
 | --- | --- | --- |
 | P0 | In progress; inventory coverage checked | Resolve scope, capability, and field mappings across the full package. |
-| P1 | In progress; schema/table options, layout, and attachment negotiation have reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
-| P2 | Shared records and schema/table surfaces generated across SDKs; snapshot remains open | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
+| P1 | In progress; schema/table options, layout, column paths, and attachment negotiation have reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
+| P2 | Shared records and schema/table/column surfaces generated across SDKs; snapshot remains open | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
 | P3 | Not qualified or released | Full capability conformance, transport tests, coordinated deployment/rollback proof, and matched publication. |
 | M0 | Haybarn refresh and source audit prepared | Establish the pinned VGI 2.0 build/CI lane and complete native diagnostics. |
 | M1–M4 | Native port remains | Binding, execution/write semantics, nested identities, platform/browser qualification, and distribution. |
@@ -413,8 +483,10 @@ reviewable changes on integration branches, but publishing a narrow catalog
 increment followed by separate table-layout, trigger, or query increments would
 repeat the implementation migration this plan is intended to avoid.
 
-The initial candidate remains **`vgi.v2` / `2.2.0`** if the package is additive.
-Select the final version only after reviewing the entire schema diff. If
+The initial candidate was **`vgi.v2` / `2.2.0`** if the package stayed additive.
+The in-progress raw column-path migration now changes existing parameter types
+and adds required targets, so retaining it requires a **major version**. Select
+the final version and routing name after reviewing the entire schema diff. If
 replacing flat column parameters, changing existing types, consolidating
 inconsistent operations, or removing legacy forms materially improves the
 contract, evaluate one major release instead. Do not lock in redundant legacy

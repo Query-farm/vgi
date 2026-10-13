@@ -156,7 +156,30 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 		names.push_back(col.GetName());
 	}
 
-	return BuildArrowSchemaFromDuckDB(context, types, names);
+	auto schema = BuildArrowSchemaFromDuckDB(context, types, names);
+	arrow::FieldVector fields;
+	idx_t index = 0;
+	for (auto &col : columns.Logical()) {
+		// A profile for creating generated/compressed columns has not been negotiated.
+		// Refuse the operation before RPC rather than reconstructing an ordinary column.
+		if (col.Generated()) {
+			throw NotImplementedException("VGI generated-column creation requires a supported column definition profile");
+		}
+		if (col.CompressionType() != CompressionType::COMPRESSION_AUTO) {
+			throw NotImplementedException("VGI does not support non-default column compression");
+		}
+		if (!col.Comment().IsNull()) {
+			throw NotImplementedException("VGI inline column comments require a supported column definition profile");
+		}
+		auto field = schema->field(static_cast<int>(index++));
+		if (col.HasDefaultValue()) {
+			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
+			metadata->Append("default", col.DefaultValue().ToString());
+			field = field->WithMetadata(metadata);
+		}
+		fields.push_back(field);
+	}
+	return arrow::schema(fields, schema->metadata());
 }
 
 // ============================================================================

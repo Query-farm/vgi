@@ -276,13 +276,18 @@ unique_ptr<CatalogEntry> VgiCatalogSet::HarvestEntry(const std::string &name) {
 		schema_entry_->DiscardSeed(CacheKindName());
 	}
 	std::lock_guard<std::mutex> lock(entry_lock_);
+	// A removed cache entry may still exist remotely with changed metadata.
+	// The listing is incomplete until reloaded: otherwise catalog scans omit
+	// an altered table until an individual lookup happens to fetch it again.
+	// Invalidate in-flight loads even when this entry is not cached yet.
+	is_loaded_ = false;
+	generation_.fetch_add(1, std::memory_order_release);
 	auto it = entries_.find(name);
 	if (it == entries_.end()) {
 		return nullptr;
 	}
 	auto entry = std::move(it->second);
 	entries_.erase(it);
-	generation_.fetch_add(1, std::memory_order_release);
 	return entry;
 }
 

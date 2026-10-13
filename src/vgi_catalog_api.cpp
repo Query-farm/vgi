@@ -1189,7 +1189,8 @@ void InvokeCatalogTableColumnAdd(
     ClientContext &context) {
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
 	auto params = generated::BuildCatalogTableColumnAddParams(
-	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_bytes,
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
+	    std::vector<std::string> {column_definition->field(0)->name()}, column_bytes,
 	    /*ignore_not_found=*/false, if_column_not_exists, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_add", params, context);
 }
@@ -1200,7 +1201,7 @@ void InvokeCatalogTableColumnDrop(
     const std::string &column_name, bool if_column_exists, bool cascade,
     ClientContext &context) {
 	auto params = generated::BuildCatalogTableColumnDropParams(
-	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_name,
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, std::vector<std::string> {column_name},
 	    /*ignore_not_found=*/false, if_column_exists, cascade, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_drop", params, context);
 }
@@ -1211,7 +1212,7 @@ void InvokeCatalogTableColumnRename(
     const std::string &old_column_name, const std::string &new_column_name,
     ClientContext &context) {
 	auto params = generated::BuildCatalogTableColumnRenameParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
-	                                                             table_name, old_column_name, new_column_name,
+	                                                             table_name, std::vector<std::string> {old_column_name}, new_column_name,
 	                                                             /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_rename", params, context);
 }
@@ -1236,7 +1237,7 @@ void InvokeCatalogTableColumnCommentSet(
     bool ignore_not_found,
     ClientContext &context) {
 	auto params = generated::BuildCatalogTableColumnCommentSetParams(
-	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_name,
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, std::vector<std::string> {column_name},
 	    OptStrNullable(comment, comment_is_null), ignore_not_found, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_comment_set", params, context);
 }
@@ -1249,7 +1250,8 @@ void InvokeCatalogTableColumnTypeChange(
     ClientContext &context) {
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
 	auto params = generated::BuildCatalogTableColumnTypeChangeParams(
-	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_bytes, OptStrIfNonEmpty(expression),
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
+	    std::vector<std::string> {column_definition->field(0)->name()}, column_bytes, OptStrIfNonEmpty(expression),
 	    /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_type_change", params, context);
 }
@@ -1260,7 +1262,7 @@ void InvokeCatalogTableColumnDefaultSet(
     const std::string &column_name, const std::string &expression,
     ClientContext &context) {
 	auto params = generated::BuildCatalogTableColumnDefaultSetParams(
-	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_name, expression,
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, std::vector<std::string> {column_name}, expression,
 	    /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_default_set", params, context);
 }
@@ -1271,7 +1273,7 @@ void InvokeCatalogTableColumnDefaultDrop(
     const std::string &column_name,
     ClientContext &context) {
 	auto params = generated::BuildCatalogTableColumnDefaultDropParams(
-	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_name,
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, std::vector<std::string> {column_name},
 	    /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_default_drop", params, context);
 }
@@ -1282,7 +1284,7 @@ void InvokeCatalogTableNotNullSet(
     const std::string &column_name,
     ClientContext &context) {
 	auto params = generated::BuildCatalogTableNotNullSetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
-	                                                           table_name, column_name,
+	                                                           table_name, std::vector<std::string> {column_name},
 	                                                           /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_not_null_set", params, context);
 }
@@ -1293,7 +1295,7 @@ void InvokeCatalogTableNotNullDrop(
     const std::string &column_name,
     ClientContext &context) {
 	auto params = generated::BuildCatalogTableNotNullDropParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
-	                                                            table_name, column_name,
+	                                                            table_name, std::vector<std::string> {column_name},
 	                                                            /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_not_null_drop", params, context);
 }

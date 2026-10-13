@@ -1,0 +1,146 @@
+# name: test/sql/duckdb2/column_paths.test
+# description: Successor column paths and ADD defaults through the pinned 1.5 adapter
+# group: [vgi_duckdb2_protocol]
+
+require-env VGI_COLUMN_REFERENCE_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'columns' AS w (TYPE vgi, LOCATION '${VGI_COLUMN_REFERENCE_WORKER}');
+
+statement ok
+CREATE TABLE w.main.column_paths (id INTEGER, "a.b" INTEGER DEFAULT 7);
+
+statement ok
+INSERT INTO w.main.column_paths (id) VALUES (1);
+
+statement ok
+ALTER TABLE w.main.column_paths ADD COLUMN "x.y" INTEGER DEFAULT 42;
+
+query III
+SELECT id, "a.b", "x.y" FROM w.main.column_paths;
+----
+1	7	42
+
+statement ok
+ALTER TABLE w.main.column_paths ALTER COLUMN "x.y" SET DEFAULT 9;
+
+statement ok
+INSERT INTO w.main.column_paths (id) VALUES (2);
+
+query III
+SELECT id, "a.b", "x.y" FROM w.main.column_paths ORDER BY id;
+----
+1	7	42
+2	7	9
+
+statement ok
+ALTER TABLE w.main.column_paths RENAME COLUMN "a.b" TO "renamed.literal";
+
+statement ok
+ALTER TABLE w.main.column_paths ALTER COLUMN "x.y" TYPE BIGINT USING "x.y" + 1;
+
+statement ok
+ALTER TABLE w.main.column_paths ALTER COLUMN "x.y" SET NOT NULL;
+
+statement ok
+COMMENT ON COLUMN w.main.column_paths."x.y" IS 'kept';
+
+query TTTT
+SELECT comment, column_default, is_nullable, data_type FROM duckdb_columns()
+WHERE database_name = 'w' AND table_name = 'column_paths' AND column_name = 'x.y';
+----
+kept	9	false	BIGINT
+
+query III
+SELECT id, "renamed.literal", "x.y" FROM w.main.column_paths ORDER BY id;
+----
+1	7	43
+2	7	10
+
+statement ok
+ALTER TABLE w.main.column_paths ALTER COLUMN "x.y" DROP NOT NULL;
+
+statement ok
+ALTER TABLE w.main.column_paths ALTER COLUMN "x.y" DROP DEFAULT;
+
+statement ok
+INSERT INTO w.main.column_paths (id) VALUES (3);
+
+query III
+SELECT id, "renamed.literal", "x.y" FROM w.main.column_paths ORDER BY id;
+----
+1	7	43
+2	7	10
+3	7	NULL
+
+statement error
+ALTER TABLE w.main.column_paths ALTER COLUMN "x.y" SET NOT NULL;
+----
+NOT NULL
+
+query TTTT
+SELECT comment, column_default, is_nullable, data_type FROM duckdb_columns()
+WHERE database_name = 'w' AND table_name = 'column_paths' AND column_name = 'x.y';
+----
+kept	NULL	true	BIGINT
+
+query III
+SELECT id, "renamed.literal", "x.y" FROM w.main.column_paths ORDER BY id;
+----
+1	7	43
+2	7	10
+3	7	NULL
+
+# A transaction must roll back both the schema change and appended rows.
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE w.main.column_paths ADD COLUMN "temporary.field" INTEGER DEFAULT 99;
+
+statement ok
+INSERT INTO w.main.column_paths (id) VALUES (4);
+
+query II
+SELECT id, "temporary.field" FROM w.main.column_paths ORDER BY id;
+----
+1	99
+2	99
+3	99
+4	99
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT "temporary.field" FROM w.main.column_paths;
+----
+not found
+
+query III
+SELECT id, "renamed.literal", "x.y" FROM w.main.column_paths ORDER BY id;
+----
+1	7	43
+2	7	10
+3	7	NULL
+
+statement ok
+ALTER TABLE w.main.column_paths DROP COLUMN "renamed.literal";
+
+statement error
+CREATE TABLE w.main.bad_generated (id INTEGER, doubled INTEGER GENERATED ALWAYS AS (id * 2));
+----
+generated-column creation requires
+
+statement error
+SELECT * FROM w.main.bad_generated;
+----
+does not exist
+
+statement ok
+DROP TABLE w.main.column_paths;
+
+statement ok
+DETACH w;

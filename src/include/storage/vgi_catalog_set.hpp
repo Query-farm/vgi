@@ -63,9 +63,9 @@ public:
 	// catalog is destroyed or vgi_clear_cache() is called explicitly.
 	std::vector<unique_ptr<CatalogEntry>> HarvestEntries();
 
-	// Move a single named entry out of the set; returns nullptr if the
-	// entry isn't currently cached. Used by schema-level DDL paths that
-	// need to invalidate one entry without disturbing siblings.
+	// Move a single named entry out and mark the listing incomplete; returns
+	// nullptr if the entry isn't cached. Schema-level DDL keeps sibling
+	// entries alive while forcing scans to reload the changed listing.
 	unique_ptr<CatalogEntry> HarvestEntry(const std::string &name);
 
 	// Generation counter — bumped every time the entry set is mutated

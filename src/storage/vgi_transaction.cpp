@@ -72,6 +72,15 @@ void VgiTransaction::Commit(ClientContext &context) {
 void VgiTransaction::Rollback() {
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
 
+	// DDL invalidates entries eagerly, but a later statement can refill them
+	// from this transaction's uncommitted schema. Rollback does not advance
+	// the committed catalog version, so the next Start cannot detect those
+	// stale entries by polling. Discard them even if the context is gone or
+	// the rollback RPC fails; use deferred drops to retain bound references.
+	if (!transaction_opaque_data_.empty()) {
+		vgi_catalog_.ClearCache();
+	}
+
 	// Lock the base class's weak_ptr<ClientContext>. If the original session
 	// has gone away (cross-session rollback during shutdown reconciliation,
 	// extension teardown, etc.), we have no context to dispatch on — skip
@@ -92,10 +101,8 @@ void VgiTransaction::Rollback() {
 		}
 	}
 
-	// Same rationale as Commit: skip CheckAndInvalidateCache. A rollback
-	// undoes any pending writes, so the worker's version cannot have moved
-	// because of this session's actions. Other-session changes are caught
-	// at the next Transaction::Start.
+	// No extra version RPC is needed. Transaction-local cache entries were
+	// discarded above; other-session changes are caught at the next Start.
 }
 
 VgiTransaction &VgiTransaction::Get(ClientContext &context, Catalog &catalog) {
