@@ -599,7 +599,7 @@ explicit transaction; separate transactions must not share mutable snapshot
 entries. Catalogs advertising invariant metadata (`catalog_version_frozen`) keep
 shared metadata caches even when transactions scope function state.
 
-The current inventory is **80 methods**, hash
+The dependency increment's inventory was **80 methods**, hash
 `e23f22d5fcbbc06ad977a3719414ed8a741b2ddf268ab0d536807611e73182fe`.
 All SDK unit suites, 29 configured public RPC checks, 53 overlapping
 manifest/corpus/generation checks, strict generation, lint and type checks pass.
@@ -610,6 +610,81 @@ the protocol manifest. Full production provider support, index/trigger/macro and
 constraint dependency enforcement, rename semantics, cross-attachment authority,
 native 2.0, performance/platform qualification, freeze and release remain open.
 
+The **typed query preparation increment** adds schema metadata on one-row
+parameter batches, inline query capability/context/object records, and
+`catalog_query_prepare` / `catalog_query_release`. The Python SDK negotiates
+support on authenticated attachments and executes accepted preparations through
+one internal TABLE executor. Prepared tokens bind identity, attachment,
+transaction, capability revision, SQL, exact parameter/output schemas and
+context. Execution requires the same schema with new values, including typed
+NULLs; parameter values are never substituted into SQL text.
+
+The durable reference binds six exact read queries without fetching results
+during prepare/bind. Init materializes ordered Arrow fragments in shared SQLite
+storage; a fresh worker can continue without a cursor or SQL re-execution.
+Tests cover preparation release, independent execution lifetimes, auth and
+transaction ownership, quotas, cancellation, expired/lost results, schema
+changes and capability withdrawal. Failed continuations never retry or fall
+back. The reference is deliberately finite and does not qualify general SQL,
+automatic plan replacement, mutable data snapshots or production cleanup.
+
+All seven SDKs have the new codecs and RPC inventory; ordinary workers select
+no query profile and reject these operations. The native **1.5** extension
+builds and sends a NULL query offer. The explicit `vgi_query` adapter and native
+2.0 automatic adapter are still required. All query additions belong to the
+same combined successor release; the earlier proposal's separate 2.2 rollout
+and parameter deferral are superseded.
+
+The current inventory is **82 methods**, hash
+`28cf2ae30b6cf07dbd4db602e4972611319b993fb073b27de456b6fcf341dc00`.
+The initial SDK suites pass. The catalog/registry Python lane has **949 passed /
+4 skipped**, the generator/manifest lane has **228 passed**, and all **36**
+configured public RPC checks pass, including unsupported-query behavior across
+the seven SDK workers. Strict generation, lint, type checking and the native
+1.5 build pass. Native catalog checks pass **99 assertions per worker**.
+
+Each full native integration run found one stale expected protocol hash. After
+correcting that expectation, the reflection test passes against all seven
+workers. The initial full runs recorded the following counts; the full suites
+were not rerun after the correction or the later parameter codec change.
+
+| Worker | Executed passes | Skipped | Stale-hash failures in initial run |
+| --- | ---: | ---: | ---: |
+| Python | 343 | 33 | 1 |
+| Go | 337 | 40 | 1 |
+| Rust | 324 | 42 | 1 |
+| TypeScript | 329 | 46 | 1 |
+| Java | 323 | 37 | 1 |
+| C# | 329 | 37 | 1 |
+| C++ | 325 | 47 | 1 |
+
+The C++ harness includes skips in its reported passing-case total; the table
+subtracts them. Its separate bearer-auth checks pass **2 cases / 13 assertions**.
+Separate native crash/recovery checks pass **2 cases each** against Python and
+Java. Later shared parameter-batch checks pass in all seven SDKs. They exposed a
+TypeScript serialization issue, now fixed and validated by its complete Arrow
+suite (**617 passed / 68 skipped**) and Flechette suite (**618 passed / 67
+skipped**), declaration/bundle checks and an explicit Flechette browser bundle.
+The zero-column carrier uses a narrow Flechette 2.4.1 internal `encodeIPC`
+import, covered by these checks and requiring revalidation on dependency upgrades.
+A read-only lifecycle, authorization, schema and continuation review found no
+commit blockers. Source verification matched **33,044 files across 15
+repositories** with no differences. The bounded increment is recorded in
+coordinated local commits on `codex/duckdb-2.0-protocol`. The evidence and exact
+logs are recorded in
+`query_preparation_validation` in
+the protocol manifest under the unique EC2 workspace
+`/home/ec2-user/vgi-duckdb2-20261013-UgAEHC`.
+
+**Next checkpoint:** implement the native DuckDB **1.5** explicit `vgi_query`
+adapter. Its review boundary is opt-in negotiation, typed named/positional
+binding, exact result-schema and ordering checks, cancellation/cleanup, and
+focused integration against the finite durable Python reference. Typed NULLs,
+rebinding and error paths must pass before broadening that work. Automatic 2.0
+optimizer integration and general SQL providers remain separate checkpoints.
+This increment closes no broad P0–P3 or M0–M4 gate and publishes no protocol
+version.
+
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
 protocol transition, including the matching routing name and migration guide;
@@ -619,7 +694,7 @@ strings remain unpublished placeholders until the complete contract is frozen.
 | Gate | Current status | Work still required |
 | --- | --- | --- |
 | P0 | In progress; inventory coverage checked | Resolve scope, capability, and field mappings across the full package. |
-| P1 | In progress; schema/table options, layout, column paths, and attachment negotiation have reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
+| P1 | In progress; catalog groundwork and typed read-query preparation/execution have bounded reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
 | P2 | Shared records and schema/table/column surfaces generated across SDKs; snapshot remains open | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
 | P3 | Not qualified or released | Full capability conformance, transport tests, coordinated deployment/rollback proof, and matched publication. |
 | M0 | Haybarn refresh and source audit prepared | Establish the pinned VGI 2.0 build/CI lane and complete native diagnostics. |
@@ -767,7 +842,7 @@ means work before the shared freeze, rather than an automatic later release.
 | Dependencies and catalog consistency | Shared qualified object references; explicit ownership/drop/alter dependency semantics; mutation visibility and metadata-version rules | Settle worker versus engine authority, RESTRICT/CASCADE, rename effects, transaction-local reads, committed versions/etags, and retained entries. Include dependency records where enforcement across clients requires them; no DuckDB pointers or OIDs on the wire. |
 | Transactions and write replay | Explicit DDL rollback and mixed DDL/DML atomicity guarantees; operation identity/deduplication if retry support is included | Expanded ADD COLUMN, CTAS, multi-DML CTEs, and triggers use coherent transaction state. Reuse begin/commit/rollback and OLD/NEW `changes` mode. Define ambiguous commit/reply-loss behavior; never retry side effects just because transport failed. No distributed atomicity claim across independent catalogs. |
 | Triggers — design required | Table-owned identity, list/get/create/drop and metadata mutation, event/timing/granularity, UPDATE OF, transition aliases, action definition, dependencies, and execution mode | Prefer worker authority for persistent definitions. Distinguish engine-executed from backend-executed triggers so they cannot fire twice. Define SQL dialect, ordering, supported row/statement forms, OLD/NEW requirements, rollback, detach/reconnect, and cross-client discovery. |
-| Catalog query execution — existing design to consolidate | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
+| Catalog query execution — preparation lifecycle and shared codecs implemented; adapters pending | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
 | Logical type preservation — design required | Recursive type annotations/capabilities for ambiguous Arrow mappings, particularly TUPLE and VARIANT | Verify actual import/export at the selected engine pin. Define nested round trips, missing versus NULL, numeric/time identity, and SDK metadata preservation. Reject opaque aggregate-state layouts unless a portable state contract is proven. |
 | Optimizer and observability additions — design required | Projection expressions and result mapping, repeatability, typed metrics, and any necessary partition-selection/parallelism additions | Reuse Filter v2 and existing split/partition/ordering metadata first. Define decline and local residual behavior, type/NULL semantics, query-scoped repeatability, metric units/lifetime, and selected-partition identity. Existing monotonicity and runtime-filter fields are not new additions. |
 

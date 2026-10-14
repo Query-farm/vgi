@@ -74,6 +74,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    "catalog_schema_create",
 		    "catalog_schema_drop",
 		    "catalog_schema_alter_metadata",
+		    "catalog_query_release",
 		    "catalog_schema_alter_options",
 		    "catalog_table_create",
 		    "catalog_table_drop",
@@ -108,6 +109,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		m["catalog_attach"] = ResponseSchema{CatalogAttachResultSchema(), nullptr, false, nullptr};
 		m["catalog_version"] = ResponseSchema{CatalogVersionResultSchema(), nullptr, false, nullptr};
 		m["catalog_dependencies"] = ResponseSchema{CatalogDependenciesResultSchema(), nullptr, false, nullptr};
+		m["catalog_query_prepare"] = ResponseSchema{CatalogQueryPrepareResultSchema(), nullptr, false, nullptr};
 		m["catalog_schema_option_definitions"] =
 		    ResponseSchema{CatalogSchemaOptionDefinitionsResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_option_definitions"] =
@@ -194,6 +196,8 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_drop", &CatalogDropParamsSchema},
 		    {"catalog_version", &CatalogVersionParamsSchema},
 		    {"catalog_dependencies", &CatalogDependenciesParamsSchema},
+		    {"catalog_query_prepare", &CatalogQueryPrepareParamsSchema},
+		    {"catalog_query_release", &CatalogQueryReleaseParamsSchema},
 		    {"catalog_transaction_begin", &CatalogTransactionBeginParamsSchema},
 		    {"catalog_transaction_commit", &CatalogTransactionCommitParamsSchema},
 		    {"catalog_transaction_rollback", &CatalogTransactionRollbackParamsSchema},
