@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_rpc_types.hpp"
+#include "vgi_query_rpc.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_ipc.hpp"
@@ -1368,19 +1369,19 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::sh
 //! It lists formats DuckDB reads natively; extension-provided readers are omitted
 //! because whether they are loadable is a per-session question this static list
 //! cannot answer.
-static std::vector<uint8_t> BuildClientCapabilitiesBytes() {
+static std::vector<uint8_t> BuildClientCapabilitiesBytes(bool query_enabled) {
 	// DuckDB has no streaming scan: saying false prevents a worker from
 	// returning an unbounded split this client could never terminate.
 	return SerializeToIpcBytes(generated::BuildClientCapabilities(
 	    "duckdb", {"parquet", "csv", "json"}, {"ducklake", "iceberg", "postgres", "mysql", "sqlite", "duckdb"}, false,
-	    {"vgi.filters.v2"}, /*catalog=*/std::nullopt, /*query_pushdown=*/nullptr));
+	    {"vgi.filters.v2"}, /*catalog=*/std::nullopt, /*query_pushdown=*/query_enabled ? BuildClientQueryCapabilities() : nullptr));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
     const std::string &name,
     const std::vector<uint8_t> &options_ipc_bytes,
     const std::string &data_version_spec,
-    const std::string &implementation_version) {
+    const std::string &implementation_version, bool query_enabled) {
 	// Matches vgi-python's CatalogAttachRequest (vgi/protocol.py:193). The
 	// pyarrow-inferred wire schema marks `options` as not null (even though
 	// the dataclass defaults it to None) and `data_version_spec` /
@@ -1392,7 +1393,7 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 	request_arrays.push_back(BuildBinaryScalar(options_ipc_bytes));
 	request_arrays.push_back(BuildNullableStringScalar(data_version_spec));
 	request_arrays.push_back(BuildNullableStringScalar(implementation_version));
-	request_arrays.push_back(BuildBinaryScalar(BuildClientCapabilitiesBytes()));
+	request_arrays.push_back(BuildBinaryScalar(BuildClientCapabilitiesBytes(query_enabled)));
 	return arrow::RecordBatch::Make(generated::CatalogAttachRequestSchema(), 1, request_arrays);
 }
 

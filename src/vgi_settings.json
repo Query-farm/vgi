@@ -212,6 +212,15 @@
     "maximum": 2147483647
   },
   {
+    "name": "vgi_query_enabled",
+    "type": "BOOLEAN",
+    "default": false,
+    "scope": "session",
+    "effect": "Enable before ATTACH to negotiate explicit remote reads. Disabling prevents new preparation; existing executions retain their contract.",
+    "platform": "all",
+    "description": "Opt in to explicit read-only remote queries through vgi_query. Does not enable automatic query pushdown."
+  },
+  {
     "name": "vgi_result_cache",
     "type": "BOOLEAN",
     "default": true,

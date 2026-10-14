@@ -30,6 +30,7 @@
 // spares the many [metadata + attach] consumers a second include without
 // dragging in anything heavy.
 #include "vgi_attach_parameters.hpp"
+#include "vgi_query_rpc.hpp"
 
 // Arrow types appear only as shared_ptr members / parameters below — see the
 // file header. Forward declarations only.
@@ -149,6 +150,8 @@ struct CatalogAttachResult {
 	// of catalog_schemas + a catalog_schema_contents_* call per schema and kind.
 	// Older workers omit the field and read as false. See docs/catalog_contents.md.
 	bool supports_catalog_contents = false;
+	// Immutable explicit-query agreement, selected only after an opt-in offer.
+	std::optional<VgiQueryCapabilities> query_pushdown;
 };
 
 // One published data version of a catalog, surfaced via catalog_catalogs().
@@ -720,7 +723,7 @@ VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::s
 
 // Parse a CatalogAttachResult from an Arrow RecordBatch
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                             const std::string &worker_path, ClientContext &context);
+                                             const std::string &worker_path, ClientContext &context, bool query_offered = false);
 
 // Parse a VgiSchemaInfo from an Arrow RecordBatch (single row)
 VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);

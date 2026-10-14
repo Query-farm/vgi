@@ -492,7 +492,7 @@ VGI_JAVA_DIR   ?= $(HOME)/Development/vgi-java
 VGI_RUST_DIR   ?= $(HOME)/Development/vgi-rust
 VGI_CSHARP_DIR ?= $(HOME)/Development/vgi-csharp
 
-.PHONY: test_python test_python_crash test_column_paths test_dependencies test_go test_typescript test_java test_rust test_csharp test_languages \
+.PHONY: test_python test_python_crash test_column_paths test_dependencies test_queries test_go test_typescript test_java test_rust test_csharp test_languages \
 	build_database_workers test_database_workers test_database_worker_restart
 
 # Successor protocol preparation: run real 1.5 SQL against the durable DDL
@@ -502,6 +502,10 @@ test_column_paths:
 
 test_dependencies:
 	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" python3 test/run_dependencies.py
+
+# Explicit prepared queries against the finite durable reference on DuckDB 1.5.
+test_queries:
+	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" python3 test/run_queries.py
 
 # Real database-package demonstrations. These are intentionally separate from
 # the fast default suite: PyInstaller and Bun each produce a ~100 MiB native

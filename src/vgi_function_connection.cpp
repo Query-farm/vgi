@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_function_connection.hpp"
+#include "vgi_query_rpc.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/blob.hpp"
@@ -916,6 +917,10 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
+		if (function_name_ == VGI_QUERY_EXECUTOR &&
+		    !data_reader_->schema()->Equals(*bind_result.output_schema, true)) {
+			throw IOException("vgi_query output stream schema differs from the prepared schema");
+		}
 	} else {
 		// Scalar or table-in-out function: exchange mode
 		is_producer_mode_ = false;

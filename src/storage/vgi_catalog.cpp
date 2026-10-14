@@ -86,6 +86,16 @@ VgiCatalog::~VgiCatalog() = default;
 // AttachedDatabase::OnDetach AFTER DetachInternal removed the parent
 // (databases_lock not held) — nested DetachDatabase is safe here.
 void VgiCatalog::OnDetach(ClientContext &context) {
+	// The attachment owns remote resources independently of individual queries.
+	// DuckDB has already detached this catalog, so a cleanup failure cannot undo
+	// that operation; the provider's expiry policy handles lost notifications.
+	if (attach_result_ && !attach_result_->attach_opaque_data.empty()) {
+		try {
+			vgi::InvokeCatalogDetach({attach_parameters_, attach_result_->attach_opaque_data, {}}, context);
+		} catch (const std::exception &error) {
+			VGI_LOG(context, "catalog.detach.error", {{"catalog", internal_name_}, {"error_message", error.what()}});
+		}
+	}
 	// The catalog lifetime pin is no longer needed. Running/pooled subprocesses
 	// carry independent leases, so cleanup remains unable to race live code.
 	attach_parameters_->ReleaseWorkerArtifactAnchor();

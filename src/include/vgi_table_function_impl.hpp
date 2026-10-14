@@ -106,7 +106,15 @@ private:
 
 //! Bind data for VGI table functions. Used by both the direct vgi_table_function()
 //! and catalog-based VGI table functions.
+class VgiQueryPreparationLease;
+
 struct VgiTableFunctionBindData : public TableFunctionData {
+	// Explicit remote SQL owns a transaction-scoped preparation and must rebind
+	// on every DuckDB prepared-statement execution, including parameter changes.
+	bool explicit_query = false;
+	std::shared_ptr<VgiQueryPreparationLease> query_preparation;
+	bool SupportStatementCache() const override { return !explicit_query; }
+
 	// Worker identification
 	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::vector<uint8_t> attach_opaque_data;

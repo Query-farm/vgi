@@ -5,7 +5,8 @@
 on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
 
 **Build/test workflow:** edit the isolated worktrees locally, then synchronize
-source changes to `ec2-user@52.90.218.118` and build/test there. This task owns
+source changes to `ec2-user@32.192.49.19` and build/test there (resumed October 14;
+previous address `52.90.218.118`). This task owns
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
 Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
@@ -629,9 +630,10 @@ back. The reference is deliberately finite and does not qualify general SQL,
 automatic plan replacement, mutable data snapshots or production cleanup.
 
 All seven SDKs have the new codecs and RPC inventory; ordinary workers select
-no query profile and reject these operations. The native **1.5** extension
-builds and sends a NULL query offer. The explicit `vgi_query` adapter and native
-2.0 automatic adapter are still required. All query additions belong to the
+no query profile and reject these operations. At this initial checkpoint the
+native **1.5** extension sent a NULL query offer; the explicit adapter is now
+implemented in the checkpoint below. The native 2.0 automatic adapter remains
+required. All query additions belong to the
 same combined successor release; the earlier proposal's separate 2.2 rollout
 and parameter deferral are superseded.
 
@@ -738,14 +740,54 @@ The native 1.5 test target builds and its three guard cases pass 16 assertions.
 These tests qualify opaque transport and rejection boundaries; they do not
 qualify backend Variant decoding or native 2.0 execution.
 
-**Next checkpoint:** implement the native DuckDB **1.5** explicit `vgi_query`
-adapter. Its review boundary is opt-in negotiation, typed named/positional
-binding, exact result-schema and ordering checks, cancellation/cleanup, and
-focused integration against the finite durable Python reference. Typed NULLs,
-rebinding and error paths must pass before broadening that work. Automatic 2.0
-optimizer integration and general SQL providers remain separate checkpoints.
-This increment closes no broad P0–P3 or M0–M4 gate and publishes no protocol
-version.
+**Native explicit query checkpoint (2026-10-14)**
+
+The pinned DuckDB **1.5** extension now implements `vgi_query`. Set
+`vgi_query_enabled=true` before ATTACH to offer explicit read-query support;
+the default is false. The attachment must select `duckdb.sql.v1` and
+`vgi.remote.readonly.v1`. Named STRUCT parameters and explicitly positional
+`row(...)` parameters travel in one-row Arrow IPC batches, including typed
+NULLs. The provider's default evaluation context is explicit and its digest
+is checked. DuckDB prepared statements rebind each execution to obtain fresh
+values and the current transaction identity.
+
+The adapter checks exact output schema and metadata, including empty output
+and required nested values. It uses one ordered reader without result caching
+or scan pushdown. Ambiguous preparation and execution failures never retry.
+Preparation leases and execution cleanup have separate lifetimes; cancellation
+is enabled for the query executor. Native DETACH now calls the existing
+authenticated `catalog_detach` RPC, best effort, before releasing its worker
+artifact anchor. Abrupt client loss still requires provider expiry/janitor
+cleanup.
+
+EC2 Linux ARM64 validation passes the pinned shell, static/loadable extension
+and test builds; **12 native cases / 73 assertions**; **18 integration
+scenarios** against the finite durable Python reference; and **104 Python
+query tests**. The native scenarios check typed NULLs, named/positional values,
+ordering and empty output, prepared statement rebinding in autocommit and
+explicit transactions, bind-only release, capability rejection, preparation
+and execution errors, lost preparation responses, output schema rejection,
+rollback, early LIMIT, and connection interruption. Each scenario checks
+execution counts and zero retained preparations, executions, fragments and
+attachments. Catalog metadata regression passes **99 assertions against each
+of seven SDK workers**. Strict generation, settings, lint, types and inventory
+checks pass. The inventory remains **82 methods** with the same hash; this
+checkpoint adds no wire fields or methods.
+
+Two agents cross-reviewed the native implementation. Review found and fixed
+an inherited pooled preparation retry; the lost-response test proves that
+preparation is attempted once. Interruption is tested through
+`Connection::Interrupt()` while the connection remains alive: noninteractive
+CLI SIGINT stops its input loop before trailing DETACH and is not a substitute
+for this lifecycle test. Exact logs and limits are recorded in
+`native_query_adapter_validation` in the protocol manifest.
+
+**Next checkpoint:** reconcile the remaining field/capability reviews for the
+combined contract freeze, with broader provider and transport qualification
+tracked separately. This finite subprocess reference does not qualify general
+SQL providers, native HTTP/WASM queries, all platforms, performance, or automatic
+DuckDB 2.0 optimizer integration. No broad P0–P3 or M0–M4 gate is closed and no
+protocol version is published.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major

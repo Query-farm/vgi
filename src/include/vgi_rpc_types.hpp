@@ -381,7 +381,8 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
     const std::string &name,
     const std::vector<uint8_t> &options_ipc_bytes = {},
     const std::string &data_version_spec = "",
-    const std::string &implementation_version = "");
+    const std::string &implementation_version = "",
+    bool query_enabled = false);
 
 
 // Build the inner TableCreateRequest batch (catalog_table_create's payload).

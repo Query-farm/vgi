@@ -338,6 +338,8 @@ src/vgi_copy_to_impl.cpp
 src/vgi_table_buffering_builders.cpp
 src/vgi_table_buffering_impl.cpp
 src/vgi_catalog_api.cpp
+src/vgi_query_rpc.cpp
+src/vgi_query_function.cpp
 src/vgi_function_connection.cpp
 src/vgi_client_timing.cpp
 src/vgi_shm_segment.cpp
@@ -642,7 +644,10 @@ option(BUILD_VGI_CATALOG_TESTS "Build catalog metadata integration tests" OFF)
 if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
   add_executable(vgi_catalog_tests
     test/cpp/test_main.cpp
-    test/cpp/test_schema_metadata.cpp)
+    test/cpp/test_schema_metadata.cpp
+    test/cpp/test_query_bind.cpp
+    test/cpp/test_query_interrupt.cpp
+    test/cpp/test_query_rpc.cpp)
   target_include_directories(vgi_catalog_tests PRIVATE
     src/include
     duckdb/src/include

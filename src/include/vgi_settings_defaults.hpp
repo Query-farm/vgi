@@ -28,6 +28,7 @@ inline constexpr bool OAUTH_ENABLED = true;
 inline constexpr const char *OAUTH_FLOW = "auto";
 inline constexpr const char *OAUTH_PROMPT = "none";
 inline constexpr int64_t OAUTH_TIMEOUT_SECONDS = 120LL;
+inline constexpr bool QUERY_ENABLED = false;
 inline constexpr bool RESULT_CACHE = true;
 inline constexpr uint64_t RESULT_CACHE_DEFAULT_TTL_SECONDS = 0ULL;
 inline constexpr const char *RESULT_CACHE_DIR = "";

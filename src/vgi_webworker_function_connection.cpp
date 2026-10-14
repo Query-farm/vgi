@@ -1,5 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vgi_webworker_function_connection.hpp"
+#include "vgi_query_rpc.hpp"
 
 // The `worker:` SAB transport is compiled only for the wasm extension
 // (__EMSCRIPTEN__) and the native SAB unit-test binary (-DVGI_SAB_NATIVE_TEST,
@@ -864,6 +865,10 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
+		if (function_name_ == VGI_QUERY_EXECUTOR &&
+		    !data_reader_->schema()->Equals(*bind_result.output_schema, true)) {
+			throw IOException("vgi_query output stream schema differs from the prepared schema");
+		}
 	} else {
 		is_producer_mode_ = false;
 

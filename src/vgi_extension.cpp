@@ -71,6 +71,7 @@
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_catalogs.hpp"
 #include "vgi_protocols.hpp"
+#include "vgi_query_function.hpp"
 #include "vgi_attach_tickets.hpp"
 #include "vgi_reflection.hpp"
 #include "vgi_copy_from_impl.hpp"
@@ -3774,6 +3775,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
 	RegisterVgiProtocolsFunction(loader);
+	vgi::RegisterVgiQueryFunction(loader);
 	vgi::RegisterVgiExportSessionFunction(loader);
 
 	// Register the synthetic catalog-scan function under its name. VgiTableEntry

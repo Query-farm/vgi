@@ -23,6 +23,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp" // ComputeCatalogIdentityFingerprint (cache identity scoping)
 #include "vgi_protocol.hpp"
+#include "vgi_query_function.hpp"
 #include "vgi_worker_pool.hpp"
 
 #include "arrow/util/byte_size.h" // TotalBufferSize (batch-shape stats)
@@ -215,6 +216,8 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
 
 unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	auto result = make_uniq<VgiTableFunctionBindData>();
+	result->explicit_query = explicit_query;
+	result->query_preparation = query_preparation;
 
 	// Worker identification + invocation inputs (shared_ptr / value copies).
 	result->attach_params = attach_params;
@@ -2756,6 +2759,9 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableFunctionLocalState>(std::move(current_chunk), context.client,
 	                                                         bind_data.attach_params);
+	if (bind_data.explicit_query) {
+		local_state->cancel_enabled = true;
+	}
 
 	// Set column_ids for ArrowToDuckDB projection support if function supports it
 	// This tells ArrowToDuckDB which columns to extract from the Arrow arrays
@@ -2820,6 +2826,9 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 
 		local_state->prefetch_slot_->connection = std::move(primary_connection);
 	} else {
+		if (bind_data.explicit_query) {
+			throw IOException("vgi_query cannot initialize a secondary reader");
+		}
 		// Secondary worker: acquire a connection without firing a redundant
 		// bind RPC. The cached planner-phase BindResult on bind_data is what
 		// PerformInit needs; the global_execution_id is threaded via
@@ -3921,6 +3930,9 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 		// Update dynamic filter state before each tick is sent
 		UpdateDynamicFilterState(global_state, context, bind_data);
 		auto arrow_batch = local_state.connection()->ReadDataBatch();
+		if (bind_data.explicit_query) {
+			ValidateVgiQueryResultBatch(arrow_batch, bind_data.bind_result.output_schema);
+		}
 		if (!arrow_batch) {
 			// End of THIS stream. On the split path that is the end of one split,
 			// not the end of the scan: claim the next one and keep going.
@@ -4125,6 +4137,9 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 	// a real option, but it needs the claim moved into the task along with the
 	// interrupt and poisoning handling that lives around PerformInit.
 	is_async = is_async && !bind_data.supports_splits;
+	// Explicit SQL has one ordered reader. Keep every batch, including empty
+	// batches, on the validation and cancellation path above before conversion.
+	is_async = is_async && !bind_data.explicit_query;
 
 	// Fast path: current batch still has rows to consume
 	if (!BatchExhausted(local_state)) {

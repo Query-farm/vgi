@@ -78,6 +78,9 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         const std::string &tcp_proxy = "",
                                         std::shared_ptr<IrohClientConfig> iroh = nullptr);
 
+// Notify the worker that an attachment has been detached and may be released.
+void InvokeCatalogDetach(const CatalogRpcContext &ctx, ClientContext &context);
+
 // List catalogs exposed by a worker. Returns per-catalog discovery records
 // carrying implementation_version and data_version_spec metadata alongside the
 // catalog name.

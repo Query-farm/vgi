@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_http_function_connection.hpp"
+#include "vgi_query_rpc.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/blob.hpp"
@@ -305,6 +306,9 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 	stream_state_token_.clear();
 
 	if (!owned || offset >= static_cast<size_t>(owned->size())) {
+		if (function_name_ == VGI_QUERY_EXECUTOR) {
+			throw IOException("vgi_query response is missing its Arrow output stream");
+		}
 		return;
 	}
 	const size_t data_bytes = static_cast<size_t>(owned->size()) - offset;
@@ -316,10 +320,17 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
+		if (function_name_ == VGI_QUERY_EXECUTOR) {
+			throw IOException("vgi_query response has an invalid Arrow output stream");
+		}
 		// Empty data stream is valid (no output yet)
 		return;
 	}
 	auto reader = reader_result.ValueUnsafe();
+	if (function_name_ == VGI_QUERY_EXECUTOR &&
+	    !reader->schema()->Equals(*cached_output_schema_, true)) {
+		throw IOException("vgi_query output stream schema differs from the prepared schema");
+	}
 
 	// Per-response counters surfaced via VGI_LOG below.  Useful to confirm
 	// the server's batch-bundling (``max_stream_response_bytes``) is taking
@@ -337,6 +348,10 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 			throw InterruptException();
 		}
 		auto read_result = reader->ReadNext();
+		if (function_name_ == VGI_QUERY_EXECUTOR && !read_result.ok()) {
+			throw IOException("vgi_query response contains an invalid Arrow batch: %s",
+			                  read_result.status().ToString());
+		}
 		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
 			break;
 		}

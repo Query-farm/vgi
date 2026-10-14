@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_query_rpc.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -276,6 +277,12 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		                      "rpc_catalog",
 		                      ctx.params->auth(),
 		                      ctx.params->cookie_jar()};
+		// A lost prepare response can already own a remote allocation. The
+		// subprocess pool retries ambiguous IO failures, so prepare must use a
+		// single fresh attempt rather than allocate a second unseen preparation.
+		if (method_name == "catalog_query_prepare") {
+			opts.use_pool = false;
+		}
 		opts.tcp_proxy = ctx.params->tcp_proxy();
 		opts.iroh = ctx.params->iroh();
 		// Cache-hit on the HTTP path: avoids re-entering the secret manager (and
@@ -563,7 +570,8 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 		options_ipc_bytes = SerializeToIpcBytes(options_batch);
 	}
 
-	auto request_batch = BuildCatalogAttachRequest(catalog_name, options_ipc_bytes, data_version_spec, implementation_version);
+	const bool query_offered = IsVgiQueryEnabled(context);
+	auto request_batch = BuildCatalogAttachRequest(catalog_name, options_ipc_bytes, data_version_spec, implementation_version, query_offered);
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 	auto params = generated::BuildCatalogAttachParams(request_bytes);
 	auto response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
@@ -571,7 +579,57 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	if (!result_batch) {
 		throw IOException(CatalogProtocolViolation("catalog_attach", worker_path), "Empty response from catalog_attach [worker: %s]", worker_path);
 	}
-	return ParseCatalogAttachResult(result_batch, worker_path, context);
+	return ParseCatalogAttachResult(result_batch, worker_path, context, query_offered);
+}
+
+void InvokeCatalogDetach(const CatalogRpcContext &ctx, ClientContext &context) {
+	InvokeVoidRpc(ctx, "catalog_detach", generated::BuildCatalogDetachParams(ctx.attach_opaque_data), context);
+}
+
+VgiQueryPrepareResult InvokeCatalogQueryPrepare(const CatalogRpcContext &ctx,
+                                              const VgiQueryCapabilities &capabilities, const std::string &sql,
+                                              const std::shared_ptr<arrow::Schema> &parameter_schema,
+                                              ClientContext &context, const std::string &required_ordering) {
+    if (!IsVgiQueryEnabled(context)) throw InvalidInputException("vgi_query_enabled must be true before preparing a remote query");
+    auto request = SerializeToIpcBytes(BuildVgiQueryPrepareRequest(ctx, capabilities, sql, parameter_schema, required_ordering));
+    if (request.size() > VGI_QUERY_MAX_RECORD_BYTES) throw InvalidInputException("VGI query request is too large");
+    auto response = InvokeRpcMethod(ctx, "catalog_query_prepare", generated::BuildCatalogQueryPrepareParams(request), context);
+    if (!response.batch || !response.batch->ValidateFull().ok() ||
+        response.batch->num_rows() != 1 || response.batch->num_columns() != 1 ||
+        response.batch->schema()->field(0)->name() != "result" || response.batch->column(0)->type_id() != arrow::Type::BINARY) {
+        throw IOException("Malformed catalog_query_prepare response envelope");
+    }
+    auto payload = std::static_pointer_cast<arrow::BinaryArray>(response.batch->column(0));
+    if (payload->IsNull(0) || payload->value_length(0) > VGI_QUERY_MAX_RECORD_BYTES) {
+        throw IOException("Invalid catalog_query_prepare response size");
+    }
+    RecordBatchSingleRow envelope(response.batch, 0, "catalog_query_prepare response", ctx.params->worker_path());
+    auto batch = DeserializeVgiQueryRecord(envelope["result"].value_not_null<std::vector<uint8_t>>());
+    try {
+        ValidateResponseSchema(batch, "catalog_query_prepare", ctx.params->worker_path());
+        return ParseVgiQueryPrepareResult(batch, capabilities, required_ordering, QueryEpochMillisNow(), ctx.params->worker_path());
+    } catch (...) {
+        // A valid token can already own a preparation even when another result
+        // field is malformed. Release best-effort without hiding the primary error.
+        try {
+            RecordBatchSingleRow row(batch, 0, "CatalogQueryPrepareResult", ctx.params->worker_path());
+            auto token = row["prepared_query_token"].as<std::vector<uint8_t>>();
+            if (token && !token->empty() && token->size() <= VGI_QUERY_MAX_TOKEN_BYTES) {
+                InvokeCatalogQueryRelease(ctx, *token, context);
+            }
+        } catch (...) { }
+        throw;
+    }
+}
+
+void InvokeCatalogQueryRelease(const CatalogRpcContext &ctx, const std::vector<uint8_t> &prepared_query_token,
+                               ClientContext &context) {
+    if (ctx.attach_opaque_data.empty() || ctx.attach_opaque_data.size() > VGI_QUERY_MAX_TOKEN_BYTES ||
+        prepared_query_token.empty() || prepared_query_token.size() > VGI_QUERY_MAX_TOKEN_BYTES) {
+        throw InvalidInputException("Invalid VGI query attachment or preparation token");
+    }
+    InvokeVoidRpc(ctx, "catalog_query_release",
+                  generated::BuildCatalogQueryReleaseParams(ctx.attach_opaque_data, prepared_query_token, OptTxn(ctx)), context);
 }
 
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context) {
@@ -2449,10 +2507,10 @@ static VgiAttachCatalogInfo ParseVgiAttachCatalog(const std::vector<uint8_t> &by
 }
 
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                             const std::string &worker_path, ClientContext &context) {
+                                             const std::string &worker_path, ClientContext &context, bool query_offered) {
 	CatalogAttachResult result;
 
-	if (!batch || batch->num_rows() == 0) {
+	if (!batch || batch->num_rows() != 1) {
 		throw IOException(CatalogProtocolViolation("catalog_attach", worker_path), "Empty response from catalog_attach");
 	}
 
@@ -2514,6 +2572,12 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 
 	// catalog_contents capability (backward-compatible: older workers omit it)
 	result.supports_catalog_contents = row["supports_catalog_contents"].value_or(false);
+
+	result.query_pushdown = ParseVgiQueryCapabilities(batch->GetColumnByName("query_pushdown"), query_offered, worker_path);
+	if (result.query_pushdown && (!result.attach_opaque_data_required || result.attach_opaque_data.empty() ||
+	                             result.attach_opaque_data.size() > VGI_QUERY_MAX_TOKEN_BYTES)) {
+		throw IOException("VGI query support requires a nonempty required attachment identity [worker: %s]", worker_path);
+	}
 
 	return result;
 }

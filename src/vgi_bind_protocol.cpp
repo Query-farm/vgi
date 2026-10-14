@@ -6,6 +6,7 @@
 #include "vgi_cache_identity.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_query_rpc.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -131,6 +132,10 @@ BindResult PerformBindProtocol(
 
 	// Resolve unscoped + static-scope/name secrets up front. Scoped secrets
 	// requested by the worker mid-bind are merged in below if needed.
+	const bool query_executor = function_name == VGI_QUERY_EXECUTOR;
+	if (query_executor && !required_secrets.empty()) {
+		throw IOException("vgi_query does not allow external secret resolution");
+	}
 	auto secrets = ExtractVgiSecrets(context, required_secrets);
 	bool secret_dependent = !required_secrets.empty();
 
@@ -148,6 +153,9 @@ BindResult PerformBindProtocol(
 	// secrets, we resolve them and re-send with resolved_secrets_provided=true.
 	auto scope_request = TryParseBindSecretScopeResponse(bind_response_batch);
 	if (scope_request) {
+		if (query_executor) {
+			throw IOException("vgi_query executor cannot request secret negotiation");
+		}
 		secret_dependent = true;
 		std::vector<VgiSecretRequirement> scoped_reqs;
 		for (const auto &lookup : scope_request->lookups) {
