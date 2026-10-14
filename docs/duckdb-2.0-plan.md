@@ -782,12 +782,62 @@ CLI SIGINT stops its input loop before trailing DETACH and is not a substitute
 for this lifecycle test. Exact logs and limits are recorded in
 `native_query_adapter_validation` in the protocol manifest.
 
-**Next checkpoint:** reconcile the remaining field/capability reviews for the
-combined contract freeze, with broader provider and transport qualification
-tracked separately. This finite subprocess reference does not qualify general
-SQL providers, native HTTP/WASM queries, all platforms, performance, or automatic
-DuckDB 2.0 optimizer integration. No broad P0–P3 or M0–M4 gate is closed and no
-protocol version is published.
+This finite subprocess reference does not qualify general SQL providers,
+native HTTP/WASM queries, all platforms, performance, or automatic DuckDB 2.0
+optimizer integration.
+
+**Combined contract design checkpoint (2026-10-14)**
+
+The [shared contract specification](../../vgi-python-duckdb2/docs/protocol/shared-catalog-values.md#combined-expression-constraint-transaction-and-trigger-design)
+now gives concrete successor shapes and semantics for expressions, canonical
+constraints/indexes, composite transactions, triggers and durable mutation
+outcomes. These are design decisions for the same release, **not implemented
+profiles or a frozen wire snapshot**. The current 82-method inventory/hash and
+DuckDB 1.5 build pin are unchanged.
+
+- Reuse `QueryEvaluationContext` for scalar SQL definitions; distinguish one
+  scalar expression from a query/DML statement. Specify DEFAULT, generated,
+  CHECK, USING, layout, index and macro evaluation phases rather than treating
+  all SQL text alike.
+- Replace five parallel constraint arrays with canonical create/read records.
+  Provider-issued logical keys distinguish constraint identity from SQL labels.
+  One atomic apply method covers add/drop/rename/replace; complete readback,
+  enforcement, FK semantics and table revisions are explicit. Extend existing
+  index methods with typed options and keys.
+- Extend shared dependencies with semantic ALTER protection and column scope.
+  Preserve exact referenced-key and backing-index dependencies; object-only
+  DROP graphs cannot establish generated-column or trigger ALTER safety.
+- Use existing capability lists for DDL, DML, mixed and multi-operation atomicity.
+  Add an authoritative statement lifecycle and COMMIT fence; batches and stream
+  execution IDs do not establish whole-statement completion.
+- Specify persistent trigger CRUD/readback, singular event, exact pinned grammar
+  restrictions, exclusive engine/backend ownership, stale-writer checks,
+  operation identity and final completion receipts. Trigger execution stays
+  unadvertised until whole-statement/OLD-NEW/rollback behavior is proven.
+- Include optional durable mutation wrapper/status RPCs with exact request-byte
+  identity, bounded admission and retained outcomes. Existing mutations remain
+  no-retry after ambiguous dispatch; carrying an ID alone proves no replay safety.
+
+Three agents reviewed the source and cross-reviewed the resulting specification.
+The review tightened generated-column edge identity, revision/enforcement rules,
+UPDATE OF selection, trigger action identity, statement terminal transitions,
+COMMIT fencing, stream completion and recovery after transaction completion.
+The manifest records the reviewed fields and planned methods separately from
+implemented code. It also corrects the stale native-query status and moves
+already implemented RPCs out of the proposed-method inventory. This resolves
+**50 review entries**, reducing the manifest's outstanding scope/capability/field
+reviews from 134 to **84**. These are design decisions, not 50 newly implemented
+features. EC2 checks pass all 11 inventory tests and strict generation; the
+inventory still covers 151 audit rows and 20 areas. Source verification matches
+33,065 files across 15 repositories. The manifest's `combined_design_review`
+records the exact evidence and 12 newly specified (not implemented) methods.
+
+**Next checkpoint:** prove the shared expression/context and canonical constraint
+contracts in durable references, then implement statement/write-requirement
+checks before trigger execution. Continue resolving the remaining catalog and
+optional-candidate decisions before the combined freeze. Durable replay needs
+its own crash/reconnect proof; no general mutation retry is enabled by this
+specification. No P0–P3 or M0–M4 gate is closed and no version is published.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
@@ -945,8 +995,8 @@ means work before the shared freeze, rather than an automatic later release.
 | Macros — concrete contract and reference implemented; adapters pending | Overload collections, declared parameter types, expression/default representation, documentation, and owner-relative definitions | Reconcile the existing single-definition request and typed-value defaults with engine overloads and expression defaults. Define resolution and stable round trips; do not introduce a function overload handle just to mirror DuckDB internals. |
 | Dependencies and catalog consistency | Shared qualified object references; explicit ownership/drop/alter dependency semantics; mutation visibility and metadata-version rules | Settle worker versus engine authority, RESTRICT/CASCADE, rename effects, transaction-local reads, committed versions/etags, and retained entries. Include dependency records where enforcement across clients requires them; no DuckDB pointers or OIDs on the wire. |
 | Transactions and write replay | Explicit DDL rollback and mixed DDL/DML atomicity guarantees; operation identity/deduplication if retry support is included | Expanded ADD COLUMN, CTAS, multi-DML CTEs, and triggers use coherent transaction state. Reuse begin/commit/rollback and OLD/NEW `changes` mode. Define ambiguous commit/reply-loss behavior; never retry side effects just because transport failed. No distributed atomicity claim across independent catalogs. |
-| Triggers — design required | Table-owned identity, list/get/create/drop and metadata mutation, event/timing/granularity, UPDATE OF, transition aliases, action definition, dependencies, and execution mode | Prefer worker authority for persistent definitions. Distinguish engine-executed from backend-executed triggers so they cannot fire twice. Define SQL dialect, ordering, supported row/statement forms, OLD/NEW requirements, rollback, detach/reconnect, and cross-client discovery. |
-| Catalog query execution — preparation lifecycle and shared codecs implemented; adapters pending | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
+| Triggers — contract specified; reference pending | Table-owned identity, list/get/create/drop and metadata mutation, event/timing/granularity, UPDATE OF, transition aliases, action definition, dependencies, and execution mode | Prefer worker authority for persistent definitions. Distinguish engine-executed from backend-executed triggers so they cannot fire twice. Define SQL dialect, ordering, supported row/statement forms, OLD/NEW requirements, rollback, detach/reconnect, and cross-client discovery. |
+| Catalog query execution — explicit 1.5 adapter implemented; automatic pending | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
 | Logical type preservation — concrete contract and codecs implemented; adapters pending | Recursive VGI TUPLE annotation and canonical Arrow Parquet Variant capability with unshredded metadata/value storage | Qualify canonical Variant semantics, missing versus NULL and SDK byte/metadata preservation at each engine pin. Original DuckDB integer width/signedness and its full type domain are not promised; unsupported mappings reject. Reject opaque aggregate-state layouts without a portable contract. |
 | Optimizer and observability additions — design required | Projection expressions and result mapping, repeatability, typed metrics, and any necessary partition-selection/parallelism additions | Reuse Filter v2 and existing split/partition/ordering metadata first. Define decline and local residual behavior, type/NULL semantics, query-scoped repeatability, metric units/lifetime, and selected-partition identity. Existing monotonicity and runtime-filter fields are not new additions. |
 
