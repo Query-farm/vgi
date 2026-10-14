@@ -690,8 +690,10 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	if (info.type == CatalogType::VIEW_ENTRY) {
 		vgi::InvokeCatalogViewDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
 		if (info.cascade) {
-			// Cascade may have dropped views that depend on this view
-			DeferDrop(catalog, views_.HarvestEntries());
+			// Dependents may live in other schemas; invalidate this transaction's
+			// whole catalog view, retaining entries held by bound statements.
+			vgi_tx.ClearSchemaCache();
+			vgi_catalog.ClearCache();
 		} else {
 			DeferDrop(catalog, views_.HarvestEntry(info.name));
 		}
@@ -699,6 +701,11 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	}
 
 	vgi::InvokeCatalogTableDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
+	if (info.cascade) {
+		vgi_tx.ClearSchemaCache();
+		vgi_catalog.ClearCache();
+		return;
+	}
 
 	DeferDrop(catalog, tables_.HarvestEntry(info.name));
 	// Views referencing the dropped table are now stale; clear to force re-fetch.

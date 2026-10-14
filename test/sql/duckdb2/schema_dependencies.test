@@ -1,0 +1,163 @@
+# name: test/sql/duckdb2/schema_dependencies.test
+# description: Schema RESTRICT, REPLACE and CASCADE use durable provider dependencies on 1.5
+# group: [vgi_duckdb2_protocol]
+
+require-env VGI_DEPENDENCY_REFERENCE_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'dependencies' AS w (TYPE vgi, LOCATION '${VGI_DEPENDENCY_REFERENCE_WORKER}');
+
+statement ok
+CREATE SCHEMA w."a.b";
+
+statement ok
+CREATE TABLE w."a.b".t (i INTEGER);
+
+statement error
+CREATE OR REPLACE SCHEMA w."a.b";
+----
+dependent objects
+
+statement error
+DROP SCHEMA w."a.b";
+----
+dependent objects
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+1
+
+# Concurrent connections retain separate metadata snapshots.
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+1
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+DROP SCHEMA w."a.b" CASCADE;
+
+query I con2
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+0
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+1
+
+statement ok con2
+ROLLBACK;
+
+statement ok con1
+COMMIT;
+
+# An older read-only transaction keeps its snapshot after another writer commits.
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+1
+
+statement ok con2
+DROP SCHEMA w."a.b" CASCADE;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+1
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+0
+
+statement ok
+CREATE SCHEMA w."a.b";
+
+statement ok
+CREATE TABLE w."a.b".t (i INTEGER);
+
+statement ok
+BEGIN;
+
+statement ok
+DROP SCHEMA w."a.b" CASCADE;
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+1
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+SET vgi_catalog_contents = false;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+1
+
+statement ok
+BEGIN;
+
+statement ok
+DROP SCHEMA w."a.b" CASCADE;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+0
+
+statement ok
+DETACH w;
+
+statement ok
+ATTACH 'dependencies' AS w (TYPE vgi, LOCATION '${VGI_DEPENDENCY_REFERENCE_WORKER}');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND schema_name = 'a.b';
+----
+0
+
+statement ok
+CREATE SCHEMA w."a.b";
+
+statement ok
+CREATE OR REPLACE SCHEMA w."a.b";
+
+statement ok
+DROP SCHEMA w."a.b";
+
+statement ok
+DROP SCHEMA IF EXISTS w."a.b" CASCADE;
+
+statement ok
+DETACH w;

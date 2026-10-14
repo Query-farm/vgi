@@ -138,6 +138,7 @@ public:
 	}
 
 private:
+	VgiSchemaSet &SchemaSet(ClientContext &context);
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
 	/// Raise the known catalog version to `version` if it is not older (a

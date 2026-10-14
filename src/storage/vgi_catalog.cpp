@@ -134,12 +134,26 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 	// Invalidate schema cache so re-fetch picks up the new schema. Use the
 	// deferred path so any bound query holding a CatalogEntry* doesn't
 	// dangle.
+	vgi_tx.ClearSchemaCache();
 	ClearCache(/*force=*/false);
 	return nullptr;
 }
 
+VgiSchemaSet &VgiCatalog::SchemaSet(ClientContext &context) {
+	// Non-transactional and frozen metadata can use shared entries without
+	// starting a transaction (and another version probe).
+	if (!attach_result_ || !attach_result_->supports_transactions || attach_result_->catalog_version_frozen) {
+		return schemas;
+	}
+	auto &transaction = VgiTransaction::Get(context, *this);
+	if (auto local = transaction.SchemaCache()) {
+		return *local;
+	}
+	return schemas;
+}
+
 void VgiCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
-	schemas.Scan(context, [&](CatalogEntry &entry) {
+	SchemaSet(context).Scan(context, [&](CatalogEntry &entry) {
 		// A schema seeded from catalog_contents decodes its SchemaInfo lazily;
 		// scans (duckdb_schemas() & co.) read its comment and tags.
 		auto &schema = entry.Cast<VgiSchemaEntry>();
@@ -151,7 +165,7 @@ void VgiCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCa
 optional_ptr<SchemaCatalogEntry> VgiCatalog::LookupSchema(CatalogTransaction transaction,
                                                           const EntryLookupInfo &schema_lookup,
                                                           OnEntryNotFound if_not_found) {
-	auto entry = schemas.GetEntry(transaction.GetContext(), schema_lookup.GetEntryName());
+	auto entry = SchemaSet(transaction.GetContext()).GetEntry(transaction.GetContext(), schema_lookup.GetEntryName());
 	if (entry) {
 		return &entry->Cast<SchemaCatalogEntry>();
 	}
@@ -494,6 +508,12 @@ bool VgiCatalog::ReloadUsesCatalogContents() {
 
 std::shared_ptr<vgi::VgiCatalogContents> VgiCatalog::TakeCatalogContents(ClientContext &context,
                                                                          const vgi::CatalogRpcContext &rpc_ctx) {
+	// catalog_contents has no transaction argument. Its committed snapshot
+	// cannot seed mutable transaction metadata, even before the first mutation.
+	// Frozen catalogs promise schema/object information never changes.
+	if (!rpc_ctx.transaction_opaque_data.empty() && (!attach_result_ || !attach_result_->catalog_version_frozen)) {
+		return nullptr;
+	}
 	if (!attach_result_ || !attach_result_->supports_catalog_contents) {
 		return nullptr;
 	}
@@ -635,6 +655,7 @@ void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 
 	// Invalidate schema cache via the deferred path so any bound query
 	// holding a CatalogEntry* doesn't dangle.
+	vgi_tx.ClearSchemaCache();
 	ClearCache(/*force=*/false);
 }
 

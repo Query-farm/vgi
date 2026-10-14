@@ -492,13 +492,16 @@ VGI_JAVA_DIR   ?= $(HOME)/Development/vgi-java
 VGI_RUST_DIR   ?= $(HOME)/Development/vgi-rust
 VGI_CSHARP_DIR ?= $(HOME)/Development/vgi-csharp
 
-.PHONY: test_python test_python_crash test_column_paths test_go test_typescript test_java test_rust test_csharp test_languages \
+.PHONY: test_python test_python_crash test_column_paths test_dependencies test_go test_typescript test_java test_rust test_csharp test_languages \
 	build_database_workers test_database_workers test_database_worker_restart
 
 # Successor protocol preparation: run real 1.5 SQL against the durable DDL
 # reference without requiring the older transactor's fork-only subcursor API.
 test_column_paths:
 	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" python3 test/run_column_paths.py
+
+test_dependencies:
+	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" python3 test/run_dependencies.py
 
 # Real database-package demonstrations. These are intentionally separate from
 # the fast default suite: PyInstaller and Bun each produce a ~100 MiB native
@@ -587,6 +590,7 @@ test_python:
 	        "~test/sql/duckdb2/column_paths.test" \
 	        "~test/sql/duckdb2/required_filter_paths.test" \
 	        "~test/sql/duckdb2/view_alias_metadata.test" \
+	        "~test/sql/duckdb2/schema_dependencies.test" \
 	        "~test/sql/integration/writable/*" \
 	        "~test/sql/vgi_worker_pool.test"
 	@$(MAKE) test_python_crash
@@ -700,7 +704,7 @@ test_rust:
 # Run the column reference, then the integration suite against every language implementation. Keeps going
 # on failure so one language's result doesn't mask the others, then exits
 # non-zero if any failed.
-test_languages: test_column_paths
+test_languages: test_column_paths test_dependencies
 	@rc=0; \
 	for t in test_python test_go test_rust test_typescript test_java test_csharp; do \
 		echo "==================== $$t ===================="; \

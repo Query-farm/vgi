@@ -145,6 +145,11 @@ SET vgi_catalog_contents = false;
 statement ok
 ATTACH 'example' AS renamed (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
+# Transactional workers own a separate metadata snapshot for each transaction.
+# Keep both calls in one snapshot to verify inventory reuse within that snapshot.
+statement ok
+BEGIN;
+
 statement ok
 CALL enable_logging(level := 'debug');
 
@@ -165,8 +170,8 @@ SELECT renamed.vgi_clamp(50);
 50
 
 # Scalar/aggregate/table function and scalar/table macro inventories are each
-# fetched at most once for this schema. Both macro sets share the discovery
-# snapshot, and normal function-set loading reuses it too.
+# fetched at most once for this schema in this transaction. Both macro sets
+# share the discovery snapshot, and normal function-set loading reuses it too.
 query I
 SELECT COUNT(*) FROM duckdb_logs()
 WHERE type = 'VGI'
@@ -184,6 +189,9 @@ WHERE type = 'VGI'
   AND message LIKE '%entity_qualifier=main%';
 ----
 2
+
+statement ok
+COMMIT;
 
 statement ok
 DETACH renamed;

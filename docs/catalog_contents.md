@@ -285,3 +285,18 @@ lazy above) — requires the counts before the call, e.g. on the attach result.
 Full enumeration: 32 RPCs → 3 (`catalog_attach`, `catalog_copy_from_formats`,
 `catalog_contents`), i.e. ~3.4 s of latency → ~0.3 s. Measured numbers go here
 once the implementation is benchmarked.
+
+
+### Worker transactions
+
+For mutable catalogs, a nonempty worker transaction handle selects
+transaction-owned native schema and object caches. The `catalog_contents` RPC carries no transaction handle, so
+its committed snapshot cannot populate these caches. Native reads use the
+transaction-aware schema and per-kind discovery RPCs instead. Commit/rollback
+retire cached entries through the existing retention mechanism for bound
+statements; they never publish uncommitted metadata into a shared cache.
+CASCADE clears the relevant transaction's catalog cache because dependent objects
+may live in other schemas. Other active transactions retain their own snapshots.
+Workers without transaction handles keep the shared contents/etag path. A
+`catalog_version_frozen` attachment promises invariant schema/object information,
+so it also keeps shared metadata even when transactions scope function state.

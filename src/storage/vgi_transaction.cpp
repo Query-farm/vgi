@@ -2,6 +2,7 @@
 #include "storage/vgi_transaction.hpp"
 
 #include "storage/vgi_catalog.hpp"
+#include "storage/vgi_schema_set.hpp"
 #include "vgi_catalog_rpc.hpp"
 
 #include "duckdb/main/attached_database.hpp"
@@ -34,6 +35,11 @@ void VgiTransaction::Start(ClientContext &context) {
 		auto &params = vgi_catalog_.attach_parameters();
 		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, {}};
 		transaction_opaque_data_ = vgi::InvokeCatalogTransactionBegin(rpc_ctx, context);
+		// A frozen catalog promises invariant schema/object information even
+		// when transactions scope function state. It can retain shared caches.
+		if (!transaction_opaque_data_.empty() && !attach_result->catalog_version_frozen) {
+			transaction_schemas_ = make_uniq<VgiSchemaSet>(vgi_catalog_);
+		}
 	}
 }
 
@@ -47,39 +53,18 @@ void VgiTransaction::Commit(ClientContext &context) {
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
 
-	// We deliberately do NOT call CheckAndInvalidateCache here. Rationale:
-	//
-	//   - DDL paths (CreateSchema, DropSchema, CreateTable, …) call
-	//     ClearCache eagerly inside their RPC handlers, before Commit runs.
-	//     By the time we reach this point in those flows, the cache is
-	//     already invalidated.
-	//
-	//   - Other-session changes that bumped the worker's catalog_version
-	//     during this transaction are caught at the next Transaction::Start
-	//     (one transaction late, but no in-flight query observes stale
-	//     metadata because the next query polls before it executes).
-	//
-	//   - For read-only sessions (the common case), no work in this
-	//     transaction could have moved the worker's version, so polling
-	//     here can only ever return noop. Removing the call drops two
-	//     catalog_version RPCs per query (Commit + Rollback paths).
-	//
-	// If a future write path forgets to ClearCache after a worker
-	// mutation, the next Start probe still catches it — staleness is
-	// bounded to one transaction.
+	// Retain entries referenced by bound statements, but do not publish this
+	// transaction's metadata cache as the catalog's committed cache.
+	ClearSchemaCache();
+	// The next Start still checks committed catalog/result-cache versions.
 }
 
 void VgiTransaction::Rollback() {
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
 
-	// DDL invalidates entries eagerly, but a later statement can refill them
-	// from this transaction's uncommitted schema. Rollback does not advance
-	// the committed catalog version, so the next Start cannot detect those
-	// stale entries by polling. Discard them even if the context is gone or
-	// the rollback RPC fails; use deferred drops to retain bound references.
-	if (!transaction_opaque_data_.empty()) {
-		vgi_catalog_.ClearCache();
-	}
+	// Entries loaded after DDL belong only to this transaction. Rollback must
+	// discard them without clearing another connection's snapshot.
+	ClearSchemaCache();
 
 	// Lock the base class's weak_ptr<ClientContext>. If the original session
 	// has gone away (cross-session rollback during shutdown reconciliation,
@@ -103,6 +88,12 @@ void VgiTransaction::Rollback() {
 
 	// No extra version RPC is needed. Transaction-local cache entries were
 	// discarded above; other-session changes are caught at the next Start.
+}
+
+void VgiTransaction::ClearSchemaCache() {
+	if (transaction_schemas_) {
+		vgi_catalog_.AbsorbDroppedEntries(transaction_schemas_->HarvestEntries());
+	}
 }
 
 VgiTransaction &VgiTransaction::Get(ClientContext &context, Catalog &catalog) {

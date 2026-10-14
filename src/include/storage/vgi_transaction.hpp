@@ -11,6 +11,7 @@
 namespace duckdb {
 
 class VgiCatalog;
+class VgiSchemaSet;
 
 enum class VgiTransactionState { TRANSACTION_NOT_YET_STARTED, TRANSACTION_STARTED, TRANSACTION_FINISHED };
 
@@ -22,6 +23,13 @@ public:
 	void Start(ClientContext &context);
 	void Commit(ClientContext &context);
 	void Rollback();  // Uses stored context_ from Start
+
+	//! Mutable metadata read through a worker transaction must never share another
+	//! transaction's entries. Null for non-transactional or metadata-frozen workers.
+	optional_ptr<VgiSchemaSet> SchemaCache() {
+		return transaction_schemas_.get();
+	}
+	void ClearSchemaCache();
 
 	static VgiTransaction &Get(ClientContext &context, Catalog &catalog);
 
@@ -45,6 +53,7 @@ private:
 	VgiCatalog &vgi_catalog_;
 	// (Rollback uses the base class's `Transaction::context` weak_ptr to
 	// safely reach a ClientContext if one is still alive at rollback time.)
+	unique_ptr<VgiSchemaSet> transaction_schemas_;
 	std::vector<uint8_t> transaction_opaque_data_;   // Assigned by worker's catalog_transaction_begin
 };
 

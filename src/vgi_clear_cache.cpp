@@ -7,8 +7,10 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include "storage/vgi_catalog.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "vgi_function_docs.hpp"
 #include "vgi_logging.hpp"
 
@@ -43,6 +45,9 @@ static void VgiClearCacheScan(ClientContext &context, TableFunctionInput &data_p
 		// Documented to invalidate any in-flight bound queries against
 		// VGI catalogs.
 		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
+		if (auto transaction = MetaTransaction::Get(context).TryGetTransaction(*db)) {
+			transaction->Cast<VgiTransaction>().ClearSchemaCache();
+		}
 		vgi_catalog.ClearCache(/*force=*/true);
 		// And what the worker hosts (vgi_rpc.Reflection.v1): refetched on next use.
 		if (vgi_catalog.attach_parameters()) {

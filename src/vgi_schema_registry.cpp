@@ -107,6 +107,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		// --- Strictly-typed single-struct responses -----------------------
 		m["catalog_attach"] = ResponseSchema{CatalogAttachResultSchema(), nullptr, false, nullptr};
 		m["catalog_version"] = ResponseSchema{CatalogVersionResultSchema(), nullptr, false, nullptr};
+		m["catalog_dependencies"] = ResponseSchema{CatalogDependenciesResultSchema(), nullptr, false, nullptr};
 		m["catalog_schema_option_definitions"] =
 		    ResponseSchema{CatalogSchemaOptionDefinitionsResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_option_definitions"] =
@@ -192,6 +193,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_create", &CatalogCreateParamsSchema},
 		    {"catalog_drop", &CatalogDropParamsSchema},
 		    {"catalog_version", &CatalogVersionParamsSchema},
+		    {"catalog_dependencies", &CatalogDependenciesParamsSchema},
 		    {"catalog_transaction_begin", &CatalogTransactionBeginParamsSchema},
 		    {"catalog_transaction_commit", &CatalogTransactionCommitParamsSchema},
 		    {"catalog_transaction_rollback", &CatalogTransactionRollbackParamsSchema},

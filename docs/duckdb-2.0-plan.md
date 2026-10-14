@@ -555,7 +555,7 @@ without advertising its profile. This is reference implementation and shared
 schema preparation; production provider/capability ports remain open. Tests also
 fixed TypeScript's generic map codec losing a literal `__proto__` key.
 
-The current wire inventory is **79 methods**, hash
+That increment brought the wire inventory to **79 methods**, hash
 `f98de1aecf595fb5866082998a4a6d77d1850e781edce50b5b08ffc163e83b94`.
 The native 1.5 build, all SDK unit suites (including 803 passing Python tests),
 strict generation, and 23 overlapping manifest/corpus/native-inventory checks
@@ -567,6 +567,48 @@ Both the 1.5 and refreshed 2.0 source pins reject SQL COMMENT ON SCHEMA, so RPC
 registration does not advertise native schema-comment syntax. Exact evidence and
 remaining limits are recorded in `schema_metadata_mutation_validation` and the
 shared catalog values specification. No release or native 2.0 gate is closed.
+
+The **dependency and schema lifecycle increment** adds attachment-relative
+`CatalogObjectRef`, `ObjectDependency`, `DependencySnapshot`, and
+`catalog_dependencies`. Resolved identities retain raw schema components,
+object kind, and table-owned trigger names. A complete graph distinguishes
+blocking references from automatically removed owned objects; RESTRICT checks
+all blockers after computing the owned closure. CASCADE follows reference
+cycles safely and authorizes every affected object before changes.
+
+The durable Python reference provides schema/table/simple-view authority,
+non-cascading schema REPLACE, subtree and cross-schema CASCADE, unchanged
+versions on failure, sealed capability routing, transaction isolation,
+rollback/commit/reconnect, and concurrent-writer conflict detection. Its limited
+view binder rejects unsupported SQL rather than recording incomplete dependencies.
+Only this reference advertises the new dependency-read and schema-lifecycle
+profiles. All seven SDKs carry matching schemas and actual codec fixtures;
+ordinary providers reject unsupported graph discovery.
+
+Native 1.5 SQL testing exposed committed catalog contents being reused after
+transactional schema deletion. For mutable catalogs, the adapter now gives each
+nonempty worker transaction its own schema/object caches, avoids committed contents for those
+reads, and retires entries without publishing them as shared committed metadata.
+CASCADE invalidates dependent caches across schemas. The new
+`make test_dependencies` covers RESTRICT/REPLACE/CASCADE, concurrent snapshots,
+rollback, cache refresh and reconnect. All seven full native SDK suites pass
+after the cache change. Transaction-owned metadata increases fetches
+relative to cross-transaction cache reuse; performance qualification remains an
+explicit gate. The macro inventory regression now checks reuse within one
+explicit transaction; separate transactions must not share mutable snapshot
+entries. Catalogs advertising invariant metadata (`catalog_version_frozen`) keep
+shared metadata caches even when transactions scope function state.
+
+The current inventory is **80 methods**, hash
+`e23f22d5fcbbc06ad977a3719414ed8a741b2ddf268ab0d536807611e73182fe`.
+All SDK unit suites, 29 configured public RPC checks, 53 overlapping
+manifest/corpus/generation checks, strict generation, lint and type checks pass.
+Native evidence includes 42 dependency-lifecycle assertions, 218 earlier
+reference assertions, and 99 metadata assertions against each of seven workers.
+Detailed counts and logs are recorded in `dependency_lifecycle_validation` in
+the protocol manifest. Full production provider support, index/trigger/macro and
+constraint dependency enforcement, rename semantics, cross-attachment authority,
+native 2.0, performance/platform qualification, freeze and release remain open.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
