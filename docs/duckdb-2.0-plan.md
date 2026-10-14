@@ -676,18 +676,16 @@ logs are recorded in
 the protocol manifest under the unique EC2 workspace
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC`.
 
-**TUPLE/VARIANT and macro contract checkpoint (2026-10-13)**
+**TUPLE/VARIANT and macro contract checkpoint (2026-10-13; VARIANT draft superseded)**
 
-The two wire design items now have concrete contracts and Python reference
-implementations: [logical types](../../vgi-python-duckdb2/docs/protocol/logical-types.md)
+This historical checkpoint implemented TUPLE/macro records and an initial
+VARIANT draft. That draft used a per-value Arrow IPC envelope and custom scalar
+annotations. The user subsequently chose canonical Arrow VARIANT instead;
+the draft encoding and its full source-type identity ambition are superseded.
+The counts below remain evidence for the historical snapshot, not the canonical
+replacement. Current contracts are [logical types](../../vgi-python-duckdb2/docs/protocol/logical-types.md)
 and [macro families](../../vgi-python-duckdb2/docs/protocol/macro-contract.md).
-TUPLE is an explicitly annotated Arrow struct with ordered members. VARIANT is
-an annotated binary field carrying a bounded one-scalar Arrow IPC envelope;
-outer SQL NULL, variant-null, missing object members, and typed nested NULLs
-remain distinct. Numeric/time identities use native Arrow types or specified
-portable scalar annotations. Neither contract sends DuckDB-private vectors.
-Actual Haybarn 2.0 export currently erases tuple identity and its Parquet
-variant conversion is incomplete, so native adapters remain unqualified.
+TUPLE remains an explicitly annotated struct; native adapters remain unqualified.
 
 MacroInfo and MacroCreateRequest gain an optional complete overload family.
 Each parameter separately carries its declared type, literal or expression
@@ -701,8 +699,8 @@ their legacy hook; Python exposes a separate family hook.
 The pinned native 1.5 adapter rejects unqualified type annotations and macro
 families before interpreting their storage. Other SDKs gain the shared codec
 shapes and explicit unsupported behavior where family adapters are absent.
-These are settled development contracts, subject to the combined review and
-freeze. They do not qualify native 2.0 import/export, production macro DDL,
+The macro/TUPLE work remains subject to combined review and freeze; the
+VARIANT part is superseded below. These results do not qualify native 2.0 import/export, production macro DDL,
 or complete the broader plan. EC2 validation passes 1,077 Python checks (five
 skips), the complete Go/Rust/Java/C#/C++ suites, TypeScript Arrow and Flechette
 suites, strict generation, Ruff and mypy. The final native 1.5 build passes;
@@ -710,6 +708,35 @@ three guard regressions pass 14 assertions, and seven focused macro/catalog
 cases pass 420 assertions against each of the seven workers. The
 manifest records exact counts, limits and logs in `types_macros_validation`;
 counts overlap and must not be added together.
+
+**Canonical Arrow VARIANT replacement (current)**
+
+VARIANT uses `ARROW:extension:name = arrow.parquet.variant` with empty extension
+metadata and the standard unshredded `metadata`/`value` binary struct. The new
+capability is `vgi.type.variant.parquet.v1`; the former custom VARIANT profile,
+per-cell IPC envelopes and custom scalar encodings are rejected. TUPLE keeps
+`vgi.logical_type.v1 = tuple` and `vgi.type.tuple.v1`; that annotation is not a
+canonical Arrow tuple extension.
+
+PyArrow 25.0.1 carries the canonical field as ordinary Arrow storage plus
+metadata without a public Variant API. Helpers and SDK codecs preserve the
+payload bytes, validity and metadata; a backend must still validate/decode the
+Parquet Variant binary format before evaluation. The profile promises canonical
+Variant semantics, not every original DuckDB width, signedness or logical type.
+Standard unsigned widening is permitted. Unsupported engine-domain mappings
+reject or remain deferred instead of introducing a custom side channel.
+
+Shredded `typed_value` storage, native 2.0 conversion, full backend decoding,
+cross-SDK execution and performance remain qualification work. The manifest's
+`canonical_variant_validation` records this replacement separately from the
+historical `types_macros_validation` counts. Macro contract work is unchanged.
+
+The canonical replacement passes the focused EC2 checkpoint: 1,024 Python
+tests (five skips), all six SDK catalog-contract suites (including both
+TypeScript backends), type checks, strict generation and manifest validation.
+The native 1.5 test target builds and its three guard cases pass 16 assertions.
+These tests qualify opaque transport and rejection boundaries; they do not
+qualify backend Variant decoding or native 2.0 execution.
 
 **Next checkpoint:** implement the native DuckDB **1.5** explicit `vgi_query`
 adapter. Its review boundary is opt-in negotiation, typed named/positional
@@ -878,7 +905,7 @@ means work before the shared freeze, rather than an automatic later release.
 | Transactions and write replay | Explicit DDL rollback and mixed DDL/DML atomicity guarantees; operation identity/deduplication if retry support is included | Expanded ADD COLUMN, CTAS, multi-DML CTEs, and triggers use coherent transaction state. Reuse begin/commit/rollback and OLD/NEW `changes` mode. Define ambiguous commit/reply-loss behavior; never retry side effects just because transport failed. No distributed atomicity claim across independent catalogs. |
 | Triggers — design required | Table-owned identity, list/get/create/drop and metadata mutation, event/timing/granularity, UPDATE OF, transition aliases, action definition, dependencies, and execution mode | Prefer worker authority for persistent definitions. Distinguish engine-executed from backend-executed triggers so they cannot fire twice. Define SQL dialect, ordering, supported row/statement forms, OLD/NEW requirements, rollback, detach/reconnect, and cross-client discovery. |
 | Catalog query execution — preparation lifecycle and shared codecs implemented; adapters pending | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
-| Logical type preservation — concrete contract and codecs implemented; adapters pending | Recursive type annotations/capabilities for ambiguous Arrow mappings, particularly TUPLE and VARIANT | Verify actual import/export at the selected engine pin. Define nested round trips, missing versus NULL, numeric/time identity, and SDK metadata preservation. Reject opaque aggregate-state layouts unless a portable state contract is proven. |
+| Logical type preservation — concrete contract and codecs implemented; adapters pending | Recursive VGI TUPLE annotation and canonical Arrow Parquet Variant capability with unshredded metadata/value storage | Qualify canonical Variant semantics, missing versus NULL and SDK byte/metadata preservation at each engine pin. Original DuckDB integer width/signedness and its full type domain are not promised; unsupported mappings reject. Reject opaque aggregate-state layouts without a portable contract. |
 | Optimizer and observability additions — design required | Projection expressions and result mapping, repeatability, typed metrics, and any necessary partition-selection/parallelism additions | Reuse Filter v2 and existing split/partition/ordering metadata first. Define decline and local residual behavior, type/NULL semantics, query-scoped repeatability, metric units/lifetime, and selected-partition identity. Existing monotonicity and runtime-filter fields are not new additions. |
 
 For options, prefer a shared typed-value representation, such as the existing
@@ -1205,7 +1232,7 @@ that contract rather than trigger another planned schema migration. An internal
 | First | Scalar monotonicity and optimizer metadata | Connect existing `argument_monotonicity` metadata to 2.0 argument properties. Prove both plan benefit and result equivalence, including decreasing functions and NULL behavior. |
 | First | Async split scans and table-in/out | Split scans currently disable async prefetch. Give each split correct task/connection ownership and backpressure. Audit/extend the engine's table-in/out blocking/resume contract for both Execute and FinalExecute; test cancellation and bounded memory. Source-side `AsyncResult` alone does not establish this capability. |
 | Next | DML in CTEs and custom-table triggers | Consume the frozen transaction/trigger contracts; cache worker-authoritative persistent definitions locally. Qualify the selected execution mode, OLD/NEW, RETURNING, rollback, and single execution. Reject unsupported atomicity; do not assume arbitrary workers provide distributed transactions. |
-| Next | Lossless VARIANT and TUPLE | Enable the agreed recursive Arrow/type contract after engine import/export qualification. Test missing versus NULL, nested values, numeric identity, timestamps, and every SDK. Avoid DuckDB-private vector layouts on the wire. |
+| Next | Canonical VARIANT and TUPLE | Qualify canonical Parquet Variant mappings and the VGI tuple annotation at engine import/export boundaries. Test missing versus NULL, nested values and SDK metadata/byte preservation. Reject unsupported DuckDB values; original width/signedness is not a full-domain preservation guarantee. |
 | Separate engine project | Multiple relational inputs | Follow [the existing proposal](multi_input_table_functions.md). Resolve inclusion of its wire model during P0/P1; binder/operator scheduling may follow later. Inputs must share the caller's transaction semantics. |
 | Optional capability | Whole-query remote execution | Implement the consolidated read-query contract, including explicit queries on 1.5 and qualified automatic pushdown on 2.0. Enable raw SQL/statement execution only under its separately specified capability if included. |
 

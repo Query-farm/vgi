@@ -110,12 +110,24 @@ TEST_CASE("Legacy macro defaults cannot bypass logical type rejection", "[wire-c
 	std::shared_ptr<arrow::Array> tags;
 	REQUIRE(tags_builder.Finish(&tags).ok());
 	auto defaults_array = vgi::MakeSingleBinaryArray({0});
-	for (bool annotated : {false, true}) {
+	for (int representation : {0, 1, 2}) {
 		auto field = arrow::field("x", arrow::binary());
-		if (annotated) {
+		auto default_value = defaults_array;
+		if (representation == 1) {
+			// The unpublished custom VARIANT annotation must remain rejected.
 			field = field->WithMetadata(arrow::key_value_metadata({"vgi.logical_type.v1"}, {"variant"}));
+		} else if (representation == 2) {
+			arrow::FieldVector children = {arrow::field("metadata", arrow::binary(), false),
+			                              arrow::field("value", arrow::binary())};
+			auto canonical = arrow::StructArray::Make(
+			    {vgi::MakeSingleBinaryArray({1, 0, 0}), defaults_array}, children);
+			REQUIRE(canonical.ok());
+			default_value = canonical.ValueUnsafe();
+			field = arrow::field("x", default_value->type(), true,
+			                     arrow::key_value_metadata({"ARROW:extension:name", "ARROW:extension:metadata"},
+			                                               {"arrow.parquet.variant", ""}));
 		}
-		auto defaults = arrow::RecordBatch::Make(arrow::schema({field}), 1, {defaults_array});
+		auto defaults = arrow::RecordBatch::Make(arrow::schema({field}), 1, {default_value});
 		std::vector<std::string> names = {"name", "schema_path", "macro_type", "definition", "comment", "tags",
 		                                  "parameters", "parameter_default_values"};
 		std::vector<std::shared_ptr<arrow::Array>> arrays = {
@@ -127,7 +139,7 @@ TEST_CASE("Legacy macro defaults cannot bypass logical type rejection", "[wire-c
 			fields.push_back(arrow::field(names[i], arrays[i]->type()));
 		}
 		auto batch = arrow::RecordBatch::Make(arrow::schema(fields), 1, arrays);
-		if (annotated) {
+		if (representation != 0) {
 			CHECK_THROWS_AS(vgi::ParseMacroInfo(batch, "test-worker"), NotImplementedException);
 		} else {
 			CHECK_NOTHROW(vgi::ParseMacroInfo(batch, "test-worker"));
