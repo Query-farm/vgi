@@ -391,9 +391,7 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
     const std::vector<uint8_t> &attach_opaque_data, const std::vector<std::string> &schema_path,
     const std::string &name, const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
-    const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
-    const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
-    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<std::vector<uint8_t>> &constraint_definitions,
     const std::vector<uint8_t> &transaction_opaque_data = {});
 
 } // namespace vgi

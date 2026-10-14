@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_constraint_contract.hpp"
 #include "storage/vgi_table_set.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -43,6 +44,9 @@ void VgiTableSet::LoadEntries(ClientContext &context,
 	// Publish each entry under entry_lock_ briefly (per-entry, not whole loop).
 	// Mirrors UnityCatalog UCTableSet::LoadEntries.
 	for (auto &table_info : tables) {
+		if (!table_info.constraints.empty()) {
+			vgi::RequireNativeConstraintCapabilities(*catalog_.Cast<VgiCatalog>().attach_result(), "read");
+		}
 		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
 		auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 		{
@@ -118,6 +122,9 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 			std::vector<unique_ptr<CatalogEntry>> built_entries;
 			built_entries.reserve(tables.size());
 			for (auto &table_info : tables) {
+				if (!table_info.constraints.empty()) {
+					vgi::RequireNativeConstraintCapabilities(*catalog_.Cast<VgiCatalog>().attach_result(), "read");
+				}
 				auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
 				built_entries.push_back(make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info));
 			}
@@ -189,6 +196,9 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	}
 
 	auto &table_info = *table_info_opt;
+	if (!table_info.constraints.empty()) {
+		vgi::RequireNativeConstraintCapabilities(*catalog_.Cast<VgiCatalog>().attach_result(), "read");
+	}
 	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
 	auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 
@@ -277,6 +287,9 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	}
 
 	auto &table_info = *table_info_opt;
+	if (!table_info.constraints.empty()) {
+		vgi::RequireNativeConstraintCapabilities(*catalog_.Cast<VgiCatalog>().attach_result(), "read");
+	}
 	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
 	auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 

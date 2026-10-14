@@ -265,14 +265,13 @@ void InvokeCatalogTableCreate(
     const std::string &schema_name, const std::string &table_name,
     const std::shared_ptr<arrow::Schema> &columns_schema,
     const std::string &on_conflict,
-    const std::vector<int> &not_null_constraints,
-    const std::vector<std::vector<int>> &unique_constraints,
-    const std::vector<std::string> &check_constraints,
-    const std::vector<std::vector<int>> &primary_key_constraints,
-    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<std::vector<uint8_t>> &constraint_definitions,
     ClientContext &context);
 
 // Invoke catalog_table_drop: drop a table from the catalog.
+void InvokeCatalogTableConstraintsApply(const CatalogRpcContext &ctx, const VgiTableInfo &table,
+                                      const std::vector<uint8_t> &change, ClientContext &context);
+
 void InvokeCatalogTableDrop(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,

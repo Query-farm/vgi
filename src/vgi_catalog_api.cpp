@@ -2,6 +2,7 @@
 #include "vgi_settings_defaults.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_query_rpc.hpp"
+#include "vgi_constraint_contract.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -277,10 +278,11 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		                      "rpc_catalog",
 		                      ctx.params->auth(),
 		                      ctx.params->cookie_jar()};
-		// A lost prepare response can already own a remote allocation. The
-		// subprocess pool retries ambiguous IO failures, so prepare must use a
-		// single fresh attempt rather than allocate a second unseen preparation.
-		if (method_name == "catalog_query_prepare") {
+		// Preparation, CREATE and constraint mutation can take effect before a lost response.
+		// The subprocess pool retries ambiguous IO failures; use one fresh attempt
+		// until these operations have an explicit durable replay contract.
+		if (method_name == "catalog_query_prepare" || method_name == "catalog_table_constraints_apply" ||
+		    method_name == "catalog_table_create") {
 			opts.use_pool = false;
 		}
 		opts.tcp_proxy = ctx.params->tcp_proxy();
@@ -1204,19 +1206,28 @@ void InvokeCatalogTableCreate(
     const std::string &schema_name, const std::string &table_name,
     const std::shared_ptr<arrow::Schema> &columns_schema,
     const std::string &on_conflict,
-    const std::vector<int> &not_null_constraints,
-    const std::vector<std::vector<int>> &unique_constraints,
-    const std::vector<std::string> &check_constraints,
-    const std::vector<std::vector<int>> &primary_key_constraints,
-    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<std::vector<uint8_t>> &constraint_definitions,
     ClientContext &context) {
 	auto request_batch =
 	    BuildTableCreateRequest(ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, columns_schema,
-	                            on_conflict, not_null_constraints, unique_constraints, check_constraints,
-	                            primary_key_constraints, foreign_key_constraints, ctx.transaction_opaque_data);
+	                            on_conflict, constraint_definitions, ctx.transaction_opaque_data);
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 	auto params = generated::BuildCatalogTableCreateParams(request_bytes);
 	InvokeVoidRpc(ctx, "catalog_table_create", params, context);
+}
+
+void InvokeCatalogTableConstraintsApply(const CatalogRpcContext &ctx, const VgiTableInfo &table,
+                                      const std::vector<uint8_t> &change, ClientContext &context) {
+	auto request = BuildNativeConstraintsApply(ctx.attach_opaque_data, ctx.transaction_opaque_data, table, change);
+	auto params = generated::BuildCatalogTableConstraintsApplyParams(request);
+	auto response = InvokeRpcMethod(ctx, "catalog_table_constraints_apply", params, context);
+	if (!response.batch || response.batch->num_rows() != 1 ||
+	    !response.batch->GetColumnByName("result") ||
+	    response.batch->GetColumnByName("result")->type_id() != arrow::Type::BINARY) {
+		throw IOException("Malformed catalog_table_constraints_apply response envelope");
+	}
+	RecordBatchSingleRow row(response.batch, 0, "ConstraintsApplyResponse", ctx.params->worker_path());
+	ValidateNativeConstraintSnapshot(row["result"].value_not_null<std::vector<uint8_t>>(), table);
 }
 
 void InvokeCatalogTableDrop(
@@ -2573,6 +2584,7 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	// catalog_contents capability (backward-compatible: older workers omit it)
 	result.supports_catalog_contents = row["supports_catalog_contents"].value_or(false);
 
+	ParseNativeConstraintCapabilities(result, row["selected_capabilities"].value_or(std::vector<uint8_t>()));
 	result.query_pushdown = ParseVgiQueryCapabilities(batch->GetColumnByName("query_pushdown"), query_offered, worker_path);
 	if (result.query_pushdown && (!result.attach_opaque_data_required || result.attach_opaque_data.empty() ||
 	                             result.attach_opaque_data.size() > VGI_QUERY_MAX_TOKEN_BYTES)) {
@@ -2635,41 +2647,14 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 		}
 	}
 
-	// Parse constraints (non-nullable arrays per protocol)
-	auto not_null = row["not_null_constraints"].value_not_null<std::vector<int32_t>>();
-	info.not_null_constraints = std::vector<int>(not_null.begin(), not_null.end());
-	auto unique = row["unique_constraints"].value_not_null<std::vector<std::vector<int32_t>>>();
-	for (const auto &u : unique) {
-		info.unique_constraints.push_back(std::vector<int>(u.begin(), u.end()));
+	ValidateNativeConstraintList(batch->GetColumnByName("constraints"), row_idx);
+	info.constraints = row["constraints"].value_not_null<std::vector<std::vector<uint8_t>>>();
+	info.definition_revision = row["definition_revision"].value_or(std::vector<uint8_t>());
+	if (!batch->GetColumnByName("definition_revision") ||
+	    (!batch->GetColumnByName("definition_revision")->IsNull(row_idx) && info.definition_revision.empty())) {
+		throw IOException("TableInfo.definition_revision must be NULL or a nonempty bounded token");
 	}
-	info.check_constraints = row["check_constraints"].value_not_null<std::vector<std::string>>();
-
-	// Parse primary_key_constraints (optional, backward-compatible)
-	auto pk = row["primary_key_constraints"].value_or(std::vector<std::vector<int32_t>>{});
-	for (const auto &p : pk) {
-		info.primary_key_constraints.push_back(std::vector<int>(p.begin(), p.end()));
-	}
-
-	// Parse foreign_key_constraints (optional, backward-compatible)
-	// Each element is IPC-serialized bytes containing fk_columns, pk_columns,
-	// referenced_table, referenced_schema_path
-	auto fk_bytes_list = row["foreign_key_constraints"].value_or(std::vector<std::vector<uint8_t>>{});
-	for (const auto &fk_bytes : fk_bytes_list) {
-		auto fk_batch = DeserializeFromIpcBytes(fk_bytes);
-		if (!fk_batch || fk_batch->num_rows() == 0) {
-			continue;
-		}
-		RecordBatchSingleRow fk_row(fk_batch, 0, "ForeignKeyInfo", worker_path);
-
-		VgiTableInfo::ForeignKey fk;
-		fk.fk_columns = fk_row["fk_columns"].value_not_null<std::vector<std::string>>();
-		fk.pk_columns = fk_row["pk_columns"].value_not_null<std::vector<std::string>>();
-		fk.referenced_table = fk_row["referenced_table"].value_not_null<std::string>();
-		fk.referenced_schema =
-		    SchemaNameFromPath(fk_row["referenced_schema_path"].value_not_null<std::vector<std::string>>(),
-		                       "ForeignKeyDef.referenced_schema_path");
-		info.foreign_key_constraints.push_back(std::move(fk));
-	}
+	DecodeNativeConstraints(info);
 
 	auto modes_column = row.batch()->GetColumnByName("write_result_modes");
 	auto modes_array = std::dynamic_pointer_cast<arrow::MapArray>(modes_column);
@@ -3427,8 +3412,8 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		fk_info.type = ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE;
 		fk_info.schema = fk.referenced_schema;
 		fk_info.table = fk.referenced_table;
-		// Physical indices are not populated — VGI tables are read-only so
-		// DML enforcement is not needed. The constraint is metadata-only.
+		// The negotiated authority enforces this validated key on every write.
+		// Worker physical indices are intentionally never imported into DuckDB.
 		vector<string> pk_cols(fk.pk_columns.begin(), fk.pk_columns.end());
 		vector<string> fk_cols(fk.fk_columns.begin(), fk.fk_columns.end());
 		create_info.constraints.push_back(

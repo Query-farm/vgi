@@ -637,7 +637,7 @@ required. All query additions belong to the
 same combined successor release; the earlier proposal's separate 2.2 rollout
 and parameter deferral are superseded.
 
-The current inventory is **82 methods**, hash
+At this initial query checkpoint, the inventory was **82 methods**, hash
 `28cf2ae30b6cf07dbd4db602e4972611319b993fb073b27de456b6fcf341dc00`.
 The initial SDK suites pass. The catalog/registry Python lane has **949 passed /
 4 skipped**, the generator/manifest lane has **228 passed**, and all **36**
@@ -857,9 +857,10 @@ exact IPC in every SDK, including both TypeScript Arrow backends. Binary record
 fields still carry raw IPC. The native 1.5 adapter rejects the new expression
 metadata namespaces recursively until their semantics are implemented.
 
-This is a record/reference checkpoint. `TableCreateRequest`/`TableInfo` still
-carry legacy constraint arrays; the public apply RPC, new capability profiles
-and native constraint/default/generated adapters remain pending. Scalar helper
+At this record/reference checkpoint, `TableCreateRequest`/`TableInfo` still
+carried legacy constraint arrays; the public apply RPC, new capability profiles
+and native adapters were pending. The public constraint checkpoint below
+supersedes that state; native default/generated translation remains pending. Scalar helper
 proof does not establish persisted default/generated semantics or statement
 execution. The public inventory stays at 82 methods; the unchanged method hash
 does not imply compatibility of the changed embedded records. DuckDB remains
@@ -872,11 +873,49 @@ pinned native shell/loadable-extension build. Native checks pass 13 cases with
 The manifest's `expression_constraint_checkpoint` records commands/scope and
 logs under `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/logs/constraints-*`.
 
-**Next:** migrate parent constraint fields and public dispatch using the proven
-records, finish typed indexes/ALTER dependencies, then implement statement and
+The following checkpoint completes parent constraint fields and public dispatch
+using the proven records. Next, finish typed indexes/ALTER dependencies, then implement statement and
 write-requirement checks before trigger execution. Durable replay still needs
 its separate crash/reconnect proof. The manifest retains 151 audit rows, 20
 areas and 84 unresolved review entries; no release gate is closed.
+
+**Public canonical constraint checkpoint (2026-10-14; verified on pinned 1.5)**
+
+Table creation now carries required `constraint_definitions`; discovery carries
+required canonical `constraints` and an optional semantic `definition_revision`.
+The five legacy arrays are removed from both parent records. The public
+`catalog_table_constraints_apply` RPC carries an atomic change batch with the
+expected revision, bringing the implemented inventory to 83 methods. Generated
+schemas and registries cover all seven SDKs. Python and MetaWorker dispatch,
+capability checks, and a durable public reference are implemented; unported
+mutable SDK providers reject constrained creation or mutation before effects.
+
+The 1.5 adapter translates top-level NOT_NULL, UNIQUE, PRIMARY_KEY and same-schema
+MATCH SIMPLE NO_ACTION/RESTRICT foreign keys. SET/DROP NOT NULL uses the canonical
+apply RPC with stable provider identity and revision checks. CHECK and nested
+constraints reject at this native boundary; public reference CHECK coverage does
+not qualify native SQL translation. Default/generated metadata translation also
+remains pending. The reference exposes catalog operations and DDL transactions;
+row enforcement is proven through its provider authority, with no public DML
+adapter advertised.
+
+EC2 validation passed: Python catalog/client suites, all SDK contract and adapter
+suites, and public RPC discovery against six independently built SDK workers.
+The native subset passed 21 codec/guard cases (218 assertions), five SQL lifecycle
+scenarios and all 18 query lifecycle regressions. The Java RPC serializer now
+preserves declared Arrow dictionary encodings for embedded constraint records;
+its 610 tests passed. Exact results, skips and log paths are recorded in the
+manifest's `constraint_public_checkpoint`.
+
+SDK example declarations carry explicit METADATA_ONLY/UNVALIDATED records. Their
+discovery checks do not qualify enforcement or native trusted-constraint
+materialization. The browser client was rebuilt and its served discovery path
+verified. Changes are isolated in the protocol worktrees and tested on EC2.
+
+No engine pin, protocol version or release-gate status changes. Next work remains
+typed index definitions/options, semantic ALTER dependencies, then statement and
+write-lifecycle checks before triggers. Other SDK providers still need actual
+enforcement/mutation implementations before selecting those profiles.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major

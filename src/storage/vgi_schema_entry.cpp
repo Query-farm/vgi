@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_constraint_contract.hpp"
 #include "storage/vgi_schema_entry.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -269,58 +270,27 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	// The shared encoder preserves defaults for both CREATE and ADD COLUMN.
 	auto columns_schema = vgi::DuckDBColumnsToArrowSchema(context, create_info.columns);
 
-	// Extract constraints
-	std::vector<int> not_null_constraints;
-	std::vector<std::vector<int>> unique_constraints;
-	std::vector<std::string> check_constraints;
-	std::vector<std::vector<int>> primary_key_constraints;
-	std::vector<std::vector<uint8_t>> foreign_key_constraints;
-
+	// The binder accepts case-insensitive SQL spellings. Resolve referenced FK
+	// coordinates to actual catalog names before the raw-path wire boundary.
 	for (auto &constraint : create_info.constraints) {
-		switch (constraint->type) {
-		case ConstraintType::NOT_NULL: {
-			auto &nn = constraint->Cast<NotNullConstraint>();
-			not_null_constraints.push_back(static_cast<int>(nn.index.index));
-			break;
+		if (constraint->type != ConstraintType::FOREIGN_KEY) continue;
+		auto &fk = constraint->Cast<ForeignKeyConstraint>();
+		if (fk.info.type == ForeignKeyType::FK_TYPE_SELF_REFERENCE_TABLE) {
+			fk.info.table = create_info.table;
+			for (auto &column : fk.pk_columns) column = create_info.columns.GetColumn(column).Name();
+		} else {
+			auto target = tables_.GetEntry(context, fk.info.table);
+			if (!target) throw BinderException("Referenced table %s does not exist", fk.info.table);
+			auto &entry = target->Cast<VgiTableEntry>();
+			fk.info.table = entry.name;
+			for (auto &column : fk.pk_columns) column = entry.GetColumns().GetColumn(column).Name();
 		}
-		case ConstraintType::UNIQUE: {
-			auto &uq = constraint->Cast<UniqueConstraint>();
-			std::vector<int> col_indices;
-			if (uq.HasIndex()) {
-				// Single-column unique: index is set directly
-				col_indices.push_back(static_cast<int>(uq.GetIndex().index));
-			} else {
-				// Multi-column unique: resolve names to indices
-				for (auto &col_name : uq.GetColumnNames()) {
-					string col_name_copy = col_name;
-					auto col_idx = create_info.columns.GetColumnIndex(col_name_copy);
-					col_indices.push_back(static_cast<int>(col_idx.index));
-				}
-			}
-			if (uq.IsPrimaryKey()) {
-				primary_key_constraints.push_back(std::move(col_indices));
-			} else {
-				unique_constraints.push_back(std::move(col_indices));
-			}
-			break;
-		}
-		case ConstraintType::CHECK: {
-			auto &chk = constraint->Cast<CheckConstraint>();
-			// Use expression->ToString(), not chk.ToString() which wraps in "CHECK(...)"
-			check_constraints.push_back(chk.expression->ToString());
-			break;
-		}
-		case ConstraintType::FOREIGN_KEY: {
-			auto &fk = constraint->Cast<ForeignKeyConstraint>();
-			// Serialize FK as IPC bytes matching the TableInfo FK format
-			auto fk_bytes = vgi::SerializeForeignKeyToIpcBytes(
-			    fk.fk_columns, fk.pk_columns, fk.info.table, fk.info.schema);
-			foreign_key_constraints.push_back(std::move(fk_bytes));
-			break;
-		}
-		default:
-			break;
-		}
+	}
+
+	// Canonical definitions use raw column names, never engine/rowid indices.
+	auto constraint_definitions = vgi::EncodeNativeConstraints(create_info, columns_schema);
+	if (!constraint_definitions.empty()) {
+		vgi::RequireNativeConstraintCapabilities(*vgi_catalog.attach_result(), vgi::VGI_CONSTRAINT_CREATE);
 	}
 
 	auto on_conflict = vgi::MapOnConflict(create_info.on_conflict);
@@ -332,21 +302,20 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
-	vgi::InvokeCatalogTableCreate(rpc_ctx, name, create_info.table, columns_schema, on_conflict,
-	                               not_null_constraints, unique_constraints, check_constraints,
-	                               primary_key_constraints, foreign_key_constraints, context);
-
-	// Invalidate table cache and re-fetch the newly created table
+	if (!constraint_definitions.empty() && !rpc_ctx.transaction_opaque_data.empty() &&
+	    !attach_result->constraint_profiles.count("vgi.transaction.ddl.v1")) {
+		throw NotImplementedException("Constraint CREATE in a transaction requires vgi.transaction.ddl.v1");
+	}
+	// CREATE (including an unconstrained REPLACE) may take effect before a lost
+	// response. Drop cached definitions and the empty-table shortcut before
+	// dispatch so failure cannot preserve stale constraints or hide a created table.
 	DeferDrop(catalog, tables_.HarvestEntries());
-	// Worker may have reported estimated_object_count[table] == 0 at attach
-	// time; CREATE TABLE just falsified that. Flip the cached count so the
-	// zero-count RPC bypass on the next GetEntry doesn't short-circuit and
-	// silently report "table not found" for the row we just created.
 	tables_.MarkPopulatedLocked();
-	// REPLACE may have changed the table schema, invalidating dependent views
 	if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		DeferDrop(catalog, views_.HarvestEntries());
 	}
+	vgi::InvokeCatalogTableCreate(rpc_ctx, name, create_info.table, columns_schema, on_conflict,
+	                             constraint_definitions, context);
 	return tables_.GetEntry(context, create_info.table);
 }
 
@@ -587,14 +556,23 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		}
 		break;
 	}
-	case AlterTableType::SET_NOT_NULL: {
-		auto &set_nn = alter_table.Cast<SetNotNullInfo>();
-		vgi::InvokeCatalogTableNotNullSet(rpc_ctx, schema_name, table_name, set_nn.column_name, context);
-		break;
-	}
+	case AlterTableType::SET_NOT_NULL:
 	case AlterTableType::DROP_NOT_NULL: {
-		auto &drop_nn = alter_table.Cast<DropNotNullInfo>();
-		vgi::InvokeCatalogTableNotNullDrop(rpc_ctx, schema_name, table_name, drop_nn.column_name, context);
+		vgi::RequireNativeConstraintCapabilities(*attach_result, vgi::VGI_CONSTRAINT_MUTATE);
+		if (!rpc_ctx.transaction_opaque_data.empty() && !attach_result->constraint_profiles.count("vgi.transaction.ddl.v1")) {
+			throw NotImplementedException("Constraint ALTER in a transaction requires vgi.transaction.ddl.v1");
+		}
+		const bool add = alter_table.alter_table_type == AlterTableType::SET_NOT_NULL;
+		auto column = add ? alter_table.Cast<SetNotNullInfo>().column_name : alter_table.Cast<DropNotNullInfo>().column_name;
+		// Fresh read ties stable constraint identity to its current definition revision.
+		auto current = vgi::InvokeCatalogTableGet(rpc_ctx, schema_name, table_name, context);
+		if (!current) throw BinderException("Table %s does not exist", table_name);
+		auto change = vgi::BuildNativeNotNullChange(*current, column, add);
+		if (!change.empty()) {
+			// A remote mutation may succeed even if its response is lost or malformed.
+			DeferDrop(catalog, tables_.HarvestEntry(table_name));
+			vgi::InvokeCatalogTableConstraintsApply(rpc_ctx, *current, change, context);
+		}
 		break;
 	}
 	default:

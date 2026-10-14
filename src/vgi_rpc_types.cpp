@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_rpc_types.hpp"
+#include "vgi_constraint_contract.hpp"
 #include "vgi_query_rpc.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -1374,7 +1375,7 @@ static std::vector<uint8_t> BuildClientCapabilitiesBytes(bool query_enabled) {
 	// returning an unbounded split this client could never terminate.
 	return SerializeToIpcBytes(generated::BuildClientCapabilities(
 	    "duckdb", {"parquet", "csv", "json"}, {"ducklake", "iceberg", "postgres", "mysql", "sqlite", "duckdb"}, false,
-	    {"vgi.filters.v2"}, /*catalog=*/std::nullopt, /*query_pushdown=*/query_enabled ? BuildClientQueryCapabilities() : nullptr));
+	    {"vgi.filters.v2"}, /*catalog=*/BuildNativeConstraintCapabilities(), /*query_pushdown=*/query_enabled ? BuildClientQueryCapabilities() : nullptr));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
@@ -1400,9 +1401,7 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
     const std::vector<uint8_t> &attach_opaque_data, const std::vector<std::string> &schema_path,
     const std::string &name, const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
-    const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
-    const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
-    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<std::vector<uint8_t>> &constraint_definitions,
     const std::vector<uint8_t> &transaction_opaque_data) {
 	static const std::vector<std::string> on_conflict_values = {"ERROR", "IGNORE", "REPLACE"};
 
@@ -1436,68 +1435,7 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
 	// on_conflict: dictionary(int16, utf8)
 	arrays.push_back(BuildEnumArray(on_conflict, on_conflict_values));
 
-	// not_null_constraints: list<int32> — always non-null (empty list for no constraints)
-	{
-		auto value_builder = std::make_shared<arrow::Int32Builder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		CheckStatus(list_builder.Append(), "start not_null_constraints list");
-		for (int idx : not_null_constraints) {
-			CheckStatus(value_builder->Append(static_cast<int32_t>(idx)), "append not_null index");
-		}
-		arrays.push_back(FinishArray(list_builder, "not_null_constraints"));
-	}
-
-	// unique_constraints: list<list<int32>> — always non-null
-	{
-		auto inner_value_builder = std::make_shared<arrow::Int32Builder>();
-		auto inner_list_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), inner_value_builder);
-		arrow::ListBuilder outer_list_builder(arrow::default_memory_pool(), inner_list_builder);
-		CheckStatus(outer_list_builder.Append(), "start unique_constraints outer list");
-		for (const auto &constraint : unique_constraints) {
-			CheckStatus(inner_list_builder->Append(), "start unique_constraints inner list");
-			for (int idx : constraint) {
-				CheckStatus(inner_value_builder->Append(static_cast<int32_t>(idx)), "append unique index");
-			}
-		}
-		arrays.push_back(FinishArray(outer_list_builder, "unique_constraints"));
-	}
-
-	// check_constraints: list<utf8> — always non-null
-	{
-		auto value_builder = std::make_shared<arrow::StringBuilder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		CheckStatus(list_builder.Append(), "start check_constraints list");
-		for (const auto &expr : check_constraints) {
-			CheckStatus(value_builder->Append(expr), "append check constraint");
-		}
-		arrays.push_back(FinishArray(list_builder, "check_constraints"));
-	}
-
-	// primary_key_constraints: list<list<int32>> — always non-null
-	{
-		auto inner_value_builder = std::make_shared<arrow::Int32Builder>();
-		auto inner_list_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), inner_value_builder);
-		arrow::ListBuilder outer_list_builder(arrow::default_memory_pool(), inner_list_builder);
-		CheckStatus(outer_list_builder.Append(), "start primary_key_constraints outer list");
-		for (const auto &constraint : primary_key_constraints) {
-			CheckStatus(inner_list_builder->Append(), "start primary_key_constraints inner list");
-			for (int idx : constraint) {
-				CheckStatus(inner_value_builder->Append(static_cast<int32_t>(idx)), "append pk index");
-			}
-		}
-		arrays.push_back(FinishArray(outer_list_builder, "primary_key_constraints"));
-	}
-
-	// foreign_key_constraints: list<binary> — always non-null
-	{
-		auto value_builder = std::make_shared<arrow::BinaryBuilder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		CheckStatus(list_builder.Append(), "start foreign_key_constraints list");
-		for (const auto &fk_bytes : foreign_key_constraints) {
-			CheckStatus(value_builder->Append(fk_bytes.data(), fk_bytes.size()), "append fk bytes");
-		}
-		arrays.push_back(FinishArray(list_builder, "foreign_key_constraints"));
-	}
+	arrays.push_back(BuildBinaryListScalar(constraint_definitions));
 
 	// transaction_opaque_data: binary (nullable)
 	arrays.push_back(BuildBinaryScalar(transaction_opaque_data));

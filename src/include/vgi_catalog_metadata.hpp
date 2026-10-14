@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <string>
@@ -152,6 +153,7 @@ struct CatalogAttachResult {
 	bool supports_catalog_contents = false;
 	// Immutable explicit-query agreement, selected only after an opt-in offer.
 	std::optional<VgiQueryCapabilities> query_pushdown;
+	std::set<std::string> constraint_profiles;
 };
 
 // One published data version of a catalog, surfaced via catalog_catalogs().
@@ -308,6 +310,11 @@ struct VgiTableInfo {
 	int row_id_column = -1;
 	// DuckDB type for the row_id column (INVALID when row_id_column == -1)
 	LogicalType rowid_type = LogicalType::INVALID;
+
+	// Canonical wire authority; index vectors below are derived native binding data.
+	std::vector<std::vector<uint8_t>> constraints;
+	std::vector<uint8_t> definition_revision;
+	std::map<std::string, std::vector<std::vector<uint8_t>>> not_null_constraint_refs;
 
 	// Constraint indices
 	std::vector<int> not_null_constraints;

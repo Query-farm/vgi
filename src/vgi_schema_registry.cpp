@@ -106,6 +106,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		}
 
 		// --- Strictly-typed single-struct responses -----------------------
+		m["catalog_table_constraints_apply"] = ResponseSchema{ConstraintSnapshotSchema(), nullptr, false, nullptr};
 		m["catalog_attach"] = ResponseSchema{CatalogAttachResultSchema(), nullptr, false, nullptr};
 		m["catalog_version"] = ResponseSchema{CatalogVersionResultSchema(), nullptr, false, nullptr};
 		m["catalog_dependencies"] = ResponseSchema{CatalogDependenciesResultSchema(), nullptr, false, nullptr};
@@ -217,6 +218,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_schema_contents_indexes", &CatalogSchemaContentsIndexesParamsSchema},
 		    {"catalog_table_get", &CatalogTableGetParamsSchema},
 		    {"catalog_table_create", &CatalogTableCreateParamsSchema},
+		    {"catalog_table_constraints_apply", &CatalogTableConstraintsApplyParamsSchema},
 		    {"catalog_table_alter_options", &CatalogTableAlterOptionsParamsSchema},
 		    {"catalog_table_alter_layout", &CatalogTableAlterLayoutParamsSchema},
 		    {"catalog_table_option_definitions", &CatalogTableOptionDefinitionsParamsSchema},
