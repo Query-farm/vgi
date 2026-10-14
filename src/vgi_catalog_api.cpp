@@ -2886,6 +2886,14 @@ VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 	if (!batch || batch->num_rows() == 0) {
 		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from macro_get");
 	}
+	// The legacy loader installs exactly one untyped definition. Reject the new
+	// family representation before it can ignore overloads or skip parse errors.
+	if (auto overloads = batch->GetColumnByName("overloads")) {
+		if (!overloads->IsNull(0)) {
+			throw NotImplementedException(
+			    "VGI macro overload families require a qualified native adapter [worker: %s]", worker_path);
+		}
+	}
 
 	RecordBatchSingleRow row(batch, 0, "MacroInfo", worker_path);
 	info.name = row["name"].value_not_null<std::string>();
@@ -2900,6 +2908,14 @@ VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 	// parameter_default_values is nullable binary (IPC bytes)
 	auto default_bytes = row["parameter_default_values"].as<std::vector<uint8_t>>();
 	if (default_bytes && !default_bytes->empty()) {
+		// The legacy macro loader reads defaults manually instead of using the
+		// Arrow scanner. Apply the same logical-type gate here, outside that
+		// loader's catch-and-skip path, so annotated storage cannot be coerced.
+		auto defaults = DeserializeFromIpcBytes(*default_bytes);
+		if (defaults) {
+			ArrowSchemaWrapper defaults_schema;
+			ExportSchema(defaults->schema(), defaults_schema);
+		}
 		info.parameter_default_values_bytes = std::move(*default_bytes);
 	}
 
