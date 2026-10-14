@@ -509,10 +509,10 @@ check; it is skipped in the ordinary Python run. Eight Flechette codec checks
 pass; its previously recorded stdio limitation remains open. Detailed evidence
 is in the manifest's `view_metadata_validation` entry.
 
-The native runtime registry now includes all 78 protocol methods, including the
-five earlier schema/table option and layout methods. An inventory test checks
+The view metadata increment completed native runtime registration for all 78
+methods then present, including the earlier schema/table option and layout methods. An inventory test checks
 both request and response registration; registration alone enables no capability.
-The current reflection hash is
+Its reflection hash was
 `18fc1d304bafc3ea667bc77e20dbbd0028444ec7587cca7f03a428067942a4f7`.
 See `vgi-python-duckdb2/docs/protocol/view-metadata.md` for the contract and limits.
 Full capability negotiation, query resolution, dependencies, output contracts,
@@ -538,6 +538,35 @@ not rerun for this increment. See `schema_metadata_validation` for exact evidenc
 Schema comment/tag mutation, replacement/deletion dependencies, descendant
 semantics and native 2.0 qualification remain open. The 78-method wire hash is
 unchanged; no release gate is closed.
+
+The **schema metadata mutation increment** introduces shared
+`CatalogMetadataChanges` and `catalog_schema_alter_metadata`, with selected DDL
+profile `vgi.schema.metadata.alter.v1`. One atomic patch distinguishes leaving a
+comment unchanged, clearing it, or setting an empty string, and combines literal
+string tag updates/removals. Strict validation rejects contradictory or malformed
+requests before effects. No-op patches preserve versions/etags; actual changes
+invalidate committed snapshots and preserve options and other object metadata.
+
+The durable Python HTTP reference proves selected/current capability checks,
+transaction ownership and DDL guarantees, routed sealed handles, readback,
+commit/rollback/reconnect, and cache invalidation. All seven SDKs carry matching
+schemas and codec vectors; ordinary providers explicitly reject the new operation
+without advertising its profile. This is reference implementation and shared
+schema preparation; production provider/capability ports remain open. Tests also
+fixed TypeScript's generic map codec losing a literal `__proto__` key.
+
+The current wire inventory is **79 methods**, hash
+`f98de1aecf595fb5866082998a4a6d77d1850e781edce50b5b08ffc163e83b94`.
+The native 1.5 build, all SDK unit suites (including 803 passing Python tests),
+strict generation, and 23 overlapping manifest/corpus/native-inventory checks
+pass. The configured public-client run passes 22 checks, including rejection
+without changes on all seven ordinary SDK providers. All seven workers pass native
+metadata creation/copy/cache checks (99 assertions each) and protocol reflection
+(two assertions each); the reference suite retains 218 passing assertions.
+Both the 1.5 and refreshed 2.0 source pins reject SQL COMMENT ON SCHEMA, so RPC
+registration does not advertise native schema-comment syntax. Exact evidence and
+remaining limits are recorded in `schema_metadata_mutation_validation` and the
+shared catalog values specification. No release or native 2.0 gate is closed.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
