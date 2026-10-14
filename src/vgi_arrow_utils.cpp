@@ -80,6 +80,13 @@ static void RejectUnsupportedLogicalField(const std::shared_ptr<arrow::Field> &f
 	if (auto metadata = field->metadata()) {
 		for (int64_t i = 0; i < metadata->size(); ++i) {
 			const auto &key = metadata->key(i);
+			if (key.compare(0, 19, "vgi.column.default.") == 0 ||
+			    key.compare(0, 21, "vgi.column.generated.") == 0 ||
+			    key.compare(0, 22, "vgi.column.generation.") == 0) {
+				throw NotImplementedException(
+				    "VGI column expressions require a qualified native adapter; field '%s' is unsupported",
+				    field->name());
+			}
 			if (key.compare(0, 17, "vgi.logical_type.") == 0 ||
 			    (key == "ARROW:extension:name" && metadata->value(i) == "arrow.parquet.variant")) {
 				throw NotImplementedException(
@@ -108,8 +115,8 @@ static void RejectUnsupportedLogicalType(const std::shared_ptr<arrow::DataType> 
 
 void ExportSchema(const std::shared_ptr<arrow::Schema> &schema, ArrowSchemaWrapper &out) {
 	// Every Arrow-to-DuckDB path exports through this helper, including statistics,
-	// secrets and function arguments. Never silently treat a new logical type as
-	// its ordinary Arrow storage while the pinned native adapter is unqualified.
+	// secrets and function arguments. Never silently discard new logical type or
+	// column-expression semantics while the pinned native adapter is unqualified.
 	for (const auto &field : schema->fields()) {
 		RejectUnsupportedLogicalField(field);
 	}

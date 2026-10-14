@@ -839,6 +839,45 @@ optional-candidate decisions before the combined freeze. Durable replay needs
 its own crash/reconnect proof; no general mutation retry is enabled by this
 specification. No P0–P3 or M0–M4 gate is closed and no version is published.
 
+**Expression and constraint implementation checkpoint (2026-10-14)**
+
+The [shared SQL/constraint contracts](../../vgi-python-duckdb2/docs/protocol/shared-catalog-values.md#sql-and-constraint-implementation-checkpoint)
+now have required evaluation context, a separate statement carrier, strict
+canonical constraint records and generated representations across seven SDKs.
+The durable reference enforces NOT_NULL, UNIQUE, PRIMARY_KEY, BOOLEAN CHECK and
+immediate MATCH SIMPLE foreign keys on top-level primitive columns. It proves
+atomic existing-row validation, stable identity/revisions, FK dependency safety,
+schema nullability, rollback, reconnect and failed-publication recovery. Broader
+types, paths, enforcement states and FK actions reject explicitly.
+
+The metadata interoperability check found that raw IPC in Arrow field metadata
+fails Rust's UTF-8 validation. Canonical column-expression metadata therefore
+uses strict padded base64 ASCII; the shared corpus verifies recovery of the
+exact IPC in every SDK, including both TypeScript Arrow backends. Binary record
+fields still carry raw IPC. The native 1.5 adapter rejects the new expression
+metadata namespaces recursively until their semantics are implemented.
+
+This is a record/reference checkpoint. `TableCreateRequest`/`TableInfo` still
+carry legacy constraint arrays; the public apply RPC, new capability profiles
+and native constraint/default/generated adapters remain pending. Scalar helper
+proof does not establish persisted default/generated semantics or statement
+execution. The public inventory stays at 82 methods; the unchanged method hash
+does not imply compatibility of the changed embedded records. DuckDB remains
+pinned to `105edd31b57fe7e6d32ee648efad562e45a9f908`.
+
+EC2 validation passes **1,350 Python checks** (five optional skips), strict
+all-SDK generation, lint/type checking, all seven SDK corpus suites, and the
+pinned native shell/loadable-extension build. Native checks pass 13 cases with
+98 assertions plus 18 query lifecycle scenarios with no retained query resources.
+The manifest's `expression_constraint_checkpoint` records commands/scope and
+logs under `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/logs/constraints-*`.
+
+**Next:** migrate parent constraint fields and public dispatch using the proven
+records, finish typed indexes/ALTER dependencies, then implement statement and
+write-requirement checks before trigger execution. Durable replay still needs
+its separate crash/reconnect proof. The manifest retains 151 audit rows, 20
+areas and 84 unresolved review entries; no release gate is closed.
+
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
 protocol transition, including the matching routing name and migration guide;

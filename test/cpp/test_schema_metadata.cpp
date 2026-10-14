@@ -83,6 +83,22 @@ TEST_CASE("Unqualified logical types fail before Arrow storage conversion", "[wi
 	CHECK_NOTHROW(vgi::ExportSchema(arrow::schema({arrow::field("plain", tuple->type())}), ordinary));
 }
 
+TEST_CASE("Unqualified column expressions fail before Arrow schema conversion", "[wire-contract-guards]") {
+	for (const auto &key : {"vgi.column.default.v1", "vgi.column.generated.v1", "vgi.column.generation.v1",
+	                        "vgi.column.default.v99", "vgi.column.generated.v99", "vgi.column.generation.v99"}) {
+		auto field = arrow::field("value", arrow::int64(), true, arrow::key_value_metadata({key}, {"opaque"}));
+		for (const auto &candidate :
+		     {field, arrow::field("nested", arrow::struct_({field})), arrow::field("items", arrow::list(field)),
+		      arrow::field("encoded", arrow::dictionary(arrow::int32(), arrow::struct_({field})))}) {
+			ArrowSchemaWrapper exported;
+			CHECK_THROWS_AS(vgi::ExportSchema(arrow::schema({candidate}), exported), NotImplementedException);
+		}
+	}
+	ArrowSchemaWrapper legacy;
+	auto field = arrow::field("value", arrow::int64(), true, arrow::key_value_metadata({"default"}, {"7"}));
+	CHECK_NOTHROW(vgi::ExportSchema(arrow::schema({field}), legacy));
+}
+
 TEST_CASE("Unqualified macro families fail before legacy macro decoding", "[wire-contract-guards]") {
 	auto values = std::make_shared<arrow::Int32Builder>();
 	arrow::ListBuilder overloads(arrow::default_memory_pool(), values);
