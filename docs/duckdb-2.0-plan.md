@@ -19,6 +19,15 @@ qualify any protocol/native migration gate.
 complete. The tested groundwork below is partial implementation, not completion
 of the broader protocol or the native DuckDB 2.0 port.
 
+**Scope correction (2026-10-15):** retain the existing transaction and streamed
+write fundamentals. No savepoints, durable mutation replay/status service or
+general statement ticket/receipt framework is included. Audit the existing
+begin/commit/rollback, init/exchange/finalize and OLD/NEW paths against concrete
+DuckDB2 execution needs; add protocol fields only for demonstrated gaps. This
+supersedes the corresponding October 14 design proposals below, not completed
+runtime work. Failed writes use whole-transaction rollback/invalidation; an
+ambiguous mutation response remains an error without automatic retry.
+
 Prepare **one broad, coordinated protocol release** for the catalog and
 execution capabilities we intend to support in DuckDB 2.0, while continuing to
 build and test the extension on the pinned Haybarn/DuckDB 1.5.x engine. Batch
@@ -786,14 +795,15 @@ This finite subprocess reference does not qualify general SQL providers,
 native HTTP/WASM queries, all platforms, performance, or automatic DuckDB 2.0
 optimizer integration.
 
-**Combined contract design checkpoint (2026-10-14)**
+**Combined contract design checkpoint (2026-10-14; transaction/recovery proposals superseded on 2026-10-15)**
 
 The [shared contract specification](../../vgi-python-duckdb2/docs/protocol/shared-catalog-values.md#combined-expression-constraint-transaction-and-trigger-design)
-now gives concrete successor shapes and semantics for expressions, canonical
+recorded proposed shapes and semantics for expressions, canonical
 constraints/indexes, composite transactions, triggers and durable mutation
-outcomes. These are design decisions for the same release, **not implemented
-profiles or a frozen wire snapshot**. The current 82-method inventory/hash and
-DuckDB 1.5 build pin are unchanged.
+outcomes. This is a historical review record: the transaction coordination and
+recovery proposals were withdrawn on 2026-10-15. They were **not implemented
+profiles or a frozen wire snapshot**. At that checkpoint, the 82-method
+inventory/hash and DuckDB 1.5 build pin were unchanged.
 
 - Reuse `QueryEvaluationContext` for scalar SQL definitions; distinguish one
   scalar expression from a query/DML statement. Specify DEFAULT, generated,
@@ -832,12 +842,10 @@ inventory still covers 151 audit rows and 20 areas. Source verification matches
 33,065 files across 15 repositories. The manifest's `combined_design_review`
 records the exact evidence and 12 newly specified (not implemented) methods.
 
-**Next checkpoint:** prove the shared expression/context and canonical constraint
-contracts in durable references, then implement statement/write-requirement
-checks before trigger execution. Continue resolving the remaining catalog and
-optional-candidate decisions before the combined freeze. Durable replay needs
-its own crash/reconnect proof; no general mutation retry is enabled by this
-specification. No P0–P3 or M0–M4 gate is closed and no version is published.
+**Historical next checkpoint:** the shared expression/context, canonical
+constraint, typed index and semantic ALTER work is recorded below. The later
+2026-10-15 scope decision removes statement tickets and durable replay from
+the remaining plan. No P0–P3 or M0–M4 gate is closed and no version is published.
 
 **Expression and constraint implementation checkpoint (2026-10-14)**
 
@@ -874,9 +882,9 @@ The manifest's `expression_constraint_checkpoint` records commands/scope and
 logs under `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/logs/constraints-*`.
 
 The following checkpoint completes parent constraint fields and public dispatch
-using the proven records. Next, finish typed indexes/ALTER dependencies, then implement statement and
-write-requirement checks before trigger execution. Durable replay still needs
-its separate crash/reconnect proof. The manifest retains 151 audit rows, 20
+using the proven records. Typed indexes/ALTER dependencies are implemented by
+the checkpoints below. Remaining trigger execution work now follows the
+2026-10-15 decision to reuse existing transactions and streams. The manifest retains 151 audit rows, 20
 areas and 84 unresolved review entries; no release gate is closed.
 
 **Public canonical constraint checkpoint (2026-10-14; verified on pinned 1.5)**
@@ -954,10 +962,11 @@ subprocess safeguards. Index CREATE/DROP, query preparation, table CREATE and
 constraint apply now share a single-attempt policy for ambiguous failures.
 Five HTTP cases with 145 assertions prove one POST after server errors or lost
 replies, retained read-only retries and interrupt behavior. This does not supply
-the separate durable replay contract or qualify every legacy mutation method.
+durable replay (removed from current scope on 2026-10-15) or qualify every
+legacy mutation method.
 
-Next is semantic ALTER dependency coverage, followed by statement/write
-requirements before trigger execution and durable replay. The engine remains
+The next checkpoint implemented semantic ALTER dependency coverage. The
+remaining write/trigger work follows the narrower 2026-10-15 scope. The engine remains
 on the existing 1.5 pin; the combined protocol version is still unpublished.
 
 **Semantic ALTER checkpoint (2026-10-14; pinned 1.5)**
@@ -992,8 +1001,10 @@ The inventory stays at 84 methods. Its top-level schema hash is unchanged
 because these dependency records are embedded in binary payloads; their new
 required field still belongs to the unpublished breaking protocol transition.
 Exact EC2 checks and limits are recorded in `semantic_alter_checkpoint` in the
-Python manifest, with `alter-` log names. Next is the write-requirement and
-statement lifecycle contract, followed by trigger execution and durable replay.
+Python manifest, with `alter-` log names. Next is an audit of existing transaction
+and write-finalization paths for the supported DuckDB2 operations, followed by
+minimal trigger integration. The 2026-10-15 scope correction removes the earlier
+statement-ticket and durable-replay follow-ups.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
@@ -1150,7 +1161,7 @@ means work before the shared freeze, rather than an automatic later release.
 | Constraints and indexes | Constraint addition and supported mutation/discovery; full native integration of existing index RPCs; typed index options if string values are insufficient | Worker enforcement versus metadata-only declaration, existing-data validation, logical column identity, FK target paths, dependent objects, and atomic changes. Do not promise SQL constraint forms the selected engine itself rejects. |
 | Macros — concrete contract and reference implemented; adapters pending | Overload collections, declared parameter types, expression/default representation, documentation, and owner-relative definitions | Reconcile the existing single-definition request and typed-value defaults with engine overloads and expression defaults. Define resolution and stable round trips; do not introduce a function overload handle just to mirror DuckDB internals. |
 | Dependencies and catalog consistency | Shared qualified object references; explicit ownership/drop/alter dependency semantics; mutation visibility and metadata-version rules | Settle worker versus engine authority, RESTRICT/CASCADE, rename effects, transaction-local reads, committed versions/etags, and retained entries. Include dependency records where enforcement across clients requires them; no DuckDB pointers or OIDs on the wire. |
-| Transactions and write replay | Explicit DDL rollback and mixed DDL/DML atomicity guarantees; operation identity/deduplication if retry support is included | Expanded ADD COLUMN, CTAS, multi-DML CTEs, and triggers use coherent transaction state. Reuse begin/commit/rollback and OLD/NEW `changes` mode. Define ambiguous commit/reply-loss behavior; never retry side effects just because transport failed. No distributed atomicity claim across independent catalogs. |
+| Transactions and write execution | Reuse existing transaction handles, begin/commit/rollback, write init/exchange/finalize and OLD/NEW results; audit concrete DuckDB2 gaps before adding wire fields | Keep supported DDL, DML and trigger effects in the existing provider transaction; failed writes cannot partially commit. No savepoints, durable replay/status service or general statement ticket/receipt framework in this package. Ambiguous dispatch remains an error without automatic retry. |
 | Triggers — contract specified; reference pending | Table-owned identity, list/get/create/drop and metadata mutation, event/timing/granularity, UPDATE OF, transition aliases, action definition, dependencies, and execution mode | Prefer worker authority for persistent definitions. Distinguish engine-executed from backend-executed triggers so they cannot fire twice. Define SQL dialect, ordering, supported row/statement forms, OLD/NEW requirements, rollback, detach/reconnect, and cross-client discovery. |
 | Catalog query execution — explicit 1.5 adapter implemented; automatic pending | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
 | Logical type preservation — concrete contract and codecs implemented; adapters pending | Recursive VGI TUPLE annotation and canonical Arrow Parquet Variant capability with unshredded metadata/value storage | Qualify canonical Variant semantics, missing versus NULL and SDK byte/metadata preservation at each engine pin. Original DuckDB integer width/signedness and its full type domain are not promised; unsupported mappings reject. Reject opaque aggregate-state layouts without a portable contract. |
@@ -1541,5 +1552,5 @@ before advertising parity.
 Re-estimate the remaining work after M1, when hidden compilation and link
 failures are visible. The largest correctness risks are predicate or DDL-field
 loss, secure-view flag loss, catalog identity collisions, bind-data lifetime,
-cancellation deadlocks, and remote write replay/rollback. Each has an explicit
+cancellation deadlocks, and failed writes escaping transaction rollback. Each has an explicit
 test gate above or in the field audit.
