@@ -158,6 +158,19 @@ std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &macro_type, ClientContext &context);
 
+std::vector<VgiIndexInfo> DecodeContentsIndexes(const VgiSchemaContents &contents);
+std::vector<VgiIndexInfo> InvokeCatalogSchemaContentsIndexes(const CatalogRpcContext &ctx,
+    const std::string &schema_name, ClientContext &context);
+std::optional<VgiIndexInfo> InvokeCatalogIndexGet(const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &name, ClientContext &context);
+void InvokeCatalogIndexCreate(const CatalogRpcContext &ctx, const std::string &schema_name,
+    const std::string &name, const std::vector<uint8_t> &definition, const std::string &on_conflict,
+    ClientContext &context);
+void InvokeCatalogIndexDrop(const CatalogRpcContext &ctx, const std::string &schema_name,
+    const std::string &name, bool ignore_not_found, bool cascade, ClientContext &context);
+void RequireCatalogIndexAlgorithm(const CatalogRpcContext &ctx, const std::string &schema,
+    const std::string &table, const std::string &algorithm, ClientContext &context);
+
 // Invoke catalog_schema_contents_functions: list functions in a schema
 // function_type: "SCALAR_FUNCTION" or "TABLE_FUNCTION"
 std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(

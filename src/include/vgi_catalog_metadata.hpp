@@ -402,6 +402,15 @@ struct VgiViewInfo {
 	std::map<std::string, std::string> column_comments;
 };
 
+// Bounded native projection of the canonical typed index definition.
+struct VgiIndexInfo {
+	std::string name, schema_name, table_name, algorithm;
+	bool unique = false;
+	std::vector<std::string> columns;
+	std::optional<std::string> comment;
+	std::map<std::string, std::string> tags;
+};
+
 // Macro metadata from the worker
 struct VgiMacroInfo {
 	std::string name;

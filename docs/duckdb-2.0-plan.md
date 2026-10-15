@@ -917,6 +917,49 @@ typed index definitions/options, semantic ALTER dependencies, then statement and
 write-lifecycle checks before triggers. Other SDK providers still need actual
 enforcement/mutation implementations before selecting those profiles.
 
+**Typed index checkpoint (2026-10-14; verified on pinned 1.5)**
+
+Index CREATE and discovery now use required typed definitions: exact target
+table identity, explicit algorithm, ordered raw-path/expression keys, typed
+options and optional authoritative constraint association. Discovery also
+returns effective `OptionState`. The new option-definitions RPC brings the
+implemented inventory to 84 methods. All seven SDK wire surfaces and the shared
+corpus are generated together; unported mutable providers refuse index changes.
+
+The durable reference builds actual SQLite regular/UNIQUE indexes and proves
+row enforcement, rollback of failed replacement, reconnect, transaction-local
+visibility and stale-commit rejection. Native 1.5 CREATE/discovery/DROP is now
+integrated, including execution-time creation and cache invalidation. It requires
+the explicit `SQLITE.BTREE.V1` algorithm for this reference; ordinary ART is not
+silently mapped to SQLite. SQL lifecycle checks cover creation/readback/drop,
+transactions, EXPLAIN without effects and rejection of unsupported forms.
+
+This is bounded support: raw top-level keys, binary collation and an empty
+declared option schema. Expression/nested keys, nonempty algorithm options,
+PRIMARY/backing-constraint closure and CASCADE remain unsupported by these
+adapters. The general wire records preserve richer values without claiming
+those execution semantics. General identity allows different index/table
+schema paths; the bounded adapters require one flat schema.
+
+Python passed 1,643 checks plus the targeted follow-up, and all SDK contract
+suites passed on EC2. Live public RPC checks against six independently built
+workers passed 15 cases. Native codec/guard checks passed 26 cases with 401
+assertions and seven index SQL scenarios. The browser bundle was regenerated
+with the typed schema. Exact checks, skips and limits are in the manifest's
+`index_public_checkpoint`; logs use the `indexes-` prefix in the existing EC2
+workspace.
+
+Transport review also found HTTP automatic retries beneath the existing
+subprocess safeguards. Index CREATE/DROP, query preparation, table CREATE and
+constraint apply now share a single-attempt policy for ambiguous failures.
+Five HTTP cases with 145 assertions prove one POST after server errors or lost
+replies, retained read-only retries and interrupt behavior. This does not supply
+the separate durable replay contract or qualify every legacy mutation method.
+
+Next is semantic ALTER dependency coverage, followed by statement/write
+requirements before trigger execution and durable replay. The engine remains
+on the existing 1.5 pin; the combined protocol version is still unpublished.
+
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
 protocol transition, including the matching routing name and migration guide;

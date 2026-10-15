@@ -3,6 +3,7 @@
 #include "vgi_catalog_api.hpp"
 #include "vgi_query_rpc.hpp"
 #include "vgi_constraint_contract.hpp"
+#include "vgi_index_contract.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -35,6 +36,7 @@
 #include "vgi_schema_registry.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
+#include "vgi_unary_retry.hpp"
 #include "yyjson.hpp"
 
 using namespace duckdb_yyjson; // NOLINT
@@ -281,8 +283,7 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		// Preparation, CREATE and constraint mutation can take effect before a lost response.
 		// The subprocess pool retries ambiguous IO failures; use one fresh attempt
 		// until these operations have an explicit durable replay contract.
-		if (method_name == "catalog_query_prepare" || method_name == "catalog_table_constraints_apply" ||
-		    method_name == "catalog_table_create") {
+		if (RequiresSingleAttemptUnary(method_name)) {
 			opts.use_pool = false;
 		}
 		opts.tcp_proxy = ctx.params->tcp_proxy();
@@ -797,6 +798,63 @@ std::vector<VgiTableInfo> DecodeContentsTables(const VgiSchemaContents &contents
 		out.push_back(ParseTableInfo(context, b, contents.worker_path));
 	}
 	return out;
+}
+
+std::vector<VgiIndexInfo> DecodeContentsIndexes(const VgiSchemaContents &contents) {
+	std::vector<VgiIndexInfo> out;
+	for (const auto &batch : ContentsItems(contents, "indexes", "catalog_schema_contents_indexes"))
+		out.push_back(ParseNativeIndexInfo(batch));
+	return out;
+}
+
+std::vector<VgiIndexInfo> InvokeCatalogSchemaContentsIndexes(const CatalogRpcContext &ctx,
+    const std::string &schema_name, ClientContext &context) {
+	auto params = generated::BuildCatalogSchemaContentsIndexesParams(ctx.attach_opaque_data,
+	    SingleSchemaPath(schema_name), OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_indexes", params, context);
+	auto result = ExtractAndDeserializeResult(response, "catalog_schema_contents_indexes", ctx.params->worker_path());
+	if (!result) throw IOException("Missing typed index listing response");
+	std::vector<VgiIndexInfo> out;
+	for (const auto &batch : UnwrapAndValidateItems(result, "catalog_schema_contents_indexes", ctx.params->worker_path())) {
+		auto info = ParseNativeIndexInfo(batch);
+		if (info.schema_name != schema_name) throw IOException("Index response belongs to another schema");
+		out.push_back(std::move(info));
+	}
+	return out;
+}
+std::optional<VgiIndexInfo> InvokeCatalogIndexGet(const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &name, ClientContext &context) {
+	auto params = generated::BuildCatalogIndexGetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name), name, OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_index_get", params, context);
+	auto result = ExtractAndDeserializeResult(response, "catalog_index_get", ctx.params->worker_path());
+	if (!result) throw IOException("Missing typed index lookup response");
+	auto items = UnwrapAndValidateItems(result, "catalog_index_get", ctx.params->worker_path());
+	if (items.empty()) return std::nullopt;
+	if (items.size() != 1) throw IOException("Index lookup returned multiple records");
+	auto info = ParseNativeIndexInfo(items[0]);
+	if (info.schema_name != schema_name || !StringUtil::CIEquals(info.name, name))
+		throw IOException("Index lookup returned another identity");
+	return info;
+}
+void RequireCatalogIndexAlgorithm(const CatalogRpcContext &ctx, const std::string &schema,
+    const std::string &table, const std::string &algorithm, ClientContext &context) {
+	auto params = generated::BuildCatalogIndexOptionDefinitionsParams(ctx.attach_opaque_data,
+	    BuildNativeIndexTableRef(schema, table), algorithm, OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_index_option_definitions", params, context);
+	auto result = ExtractAndDeserializeResult(response, "catalog_index_option_definitions", ctx.params->worker_path());
+	ValidateNativeIndexOptionDefinitions(result);
+}
+void InvokeCatalogIndexCreate(const CatalogRpcContext &ctx, const std::string &schema_name,
+    const std::string &name, const std::vector<uint8_t> &definition, const std::string &on_conflict,
+    ClientContext &context) {
+	auto request = BuildNativeIndexCreate(ctx.attach_opaque_data, ctx.transaction_opaque_data, schema_name, name,
+	                                     definition, on_conflict);
+	InvokeVoidRpc(ctx, "catalog_index_create", generated::BuildCatalogIndexCreateParams(request), context);
+}
+void InvokeCatalogIndexDrop(const CatalogRpcContext &ctx, const std::string &schema_name,
+    const std::string &name, bool ignore_not_found, bool cascade, ClientContext &context) {
+	InvokeVoidRpc(ctx, "catalog_index_drop", generated::BuildCatalogIndexDropParams(ctx.attach_opaque_data,
+	    SingleSchemaPath(schema_name), name, ignore_not_found, cascade, OptTxn(ctx)), context);
 }
 
 std::vector<VgiViewInfo> DecodeContentsViews(const VgiSchemaContents &contents) {

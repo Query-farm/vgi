@@ -1,5 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vgi_constraint_contract.hpp"
+#include "vgi_index_contract.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_query_function.hpp"
 #include "vgi_rpc_types.hpp"
@@ -144,8 +145,8 @@ void Records(const std::vector<std::vector<uint8_t>> &records) {
 
 std::vector<uint8_t> BuildNativeConstraintCapabilities() {
 	return Encode(generated::CatalogCapabilitiesSchema(),
-	              {BuildStringListScalar({VGI_CONSTRAINT_READ}),
-	               BuildStringListScalar({VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE}),
+	              {BuildStringListScalar({VGI_CONSTRAINT_READ, VGI_INDEX_READ}),
+	               BuildStringListScalar({VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE, VGI_INDEX_CREATE, VGI_INDEX_DROP}),
 	               BuildStringListScalar({VGI_CONSTRAINT_ENFORCE}), BuildStringListScalar({"vgi.transaction.ddl.v1"})});
 }
 void ParseNativeConstraintCapabilities(CatalogAttachResult &result, const std::vector<uint8_t> &bytes) {
@@ -153,8 +154,8 @@ void ParseNativeConstraintCapabilities(CatalogAttachResult &result, const std::v
 		return;
 	auto batch = Decode(bytes, generated::CatalogCapabilitiesSchema());
 	RecordBatchSingleRow row(batch, 0, "CatalogCapabilities", "constraint");
-	std::map<std::string, std::set<std::string>> offered {{"read", {VGI_CONSTRAINT_READ}},
-	                                                      {"ddl", {VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE}},
+	std::map<std::string, std::set<std::string>> offered {{"read", {VGI_CONSTRAINT_READ, VGI_INDEX_READ}},
+	                                                      {"ddl", {VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE, VGI_INDEX_CREATE, VGI_INDEX_DROP}},
 	                                                      {"write", {VGI_CONSTRAINT_ENFORCE}},
 	                                                      {"transaction", {"vgi.transaction.ddl.v1"}}};
 	for (const auto &category : offered) {
@@ -165,6 +166,8 @@ void ParseNativeConstraintCapabilities(CatalogAttachResult &result, const std::v
 			result.constraint_profiles.insert(profile);
 		}
 	}
+	Require(!(result.constraint_profiles.count(VGI_INDEX_CREATE) || result.constraint_profiles.count(VGI_INDEX_DROP)) ||
+	            result.constraint_profiles.count(VGI_INDEX_READ), "index DDL requires typed index read support");
 	Require(!result.constraint_profiles.count("vgi.transaction.ddl.v1") || result.supports_transactions,
 	        "DDL transaction profile requires transaction support");
 	if (result.constraint_profiles.count(VGI_CONSTRAINT_CREATE) ||

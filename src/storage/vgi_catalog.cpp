@@ -344,10 +344,6 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 	return result;
 }
 
-unique_ptr<LogicalOperator> VgiCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
-                                                        unique_ptr<LogicalOperator> plan) {
-	throw BinderException("VGI catalogs are read-only");
-}
 
 DatabaseSize VgiCatalog::GetDatabaseSize(ClientContext &context) {
 	DatabaseSize size;

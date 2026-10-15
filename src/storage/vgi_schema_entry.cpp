@@ -1,5 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_constraint_contract.hpp"
+#include "vgi_index_contract.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
+#include "duckdb/main/settings.hpp"
 #include "storage/vgi_schema_entry.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -33,7 +36,7 @@ VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const v
       // Default missing keys to 1: workers that don't populate the field bias toward
       // eager bulk-load, matching the semantics described on VgiSchemaInfo.
       estimated_counts_(ObjectCountsFromMap(schema_info.estimated_object_count, /*default_value=*/1)),
-      tables_(catalog, *this), views_(catalog, *this), scalar_functions_(catalog, *this),
+      indexes_(catalog, *this), tables_(catalog, *this), views_(catalog, *this), scalar_functions_(catalog, *this),
       aggregate_functions_(catalog, *this), table_functions_(catalog, *this),
       scalar_macros_(catalog, *this, CatalogType::MACRO_ENTRY),
       table_macros_(catalog, *this, CatalogType::TABLE_MACRO_ENTRY) {
@@ -41,7 +44,7 @@ VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const v
 
 VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info,
                                std::shared_ptr<const vgi::VgiSchemaContents> seed)
-    : SchemaCatalogEntry(catalog, info), info_source_(seed), schema_info_ready_(false), tables_(catalog, *this),
+    : SchemaCatalogEntry(catalog, info), info_source_(seed), schema_info_ready_(false), indexes_(catalog, *this), tables_(catalog, *this),
       views_(catalog, *this), scalar_functions_(catalog, *this), aggregate_functions_(catalog, *this),
       table_functions_(catalog, *this), scalar_macros_(catalog, *this, CatalogType::MACRO_ENTRY),
       table_macros_(catalog, *this, CatalogType::TABLE_MACRO_ENTRY), seed_(std::move(seed)) {
@@ -116,6 +119,13 @@ std::vector<vgi::VgiTableInfo> VgiSchemaEntry::TakeTables(const vgi::CatalogRpcC
 		return LogSeedDecode(context, name, "table", vgi::DecodeContentsTables(*seed, context));
 	}
 	return vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, name, context);
+}
+
+std::vector<vgi::VgiIndexInfo> VgiSchemaEntry::TakeIndexes(const vgi::CatalogRpcContext &rpc_ctx,
+                                                         ClientContext &context) {
+	if (auto seed = ClaimSeed("index"))
+		return LogSeedDecode(context, name, "index", vgi::DecodeContentsIndexes(*seed));
+	return vgi::InvokeCatalogSchemaContentsIndexes(rpc_ctx, name, context);
 }
 
 std::vector<vgi::VgiViewInfo> VgiSchemaEntry::TakeViews(const vgi::CatalogRpcContext &rpc_ctx,
@@ -312,6 +322,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	DeferDrop(catalog, tables_.HarvestEntries());
 	tables_.MarkPopulatedLocked();
 	if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+		DeferDrop(catalog, indexes_.HarvestEntries());
 		DeferDrop(catalog, views_.HarvestEntries());
 	}
 	vgi::InvokeCatalogTableCreate(rpc_ctx, name, create_info.table, columns_schema, on_conflict,
@@ -325,7 +336,24 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateFunction(CatalogTransaction tra
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
                                                        TableCatalogEntry &table) {
-	throw BinderException("VGI catalogs are read-only");
+	auto &owner = catalog.Cast<VgiCatalog>();
+	if (owner.GetAccessMode() == AccessMode::READ_ONLY) throw BinderException("Cannot CREATE INDEX in read-only VGI catalog");
+	auto &context = transaction.GetContext();
+	const auto &collation = Settings::Get<DefaultCollationSetting>(context);
+	if (!collation.empty() && !StringUtil::CIEquals(collation, "binary"))
+		throw BinderException("VGI raw index keys require binary default collation");
+	auto &tx = VgiTransaction::Get(context, catalog);
+	auto &attached = *owner.attach_result();
+	vgi::CatalogRpcContext rpc {owner.attach_parameters(), attached.attach_opaque_data, tx.GetTransactionOpaqueData()};
+	vgi::RequireNativeIndexCapabilities(attached, vgi::VGI_INDEX_CREATE,
+	    info.constraint_type == IndexConstraintType::UNIQUE, !rpc.transaction_opaque_data.empty());
+	auto definition = vgi::EncodeNativeIndexDefinition(info, table);
+	vgi::RequireCatalogIndexAlgorithm(rpc, name, table.name, info.index_type, context);
+	// Lost responses cannot leave stale index listings, including a cached empty kind.
+	DeferDrop(catalog, indexes_.HarvestEntries());
+	indexes_.MarkPopulatedLocked();
+	vgi::InvokeCatalogIndexCreate(rpc, name, info.index_name, definition, vgi::MapOnConflict(info.on_conflict), context);
+	return nullptr;
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
@@ -499,6 +527,9 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		throw BinderException("ALTER %s is not supported for VGI catalogs", EnumUtil::ToString(info.type));
 	}
 
+	// Structural changes can rename or remove index targets. Invalidate before
+	// dispatch, including ambiguous failures; the provider owns dependencies.
+	DeferDrop(catalog, indexes_.HarvestEntries());
 	auto &alter_table = info.Cast<AlterTableInfo>();
 	auto &schema_name = name;  // VgiSchemaEntry::name
 	auto &table_name = alter_table.name;
@@ -635,6 +666,9 @@ void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	case CatalogType::TABLE_MACRO_ENTRY:
 		table_macros_.Scan(context, callback);
 		break;
+	case CatalogType::INDEX_ENTRY:
+		indexes_.Scan(context, callback);
+		break;
 	default:
 		// Other types not yet implemented
 		break;
@@ -646,7 +680,7 @@ void VgiSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntr
 }
 
 void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
+	if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY && info.type != CatalogType::INDEX_ENTRY) {
 		throw BinderException("DROP %s is not supported for VGI catalogs", EnumUtil::ToString(info.type));
 	}
 
@@ -665,6 +699,20 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	auto &attach_result = vgi_catalog.attach_result();
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 
+	if (info.type == CatalogType::INDEX_ENTRY) {
+		vgi::RequireNativeIndexCapabilities(*attach_result, vgi::VGI_INDEX_DROP, false,
+		                                  !rpc_ctx.transaction_opaque_data.empty());
+		if (info.cascade) throw BinderException("Native VGI DROP INDEX CASCADE is unsupported");
+		// Lookup validates unsupported associated/PRIMARY definitions before effects.
+		auto bound = indexes_.GetEntry(context, info.name);
+		const auto raw_name = bound ? bound->name : info.name;
+		auto current = vgi::InvokeCatalogIndexGet(rpc_ctx, name, raw_name, context);
+		if (!current && !ignore_not_found) throw BinderException("Index %s does not exist", info.name);
+		DeferDrop(catalog, indexes_.HarvestEntries());
+		vgi::InvokeCatalogIndexDrop(rpc_ctx, name, current ? current->name : info.name, ignore_not_found, false, context);
+		return;
+	}
+
 	if (info.type == CatalogType::VIEW_ENTRY) {
 		vgi::InvokeCatalogViewDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
 		if (info.cascade) {
@@ -678,6 +726,7 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		return;
 	}
 
+	DeferDrop(catalog, indexes_.HarvestEntries());
 	vgi::InvokeCatalogTableDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
 	if (info.cascade) {
 		vgi_tx.ClearSchemaCache();
@@ -708,6 +757,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transa
 	}
 	case CatalogType::VIEW_ENTRY:
 		return views_.GetEntry(context, entry_name);
+	case CatalogType::INDEX_ENTRY:
+		return indexes_.GetEntry(context, entry_name);
 	case CatalogType::SCALAR_FUNCTION_ENTRY: {
 		// DuckDB resolves all function calls via SCALAR_FUNCTION_ENTRY first.
 		// Fall back to aggregate functions and macros (they share a set in the
@@ -747,6 +798,8 @@ VgiCatalogSet &VgiSchemaEntry::GetCatalogSet(CatalogType type) {
 		return tables_;
 	case CatalogType::VIEW_ENTRY:
 		return views_;
+	case CatalogType::INDEX_ENTRY:
+		return indexes_;
 	case CatalogType::SCALAR_FUNCTION_ENTRY:
 		return scalar_functions_;
 	case CatalogType::AGGREGATE_FUNCTION_ENTRY:

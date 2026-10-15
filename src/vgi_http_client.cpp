@@ -21,6 +21,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
+#include "vgi_unary_retry.hpp"
 #include "vgi_transport.hpp"
 
 #include "mbedtls_wrapper.hpp"
@@ -314,6 +315,11 @@ static std::string HttpPostArrowIpcInternal(
                                              const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
                                              const std::atomic<bool> *cancellation = nullptr,
                                              const RpcErrorContext *error_context = nullptr) {
+	bool single_attempt = false;
+	if (error_context) {
+		auto method = error_context->fields.find(error_key::kRpcMethod);
+		single_attempt = method != error_context->fields.end() && RequiresSingleAttemptUnary(method->second);
+	}
 	const bool is_httpi = IsHttpiTransport(url);
 	const uint64_t timeout_seconds = GetHttpTimeoutSeconds(context);
 	const int64_t accepted_max_response_bytes = GetAcceptedMaxResponseBytes(context);
@@ -404,13 +410,16 @@ static std::string HttpPostArrowIpcInternal(
 #endif
 	} else {
 		auto &http_util = HTTPUtil::Get(*context.db);
-		// Reuse cached parameters when available; unlike httpi:// this remains an
-		// ordinary DuckDB HTTP request, including its established retry behavior.
-		std::shared_ptr<HTTPParams> params = cached_http_params;
+		// Mutation/prepare calls get private provider parameters. Reinitializing
+		// preserves HTTPFS-specific fields and credentials; slicing HTTPParams or
+		// changing the shared ATTACH parameters would be incorrect. Read calls
+		// retain their existing cache and retry policy.
+		std::shared_ptr<HTTPParams> params = single_attempt ? nullptr : cached_http_params;
 		if (!params) {
 			auto owned = http_util.InitializeParameters(context, url);
 			params = std::shared_ptr<HTTPParams>(owned.release());
 		}
+		if (single_attempt) params->retries = 0;
 		params->timeout = timeout_seconds;
 		PostRequestInfo post(url, headers, *params, reinterpret_cast<const_data_ptr_t>(req_body_data),
 	                     static_cast<idx_t>(req_body_size));
@@ -533,7 +542,10 @@ static std::string HttpPostArrowIpcInternal(
 	// ATTACH — and, because 500 is retryable, HTTPUtil burns its own retry
 	// budget on that one before handing it back (~0.5 s of backoff, once).
 	// Everything after it goes out as identity on the first try.
-	if (allow_codec_retry && !out_response->Success() && response_caps.discovered &&
+	// A 415 explicitly rejects the request representation before dispatch.
+	// A 500 can follow successful mutation and must never trigger a replay.
+	if (allow_codec_retry && (!single_attempt || out_response->Status() == HTTPStatusCode::UnsupportedMediaType_415) &&
+	    !out_response->Success() && response_caps.discovered &&
 	    !ServerAcceptsRequestEncoding(response_caps, request_encoding)) {
 		auto alternate = ChooseRequestEncoding(response_caps);
 		if (alternate != request_encoding) {
@@ -924,7 +936,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 		error_context.fields = *error_fields;
 	}
 	error_context.fields[error_key::kUrl] = RedactCredentials(url);
-	error_context.fields.emplace(error_key::kRpcMethod, method_name);
+	error_context.fields[error_key::kRpcMethod] = method_name;
 	auto response_body =
 	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder,
 	                     effective_caps, iroh_config, /*cancellation=*/nullptr, &error_context);

@@ -17,6 +17,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "httpfs_extension.hpp"
 #include "vgi_http_client.hpp"
+#include "vgi_exception.hpp"
+#include "vgi_rpc_client.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -39,7 +41,9 @@ namespace {
 // open until then. Destruction stops it promptly whatever the delay.
 class SlowServer {
 public:
-	explicit SlowServer(std::chrono::milliseconds reply_delay) : reply_delay_(reply_delay) {
+	enum class Reply { OK, ERROR, CODEC_ERROR, DROP };
+	explicit SlowServer(std::chrono::milliseconds reply_delay, Reply reply = Reply::OK)
+	    : reply_delay_(reply_delay), reply_(reply) {
 		listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
 		REQUIRE(listen_fd_ >= 0);
 		int one = 1;
@@ -69,6 +73,7 @@ public:
 	int Accepted() const {
 		return accepted_.load();
 	}
+	int DispatchedPosts() const { return dispatched_posts_.load(); }
 
 private:
 	static bool WaitReadable(int fd, int ms) {
@@ -101,19 +106,37 @@ private:
 		// Drain whatever the client sends; the reply never depends on it.
 		auto deadline = std::chrono::steady_clock::now() + reply_delay_;
 		char buf[4096];
+		std::string received;
+		bool dispatched = false;
 		while (!stop_.load() && std::chrono::steady_clock::now() < deadline) {
-			if (WaitReadable(fd, 20) && recv(fd, buf, sizeof(buf), 0) <= 0) {
-				break;
+			if (!WaitReadable(fd, 20)) continue;
+			auto size = recv(fd, buf, sizeof(buf), 0);
+			if (size <= 0) break;
+			received.append(buf, static_cast<size_t>(size));
+			auto end = received.find("\r\n\r\n");
+			auto length = end == std::string::npos ? std::string::npos
+			    : StringUtil::Lower(received.substr(0, end)).find("content-length:");
+			if (!dispatched && received.compare(0, 5, "POST ") == 0 && end != std::string::npos &&
+			    length != std::string::npos && length < end) {
+				auto body_size = std::stoull(received.substr(length + 15));
+				if (received.size() >= end + 4 + body_size) {
+					dispatched_posts_.fetch_add(1);
+					dispatched = true;
+				}
 			}
 		}
-		if (!stop_.load()) {
-			static const char reply[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-			(void)send(fd, reply, sizeof(reply) - 1, 0);
+		if (!stop_.load() && reply_ != Reply::DROP) {
+			const std::string reply = std::string("HTTP/1.1 ") + (reply_ == Reply::OK ? "200 OK" : "500 Internal Server Error") +
+			    (reply_ == Reply::CODEC_ERROR ? "\r\nVGI-Supported-Encodings: \r\nVGI-Accept-Max-Response-Bytes-Support: true" : "") +
+			    "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+			(void)send(fd, reply.data(), reply.size(), 0);
 		}
 		close(fd);
 	}
 
 	std::chrono::milliseconds reply_delay_;
+	Reply reply_;
+	std::atomic<int> dispatched_posts_ {0};
 	int listen_fd_ = -1;
 	int port_ = 0;
 	std::atomic<bool> stop_ {false};
@@ -223,4 +246,53 @@ TEST_CASE("an unarmed POST still completes while the query is interrupted", "[ht
 	REQUIRE(error.find("did not respond as a VGI server") != std::string::npos);
 	// what() is DuckDB's JSON form; the classification rides in extra_info.
 	REQUIRE(error.find("\"error_subtype\":\"NOT_VGI_SERVER\"") != std::string::npos);
+}
+
+TEST_CASE("protected unary HTTP mutations are not replayed after dispatch", "[http-no-replay]") {
+	for (const auto &method : {"catalog_query_prepare", "catalog_table_create", "catalog_table_constraints_apply",
+	                          "catalog_index_create", "catalog_index_drop"}) {
+		for (const auto mode : {SlowServer::Reply::ERROR, SlowServer::Reply::CODEC_ERROR, SlowServer::Reply::DROP}) {
+			SlowServer server(std::chrono::milliseconds(100), mode);
+			Fixture fixture;
+			auto &context = fixture.context();
+			auto url = server.Url(std::string("/vgi.v2/") + method);
+			RpcErrorContext error_context;
+			error_context.fields[error_key::kRpcMethod] = method;
+			std::shared_ptr<HTTPParams> cached;
+			bool failed = false;
+			context.RunFunctionInTransaction([&] {
+				auto owned = HTTPUtil::Get(*context.db).InitializeParameters(context, url);
+				cached = std::shared_ptr<HTTPParams>(owned.release());
+				cached->retries = 2;
+				try {
+					(void)HttpPostArrowIpc(context, url, std::vector<uint8_t>(2048, 0), nullptr, nullptr,
+					    cached, nullptr, nullptr, nullptr, nullptr, &error_context);
+				} catch (const std::exception &) { failed = true; }
+			});
+			INFO(method);
+			REQUIRE(failed);
+			REQUIRE(server.DispatchedPosts() == 1);
+			REQUIRE(server.Accepted() == 1);
+			REQUIRE(cached->retries == 2);
+		}
+	}
+}
+
+TEST_CASE("read-only unary HTTP calls preserve configured retries", "[http-no-replay]") {
+	SlowServer server(std::chrono::milliseconds(100), SlowServer::Reply::ERROR);
+	Fixture fixture;
+	auto &context = fixture.context();
+	auto url = server.Url("/vgi.v2/catalog_index_get");
+	RpcErrorContext error_context;
+	error_context.fields[error_key::kRpcMethod] = "catalog_index_get";
+	context.RunFunctionInTransaction([&] {
+		auto owned = HTTPUtil::Get(*context.db).InitializeParameters(context, url);
+		auto cached = std::shared_ptr<HTTPParams>(owned.release());
+		cached->retries = 2;
+		try {
+			(void)HttpPostArrowIpc(context, url, std::vector<uint8_t>(16, 0), nullptr, nullptr,
+			    cached, nullptr, nullptr, nullptr, nullptr, &error_context);
+		} catch (const std::exception &) { }
+	});
+	REQUIRE(server.DispatchedPosts() == 3);
 }

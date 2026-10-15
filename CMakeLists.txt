@@ -340,6 +340,7 @@ src/vgi_table_buffering_impl.cpp
 src/vgi_catalog_api.cpp
 src/vgi_query_rpc.cpp
 src/vgi_constraint_contract.cpp
+src/vgi_index_contract.cpp
 src/vgi_query_function.cpp
 src/vgi_function_connection.cpp
 src/vgi_client_timing.cpp
@@ -374,6 +375,9 @@ src/storage/vgi_schema_entry.cpp
 src/storage/vgi_table_set.cpp
 src/storage/vgi_table_entry.cpp
 src/storage/vgi_view_set.cpp
+src/storage/vgi_index_entry.cpp
+src/storage/vgi_index_set.cpp
+src/storage/vgi_create_index.cpp
 src/storage/vgi_scalar_function_set.cpp
 src/storage/vgi_aggregate_function_set.cpp
 src/storage/vgi_table_function_set.cpp
@@ -648,6 +652,7 @@ if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
     test/cpp/test_schema_metadata.cpp
     test/cpp/test_query_bind.cpp
     test/cpp/test_constraint_contract.cpp
+    test/cpp/test_index_contract.cpp
     test/cpp/test_query_interrupt.cpp
     test/cpp/test_query_rpc.cpp)
   target_include_directories(vgi_catalog_tests PRIVATE

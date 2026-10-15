@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "storage/vgi_aggregate_function_set.hpp"
 #include "storage/vgi_macro_set.hpp"
+#include "storage/vgi_index_set.hpp"
 #include "storage/vgi_object_counts.hpp"
 #include "storage/vgi_scalar_function_set.hpp"
 #include "storage/vgi_table_function_set.hpp"
@@ -106,6 +107,8 @@ public:
 	//! The seeded views (consumed), or the catalog_schema_contents_views RPC.
 	std::vector<vgi::VgiViewInfo> TakeViews(const vgi::CatalogRpcContext &rpc_ctx, ClientContext &context);
 
+	std::vector<vgi::VgiIndexInfo> TakeIndexes(const vgi::CatalogRpcContext &rpc_ctx, ClientContext &context);
+
 private:
 	VgiCatalogSet &GetCatalogSet(CatalogType type);
 
@@ -116,6 +119,7 @@ private:
 	std::shared_ptr<const vgi::VgiSchemaContents> info_source_;
 	std::mutex schema_info_mutex_;
 	std::atomic<bool> schema_info_ready_ {true};
+	VgiIndexSet indexes_;
 	VgiTableSet tables_;
 	VgiViewSet views_;
 	VgiScalarFunctionSet scalar_functions_;

@@ -115,6 +115,8 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    ResponseSchema{CatalogSchemaOptionDefinitionsResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_option_definitions"] =
 		    ResponseSchema{CatalogTableOptionDefinitionsResultSchema(), nullptr, false, nullptr};
+		m["catalog_index_option_definitions"] =
+		    ResponseSchema{CatalogIndexOptionDefinitionsResultSchema(), nullptr, false, nullptr};
 		// Typed result; `schemas` is list<struct<SchemaContents>> (validated as
 		// part of the result schema), whose binary fields are per-kind items.
 		m["catalog_contents"] = ResponseSchema{CatalogContentsResultSchema(), nullptr, false, nullptr};
@@ -222,6 +224,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_table_alter_options", &CatalogTableAlterOptionsParamsSchema},
 		    {"catalog_table_alter_layout", &CatalogTableAlterLayoutParamsSchema},
 		    {"catalog_table_option_definitions", &CatalogTableOptionDefinitionsParamsSchema},
+		    {"catalog_index_option_definitions", &CatalogIndexOptionDefinitionsParamsSchema},
 		    {"catalog_table_drop", &CatalogTableDropParamsSchema},
 		    {"catalog_table_rename", &CatalogTableRenameParamsSchema},
 		    {"catalog_table_scan_function_get", &CatalogTableScanFunctionGetParamsSchema},
