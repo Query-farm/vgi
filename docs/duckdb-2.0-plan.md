@@ -1001,10 +1001,98 @@ The inventory stays at 84 methods. Its top-level schema hash is unchanged
 because these dependency records are embedded in binary payloads; their new
 required field still belongs to the unpublished breaking protocol transition.
 Exact EC2 checks and limits are recorded in `semantic_alter_checkpoint` in the
-Python manifest, with `alter-` log names. Next is an audit of existing transaction
-and write-finalization paths for the supported DuckDB2 operations, followed by
-minimal trigger integration. The 2026-10-15 scope correction removes the earlier
-statement-ticket and durable-replay follow-ups.
+Python manifest, with `alter-` log names. The source audit below identifies
+focused transaction/finalization fixes before minimal trigger integration.
+The 2026-10-15 scope correction removes the earlier statement-ticket and
+durable-replay follow-ups.
+
+**Existing write-path research (2026-10-15; source audit only)**
+
+The audit supports reusing the existing transaction and write lifecycle. It
+found no requirement for a new statement coordinator, savepoints, operation
+receipts or durable recovery service. Inspected sources are Haybarn2
+`e1784fa4231072d7152b8aaa20977bdb8ff4ace3`, native VGI `02c876a`, and Python VGI
+`4e2fd83`. EC2 `32.192.49.19` was unreachable, so no new build or runtime tests
+were run. Findings below are source evidence and implementation targets, not
+qualification of VGI on DuckDB2.
+
+DuckDB already owns the relevant boundaries:
+
+- `src/planner/binder/query_node/bind_trigger_expansion.cpp:361` builds statement
+  triggers into BEFORE, base DML and AFTER CTEs. `src/execution/operator/set/physical_cte.cpp:409`
+  builds dependent pipelines; row triggers are lowered to dependent joins by
+  `src/planner/planner.cpp:80`, retaining duplicate-row multiplicity. The native
+  engine already sequences these operations; VGI should implement its catalog
+  and physical-write hooks, not repeat that scheduling over RPC.
+- `src/planner/statement_preprocessor.cpp:32` wraps expanded ALTER in the existing
+  transaction machinery, using automatic rollback or invalidation of the active
+  transaction. `src/main/client_context_execution.cpp:82` handles execution
+  failure; an invalidated transaction's COMMIT becomes ROLLBACK in
+  `src/main/client_context.cpp:1084`. The transaction grammar and enum expose
+  begin/commit/rollback, not savepoints. This is consistent with the ordinary
+  transaction behavior documented by [DuckDB](https://duckdb.org/docs/current/sql/statements/transactions).
+- Native VGI already creates CTAS tables during execution and passes the same
+  worker transaction to the write connection: [write setup](../src/storage/vgi_physical_write.cpp#L448).
+  [Finalization](../src/storage/vgi_physical_write.cpp#L262) already runs the
+  optional final phase and propagates normally surfaced errors; the raw drain
+  candidate below still needs reproduction. Statement-trigger actions can
+  remain ordinary VGI writes in the same engine/provider transaction.
+- VGI currently does not override the engine's `GetCatalogVersion`.
+  `src/main/prepared_statement_data.cpp:28` treats a missing catalog version as
+  requiring rebind, including modified databases. Thus a cached native prepared
+  plan is not, by itself, evidence for adding a new write-requirements protocol.
+  Preserve this behavior and test concurrent metadata changes and provider
+  snapshot checks before introducing a more specific revision field.
+
+The concrete remaining work is smaller:
+
+| Finding | Smallest implementation direction | Protocol implication |
+| --- | --- | --- |
+| VGI lacks external table Create/Scan/Get/DropTrigger overrides | Persist definitions in the provider and materialize native `TriggerCatalogEntry` values through the existing engine hooks. | Minimal trigger definition/discovery/mutation records still needed; no transaction RPC family. |
+| Engine uses ScanTriggers for both discovery and execution | Initially expose ENGINE-owned definitions through that hook. A backend-owned trigger must not also be executed by the client. Supporting native discovery of backend-only definitions may need a small engine filtering hook. | Keep one execution-owner field/contract; do not add a scheduler. |
+| Statement-trigger expansion forces base DML RETURNING even without transition aliases | Require the existing rows result mode for that supported path. Count-only providers remain unsupported. | Existing mode negotiation. |
+| Native writes request only count/rows; UPDATE OLD capture and duplicate row-id policy are new engine inputs | Bridge existing paired OLD/NEW changes results to the engine's NEW-then-OLD output, and honor duplicate-target handling. Do not zip reordered returned rows with input OLD values without proven correspondence. | Existing changes carrier is sufficient; no new OLD/NEW record demonstrated. |
+| FinalizeWriteConnection treats every nonempty final output batch as a count | Make final result handling match the selected count/rows/changes mode; prove zero-row and multiple-batch behavior. | Use existing init/finalize and output schemas. |
+| Pre-FINALIZE raw INPUT drain discards batch metadata and tolerates some non-Iroh read failures | Reproduce a provider returning a response then raising, missing responses and premature EOS. If errors are lost, surface them through the existing error/rollback path. | Source-identified candidate in `src/vgi_function_connection.cpp:1007`, not yet reproduced; no new error protocol. |
+| Multiple-DML CTE support is an explicit engine opt-in, absent in VGI | Keep disabled until two writes and failure/RETURNING behavior share the current provider transaction correctly. | Adapter capability/qualification, not a coordinator. |
+| Transaction begin/commit/rollback still use generic retry-capable RPC dispatch | Include them in the existing single-attempt policy and prove dispatch count after transport failure. | No new fields or recovery endpoints. |
+| Commit/rollback exceptions can skip erasing the native transaction entry | Make local cleanup exception-safe and verify provider behavior after a definite refusal; preserve unknown outcome after ambiguous commit. | Local bookkeeping/error handling, not recovery machinery. |
+| Signed HTTP writable fixture reads the sealed transaction token directly into the transactor | Reproduce begin/write/commit through signed HTTP; verify authenticated unwrapping at the provider boundary without replacing sealed wire/storage state. | Existing token plumbing; source-identified candidate, not yet reproduced. |
+
+The first implementation checkpoint should address current 1.5-compatible
+transaction dispatch/cleanup and focused finalization/failure tests. Native2 trigger hooks
+and OLD/NEW bridging follow in their engine lane. The generic transactor's SQL
+per input batch does not itself implement whole-statement backend triggers;
+start with engine-owned execution and reject unqualified backend-owned forms.
+Finalization has per-write-operator identity today, not a demonstrated global
+statement identity across operators. That is adequate for engine scheduling;
+only a concrete backend execution requirement should justify an extension.
+
+Focused qualification, using the existing wire contract:
+
+1. Autocommit and explicit-transaction writes fail at init, a later batch, or
+   finalize; no partial effects can commit. Include prior successful writes in
+   an explicit transaction, zero-row finalization, response-then-error, missing
+   per-batch responses and premature EOS.
+2. CTAS insert/finalize failure removes the new table and data; expanded ALTER
+   failure in UPDATE/default/constraint follow-up rolls back the whole change.
+3. Multiple-DML and BEFORE/base/AFTER failures roll back all admitted writes;
+   return data only after successful operation completion.
+4. OLD/NEW cases include UPDATE FROM duplicate matches, DELETE, generated
+   columns, identical input rows, zero rows and multiple batches.
+5. PREPARE before trigger creation/change, then EXECUTE; verify rebind and current
+   transaction-visible definitions. Confirm no double firing for execution owners.
+6. Definite commit/rollback errors leave no native bookkeeping entry; ambiguous
+   transport failures issue one request and do not claim rollback succeeded.
+7. Signed HTTP begin/write/commit/rollback uses the authenticated provider
+   transaction correctly; wrong-attachment tokens reject.
+
+The old writable SQL tests under `test_deferred/writable/` are useful cases,
+not current runtime evidence. Python's transactor suite is module-skipped and
+its writable conformance file is a skip stub. General function-finalization
+tests and core-engine trigger tests do not prove external VGI write/trigger
+behavior. No release gate or existing method count changes in this research
+checkpoint. The protocol manifest records the exact source findings.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
