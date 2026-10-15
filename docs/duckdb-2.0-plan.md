@@ -960,6 +960,41 @@ Next is semantic ALTER dependency coverage, followed by statement/write
 requirements before trigger execution and durable replay. The engine remains
 on the existing 1.5 pin; the combined protocol version is still unpublished.
 
+**Semantic ALTER checkpoint (2026-10-14; pinned 1.5)**
+
+Dependency edges now carry required ALTER protection plus raw subject and
+nullable dependent column paths. The planner checks schemas, preserves legal
+object lifetime cycles, rejects generated-column evaluation cycles, and returns
+separate column/object deletion sets. A generated-column dependency cannot
+accidentally delete its whole table. The same records and adversarial fixtures
+are generated across all seven SDKs; unsupported providers continue to refuse
+dependency discovery.
+
+The durable metadata reference supports table/column rename, column type/drop,
+harmless comments, generated-column chains and simple-view blockers. Bounded
+CASCADE authorizes the full closure before one atomic publication. Tests cover
+rollback, reconnect, concurrent-commit conflicts, denied closure members and
+publication failure. Canonical expression metadata requires selected/current
+profiles on write and discovery; dependency-aware transactional metadata changes
+also require selected/current DDL guarantees.
+
+Native 1.5 delegates supported rename/drop/comment operations to that authority,
+refreshes table/view caches before dispatch, and makes semantic ALTER RPCs once
+even after lost replies or HTTP errors. SQL checks cover view blockers/cascades,
+raw names, transactions and reconnect. TYPE conversions and canonical generated
+column materialization explicitly reject: the pinned parser supplies a CAST even
+without USING, and this metadata-only reference does not convert rows. The
+reference does not claim physical generated values or production constraint,
+index and trigger closure. Nested native2 integration and expression rewriting
+remain open.
+
+The inventory stays at 84 methods. Its top-level schema hash is unchanged
+because these dependency records are embedded in binary payloads; their new
+required field still belongs to the unpublished breaking protocol transition.
+Exact EC2 checks and limits are recorded in `semantic_alter_checkpoint` in the
+Python manifest, with `alter-` log names. Next is the write-requirement and
+statement lifecycle contract, followed by trigger execution and durable replay.
+
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
 protocol transition, including the matching routing name and migration guide;

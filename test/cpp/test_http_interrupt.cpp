@@ -250,7 +250,9 @@ TEST_CASE("an unarmed POST still completes while the query is interrupted", "[ht
 
 TEST_CASE("protected unary HTTP mutations are not replayed after dispatch", "[http-no-replay]") {
 	for (const auto &method : {"catalog_query_prepare", "catalog_table_create", "catalog_table_constraints_apply",
-	                          "catalog_index_create", "catalog_index_drop"}) {
+	                          "catalog_index_create", "catalog_index_drop", "catalog_table_rename",
+	                          "catalog_table_column_rename", "catalog_table_column_type_change",
+	                          "catalog_table_column_drop"}) {
 		for (const auto mode : {SlowServer::Reply::ERROR, SlowServer::Reply::CODEC_ERROR, SlowServer::Reply::DROP}) {
 			SlowServer server(std::chrono::milliseconds(100), mode);
 			Fixture fixture;

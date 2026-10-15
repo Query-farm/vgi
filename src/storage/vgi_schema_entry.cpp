@@ -533,6 +533,20 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	auto &alter_table = info.Cast<AlterTableInfo>();
 	auto &schema_name = name;  // VgiSchemaEntry::name
 	auto &table_name = alter_table.name;
+	// The provider may commit a semantic change before its reply is lost.
+	// Retire table and affected view metadata before dispatch, so a failure
+	// cannot leave a stale definition available to a later statement.
+	DeferDrop(catalog, tables_.HarvestEntry(table_name));
+	switch (alter_table.alter_table_type) {
+	case AlterTableType::RENAME_TABLE:
+	case AlterTableType::RENAME_COLUMN:
+	case AlterTableType::REMOVE_COLUMN:
+	case AlterTableType::ALTER_COLUMN_TYPE:
+		DeferDrop(catalog, views_.HarvestEntries());
+		break;
+	default:
+		break;
+	}
 
 	switch (alter_table.alter_table_type) {
 	case AlterTableType::ADD_COLUMN: {
@@ -609,22 +623,6 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	default:
 		throw BinderException("ALTER TABLE %s is not supported for VGI catalogs",
 		                       EnumUtil::ToString(alter_table.alter_table_type));
-	}
-
-	// Invalidate the specific table entry to force re-fetch
-	DeferDrop(catalog, tables_.HarvestEntry(table_name));
-
-	// Structural changes (rename, drop/rename column, type change) can invalidate
-	// dependent views — clear view cache so stale definitions are re-fetched.
-	switch (alter_table.alter_table_type) {
-	case AlterTableType::RENAME_TABLE:
-	case AlterTableType::RENAME_COLUMN:
-	case AlterTableType::REMOVE_COLUMN:
-	case AlterTableType::ALTER_COLUMN_TYPE:
-		DeferDrop(catalog, views_.HarvestEntries());
-		break;
-	default:
-		break;
 	}
 }
 

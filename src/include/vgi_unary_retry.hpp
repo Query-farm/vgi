@@ -9,7 +9,9 @@ namespace vgi {
 inline bool RequiresSingleAttemptUnary(const std::string &method) {
 	return method == "catalog_query_prepare" || method == "catalog_table_create" ||
 	       method == "catalog_table_constraints_apply" || method == "catalog_index_create" ||
-	       method == "catalog_index_drop";
+	       method == "catalog_index_drop" || method == "catalog_table_rename" ||
+	       method == "catalog_table_column_rename" || method == "catalog_table_column_type_change" ||
+	       method == "catalog_table_column_drop";
 }
 } // namespace vgi
 } // namespace duckdb
