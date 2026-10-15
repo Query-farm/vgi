@@ -65,7 +65,7 @@ inline constexpr uint64_t WORKER_CACHE_TTL_SECONDS = 2592000ULL;
 inline constexpr uint64_t WORKER_PACKAGE_MAX_BYTES = 536870912ULL;
 inline constexpr uint64_t WORKER_PACKAGE_MAX_EXTRACTED_BYTES = 1073741824ULL;
 inline constexpr uint64_t WORKER_PACKAGE_MAX_FILES = 10000ULL;
-inline constexpr int64_t WORKER_POOL_IDLE_LIMIT_SECONDS = 5LL;
+inline constexpr int64_t WORKER_POOL_IDLE_LIMIT_SECONDS = 60LL;
 inline constexpr int64_t WORKER_POOL_MAX = 256LL;
 } // namespace defaults
 } // namespace vgi

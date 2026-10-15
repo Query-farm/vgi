@@ -105,6 +105,41 @@ true
 statement ok
 DROP TABLE pool_snapshot;
 
+# ============================================================================
+# A blended function called with literals (single-row scan mode) returns its
+# worker to the pool at end-of-stream instead of killing it.
+# ============================================================================
+
+statement ok
+SELECT flushed FROM vgi_worker_pool_flush();
+
+query I
+SELECT geohash FROM ex.geo_encode(52.0, 13.0);
+----
+52.0:13.0
+
+statement ok
+CREATE TEMP TABLE literal_snapshot AS SELECT * FROM vgi_worker_pool();
+
+query I
+SELECT geohash FROM ex.geo_encode(1.0, 2.0);
+----
+1.0:2.0
+
+# Every worker the second call used came from, and went back to, the pool.
+query I
+SELECT COUNT(*) FROM vgi_worker_pool() p ANTI JOIN literal_snapshot s ON p.pid = s.pid;
+----
+0
+
+query I
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
+----
+true
+
+statement ok
+DROP TABLE literal_snapshot;
+
 # Flush and verify pool is empty
 query I
 SELECT flushed >= 1 FROM vgi_worker_pool_flush();

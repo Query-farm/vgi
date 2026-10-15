@@ -855,20 +855,30 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		//    return a 0-row chunk (SetCardinality(0)) only on nullptr (true EOS).
 		while (true) {
 			std::shared_ptr<arrow::RecordBatch> output_batch;
+			bool worker_exited = false;
 			try {
 				output_batch = conn.ReadDataBatch();
 			} catch (const IOException &) {
 				// Worker may exit right after input EOS (e.g. empty 1->0). Treat as
 				// clean end-of-stream, mirroring the scalar path's post-close read.
 				output_batch = nullptr;
+				worker_exited = true;
 			}
 			if (!output_batch) {
 				output.SetCardinality(0);
-				// Cancel-not-pool: the "no-finalize in-out worker returns to a clean
-				// accept-loop after input-EOS" transition is unproven for scan-mode,
-				// so drop the connection instead of pooling it.
 				if (parallel) {
-					local_state.connection.reset();
+					// Input was closed in step 2 and the output is now read to EOS, so a
+					// no-finalize worker is back at its accept loop: pool it, as the
+					// column-shape EOS below and the batched-lateral operator do. This
+					// used to drop the connection, which cost every literal call
+					// (`f('x')`) a fresh worker spawn. A finalize function still owes
+					// the worker its FINALIZE handshake, and a worker that broke the
+					// stream is never pooled.
+					if (!bind_data.has_finalize && !worker_exited) {
+						ReleaseSubstreamConnection(local_state.connection, bind_data, client_context);
+					} else {
+						local_state.connection.reset();
+					}
 				} else {
 					global_state.stream_finished = true;
 				}
