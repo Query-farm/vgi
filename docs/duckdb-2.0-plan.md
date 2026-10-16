@@ -25,8 +25,9 @@ general statement ticket/receipt framework is included. Audit the existing
 begin/commit/rollback, init/exchange/finalize and OLD/NEW paths against concrete
 DuckDB2 execution needs; add protocol fields only for demonstrated gaps. This
 supersedes the corresponding October 14 design proposals below, not completed
-runtime work. Failed writes use whole-transaction rollback/invalidation; an
-ambiguous mutation response remains an error without automatic retry.
+runtime work. Failed writes use whole-transaction rollback/invalidation.
+Non-idempotent mutations are not automatically retried after ambiguous dispatch;
+commit/rollback retain their existing transaction-ID-based idempotency contract.
 
 Prepare **one broad, coordinated protocol release** for the catalog and
 execution capabilities we intend to support in DuckDB 2.0, while continuing to
@@ -1055,12 +1056,12 @@ The concrete remaining work is smaller:
 | FinalizeWriteConnection treats every nonempty final output batch as a count | Make final result handling match the selected count/rows/changes mode; prove zero-row and multiple-batch behavior. | Use existing init/finalize and output schemas. |
 | Pre-FINALIZE raw INPUT drain discards batch metadata and tolerates some non-Iroh read failures | Reproduce a provider returning a response then raising, missing responses and premature EOS. If errors are lost, surface them through the existing error/rollback path. | Source-identified candidate in `src/vgi_function_connection.cpp:1007`, not yet reproduced; no new error protocol. |
 | Multiple-DML CTE support is an explicit engine opt-in, absent in VGI | Keep disabled until two writes and failure/RETURNING behavior share the current provider transaction correctly. | Adapter capability/qualification, not a coordinator. |
-| Transaction begin/commit/rollback still use generic retry-capable RPC dispatch | Include them in the existing single-attempt policy and prove dispatch count after transport failure. | No new fields or recovery endpoints. |
+| Commit/rollback already carry the transaction identifier and have an idempotency contract | Preserve existing retry semantics; test that repeats cannot apply effects twice and retain normal provider results/errors. BEGIN returns a new identifier, so review its allocation/cleanup behavior separately before changing retry policy. | Corrects the earlier blanket single-attempt recommendation; no new fields or recovery endpoints. |
 | Commit/rollback exceptions can skip erasing the native transaction entry | Make local cleanup exception-safe and verify provider behavior after a definite refusal; preserve unknown outcome after ambiguous commit. | Local bookkeeping/error handling, not recovery machinery. |
 | Signed HTTP writable fixture reads the sealed transaction token directly into the transactor | Reproduce begin/write/commit through signed HTTP; verify authenticated unwrapping at the provider boundary without replacing sealed wire/storage state. | Existing token plumbing; source-identified candidate, not yet reproduced. |
 
 The first implementation checkpoint should address current 1.5-compatible
-transaction dispatch/cleanup and focused finalization/failure tests. Native2 trigger hooks
+transaction cleanup, duplicate-completion and focused finalization/failure tests. Native2 trigger hooks
 and OLD/NEW bridging follow in their engine lane. The generic transactor's SQL
 per input batch does not itself implement whole-statement backend triggers;
 start with engine-owned execution and reject unqualified backend-owned forms.
@@ -1082,8 +1083,10 @@ Focused qualification, using the existing wire contract:
    columns, identical input rows, zero rows and multiple batches.
 5. PREPARE before trigger creation/change, then EXECUTE; verify rebind and current
    transaction-visible definitions. Confirm no double firing for execution owners.
-6. Definite commit/rollback errors leave no native bookkeeping entry; ambiguous
-   transport failures issue one request and do not claim rollback succeeded.
+6. Definite commit/rollback errors leave no native bookkeeping entry; retries
+   reuse the same transaction identifier without repeating effects. A duplicate
+   error does not prove whether an earlier commit succeeded. BEGIN allocation
+   and abandoned-transaction cleanup need separate retry review.
 7. Signed HTTP begin/write/commit/rollback uses the authenticated provider
    transaction correctly; wrong-attachment tokens reject.
 
@@ -1249,7 +1252,7 @@ means work before the shared freeze, rather than an automatic later release.
 | Constraints and indexes | Constraint addition and supported mutation/discovery; full native integration of existing index RPCs; typed index options if string values are insufficient | Worker enforcement versus metadata-only declaration, existing-data validation, logical column identity, FK target paths, dependent objects, and atomic changes. Do not promise SQL constraint forms the selected engine itself rejects. |
 | Macros — concrete contract and reference implemented; adapters pending | Overload collections, declared parameter types, expression/default representation, documentation, and owner-relative definitions | Reconcile the existing single-definition request and typed-value defaults with engine overloads and expression defaults. Define resolution and stable round trips; do not introduce a function overload handle just to mirror DuckDB internals. |
 | Dependencies and catalog consistency | Shared qualified object references; explicit ownership/drop/alter dependency semantics; mutation visibility and metadata-version rules | Settle worker versus engine authority, RESTRICT/CASCADE, rename effects, transaction-local reads, committed versions/etags, and retained entries. Include dependency records where enforcement across clients requires them; no DuckDB pointers or OIDs on the wire. |
-| Transactions and write execution | Reuse existing transaction handles, begin/commit/rollback, write init/exchange/finalize and OLD/NEW results; audit concrete DuckDB2 gaps before adding wire fields | Keep supported DDL, DML and trigger effects in the existing provider transaction; failed writes cannot partially commit. No savepoints, durable replay/status service or general statement ticket/receipt framework in this package. Ambiguous dispatch remains an error without automatic retry. |
+| Transactions and write execution | Reuse existing transaction handles, begin/commit/rollback, write init/exchange/finalize and OLD/NEW results; audit concrete DuckDB2 gaps before adding wire fields | Keep supported DDL, DML and trigger effects in the existing provider transaction; failed writes cannot partially commit. No savepoints, durable replay/status service or general statement ticket/receipt framework in this package. No automatic retry of non-idempotent mutations after ambiguous dispatch; commit/rollback retain existing transaction-ID-based idempotency. |
 | Triggers — contract specified; reference pending | Table-owned identity, list/get/create/drop and metadata mutation, event/timing/granularity, UPDATE OF, transition aliases, action definition, dependencies, and execution mode | Prefer worker authority for persistent definitions. Distinguish engine-executed from backend-executed triggers so they cannot fire twice. Define SQL dialect, ordering, supported row/statement forms, OLD/NEW requirements, rollback, detach/reconnect, and cross-client discovery. |
 | Catalog query execution — explicit 1.5 adapter implemented; automatic pending | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
 | Logical type preservation — concrete contract and codecs implemented; adapters pending | Recursive VGI TUPLE annotation and canonical Arrow Parquet Variant capability with unshredded metadata/value storage | Qualify canonical Variant semantics, missing versus NULL and SDK byte/metadata preservation at each engine pin. Original DuckDB integer width/signedness and its full type domain are not promised; unsupported mappings reject. Reject opaque aggregate-state layouts without a portable contract. |
