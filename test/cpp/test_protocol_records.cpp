@@ -148,6 +148,21 @@ TEST_CASE("Records round-trip through ToBatch/FromBatch", "[protocol-records]") 
 	}
 }
 
+TEST_CASE("FunctionType accepts the spellings peers send", "[protocol-records]") {
+	// vgi-go, vgi-rust and vgi-java send function_type in lower case; table_in_out is the
+	// legacy name of TABLE. Encoding always writes the canonical name.
+	CHECK(FunctionTypeFromWire("TABLE") == FunctionType::Table);
+	CHECK(FunctionTypeFromWire("table") == FunctionType::Table);
+	CHECK(FunctionTypeFromWire("table_in_out") == FunctionType::Table);
+	CHECK(FunctionTypeFromWire("scalar") == FunctionType::Scalar);
+	CHECK(FunctionTypeFromWire("table_buffering") == FunctionType::TableBuffering);
+	CHECK(FunctionTypeFromWire("aggregate") == FunctionType::Aggregate);
+	CHECK(!FunctionTypeFromWire("Table").has_value());
+	CHECK(std::string(ToWire(FunctionType::Table)) == "TABLE");
+	// Other enums keep their canonical spelling only.
+	CHECK(!VgiInitPhaseFromWire("input").has_value());
+}
+
 TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 	SchemaInfo info;
 	info.path = {"main"};

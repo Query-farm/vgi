@@ -2,6 +2,7 @@
 #include "vgi_schema_registry.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "generated/vgi_protocol_records.hpp"
 #include "generated/vgi_protocol_schemas.hpp"
 
 #include <sstream>
@@ -23,139 +24,57 @@ using namespace generated;
 // ============================================================================
 // Registry
 // ============================================================================
+//
+// Every VgiProtocol method's request schema, and its result schema when the
+// result is a record, come from the generated method table
+// (generated::AllMethodSchemas()). Only the policy below is hand-written: which
+// methods return `{items: List<Binary>}` and what each item is, which return raw
+// bytes of a known record, and which are genuinely dynamic (and why).
 
 struct DynamicMethod {
 	const char *name;
 	const char *reason;
 };
 
+struct ItemsMethod {
+	const char *name;
+	const std::shared_ptr<arrow::Schema> &(*item)();
+};
+
+struct BlobMethod {
+	const char *name;
+	const std::shared_ptr<arrow::Schema> &(*result)();
+};
+
 const std::unordered_map<std::string, ResponseSchema> &Registry() {
 	// Meyers singleton: thread-safe static init, no heap, no destructor ordering.
 	static const std::unordered_map<std::string, ResponseSchema> kRegistry = []() {
-		std::unordered_map<std::string, ResponseSchema> m;
-
-		// --- List-of-binary responses with per-item inner schemas ---------
-		// All catalog discovery methods wrap IPC-serialized info batches in
-		// {items: List<Binary>}. Outer + inner schemas generated from the
-		// vgi-python Protocol; see src/generated/vgi_protocol_schemas.hpp.
-		struct ItemsMethod {
-			const char *name;
-			const std::shared_ptr<arrow::Schema> &(*outer)();
-			const std::shared_ptr<arrow::Schema> &(*item)();
+		// Catalog discovery wraps IPC-serialized info batches in {items: List<Binary>}.
+		static const ItemsMethod kItemsResponses[] = {
+		    {"catalog_catalogs", &CatalogInfoSchema},
+		    {"catalog_schemas", &SchemaInfoSchema},
+		    {"catalog_schema_get", &SchemaInfoSchema},
+		    {"catalog_schema_contents_tables", &TableInfoSchema},
+		    {"catalog_schema_contents_views", &ViewInfoSchema},
+		    {"catalog_schema_contents_functions", &FunctionInfoSchema},
+		    {"catalog_schema_contents_macros", &MacroInfoSchema},
+		    {"catalog_copy_from_formats", &CopyFromFormatInfoSchema},
+		    {"catalog_schema_contents_indexes", &IndexInfoSchema},
+		    {"catalog_table_get", &TableInfoSchema},
+		    {"catalog_view_get", &ViewInfoSchema},
+		    {"catalog_macro_get", &MacroInfoSchema},
+		    {"catalog_index_get", &IndexInfoSchema},
 		};
-		const ItemsMethod kItemsResponses[] = {
-		    {"catalog_catalogs", &CatalogCatalogsResultSchema, &CatalogInfoSchema},
-		    {"catalog_schemas", &CatalogSchemasResultSchema, &SchemaInfoSchema},
-		    {"catalog_schema_get", &CatalogSchemaGetResultSchema, &SchemaInfoSchema},
-		    {"catalog_schema_contents_tables", &CatalogSchemaContentsTablesResultSchema, &TableInfoSchema},
-		    {"catalog_schema_contents_views", &CatalogSchemaContentsViewsResultSchema, &ViewInfoSchema},
-		    {"catalog_schema_contents_functions", &CatalogSchemaContentsFunctionsResultSchema,
-		     &FunctionInfoSchema},
-		    {"catalog_schema_contents_macros", &CatalogSchemaContentsMacrosResultSchema, &MacroInfoSchema},
-		    {"catalog_copy_from_formats", &CatalogCopyFromFormatsResultSchema, &CopyFromFormatInfoSchema},
-		    {"catalog_schema_contents_indexes", &CatalogSchemaContentsIndexesResultSchema, &IndexInfoSchema},
-		    {"catalog_table_get", &CatalogTableGetResultSchema, &TableInfoSchema},
-		    {"catalog_view_get", &CatalogViewGetResultSchema, &ViewInfoSchema},
-		    {"catalog_macro_get", &CatalogMacroGetResultSchema, &MacroInfoSchema},
-		    {"catalog_index_get", &CatalogIndexGetResultSchema, &IndexInfoSchema},
+		// Methods typed `bytes` in the Protocol whose bytes are a known record.
+		static const BlobMethod kBlobResponses[] = {
+		    {"catalog_table_scan_function_get", &ScanFunctionResultSchema},
+		    {"catalog_table_insert_function_get", &ScanFunctionResultSchema},
+		    {"catalog_table_update_function_get", &ScanFunctionResultSchema},
+		    {"catalog_table_delete_function_get", &ScanFunctionResultSchema},
+		    {"catalog_table_scan_branches_get", &ScanBranchesResultSchema},
 		};
-		for (const auto &e : kItemsResponses) {
-			m[e.name] = ResponseSchema{e.outer(), e.item(), false, nullptr};
-		}
-
-		// --- Void responses -----------------------------------------------
-		// Mutation methods return None; a non-empty batch is a protocol violation.
-		const char *kVoidResponses[] = {
-		    "catalog_detach",
-		    "catalog_create",
-		    "catalog_drop",
-		    "catalog_transaction_commit",
-		    "catalog_transaction_rollback",
-		    "catalog_schema_create",
-		    "catalog_schema_drop",
-		    "catalog_table_create",
-		    "catalog_table_drop",
-		    "catalog_table_rename",
-		    "catalog_table_comment_set",
-		    "catalog_table_column_comment_set",
-		    "catalog_table_column_add",
-		    "catalog_table_column_drop",
-		    "catalog_table_column_rename",
-		    "catalog_table_column_default_set",
-		    "catalog_table_column_default_drop",
-		    "catalog_table_column_type_change",
-		    "catalog_table_not_null_set",
-		    "catalog_table_not_null_drop",
-		    "catalog_view_create",
-		    "catalog_view_drop",
-		    "catalog_view_rename",
-		    "catalog_view_comment_set",
-		    "catalog_macro_create",
-		    "catalog_macro_drop",
-		    "catalog_index_create",
-		    "catalog_index_drop",
-		};
-		for (const char *name : kVoidResponses) {
-			m[name] = ResponseSchema{nullptr, nullptr, false, nullptr};
-		}
-
-		// --- Strictly-typed single-struct responses -----------------------
-		m["catalog_attach"] = ResponseSchema{CatalogAttachResultSchema(), nullptr, false, nullptr};
-		m["catalog_version"] = ResponseSchema{CatalogVersionResultSchema(), nullptr, false, nullptr};
-		// Typed result; `schemas` is list<struct<SchemaContents>> (validated as
-		// part of the result schema), whose binary fields are per-kind items.
-		m["catalog_contents"] = ResponseSchema{CatalogContentsResultSchema(), nullptr, false, nullptr};
-		m["catalog_transaction_begin"] =
-		    ResponseSchema{CatalogTransactionBeginResultSchema(), nullptr, false, nullptr};
-		m["table_function_cardinality"] =
-		    ResponseSchema{TableFunctionCardinalityResultSchema(), nullptr, false, nullptr};
-		m["table_function_plan"] = ResponseSchema{TableFunctionPlanResultSchema(), nullptr, false, nullptr};
-		m["table_function_dynamic_to_string"] =
-		    ResponseSchema{TableFunctionDynamicToStringResultSchema(), nullptr, false, nullptr};
-		m["bind"] = ResponseSchema{BindResultSchema(), nullptr, false, nullptr};
-		m["aggregate_bind"] = ResponseSchema{AggregateBindResultSchema(), nullptr, false, nullptr};
-		m["aggregate_finalize"] = ResponseSchema{AggregateFinalizeResultSchema(), nullptr, false, nullptr};
-		m["table_buffering_process"] =
-		    ResponseSchema{TableBufferingProcessResultSchema(), nullptr, false, nullptr};
-		m["table_buffering_combine"] =
-		    ResponseSchema{TableBufferingCombineResultSchema(), nullptr, false, nullptr};
-		m["aggregate_window"] = ResponseSchema{AggregateWindowResultSchema(), nullptr, false, nullptr};
-		m["aggregate_window_batch"] =
-		    ResponseSchema{AggregateWindowBatchResultSchema(), nullptr, false, nullptr};
-		m["aggregate_streaming_open"] =
-		    ResponseSchema{AggregateStreamingOpenResultSchema(), nullptr, false, nullptr};
-		m["aggregate_streaming_chunk"] =
-		    ResponseSchema{AggregateStreamingChunkResultSchema(), nullptr, false, nullptr};
-		m["catalog_table_scan_function_get"] =
-		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
-		m["catalog_table_scan_branches_get"] =
-		    ResponseSchema{ScanBranchesResultSchema(), nullptr, false, nullptr};
-		m["catalog_table_insert_function_get"] =
-		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
-		m["catalog_table_update_function_get"] =
-		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
-		m["catalog_table_delete_function_get"] =
-		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
-
-		// --- Zero-field ("empty struct") ack responses --------------------
-		// These are concrete 0-column batches on the wire, distinct from void.
-		m["aggregate_update"] = ResponseSchema{AggregateUpdateResultSchema(), nullptr, false, nullptr};
-		m["aggregate_combine"] = ResponseSchema{AggregateCombineResultSchema(), nullptr, false, nullptr};
-		m["aggregate_destructor"] =
-		    ResponseSchema{AggregateDestructorResultSchema(), nullptr, false, nullptr};
-		m["table_buffering_destructor"] =
-		    ResponseSchema{TableBufferingDestructorResultSchema(), nullptr, false, nullptr};
-		m["aggregate_window_init"] =
-		    ResponseSchema{AggregateWindowInitResultSchema(), nullptr, false, nullptr};
-		m["aggregate_window_destructor"] =
-		    ResponseSchema{AggregateWindowDestructorResultSchema(), nullptr, false, nullptr};
-		m["aggregate_streaming_close"] =
-		    ResponseSchema{AggregateStreamingCloseResultSchema(), nullptr, false, nullptr};
-
-		// --- Dynamic / genuinely per-call responses -----------------------
-		// Only methods whose response shape is not expressible as a single
-		// fixed Arrow schema belong here.
-		const DynamicMethod kDynamicResponses[] = {
+		// Only methods whose response shape is not a single fixed Arrow schema.
+		static const DynamicMethod kDynamicResponses[] = {
 		    {"catalog_table_column_statistics_get",
 		     "raw IPC sparse-union min/max batch; schema varies per column type"},
 		    {"table_function_statistics",
@@ -164,99 +83,51 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		     "stream method; response framed as a stream header plus data frames, "
 		     "not a single unary result batch"},
 		};
-		for (const auto &entry : kDynamicResponses) {
-			m[entry.name] = ResponseSchema{nullptr, nullptr, true, entry.reason};
-		}
 
-		// --- Per-method request schemas -----------------------------------
-		// Every method in the registry also has an outgoing request-schema
-		// contract generated from the Protocol. Attaching it to the existing
-		// entry keeps validation symmetric (ValidateRequestSchema uses this).
-		struct RequestSchemaEntry {
-			const char *name;
-			const std::shared_ptr<arrow::Schema> &(*request)();
+		std::unordered_map<std::string, ResponseSchema> m;
+		for (const auto &method : AllMethodSchemas()) {
+			ResponseSchema entry;
+			entry.request_schema = method.params;
+			if (method.result) {
+				// Strictly-typed record, including zero-field acks (a concrete 0-column
+				// batch, distinct from void).
+				entry.schema = method.result;
+			} else if (method.returns_value) {
+				entry.dynamic = true; // classified below
+			}
+			// else: void — the method returns None; a non-empty batch is a violation.
+			m.emplace(method.method, std::move(entry));
+		}
+		auto classify = [&](const char *name) -> ResponseSchema & {
+			auto it = m.find(name);
+			if (it == m.end()) {
+				throw InternalException("VGI schema registry: '%s' is not a VgiProtocol method", name);
+			}
+			return it->second;
 		};
-		const RequestSchemaEntry kRequestSchemas[] = {
-		    {"catalog_catalogs", &CatalogCatalogsParamsSchema},
-		    {"catalog_attach", &CatalogAttachParamsSchema},
-		    {"catalog_detach", &CatalogDetachParamsSchema},
-		    {"catalog_create", &CatalogCreateParamsSchema},
-		    {"catalog_drop", &CatalogDropParamsSchema},
-		    {"catalog_version", &CatalogVersionParamsSchema},
-		    {"catalog_transaction_begin", &CatalogTransactionBeginParamsSchema},
-		    {"catalog_transaction_commit", &CatalogTransactionCommitParamsSchema},
-		    {"catalog_transaction_rollback", &CatalogTransactionRollbackParamsSchema},
-		    {"catalog_schemas", &CatalogSchemasParamsSchema},
-		    {"catalog_contents", &CatalogContentsParamsSchema},
-		    {"catalog_schema_get", &CatalogSchemaGetParamsSchema},
-		    {"catalog_schema_create", &CatalogSchemaCreateParamsSchema},
-		    {"catalog_schema_drop", &CatalogSchemaDropParamsSchema},
-		    {"catalog_schema_contents_tables", &CatalogSchemaContentsTablesParamsSchema},
-		    {"catalog_schema_contents_views", &CatalogSchemaContentsViewsParamsSchema},
-		    {"catalog_schema_contents_functions", &CatalogSchemaContentsFunctionsParamsSchema},
-		    {"catalog_schema_contents_macros", &CatalogSchemaContentsMacrosParamsSchema},
-		    {"catalog_copy_from_formats", &CatalogCopyFromFormatsParamsSchema},
-		    {"catalog_schema_contents_indexes", &CatalogSchemaContentsIndexesParamsSchema},
-		    {"catalog_table_get", &CatalogTableGetParamsSchema},
-		    {"catalog_table_create", &CatalogTableCreateParamsSchema},
-		    {"catalog_table_drop", &CatalogTableDropParamsSchema},
-		    {"catalog_table_rename", &CatalogTableRenameParamsSchema},
-		    {"catalog_table_scan_function_get", &CatalogTableScanFunctionGetParamsSchema},
-		    {"catalog_table_scan_branches_get", &CatalogTableScanBranchesGetParamsSchema},
-		    {"catalog_table_insert_function_get", &CatalogTableInsertFunctionGetParamsSchema},
-		    {"catalog_table_update_function_get", &CatalogTableUpdateFunctionGetParamsSchema},
-		    {"catalog_table_delete_function_get", &CatalogTableDeleteFunctionGetParamsSchema},
-		    {"catalog_table_column_statistics_get", &CatalogTableColumnStatisticsGetParamsSchema},
-		    {"catalog_table_comment_set", &CatalogTableCommentSetParamsSchema},
-		    {"catalog_table_column_comment_set", &CatalogTableColumnCommentSetParamsSchema},
-		    {"catalog_table_column_add", &CatalogTableColumnAddParamsSchema},
-		    {"catalog_table_column_drop", &CatalogTableColumnDropParamsSchema},
-		    {"catalog_table_column_rename", &CatalogTableColumnRenameParamsSchema},
-		    {"catalog_table_column_default_set", &CatalogTableColumnDefaultSetParamsSchema},
-		    {"catalog_table_column_default_drop", &CatalogTableColumnDefaultDropParamsSchema},
-		    {"catalog_table_column_type_change", &CatalogTableColumnTypeChangeParamsSchema},
-		    {"catalog_table_not_null_set", &CatalogTableNotNullSetParamsSchema},
-		    {"catalog_table_not_null_drop", &CatalogTableNotNullDropParamsSchema},
-		    {"catalog_view_get", &CatalogViewGetParamsSchema},
-		    {"catalog_view_create", &CatalogViewCreateParamsSchema},
-		    {"catalog_view_drop", &CatalogViewDropParamsSchema},
-		    {"catalog_view_rename", &CatalogViewRenameParamsSchema},
-		    {"catalog_view_comment_set", &CatalogViewCommentSetParamsSchema},
-		    {"catalog_macro_get", &CatalogMacroGetParamsSchema},
-		    {"catalog_macro_create", &CatalogMacroCreateParamsSchema},
-		    {"catalog_macro_drop", &CatalogMacroDropParamsSchema},
-		    {"catalog_index_get", &CatalogIndexGetParamsSchema},
-		    {"catalog_index_create", &CatalogIndexCreateParamsSchema},
-		    {"catalog_index_drop", &CatalogIndexDropParamsSchema},
-		    {"bind", &BindParamsSchema},
-		    {"init", &InitParamsSchema},
-		    {"table_function_cardinality", &TableFunctionCardinalityParamsSchema},
-		    {"table_function_plan", &TableFunctionPlanParamsSchema},
-		    {"table_function_dynamic_to_string", &TableFunctionDynamicToStringParamsSchema},
-		    {"table_function_statistics", &TableFunctionStatisticsParamsSchema},
-		    {"aggregate_bind", &AggregateBindParamsSchema},
-		    {"aggregate_update", &AggregateUpdateParamsSchema},
-		    {"aggregate_combine", &AggregateCombineParamsSchema},
-		    {"aggregate_finalize", &AggregateFinalizeParamsSchema},
-		    {"aggregate_destructor", &AggregateDestructorParamsSchema},
-		    {"aggregate_window_init", &AggregateWindowInitParamsSchema},
-		    {"aggregate_window", &AggregateWindowParamsSchema},
-		    {"aggregate_window_destructor", &AggregateWindowDestructorParamsSchema},
-		    {"aggregate_window_batch", &AggregateWindowBatchParamsSchema},
-		    {"aggregate_streaming_open", &AggregateStreamingOpenParamsSchema},
-		    {"aggregate_streaming_chunk", &AggregateStreamingChunkParamsSchema},
-		    {"aggregate_streaming_close", &AggregateStreamingCloseParamsSchema},
-		    {"table_buffering_process", &TableBufferingProcessParamsSchema},
-		    {"table_buffering_combine", &TableBufferingCombineParamsSchema},
-		    {"table_buffering_destructor", &TableBufferingDestructorParamsSchema},
-		};
-		for (const auto &e : kRequestSchemas) {
-			auto it = m.find(e.name);
-			if (it != m.end()) {
-				it->second.request_schema = e.request();
+		for (const auto &e : kItemsResponses) {
+			auto &entry = classify(e.name);
+			entry.item_schema = e.item();
+			entry.dynamic = false;
+		}
+		for (const auto &e : kBlobResponses) {
+			auto &entry = classify(e.name);
+			entry.schema = e.result();
+			entry.dynamic = false;
+		}
+		for (const auto &e : kDynamicResponses) {
+			auto &entry = classify(e.name);
+			entry.schema = nullptr;
+			entry.dynamic = true;
+			entry.dynamic_reason = e.reason;
+		}
+		for (const auto &entry : m) {
+			if (entry.second.dynamic && !entry.second.dynamic_reason) {
+				throw InternalException("VGI schema registry: method '%s' returns bytes but is not classified as "
+				                        "a known record or dynamic in vgi_schema_registry.cpp",
+				                        entry.first);
 			}
 		}
-
 		return m;
 	}();
 	return kRegistry;

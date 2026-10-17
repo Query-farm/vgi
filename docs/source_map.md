@@ -9,7 +9,9 @@
 |------|---------|
 | `vgi_extension.cpp` | Extension entry point, settings registration, SIGPIPE setup |
 | `vgi_rpc_client.cpp` | RPC wire protocol: request writing, response reading, batch classification |
-| `vgi_rpc_types.cpp` | RPC type definitions |
+| `vgi_rpc_types.cpp` | IPC (de)serialization helpers, `UnwrapResultEnvelope` (the unary `{result: binary}` envelope), and the inner request builders / response parsers over the generated records |
+| `vgi_wire_codec.cpp` | Runtime for the generated protocol-record codecs (`generated/vgi_protocol_records.cpp`): by-name strict decoding, column building from the declared Arrow type. The only code that touches Arrow arrays for protocol records |
+| `vgi_schema_registry.cpp` | Request/response schema validation, built from the generated `AllMethodSchemas()` table plus hand-written policy (items, known-record blobs, dynamic methods) |
 | `vgi_http_params.cpp` | `HTTPParams` construction for VGI's HTTP requests. `InitSecretFreeHttpParams` (pre-signed GET/PUT: session HTTP settings, no secret lookup) and `InitHttpParamsWithSecrets`, which throws inside `VgiTransaction::Start` (`TransactionStartScope`) rather than self-deadlocking on the MetaTransaction mutex (duckdb#22258) |
 | `vgi_catalog_api.cpp` | Catalog RPC dispatchers, response parsers, type conversion |
 | `vgi_function_connection.cpp` | `FunctionConnection` class, `AcquireAndBindConnection()`. `ReadDataBatch` resolves **externalized batches** (0-row `vgi_rpc.location` pointer → `ResolveExternalLocation` HTTP fetch + splice) on the **subprocess** path too, not just HTTP — a subprocess worker that externalizes a large batch is transparently resolved (transport-independent via DuckDB `HTTPUtil`) |

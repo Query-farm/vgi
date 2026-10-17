@@ -180,6 +180,19 @@ uv run --project ~/Development/vgi-python python \
 Use that script, not `python -m vgi.codegen.X > dest`: the shell truncates the destination before
 the generator runs, so a failing generator silently destroys the file. `--check` reports drift.
 vgi-python's `tests/test_generated_cpp_*.py` fail CI if checked-in headers diverge.
+`VGI_EXTENSION_ROOT=<checkout>` points the script at a checkout other than `~/Development/vgi`.
+
+**Protocol records are typed structs, not hand-parsed batches.** `vgi_protocol_records.hpp` has
+one struct per record and one `enum class` per protocol enum (Arrow only forward-declared);
+`vgi_protocol_records.cpp` has `ToBatch(record)` / `generated::Decode<T>(batch, row, worker)`
+plus `AllMethodSchemas()`, the per-method schema table the schema registry is built from. The
+codecs call the runtime in `vgi_wire_codec.{hpp,cpp}` — the only code that touches Arrow arrays
+for protocol records. Decoding is by column name: a missing nullable column is absent; a missing
+or null required column, a wrongly typed column, an unknown enum value or a repeated map key is a
+protocol error. Use `DecodeIpcRecord<T>` / `SerializeRecord` for records carried as IPC blobs and
+`UnwrapResultEnvelope` for a unary `{result: binary}` response — never read a protocol column by
+hand. Deliberately hand-written: the zero-copy plan-page and `catalog_contents` decoders, and the
+attach-ticket / Identity / Reflection protocols.
 
 Requests are routed on **(protocol, method)**: `vgi_rpc.protocol` is required on raw transports
 and projected into the URL (`{base}/{protocol}/{method}`) over HTTP. Reserved methods
@@ -206,7 +219,7 @@ dereference it.
 `vgi_attach_parameters.hpp` (Arrow-free) ⊂ `vgi_catalog_metadata.hpp` (Arrow forward-declared)
 ⊂ `vgi_catalog_rpc.hpp` (Arrow IPC; only for `.cpp` files that issue catalog RPCs).
 
-Legitimate Arrow carriers (don't try to make them Arrow-free): `vgi_rpc_types.hpp`,
+Legitimate Arrow carriers (don't try to make them Arrow-free): `vgi_wire_codec.hpp`, `vgi_rpc_types.hpp`,
 `vgi_arrow_utils.hpp`, `vgi_arrow_ipc.hpp`, `vgi_function_connection.hpp`, `vgi_catalog_rpc.hpp`.
 
 `python3 scripts/header_reach.py` prints per-header TU reach; `--check` enforces the denylist on
