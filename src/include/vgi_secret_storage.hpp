@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -153,7 +155,7 @@ private:
 	std::unique_ptr<const KeyValueSecret> Synthesize(ClientContext &context, const string &type,
 	                                                 const std::string &provider, const std::string &name,
 	                                                 const std::vector<std::string> &scope,
-	                                                 const std::shared_ptr<arrow::RecordBatch> &values_batch,
+	                                                 const VgiBatchPtr &values_batch,
 	                                                 const std::vector<std::string> &redact_keys);
 
 	DatabaseInstance &db_;

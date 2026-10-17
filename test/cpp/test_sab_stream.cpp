@@ -10,8 +10,8 @@
 #include "vgi_sab_abi.hpp"
 #include "vgi_sab_stream.hpp"
 
-#include <arrow/api.h>
-#include <arrow/ipc/api.h>
+#include "vgi_arrow.hpp"
+#include "vgi_ipc.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -64,41 +64,38 @@ TEST_CASE("SabInput/OutputStream round-trip an Arrow IPC stream over the ring", 
 	});
 
 	// Build a tiny batch: one int64 column [10, 20, 30].
-	arrow::Int64Builder ib;
-	REQUIRE(ib.AppendValues({10, 20, 30}).ok());
-	std::shared_ptr<arrow::Array> arr;
-	REQUIRE(ib.Finish(&arr).ok());
-	auto schema = arrow::schema({arrow::field("v", arrow::int64())});
-	auto batch = arrow::RecordBatch::Make(schema, 3, {arr});
+	using namespace duckdb::vgi;
+	VgiBatchBuilder ib(MakeSchema({type::Int64().Named("v")}));
+	for (int64_t v : {10, 20, 30}) {
+		append::Int(ib.column(0), v);
+		ib.FinishRow();
+	}
+	auto batch = ib.Finish();
+	auto schema = batch->schema();
 
 	// Write it as an IPC stream to c2w (SabOutputStream), then EOS marker + ring EOF.
 	{
 		auto out = std::make_shared<SabOutputStream>(region, slot);
-		auto writer_res = arrow::ipc::MakeStreamWriter(out, schema);
-		REQUIRE(writer_res.ok());
-		auto writer = *writer_res;
-		REQUIRE(writer->WriteRecordBatch(*batch).ok());
-		REQUIRE(writer->Close().ok());
+		auto writer = VgiIpcWriter::Open(out, schema);
+		REQUIRE_NOTHROW(writer->Write(*batch));
+		REQUIRE_NOTHROW(writer->Close());
 	}
 	vgi_wasm_slot_write_eos(region, slot);
 
 	// Read it back from w2c (SabInputStream) and verify byte-for-byte.
 	auto in = std::make_shared<SabInputStream>(region, slot);
-	auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(in);
-	REQUIRE(reader_res.ok());
-	auto reader = *reader_res;
+	auto reader = VgiIpcReader::Open(in);
 
-	std::shared_ptr<arrow::RecordBatch> got;
-	REQUIRE(reader->ReadNext(&got).ok());
+	auto got = reader->ReadNext();
 	REQUIRE(got != nullptr);
 	CHECK(got->num_rows() == 3);
-	auto col = std::static_pointer_cast<arrow::Int64Array>(got->column(0));
-	CHECK(col->Value(0) == 10);
-	CHECK(col->Value(1) == 20);
-	CHECK(col->Value(2) == 30);
+	auto col = got->column(0);
+	CHECK(col.GetInt(0) == 10);
+	CHECK(col.GetInt(1) == 20);
+	CHECK(col.GetInt(2) == 30);
 
 	// Next read is EOS (null batch).
-	REQUIRE(reader->ReadNext(&got).ok());
+	got = reader->ReadNext();
 	CHECK(got == nullptr);
 
 	worker.join();

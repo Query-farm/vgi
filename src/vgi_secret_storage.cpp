@@ -4,8 +4,6 @@
 
 #include <algorithm>
 
-#include <arrow/api.h>
-
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -302,7 +300,7 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 			auto provider = wire.provider.empty() ? std::string("orchard") : std::move(wire.provider);
 			// `values` is the one-row RecordBatch (IPC bytes) of typed key→value
 			// columns; absent when the worker shipped no values.
-			std::shared_ptr<arrow::RecordBatch> values_batch;
+			VgiBatchPtr values_batch;
 			if (wire.values && !wire.values->empty()) {
 				values_batch = DeserializeFromIpcBytes(*wire.values);
 			}
@@ -342,7 +340,7 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 std::unique_ptr<const KeyValueSecret>
 VgiRemoteSecretStorage::Synthesize(ClientContext &context, const string &type, const std::string &provider,
                                    const std::string &name, const std::vector<std::string> &scope,
-                                   const std::shared_ptr<arrow::RecordBatch> &values_batch,
+                                   const VgiBatchPtr &values_batch,
                                    const std::vector<std::string> &redact_keys) {
 	vector<string> prefix_paths(scope.begin(), scope.end());
 	if (prefix_paths.empty()) {

@@ -1,12 +1,15 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_rpc_types.hpp"
-#include "vgi_nanoarrow_ipc.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_batch_validation.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_schema_registry.hpp"
+
+#include "nanoarrow/nanoarrow.h"
+
+#include <cstring>
 
 // Generated request builders — exposes ``duckdb::vgi::generated::Build<Name>Params(...)``
 // definitions that mirror the schemas in ``generated/vgi_protocol_schemas.hpp``.
@@ -22,9 +25,9 @@ namespace {
 // Validate a nested payload decoded from IPC bytes. `what` names it in the
 // message ("[worker: nested IPC payload]", unchanged) but is not a worker
 // location, so it is reported as `field` rather than `worker_path`/`transport`.
-void ValidateNestedBatch(const arrow::RecordBatch *batch, WorkerBatchValidation level, const char *what) {
+void ValidateNestedBatch(const VgiBatchPtr &batch, WorkerBatchValidation level, const char *what) {
 	try {
-		ValidateWorkerBatch(batch, level, what);
+		ValidateWorkerBatch(batch.get(), level, what);
 	} catch (const IOException &e) {
 		ErrorInfo info = ExtraInfoOf(e);
 		info.erase(error_key::kWorkerPath);
@@ -34,40 +37,42 @@ void ValidateNestedBatch(const arrow::RecordBatch *batch, WorkerBatchValidation 
 	}
 }
 
-// Helper to check Arrow status and throw on failure
-void CheckStatus(const arrow::Status &status, const char *operation) {
-	if (!status.ok()) {
-		throw IOException("Arrow %s failed: %s", operation, status.ToString());
+// A one-row array of `type` filled by `fill` (which appends exactly one element).
+template <class Fill>
+ArrowArray OneRow(const VgiField &type, Fill &&fill) {
+	ArrowSchema schema;
+	BuildSchema(type, &schema);
+	ArrowArray array;
+	ArrowError error;
+	ArrowErrorInit(&error);
+	ArrowErrorCode code = ArrowArrayInitFromSchema(&array, &schema, &error);
+	schema.release(&schema);
+	if (code != NANOARROW_OK) {
+		throw IOException("VGI: failed to build a request field: %s", error.message);
 	}
+	try {
+		if (ArrowArrayStartAppending(&array) != NANOARROW_OK) {
+			throw IOException("VGI: failed to build a request field");
+		}
+		fill(&array);
+		if (ArrowArrayFinishBuildingDefault(&array, &error) != NANOARROW_OK) {
+			throw IOException("VGI: failed to build a request field: %s", error.message);
+		}
+	} catch (...) {
+		array.release(&array);
+		throw;
+	}
+	return array;
 }
 
-// Helper to finalize a builder
-template <typename BuilderType>
-std::shared_ptr<arrow::Array> FinishArray(BuilderType &builder, const char *name) {
-	auto result = builder.Finish();
-	if (!result.ok()) {
-		throw IOException("Failed to finish Arrow builder for %s: %s", name, result.status().ToString());
-	}
-	return result.ValueUnsafe();
+VgiField EnumType() {
+	return type::Dictionary(type::Int16(), type::Utf8());
 }
 
-// Helper to build a null dictionary(int16, utf8) array
-std::shared_ptr<arrow::Array> BuildNullDictionaryArray(
-    const std::shared_ptr<arrow::DataType> &dict_type,
-    const std::vector<std::string> &dictionary_values) {
-	arrow::Int16Builder index_builder;
-	CheckStatus(index_builder.AppendNull(), "append null dict index");
-	auto index_arr = FinishArray(index_builder, "null_dict_index");
-	arrow::StringBuilder dict_builder;
+void FillDictionary(ArrowArray *array, const std::vector<std::string> &dictionary_values) {
 	for (const auto &v : dictionary_values) {
-		CheckStatus(dict_builder.Append(v), "append dict value");
+		append::String(array->dictionary, v);
 	}
-	auto dict_arr = FinishArray(dict_builder, "dict_values");
-	auto result = arrow::DictionaryArray::FromArrays(dict_type, index_arr, dict_arr);
-	if (!result.ok()) {
-		throw IOException("Failed to create null dictionary array: " + result.status().ToString());
-	}
-	return result.ValueUnsafe();
 }
 
 } // namespace
@@ -76,181 +81,118 @@ std::shared_ptr<arrow::Array> BuildNullDictionaryArray(
 // Single-row builders (declared in vgi_rpc_types.hpp).
 // ============================================================================
 //
-// "Required" non-Optional helpers always emit a non-null entry; the existing
-// "empty == null" helpers (BuildBinaryScalar, BuildNullableStringScalar) are
-// retained inside this TU for the legacy hand-coded BuildXxxParams that still
-// rely on the empty-vector-as-null convention. The Optional helpers below are
-// what the codegen calls into.
+// "Required" non-Optional helpers always emit a non-null entry; the Optional helpers
+// are what the codegen calls into.
 
-std::shared_ptr<arrow::Array> BuildBinaryScalarRequired(const std::vector<uint8_t> &value) {
-	arrow::BinaryBuilder builder;
-	CheckStatus(builder.Append(value.data(), value.size()), "append binary required");
-	return FinishArray(builder, "binary");
+ArrowArray BuildBinaryScalarRequired(const std::vector<uint8_t> &value) {
+	return OneRow(type::Binary(), [&](ArrowArray *a) { append::Bytes(a, value.data(), (int64_t)value.size()); });
 }
 
-std::shared_ptr<arrow::Array> BuildOptionalBinaryScalar(const std::optional<std::vector<uint8_t>> &value) {
-	arrow::BinaryBuilder builder;
-	if (!value.has_value()) {
-		CheckStatus(builder.AppendNull(), "append null binary");
-	} else {
-		CheckStatus(builder.Append(value->data(), value->size()), "append binary");
-	}
-	return FinishArray(builder, "optional_binary");
+ArrowArray BuildOptionalBinaryScalar(const std::optional<std::vector<uint8_t>> &value) {
+	return OneRow(type::Binary(), [&](ArrowArray *a) {
+		if (value) {
+			append::Bytes(a, value->data(), (int64_t)value->size());
+		} else {
+			append::Null(a);
+		}
+	});
 }
 
-std::shared_ptr<arrow::Array> BuildStringScalar(const std::string &value) {
-	arrow::StringBuilder builder;
-	CheckStatus(builder.Append(value), "append string");
-	return FinishArray(builder, "string");
+ArrowArray BuildStringScalar(const std::string &value) {
+	return OneRow(type::Utf8(), [&](ArrowArray *a) { append::String(a, value); });
 }
 
-std::shared_ptr<arrow::Array> BuildOptionalStringScalar(const std::optional<std::string> &value) {
-	arrow::StringBuilder builder;
-	if (!value.has_value()) {
-		CheckStatus(builder.AppendNull(), "append null string");
-	} else {
-		CheckStatus(builder.Append(*value), "append string");
-	}
-	return FinishArray(builder, "optional_string");
+ArrowArray BuildOptionalStringScalar(const std::optional<std::string> &value) {
+	return OneRow(type::Utf8(), [&](ArrowArray *a) {
+		if (value) {
+			append::String(a, *value);
+		} else {
+			append::Null(a);
+		}
+	});
 }
 
-std::shared_ptr<arrow::Array> BuildBoolScalar(bool value) {
-	arrow::BooleanBuilder builder;
-	CheckStatus(builder.Append(value), "append bool");
-	return FinishArray(builder, "bool");
+ArrowArray BuildBoolScalar(bool value) {
+	return OneRow(type::Bool(), [&](ArrowArray *a) { append::Bool(a, value); });
 }
 
-std::shared_ptr<arrow::Array> BuildOptionalBoolScalar(std::optional<bool> value) {
-	arrow::BooleanBuilder builder;
-	if (!value.has_value()) {
-		CheckStatus(builder.AppendNull(), "append null bool");
-	} else {
-		CheckStatus(builder.Append(*value), "append bool");
-	}
-	return FinishArray(builder, "optional_bool");
+ArrowArray BuildOptionalBoolScalar(std::optional<bool> value) {
+	return OneRow(type::Bool(), [&](ArrowArray *a) {
+		if (value) {
+			append::Bool(a, *value);
+		} else {
+			append::Null(a);
+		}
+	});
 }
 
-std::shared_ptr<arrow::Array> BuildInt32Scalar(int32_t value) {
-	arrow::Int32Builder builder;
-	CheckStatus(builder.Append(value), "append int32");
-	return FinishArray(builder, "int32");
+ArrowArray BuildInt32Scalar(int32_t value) {
+	return OneRow(type::Int32(), [&](ArrowArray *a) { append::Int(a, value); });
 }
 
-std::shared_ptr<arrow::Array> BuildOptionalInt32Scalar(std::optional<int32_t> value) {
-	arrow::Int32Builder builder;
-	if (!value.has_value()) {
-		CheckStatus(builder.AppendNull(), "append null int32");
-	} else {
-		CheckStatus(builder.Append(*value), "append int32");
-	}
-	return FinishArray(builder, "optional_int32");
+ArrowArray BuildOptionalInt32Scalar(std::optional<int32_t> value) {
+	return OneRow(type::Int32(), [&](ArrowArray *a) {
+		if (value) {
+			append::Int(a, *value);
+		} else {
+			append::Null(a);
+		}
+	});
 }
 
-std::shared_ptr<arrow::Array> BuildInt64Scalar(int64_t value) {
-	arrow::Int64Builder builder;
-	CheckStatus(builder.Append(value), "append int64");
-	return FinishArray(builder, "int64");
+ArrowArray BuildInt64Scalar(int64_t value) {
+	return OneRow(type::Int64(), [&](ArrowArray *a) { append::Int(a, value); });
 }
 
-std::shared_ptr<arrow::Array> BuildOptionalInt64Scalar(std::optional<int64_t> value) {
-	arrow::Int64Builder builder;
-	if (!value.has_value()) {
-		CheckStatus(builder.AppendNull(), "append null int64");
-	} else {
-		CheckStatus(builder.Append(*value), "append int64");
-	}
-	return FinishArray(builder, "optional_int64");
+ArrowArray BuildOptionalInt64Scalar(std::optional<int64_t> value) {
+	return OneRow(type::Int64(), [&](ArrowArray *a) {
+		if (value) {
+			append::Int(a, *value);
+		} else {
+			append::Null(a);
+		}
+	});
 }
-
-std::shared_ptr<arrow::Array> BuildOptionalEnumArray(const std::optional<std::string> &value,
-                                                      const std::vector<std::string> &dictionary_values) {
-	if (!value.has_value()) {
-		auto dict_type = arrow::dictionary(arrow::int16(), arrow::utf8());
-		return BuildNullDictionaryArray(dict_type, dictionary_values);
-	}
-	return BuildEnumArray(*value, dictionary_values);
-}
-
-namespace {
-// "Empty == null" legacy variants used by hand-coded BuildXxxParams in the
-// Complex bucket and a handful of older call sites. New code goes through
-// the explicit-optional helpers above.
-std::shared_ptr<arrow::Array> BuildBinaryScalar(const std::vector<uint8_t> &bytes) {
-	arrow::BinaryBuilder builder;
-	if (bytes.empty()) {
-		CheckStatus(builder.AppendNull(), "append null binary");
-	} else {
-		CheckStatus(builder.Append(bytes.data(), bytes.size()), "append binary");
-	}
-	return FinishArray(builder, "binary");
-}
-
-std::shared_ptr<arrow::Array> BuildNullableStringScalar(const std::string &value) {
-	arrow::StringBuilder builder;
-	if (value.empty()) {
-		CheckStatus(builder.AppendNull(), "append null string");
-	} else {
-		CheckStatus(builder.Append(value), "append string");
-	}
-	return FinishArray(builder, "nullable_string");
-}
-
-// A 1-row, all-null struct column. Needed because a declared-but-absent nested
-// field (bind's copy_from / copy_to on a non-COPY call) must still occupy its
-// column: a worker that validates its parameter contract compares field order,
-// name, type AND nullability, so an omitted column is a contract violation
-// rather than an absent value.
-std::shared_ptr<arrow::Array> BuildNullStructScalar(const std::shared_ptr<arrow::DataType> &type) {
-	std::unique_ptr<arrow::ArrayBuilder> builder;
-	CheckStatus(arrow::MakeBuilder(arrow::default_memory_pool(), type, &builder), "make struct builder");
-	CheckStatus(static_cast<arrow::StructBuilder *>(builder.get())->AppendNull(), "append null struct");
-	return FinishArray(*builder, "null_struct");
-}
-} // namespace
 
 // list<T> single-row builders.
 
-std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::string> &values) {
-	auto value_builder = std::make_shared<arrow::StringBuilder>();
-	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-	CheckStatus(list_builder.Append(), "start string list");
-	for (const auto &v : values) {
-		CheckStatus(value_builder->Append(v), "append string item");
-	}
-	return FinishArray(list_builder, "string_list");
-}
-
-std::shared_ptr<arrow::Array> BuildOptionalStringListScalar(const std::optional<std::vector<std::string>> &values) {
-	auto value_builder = std::make_shared<arrow::StringBuilder>();
-	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-	if (!values.has_value()) {
-		CheckStatus(list_builder.AppendNull(), "append null string list");
-	} else {
-		CheckStatus(list_builder.Append(), "start optional string list");
-		for (const auto &value : *values) {
-			CheckStatus(value_builder->Append(value), "append optional string item");
+ArrowArray BuildStringListScalar(const std::vector<std::string> &values) {
+	return OneRow(type::List(type::Utf8()), [&](ArrowArray *a) {
+		for (const auto &v : values) {
+			append::String(a->children[0], v);
 		}
-	}
-	return FinishArray(list_builder, "optional_string_list");
+		append::FinishElement(a);
+	});
 }
 
-std::shared_ptr<arrow::Array>
-BuildNullableStringListScalar(const std::optional<std::vector<std::optional<std::string>>> &values) {
-	auto value_builder = std::make_shared<arrow::StringBuilder>();
-	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-	if (!values.has_value()) {
-		CheckStatus(list_builder.AppendNull(), "append null nullable string list");
-	} else {
-		CheckStatus(list_builder.Append(), "start nullable string list");
-		for (const auto &value : *values) {
-			if (value.has_value()) {
-				CheckStatus(value_builder->Append(*value), "append nullable string item");
+ArrowArray BuildOptionalStringListScalar(const std::optional<std::vector<std::string>> &values) {
+	return OneRow(type::List(type::Utf8()), [&](ArrowArray *a) {
+		if (!values) {
+			append::Null(a);
+			return;
+		}
+		for (const auto &v : *values) {
+			append::String(a->children[0], v);
+		}
+		append::FinishElement(a);
+	});
+}
+
+ArrowArray BuildNullableStringListScalar(const std::optional<std::vector<std::optional<std::string>>> &values) {
+	return OneRow(type::List(type::Utf8()), [&](ArrowArray *a) {
+		if (!values) {
+			append::Null(a);
+			return;
+		}
+		for (const auto &v : *values) {
+			if (v) {
+				append::String(a->children[0], *v);
 			} else {
-				CheckStatus(value_builder->AppendNull(), "append null string item");
+				append::Null(a->children[0]);
 			}
 		}
-	}
-	return FinishArray(list_builder, "nullable_string_list");
+		append::FinishElement(a);
+	});
 }
 
 std::vector<std::string> SingleSchemaPath(const std::string &schema_name) {
@@ -284,207 +226,148 @@ std::string OptionalSchemaNameFromPath(const std::optional<std::vector<std::stri
 	return SchemaNameFromPath(*schema_path, field_name);
 }
 
-std::shared_ptr<arrow::Array> BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values) {
-	auto value_builder = std::make_shared<arrow::BinaryBuilder>();
-	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-	CheckStatus(list_builder.Append(), "start binary list");
-	for (const auto &v : values) {
-		CheckStatus(value_builder->Append(v.data(), v.size()), "append binary item");
-	}
-	return FinishArray(list_builder, "binary_list");
+ArrowArray BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values) {
+	return OneRow(type::List(type::Binary()), [&](ArrowArray *a) {
+		for (const auto &v : values) {
+			append::Bytes(a->children[0], v.data(), (int64_t)v.size());
+		}
+		append::FinishElement(a);
+	});
 }
 
-std::shared_ptr<arrow::Array> BuildInt32ListScalar(const std::vector<int32_t> &values) {
-	auto value_builder = std::make_shared<arrow::Int32Builder>();
-	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-	CheckStatus(list_builder.Append(), "start int32 list");
-	for (auto v : values) {
-		CheckStatus(value_builder->Append(v), "append int32 item");
-	}
-	return FinishArray(list_builder, "int32_list");
+ArrowArray BuildInt32ListScalar(const std::vector<int32_t> &values) {
+	return OneRow(type::List(type::Int32()), [&](ArrowArray *a) {
+		for (auto v : values) {
+			append::Int(a->children[0], v);
+		}
+		append::FinishElement(a);
+	});
 }
 
-std::shared_ptr<arrow::Array> BuildInt64ListScalar(const std::vector<int64_t> &values) {
-	auto value_builder = std::make_shared<arrow::Int64Builder>();
-	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-	CheckStatus(list_builder.Append(), "start int64 list");
-	for (auto v : values) {
-		CheckStatus(value_builder->Append(v), "append int64 item");
-	}
-	return FinishArray(list_builder, "int64_list");
+ArrowArray BuildInt64ListScalar(const std::vector<int64_t> &values) {
+	return OneRow(type::List(type::Int64()), [&](ArrowArray *a) {
+		for (auto v : values) {
+			append::Int(a->children[0], v);
+		}
+		append::FinishElement(a);
+	});
 }
 
 // map<utf8, utf8> single-row builders.
 
-std::shared_ptr<arrow::Array>
-BuildStringMapScalar(const std::vector<std::pair<std::string, std::string>> &entries) {
-	auto key_builder = std::make_shared<arrow::StringBuilder>();
-	auto value_builder = std::make_shared<arrow::StringBuilder>();
-	arrow::MapBuilder builder(arrow::default_memory_pool(), key_builder, value_builder);
-	CheckStatus(builder.Append(), "start string map");
+namespace {
+void FillStringMap(ArrowArray *a, const std::vector<std::pair<std::string, std::string>> &entries) {
+	ArrowArray *kv = a->children[0];
 	for (const auto &[k, v] : entries) {
-		CheckStatus(key_builder->Append(k), "append map key");
-		CheckStatus(value_builder->Append(v), "append map value");
+		append::String(kv->children[0], k);
+		append::String(kv->children[1], v);
+		append::FinishElement(kv);
 	}
-	return FinishArray(builder, "string_map");
+	append::FinishElement(a);
+}
+} // namespace
+
+ArrowArray BuildStringMapScalar(const std::vector<std::pair<std::string, std::string>> &entries) {
+	return OneRow(type::Map(type::Utf8(), type::Utf8()), [&](ArrowArray *a) { FillStringMap(a, entries); });
 }
 
-std::shared_ptr<arrow::Array>
-BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::string, std::string>>> &entries) {
-	auto key_builder = std::make_shared<arrow::StringBuilder>();
-	auto value_builder = std::make_shared<arrow::StringBuilder>();
-	arrow::MapBuilder builder(arrow::default_memory_pool(), key_builder, value_builder);
-	if (!entries.has_value()) {
-		CheckStatus(builder.AppendNull(), "append null map");
-	} else {
-		CheckStatus(builder.Append(), "start string map");
-		for (const auto &[k, v] : *entries) {
-			CheckStatus(key_builder->Append(k), "append map key");
-			CheckStatus(value_builder->Append(v), "append map value");
+ArrowArray BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::string, std::string>>> &entries) {
+	return OneRow(type::Map(type::Utf8(), type::Utf8()), [&](ArrowArray *a) {
+		if (!entries) {
+			append::Null(a);
+			return;
+		}
+		FillStringMap(a, *entries);
+	});
+}
+
+// ============================================================================
+// Enum Serialization
+// ============================================================================
+
+ArrowArray BuildEnumArray(const std::string &value, const std::vector<std::string> &dictionary_values) {
+	int16_t index = -1;
+	for (size_t i = 0; i < dictionary_values.size(); i++) {
+		if (dictionary_values[i] == value) {
+			index = static_cast<int16_t>(i);
+			break;
 		}
 	}
-	return FinishArray(builder, "optional_string_map");
+	if (index < 0) {
+		throw IOException("Enum value '%s' not found in dictionary", value);
+	}
+	return OneRow(EnumType(), [&](ArrowArray *a) {
+		FillDictionary(a, dictionary_values);
+		append::Int(a, index);
+	});
+}
+
+ArrowArray BuildOptionalEnumArray(const std::optional<std::string> &value,
+                                  const std::vector<std::string> &dictionary_values) {
+	if (value) {
+		return BuildEnumArray(*value, dictionary_values);
+	}
+	return OneRow(EnumType(), [&](ArrowArray *a) {
+		FillDictionary(a, dictionary_values);
+		append::Null(a);
+	});
 }
 
 // ============================================================================
 // IPC Bytes Serialization
 // ============================================================================
 
-std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                          const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata) {
-	// Single-allocation path: drive the payload-level Arrow APIs by hand so
-	// RecordBatchSerializer::Assemble runs ONCE, GetPayloadSize tells us the
-	// exact total bytes, and we allocate the destination std::vector at the
-	// correct size up front. Skips the realloc chain that
-	// BufferOutputStream + MakeStreamWriter incur and the extra
-	// vector-from-buffer copy the prior implementation did at the end.
-	// Wire bytes are identical to what MakeStreamWriter+WriteRecordBatch+Close
-	// would have produced (same primitive Arrow calls underneath).
-	//
-	// Dictionary columns require an extra dictionary-batch message between
-	// the schema and record batch messages (IpcFormatWriter::WriteDictionaries
-	// in MakeStreamWriter's implementation). We replicate that ordering
-	// explicitly via CollectDictionaries + GetDictionaryPayload so enum/dict
-	// schemas (e.g. DuckDB enums) round-trip correctly.
-	const auto &options = arrow::ipc::IpcWriteOptions::Defaults();
-	arrow::ipc::DictionaryFieldMapper mapper(*batch->schema());
-
-	arrow::ipc::IpcPayload schema_payload;
-	CheckStatus(arrow::ipc::GetSchemaPayload(*batch->schema(), options, mapper, &schema_payload),
-	            "build schema payload");
-
-	// Collect dictionary payloads (empty for non-dict schemas → no extra cost).
-	auto dictionaries_result = arrow::ipc::CollectDictionaries(*batch, mapper);
-	if (!dictionaries_result.ok()) {
-		throw IOException("Arrow collect dictionaries failed: %s",
-		                  dictionaries_result.status().ToString());
+namespace {
+//! Writes straight into a std::vector<uint8_t>.
+class VectorOutputStream final : public VgiOutputStream {
+public:
+	explicit VectorOutputStream(std::vector<uint8_t> &out) : out_(out) {
 	}
-	const auto dictionaries = std::move(dictionaries_result).ValueUnsafe();
-	std::vector<arrow::ipc::IpcPayload> dict_payloads(dictionaries.size());
-	for (size_t i = 0; i < dictionaries.size(); ++i) {
-		CheckStatus(arrow::ipc::GetDictionaryPayload(dictionaries[i].first, dictionaries[i].second,
-		                                              options, &dict_payloads[i]),
-		            "build dictionary payload");
+	void Write(const void *data, int64_t nbytes) override {
+		auto *p = static_cast<const uint8_t *>(data);
+		out_.insert(out_.end(), p, p + nbytes);
+	}
+	int64_t Tell() const override {
+		return static_cast<int64_t>(out_.size());
 	}
 
-	arrow::ipc::IpcPayload batch_payload;
-	CheckStatus(arrow::ipc::GetRecordBatchPayload(*batch, custom_metadata, options, &batch_payload),
-	            "build record-batch payload");
+private:
+	std::vector<uint8_t> &out_;
+};
+} // namespace
 
-	// EOS marker: 4-byte continuation token 0xFFFFFFFF + 4-byte zero length.
-	// Matches arrow::ipc PayloadStreamWriter::WriteEOS (non-legacy format).
-	static constexpr uint8_t kEosMarker[8] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
-	const int64_t schema_size = arrow::ipc::GetPayloadSize(schema_payload, options);
-	std::vector<int64_t> dict_sizes(dict_payloads.size());
-	int64_t dicts_total = 0;
-	for (size_t i = 0; i < dict_payloads.size(); ++i) {
-		dict_sizes[i] = arrow::ipc::GetPayloadSize(dict_payloads[i], options);
-		dicts_total += dict_sizes[i];
-	}
-	const int64_t batch_size = arrow::ipc::GetPayloadSize(batch_payload, options);
-	const int64_t total = schema_size + dicts_total + batch_size + static_cast<int64_t>(sizeof(kEosMarker));
-
-	std::vector<uint8_t> out(static_cast<size_t>(total));
-	int32_t mlen = 0; // discarded; only here to satisfy the API
-	auto write_payload_at = [&](const arrow::ipc::IpcPayload &p, int64_t offset, int64_t size, const char *what) {
-		auto slice = std::make_shared<arrow::MutableBuffer>(out.data() + offset, size);
-		auto sink = std::make_shared<arrow::io::FixedSizeBufferWriter>(slice);
-		CheckStatus(arrow::ipc::WriteIpcPayload(p, options, sink.get(), &mlen), what);
-	};
-
-	int64_t cursor = 0;
-	write_payload_at(schema_payload, cursor, schema_size, "write schema payload");
-	cursor += schema_size;
-	for (size_t i = 0; i < dict_payloads.size(); ++i) {
-		write_payload_at(dict_payloads[i], cursor, dict_sizes[i], "write dictionary payload");
-		cursor += dict_sizes[i];
-	}
-	write_payload_at(batch_payload, cursor, batch_size, "write record-batch payload");
-	cursor += batch_size;
-	std::memcpy(out.data() + cursor, kEosMarker, sizeof(kEosMarker));
+std::vector<uint8_t> SerializeToIpcBytes(const VgiBatchPtr &batch, const VgiMetadataPtr &custom_metadata) {
+	std::vector<uint8_t> out;
+	auto sink = std::make_shared<VectorOutputStream>(out);
+	auto writer = VgiIpcWriter::Open(sink, batch->schema());
+	VgiMetadata none;
+	writer->Write(*batch, custom_metadata ? custom_metadata.get() : &none);
+	writer->Close();
 	return out;
 }
 
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len,
-                                                             WorkerBatchValidation validation) {
-	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
-	if (!alloc_result.ok()) {
-		throw IOException("Failed to allocate buffer for IPC deserialization: %s",
-		                  alloc_result.status().ToString());
-	}
-	auto buffer = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
-	memcpy(const_cast<uint8_t *>(buffer->data()), data, len);
-	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(buffer);
-	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(buffer_reader);
-	if (!reader_result.ok()) {
-		throw IOException("Failed to open IPC stream from bytes: %s", reader_result.status().ToString());
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	std::shared_ptr<arrow::RecordBatch> batch;
-	auto status = reader->ReadNext(&batch);
-	if (!status.ok()) {
-		throw IOException("Failed to read batch from IPC bytes: %s", status.ToString());
-	}
-	ValidateNestedBatch(batch.get(), validation, "nested IPC payload");
-	return batch;
+VgiBatchPtr DeserializeFromIpcBytes(const uint8_t *data, size_t len, WorkerBatchValidation validation) {
+	return DeserializeFromIpcBytesWithMetadata(data, len, validation).batch;
 }
 
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes,
-                                                             WorkerBatchValidation validation) {
+VgiBatchPtr DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes, WorkerBatchValidation validation) {
 	return DeserializeFromIpcBytes(bytes.data(), bytes.size(), validation);
 }
 
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow::BinaryArray &bin,
-                                                                     int64_t index,
-                                                                     WorkerBatchValidation validation) {
-	// Slice the cell straight out of the array's values buffer — the slice
-	// holds a reference to the parent buffer, so batches decoded from it
-	// (Arrow IPC reads are zero-copy views) stay valid after the outer batch
-	// is dropped.
-	auto slice = arrow::SliceBuffer(bin.value_data(), bin.value_offset(index),
-	                                 bin.value_length(index));
-	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(std::move(slice));
-	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(buffer_reader);
-	if (!reader_result.ok()) {
-		throw IOException("Failed to open IPC stream from bytes: %s", reader_result.status().ToString());
+VgiBatchPtr DeserializeFromIpcBytesZeroCopy(const VgiBufferPtr &bytes, WorkerBatchValidation validation) {
+	VgiBatchPtr batch;
+	try {
+		batch = DeserializeBatch(bytes);
+	} catch (const std::exception &e) {
+		throw IOException("Failed to read batch from IPC bytes: %s", RawMessageOf(e));
 	}
-	auto reader = reader_result.ValueUnsafe();
-
-	std::shared_ptr<arrow::RecordBatch> batch;
-	auto status = reader->ReadNext(&batch);
-	if (!status.ok()) {
-		throw IOException("Failed to read batch from IPC bytes: %s", status.ToString());
-	}
-	ValidateNestedBatch(batch.get(), validation, "nested IPC payload");
+	ValidateNestedBatch(batch, validation, "nested IPC payload");
 	return batch;
 }
 
-std::shared_ptr<arrow::RecordBatch> UnwrapResultEnvelope(const std::shared_ptr<arrow::RecordBatch> &envelope,
-                                                         const std::string &method,
-                                                         const std::unordered_map<std::string, std::string> &info,
-                                                         bool null_result_ok, WorkerBatchValidation validation,
-                                                         std::shared_ptr<arrow::KeyValueMetadata> *custom_metadata) {
+VgiBatchPtr UnwrapResultEnvelope(const VgiBatchPtr &envelope, const std::string &method,
+                                 const std::unordered_map<std::string, std::string> &info, bool null_result_ok,
+                                 WorkerBatchValidation validation, VgiMetadataPtr *custom_metadata) {
 	auto violation = [&]() {
 		return ErrorInfo(error_subtype::kProtocolViolation).Merge(info).Rpc(method);
 	};
@@ -496,32 +379,31 @@ std::shared_ptr<arrow::RecordBatch> UnwrapResultEnvelope(const std::shared_ptr<a
 	}
 	auto column = envelope->GetColumnByName("result");
 	if (!column) {
-		throw IOException(violation().Set(error_key::kField, "result"), "VGI %s response is missing its 'result' column%s",
-		                  method, where);
+		throw IOException(violation().Set(error_key::kField, "result"),
+		                  "VGI %s response is missing its 'result' column%s", method, where);
 	}
-	// Compare type ids: arrow::StringArray derives from arrow::BinaryArray, so a cast
-	// would accept a utf8 column and feed its bytes to the IPC decoder.
-	if (column->type_id() != arrow::Type::BINARY) {
-		throw IOException(violation().Set(error_key::kField, "result").ExpectedActual("binary", column->type()->ToString()),
-		                  "VGI %s response 'result' column has type %s, expected binary%s", method,
-		                  column->type()->ToString(), where);
+	if (column.is_dictionary() || column.type().type != NANOARROW_TYPE_BINARY) {
+		throw IOException(
+		    violation().Set(error_key::kField, "result").ExpectedActual("binary", column.type_string()),
+		    "VGI %s response 'result' column has type %s, expected binary%s", method, column.type_string(), where);
 	}
-	const auto &binary = static_cast<const arrow::BinaryArray &>(*column);
-	if (binary.IsNull(0)) {
+	if (column.IsNull(0)) {
 		if (null_result_ok) {
 			return nullptr;
 		}
-		throw IOException(violation().Set(error_key::kField, "result"), "VGI %s response has a null 'result'%s", method, where);
+		throw IOException(violation().Set(error_key::kField, "result"), "VGI %s response has a null 'result'%s",
+		                  method, where);
 	}
 	try {
+		// Zero-copy: the slice holds the envelope's buffers alive.
+		auto view = column.GetView(0);
+		auto bytes = std::make_shared<const VgiBuffer>(envelope, reinterpret_cast<const uint8_t *>(view.data()),
+		                                               static_cast<int64_t>(view.size()));
+		auto batch = DeserializeFromIpcBytesZeroCopy(bytes, validation);
 		if (custom_metadata) {
-			auto view = binary.GetView(0);
-			auto decoded = DeserializeFromIpcBytesWithMetadata(reinterpret_cast<const uint8_t *>(view.data()),
-			                                                   view.size(), validation);
-			*custom_metadata = std::move(decoded.custom_metadata);
-			return std::move(decoded.batch);
+			*custom_metadata = batch ? batch->metadata() : nullptr;
 		}
-		return DeserializeFromIpcBytesZeroCopy(binary, 0, validation);
+		return batch;
 	} catch (const std::exception &e) {
 		throw IOException(violation().Merge(ExtraInfoOf(e)),
 		                  "VGI %s response could not be decoded%s: %s. The worker likely returned a malformed or "
@@ -532,110 +414,43 @@ std::shared_ptr<arrow::RecordBatch> UnwrapResultEnvelope(const std::shared_ptr<a
 
 DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len,
                                                       WorkerBatchValidation validation) {
-	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
-	if (!alloc_result.ok()) {
-		throw IOException("Failed to allocate buffer for IPC deserialization: %s",
-		                  alloc_result.status().ToString());
+	VgiBatchPtr batch;
+	try {
+		batch = DeserializeBatch(VgiBuffer::Copy(data, static_cast<int64_t>(len)));
+	} catch (const std::exception &e) {
+		throw IOException("Failed to read batch from IPC bytes: %s", RawMessageOf(e));
 	}
-	auto buffer = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
-	memcpy(const_cast<uint8_t *>(buffer->data()), data, len);
-	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(buffer);
-	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(buffer_reader);
-	if (!reader_result.ok()) {
-		throw IOException("Failed to open IPC stream from bytes: %s", reader_result.status().ToString());
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	// ReadNext() returns RecordBatchWithMetadata including custom metadata
-	auto result = reader->ReadNext();
-	if (!result.ok()) {
-		throw IOException("Failed to read batch from IPC bytes: %s", result.status().ToString());
-	}
-	auto bwm = result.ValueUnsafe();
-	ValidateNestedBatch(bwm.batch.get(), validation, "nested IPC payload");
-	return {bwm.batch, bwm.custom_metadata};
+	ValidateNestedBatch(batch, validation, "nested IPC payload");
+	DeserializedBatch out;
+	out.batch = batch;
+	out.custom_metadata = batch ? batch->metadata() : nullptr;
+	return out;
 }
 
-std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Schema> &schema) {
-	auto serialize_result = ::duckdb::vgi::nanoipc::SerializeSchema(*schema);
-	if (!serialize_result.ok()) {
-		throw IOException("Failed to serialize schema: %s", serialize_result.status().ToString());
-	}
-	auto buffer = serialize_result.ValueUnsafe();
-	return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
+std::vector<uint8_t> SerializeSchemaToIpcBytes(const VgiSchemaPtr &schema) {
+	return SerializeSchema(*schema)->ToVector();
 }
 
 std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string> &fk_columns,
-                                                    const std::vector<std::string> &pk_columns,
-                                                    const std::string &referenced_table,
-                                                    const std::string &referenced_schema) {
+                                                   const std::vector<std::string> &pk_columns,
+                                                   const std::string &referenced_table,
+                                                   const std::string &referenced_schema) {
 	return SerializeToIpcBytes(
 	    generated::BuildForeignKeyInfo(fk_columns, pk_columns, referenced_table, SingleSchemaPath(referenced_schema)));
 }
 
 // ============================================================================
-// Enum Serialization
-// ============================================================================
-
-std::shared_ptr<arrow::Array> BuildEnumArray(const std::string &value,
-                                             const std::vector<std::string> &dictionary_values) {
-	// Build the dictionary (all enum member names)
-	arrow::StringBuilder dict_builder;
-	for (const auto &v : dictionary_values) {
-		CheckStatus(dict_builder.Append(v), "append enum dict value");
-	}
-	auto dict_result = dict_builder.Finish();
-	if (!dict_result.ok()) {
-		throw IOException("Failed to build enum dictionary: " + dict_result.status().ToString());
-	}
-	auto dictionary = dict_result.ValueUnsafe();
-
-	// Find the index of the value in the dictionary
-	int16_t index = -1;
-	for (size_t i = 0; i < dictionary_values.size(); i++) {
-		if (dictionary_values[i] == value) {
-			index = static_cast<int16_t>(i);
-			break;
-		}
-	}
-	if (index < 0) {
-		throw IOException("Enum value '%s' not found in dictionary", value);
-	}
-
-	// Build the index array
-	arrow::Int16Builder index_builder;
-	CheckStatus(index_builder.Append(index), "append enum index");
-	auto index_result = index_builder.Finish();
-	if (!index_result.ok()) {
-		throw IOException("Failed to build enum index: " + index_result.status().ToString());
-	}
-
-	// Create the dictionary array
-	auto dict_type = arrow::dictionary(arrow::int16(), arrow::utf8());
-	auto dict_array_result = arrow::DictionaryArray::FromArrays(dict_type, index_result.ValueUnsafe(), dictionary);
-	if (!dict_array_result.ok()) {
-		throw IOException("Failed to create enum array: " + dict_array_result.status().ToString());
-	}
-	return dict_array_result.ValueUnsafe();
-}
-
-
-// ============================================================================
 // BindResponse Parsing
 // ============================================================================
 
-BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+BindResponseResult ParseBindResponse(const VgiBatchPtr &batch, const std::string &worker_path) {
 	auto wire = generated::Decode<generated::BindResponse>(batch, 0, worker_path);
 	BindResponseResult result;
-	auto schema_buffer = arrow::Buffer::Wrap(wire.output_schema.data(), wire.output_schema.size());
-	arrow::io::BufferReader reader(schema_buffer);
-	arrow::ipc::DictionaryMemo dict_memo;
-	auto schema_result = ::duckdb::vgi::nanoipc::ReadSchema(&reader, &dict_memo);
-	if (!schema_result.ok()) {
-		throw IOException("Failed to deserialize output schema: %s [worker: %s]", schema_result.status().ToString(),
-		                  worker_path);
+	try {
+		result.output_schema = ReadSchemaBytes(wire.output_schema);
+	} catch (const std::exception &e) {
+		throw IOException("Failed to deserialize output schema: %s [worker: %s]", RawMessageOf(e), worker_path);
 	}
-	result.output_schema = schema_result.MoveValueUnsafe();
 	result.opaque_data = wire.opaque_data.value_or(generated::Bytes {});
 	return result;
 }
@@ -644,8 +459,7 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 // BindSecretScopeResponse Parsing
 // ============================================================================
 
-std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
-    const std::shared_ptr<arrow::RecordBatch> &batch) {
+std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(const VgiBatchPtr &batch) {
 	if (!batch || batch->num_rows() == 0) {
 		return std::nullopt;
 	}
@@ -670,13 +484,11 @@ std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
 	return result;
 }
 
-
 // ============================================================================
 // GlobalInitResponse Parsing
 // ============================================================================
 
-GlobalInitResponseResult ParseGlobalInitResponse(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                                 const std::string &worker_path) {
+GlobalInitResponseResult ParseGlobalInitResponse(const VgiBatchPtr &batch, const std::string &worker_path) {
 	auto wire = generated::Decode<generated::GlobalInitResponse>(batch, 0, worker_path);
 	GlobalInitResponseResult result;
 	result.execution_id = std::move(wire.execution_id);
@@ -689,71 +501,85 @@ GlobalInitResponseResult ParseGlobalInitResponse(const std::shared_ptr<arrow::Re
 // Response Item Unwrapping
 // ============================================================================
 
-std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const std::shared_ptr<arrow::RecordBatch> &batch) {
-	std::vector<std::vector<uint8_t>> items;
-
+namespace {
+//! The `items` list column's element range in row 0, or false when absent/null.
+bool ItemsRange(const VgiBatchPtr &batch, VgiColumn &values, int64_t &start, int64_t &end) {
 	if (!batch || batch->num_rows() == 0) {
+		return false;
+	}
+	auto list = batch->GetColumnByName("items");
+	if (!list || list.is_dictionary()) {
+		return false;
+	}
+	auto t = list.type().type;
+	if (t != NANOARROW_TYPE_LIST && t != NANOARROW_TYPE_LARGE_LIST) {
+		throw IOException("VGI: 'items' column has type %s, expected a list", list.type_string());
+	}
+	if (list.IsNull(0)) {
+		return false;
+	}
+	list.ListRange(0, start, end);
+	values = list.child(0);
+	return true;
+}
+} // namespace
+
+std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const VgiBatchPtr &batch) {
+	std::vector<std::vector<uint8_t>> items;
+	VgiColumn values;
+	int64_t start = 0;
+	int64_t end = 0;
+	if (!ItemsRange(batch, values, start, end)) {
 		return items;
 	}
-
-	auto list_array = std::static_pointer_cast<arrow::ListArray>(batch->GetColumnByName("items"));
-	if (list_array->IsNull(0)) {
-		return items;
-	}
-
-	auto start = list_array->value_offset(0);
-	auto end = list_array->value_offset(1);
-	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
-
 	for (int64_t i = start; i < end; i++) {
-		if (!values->IsNull(i)) {
-			auto view = values->GetView(i);
+		if (!values.IsNull(i)) {
+			auto view = values.GetView(i);
 			items.emplace_back(view.data(), view.data() + view.size());
 		}
 	}
-
 	return items;
 }
 
-std::vector<std::shared_ptr<arrow::RecordBatch>>
-UnwrapAndValidateItems(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &method_name,
-                       const std::string &worker_path) {
-	auto bytes_list = UnwrapBinaryResponseItems(batch);
-	std::vector<std::shared_ptr<arrow::RecordBatch>> items;
-	items.reserve(bytes_list.size());
-	for (size_t i = 0; i < bytes_list.size(); i++) {
-		auto info_batch = DeserializeFromIpcBytes(bytes_list[i]);
+std::vector<VgiBatchPtr> UnwrapAndValidateItems(const VgiBatchPtr &batch, const std::string &method_name,
+                                                const std::string &worker_path) {
+	std::vector<VgiBatchPtr> items;
+	VgiColumn values;
+	int64_t start = 0;
+	int64_t end = 0;
+	if (!ItemsRange(batch, values, start, end)) {
+		return items;
+	}
+	for (int64_t i = start; i < end; i++) {
+		if (values.IsNull(i)) {
+			continue;
+		}
+		auto view = values.GetView(i);
+		auto bytes = std::make_shared<const VgiBuffer>(batch, reinterpret_cast<const uint8_t *>(view.data()),
+		                                               static_cast<int64_t>(view.size()));
+		auto info_batch = DeserializeFromIpcBytesZeroCopy(bytes, WorkerBatchValidation::FULL);
 		if (!info_batch || info_batch->num_rows() == 0) {
 			continue;
 		}
-		ValidateItemSchema(info_batch, method_name, worker_path, i);
+		ValidateItemSchema(info_batch, method_name, worker_path, static_cast<size_t>(i - start));
 		items.push_back(std::move(info_batch));
 	}
 	return items;
 }
 
-std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::RecordBatch> &batch) {
+std::vector<std::string> UnwrapStringResponseItems(const VgiBatchPtr &batch) {
 	std::vector<std::string> items;
-
-	if (!batch || batch->num_rows() == 0) {
+	VgiColumn values;
+	int64_t start = 0;
+	int64_t end = 0;
+	if (!ItemsRange(batch, values, start, end)) {
 		return items;
 	}
-
-	auto list_array = std::static_pointer_cast<arrow::ListArray>(batch->GetColumnByName("items"));
-	if (list_array->IsNull(0)) {
-		return items;
-	}
-
-	auto start = list_array->value_offset(0);
-	auto end = list_array->value_offset(1);
-	auto values = std::static_pointer_cast<arrow::StringArray>(list_array->values());
-
 	for (int64_t i = start; i < end; i++) {
-		if (!values->IsNull(i)) {
-			items.push_back(values->GetString(i));
+		if (!values.IsNull(i)) {
+			items.push_back(values.GetString(i));
 		}
 	}
-
 	return items;
 }
 
@@ -784,7 +610,7 @@ std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::
 
 
 InsertionOrderPreservingMap<std::string>
-ParseTableFunctionDynamicToStringResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+ParseTableFunctionDynamicToStringResult(const VgiBatchPtr &batch,
                                         const std::string &worker_path) {
 	InsertionOrderPreservingMap<std::string> result;
 	if (!batch || batch->num_rows() == 0) {
@@ -798,7 +624,7 @@ ParseTableFunctionDynamicToStringResult(const std::shared_ptr<arrow::RecordBatch
 	return result;
 }
 
-TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const VgiBatchPtr &batch,
                                                                    const std::string &worker_path) {
 	TableFunctionCardinalityResult result;
 	if (!batch || batch->num_rows() == 0) {
@@ -855,12 +681,12 @@ E RequireEnum(std::optional<E> parsed, const std::string &raw, const char *what)
 }
 
 generated::LargeBytes BufferOf(const std::vector<uint8_t> &bytes) {
-	return arrow::Buffer::FromVector(bytes);
+	return VgiBuffer::FromVector(bytes);
 }
 
 } // namespace
 
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
                  const std::string &function_type, const std::vector<uint8_t> &input_schema_bytes,
                  const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
@@ -897,11 +723,11 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	return generated::ToBatch(request);
 }
 
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<uint8_t> &output_schema_bytes,
                  const std::vector<uint8_t> &bind_opaque_data, const std::vector<int64_t> &projection_ids,
-                 std::shared_ptr<arrow::Buffer> pushdown_filters,
-                 std::vector<std::shared_ptr<arrow::Buffer>> join_keys, const std::string &phase,
+                 VgiBufferPtr pushdown_filters,
+                 std::vector<VgiBufferPtr> join_keys, const std::string &phase,
                  const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data,
                  const std::string &order_by_column_name, const std::string &order_by_direction,
                  const std::string &order_by_null_order, int64_t order_by_limit, double tablesample_percentage,
@@ -925,7 +751,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	if (!split_tokens.empty()) {
 		request.split_tokens.emplace();
 		for (const auto &token : split_tokens) {
-			request.split_tokens->push_back(arrow::Buffer::FromString(token));
+			request.split_tokens->push_back(VgiBuffer::FromString(token));
 		}
 	}
 	// row_limit stays null: TableFunctionInitInput carries no limit, and the Top-N
@@ -957,7 +783,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	return generated::ToBatch(request);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const std::vector<uint8_t> &bind_call_bytes,
+VgiBatchPtr BuildTableFunctionCardinalityRequest(const std::vector<uint8_t> &bind_call_bytes,
                                                                          const std::vector<uint8_t> &bind_opaque_data) {
 	return generated::ToBatch(generated::TableFunctionCardinalityRequest {bind_call_bytes, BytesOrNull(bind_opaque_data)});
 }
@@ -977,7 +803,7 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const s
 //! while thread count (min_splits) is the one sizing fact it genuinely knows.
 //! ``filters_complete`` is always true: no narrower filter is ever coming, so a
 //! worker must not hold splits back waiting for one.
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
                               const std::vector<uint8_t> &bind_opaque_data,
                               const std::vector<int32_t> &projection_ids,
@@ -1003,12 +829,12 @@ BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
 	return generated::ToBatch(request);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(const std::vector<uint8_t> &bind_call_bytes,
+VgiBatchPtr BuildTableFunctionStatisticsRequest(const std::vector<uint8_t> &bind_call_bytes,
                                                                         const std::vector<uint8_t> &bind_opaque_data) {
 	return generated::ToBatch(generated::TableFunctionStatisticsRequest {bind_call_bytes, BytesOrNull(bind_opaque_data)});
 }
 
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableFunctionDynamicToStringRequest(const std::vector<uint8_t> &bind_call_bytes,
                                          const std::vector<uint8_t> &bind_opaque_data,
                                          const std::vector<uint8_t> &global_execution_id) {
@@ -1032,7 +858,7 @@ static std::vector<uint8_t> ClientCapabilitiesBytes() {
 	return SerializeRecord(caps);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(const std::string &name,
+VgiBatchPtr BuildCatalogAttachRequest(const std::string &name,
                                                               const std::vector<uint8_t> &options_ipc_bytes,
                                                               const std::string &data_version_spec,
                                                               const std::string &implementation_version) {
@@ -1047,9 +873,9 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(const std::string 
 	return generated::ToBatch(request);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
+VgiBatchPtr BuildTableCreateRequest(
     const std::vector<uint8_t> &attach_opaque_data, const std::vector<std::string> &schema_path,
-    const std::string &name, const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
+    const std::string &name, const VgiSchemaPtr &columns_schema, const std::string &on_conflict,
     const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
     const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
     const std::vector<std::vector<uint8_t>> &foreign_key_constraints,

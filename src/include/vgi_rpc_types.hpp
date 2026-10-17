@@ -1,9 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
-#include <arrow/api.h>
-#include <arrow/io/api.h>
-#include <arrow/ipc/api.h>
+#include "vgi_ipc.hpp"
+
 
 #include <cstdint>
 #include <memory>
@@ -30,27 +29,26 @@ namespace vgi {
 // single-allocation payload path (payload sizes are computed up front, so the
 // destination vector is allocated once; no BufferOutputStream realloc chain
 // and no final buffer→vector copy).
-std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                          const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata = nullptr);
+std::vector<uint8_t> SerializeToIpcBytes(const VgiBatchPtr &batch,
+                                          const VgiMetadataPtr &custom_metadata = nullptr);
 
 // Deserialize a RecordBatch from IPC bytes.
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes,
+VgiBatchPtr DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes,
                                                              WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 // Nested IPC payloads come from workers, so the decoded batch is validated
 // (vgi_batch_validation.hpp). Callers without a query context keep FULL.
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len,
+VgiBatchPtr DeserializeFromIpcBytes(const uint8_t *data, size_t len,
                                                              WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 
 // Zero-copy variant: decode the inner IPC stream stored in cell ``index`` of a
 // BinaryArray (the "dataclass-as-binary" envelope pattern) WITHOUT copying the
-// bytes. The decode reads from an arrow::SliceBuffer of the array's values
+// bytes. The decode reads from a slice of the batch's values
 // buffer, so the returned batch's arrays refcount-share that buffer — the
 // outer response batch can be dropped freely. Use on response-decode hot
 // paths (bind results, table-buffering envelopes, catalog results) where the
 // pointer-based overload would alloc+memcpy the whole inner payload.
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow::BinaryArray &bin,
-                                                                     int64_t index,
-                                                                     WorkerBatchValidation validation = WorkerBatchValidation::FULL);
+VgiBatchPtr DeserializeFromIpcBytesZeroCopy(const VgiBufferPtr &bytes,
+                                            WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 
 // The inner batch of a unary response envelope: a one-row ``{result: binary}``
 // batch whose cell is the IPC-serialized method result. Decoded zero-copy and
@@ -59,12 +57,12 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow:
 // the RPC name); a NULL `result` is too, unless `null_result_ok` (methods whose
 // result is empty), in which case nullptr is returned. `custom_metadata`, when
 // given, receives the inner batch message's custom metadata.
-std::shared_ptr<arrow::RecordBatch> UnwrapResultEnvelope(const std::shared_ptr<arrow::RecordBatch> &envelope,
+VgiBatchPtr UnwrapResultEnvelope(const VgiBatchPtr &envelope,
                                                          const std::string &method,
                                                          const std::unordered_map<std::string, std::string> &info,
                                                          bool null_result_ok = false,
                                                          WorkerBatchValidation validation = WorkerBatchValidation::FULL,
-                                                         std::shared_ptr<arrow::KeyValueMetadata> *custom_metadata = nullptr);
+                                                         VgiMetadataPtr *custom_metadata = nullptr);
 
 // The callers' "empty means absent" convention, for nullable record members.
 inline std::optional<std::vector<uint8_t>> BytesOrNull(const std::vector<uint8_t> &bytes) {
@@ -90,8 +88,8 @@ std::vector<uint8_t> SerializeRecord(const T &value) {
 
 // Deserialized batch with optional custom metadata from the IPC message.
 struct DeserializedBatch {
-	std::shared_ptr<arrow::RecordBatch> batch;
-	std::shared_ptr<arrow::KeyValueMetadata> custom_metadata;
+	VgiBatchPtr batch;
+	VgiMetadataPtr custom_metadata;
 };
 
 // Deserialize a RecordBatch from IPC bytes, preserving custom metadata.
@@ -99,7 +97,7 @@ DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_
                                                       WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 
 // Serialize an Arrow Schema to IPC bytes.
-std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Schema> &schema);
+std::vector<uint8_t> SerializeSchemaToIpcBytes(const VgiSchemaPtr &schema);
 
 // Serialize a foreign key constraint to IPC bytes.
 // The format matches the Python ForeignKeyDef serialization used by TableInfo.
@@ -115,12 +113,12 @@ std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string
 // Build a dictionary-encoded array with a single value for enum serialization.
 // The dictionary_values should be the list of all enum member names.
 // The value should be the name of the selected member.
-std::shared_ptr<arrow::Array> BuildEnumArray(const std::string &value,
+ArrowArray BuildEnumArray(const std::string &value,
                                               const std::vector<std::string> &dictionary_values);
 
 // Optional variant: when ``value`` is std::nullopt, emits a single-row null
 // dictionary array; otherwise identical to ``BuildEnumArray``.
-std::shared_ptr<arrow::Array> BuildOptionalEnumArray(const std::optional<std::string> &value,
+ArrowArray BuildOptionalEnumArray(const std::optional<std::string> &value,
                                                       const std::vector<std::string> &dictionary_values);
 
 // ============================================================================
@@ -137,33 +135,33 @@ std::shared_ptr<arrow::Array> BuildOptionalEnumArray(const std::optional<std::st
 // The generator picks helper names from a fixed mapping; if you change a
 // helper signature here, regenerate the header and re-build.
 
-std::shared_ptr<arrow::Array> BuildBinaryScalarRequired(const std::vector<uint8_t> &value);
-std::shared_ptr<arrow::Array> BuildOptionalBinaryScalar(const std::optional<std::vector<uint8_t>> &value);
+ArrowArray BuildBinaryScalarRequired(const std::vector<uint8_t> &value);
+ArrowArray BuildOptionalBinaryScalar(const std::optional<std::vector<uint8_t>> &value);
 
-std::shared_ptr<arrow::Array> BuildStringScalar(const std::string &value);
-std::shared_ptr<arrow::Array> BuildOptionalStringScalar(const std::optional<std::string> &value);
+ArrowArray BuildStringScalar(const std::string &value);
+ArrowArray BuildOptionalStringScalar(const std::optional<std::string> &value);
 
-std::shared_ptr<arrow::Array> BuildBoolScalar(bool value);
-std::shared_ptr<arrow::Array> BuildOptionalBoolScalar(std::optional<bool> value);
+ArrowArray BuildBoolScalar(bool value);
+ArrowArray BuildOptionalBoolScalar(std::optional<bool> value);
 
-std::shared_ptr<arrow::Array> BuildInt32Scalar(int32_t value);
-std::shared_ptr<arrow::Array> BuildOptionalInt32Scalar(std::optional<int32_t> value);
+ArrowArray BuildInt32Scalar(int32_t value);
+ArrowArray BuildOptionalInt32Scalar(std::optional<int32_t> value);
 
-std::shared_ptr<arrow::Array> BuildInt64Scalar(int64_t value);
-std::shared_ptr<arrow::Array> BuildOptionalInt64Scalar(std::optional<int64_t> value);
+ArrowArray BuildInt64Scalar(int64_t value);
+ArrowArray BuildOptionalInt64Scalar(std::optional<int64_t> value);
 
 // list<utf8>, list<binary>, list<int32>, list<int64> — single-row lists, always non-null.
-std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::string> &values);
-std::shared_ptr<arrow::Array> BuildOptionalStringListScalar(const std::optional<std::vector<std::string>> &values);
-std::shared_ptr<arrow::Array>
+ArrowArray BuildStringListScalar(const std::vector<std::string> &values);
+ArrowArray BuildOptionalStringListScalar(const std::optional<std::vector<std::string>> &values);
+ArrowArray
 BuildNullableStringListScalar(const std::optional<std::vector<std::optional<std::string>>> &values);
-std::shared_ptr<arrow::Array> BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values);
-std::shared_ptr<arrow::Array> BuildInt32ListScalar(const std::vector<int32_t> &values);
-std::shared_ptr<arrow::Array> BuildInt64ListScalar(const std::vector<int64_t> &values);
+ArrowArray BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values);
+ArrowArray BuildInt32ListScalar(const std::vector<int32_t> &values);
+ArrowArray BuildInt64ListScalar(const std::vector<int64_t> &values);
 
 // map<utf8, utf8> single-row scalars.
-std::shared_ptr<arrow::Array> BuildStringMapScalar(const std::vector<std::pair<std::string, std::string>> &entries);
-std::shared_ptr<arrow::Array>
+ArrowArray BuildStringMapScalar(const std::vector<std::pair<std::string, std::string>> &entries);
+ArrowArray
 BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::string, std::string>>> &entries);
 
 // DuckDB 1.5 exposes a single schema identifier. These helpers adapt that
@@ -209,7 +207,7 @@ struct CopyToBindContext {
 //   attach_opaque_data: binary|null
 //   transaction_opaque_data: binary|null
 //   resolved_secrets_provided: bool (true when scoped secrets have been resolved)
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
                  const std::string &function_type,                    // "SCALAR", "TABLE", "AGGREGATE"
                  const std::vector<uint8_t> &input_schema_bytes = {}, // Empty = null
@@ -232,13 +230,13 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 
 // Parsed BindResponse
 struct BindResponseResult {
-	std::shared_ptr<arrow::Schema> output_schema;
+	VgiSchemaPtr output_schema;
 	std::vector<uint8_t> opaque_data;   // Empty if null
 };
 
 // Parse BindResponse from a deserialized RecordBatch (1 row).
 // Fields: output_schema: binary, opaque_data: binary|null
-BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &batch,
+BindResponseResult ParseBindResponse(const VgiBatchPtr &batch,
                                      const std::string &worker_path = "");
 
 // Result of trying to parse scoped secret lookup requests from a BindResponse
@@ -256,7 +254,7 @@ struct BindSecretScopeResponseResult {
 // secret scope request and the function returns the parsed lookups.
 // Returns nullopt if this is a normal BindResponse (no lookup fields or all empty).
 std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
-    const std::shared_ptr<arrow::RecordBatch> &batch);
+    const VgiBatchPtr &batch);
 
 // ============================================================================
 // InitRequest
@@ -273,13 +271,13 @@ std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
 //   phase: dictionary(int16, utf8)|null ("INPUT", "FINALIZE")
 //   execution_id: binary|null
 //   init_opaque_data: binary|null
-std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
+VgiBatchPtr BuildInitRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &output_schema_bytes,
     const std::vector<uint8_t> &bind_opaque_data = {},
     const std::vector<int64_t> &projection_ids = {},
-    std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
-    std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
+    VgiBufferPtr pushdown_filters = nullptr,
+    std::vector<VgiBufferPtr> join_keys = {},
     const std::string &phase = "",          // Empty = null, "INPUT", "FINALIZE"
     const std::vector<uint8_t> &execution_id = {},
     const std::vector<uint8_t> &init_opaque_data = {},
@@ -305,7 +303,7 @@ struct GlobalInitResponseResult {
 
 // Parse GlobalInitResponse from a header batch (1 row).
 // Fields: execution_id: binary, max_workers: int64, opaque_data: binary|null
-GlobalInitResponseResult ParseGlobalInitResponse(const std::shared_ptr<arrow::RecordBatch> &batch,
+GlobalInitResponseResult ParseGlobalInitResponse(const VgiBatchPtr &batch,
                                                   const std::string &worker_path = "");
 
 // ============================================================================
@@ -315,17 +313,17 @@ GlobalInitResponseResult ParseGlobalInitResponse(const std::shared_ptr<arrow::Re
 // Unwrap response items from a catalog response.
 // Catalog responses wrap items in {items: list<binary>} or {items: list<utf8>}.
 // This extracts the binary items from the list column.
-std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const std::shared_ptr<arrow::RecordBatch> &batch);
+std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const VgiBatchPtr &batch);
 
 // Unwrap string items (for CatalogsResponse which has items: list<str>)
-std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::RecordBatch> &batch);
+std::vector<std::string> UnwrapStringResponseItems(const VgiBatchPtr &batch);
 
 // Unwrap items, deserialize each to a RecordBatch, and validate each item's
 // schema against the registered item_schema for `method_name`. Zero-row items
 // are skipped. Throws IOException on item schema mismatch (see
 // ValidateItemSchema in vgi_schema_registry.hpp for the error format).
-std::vector<std::shared_ptr<arrow::RecordBatch>>
-UnwrapAndValidateItems(const std::shared_ptr<arrow::RecordBatch> &batch,
+std::vector<VgiBatchPtr>
+UnwrapAndValidateItems(const VgiBatchPtr &batch,
                        const std::string &method_name,
                        const std::string &worker_path);
 
@@ -339,7 +337,7 @@ UnwrapAndValidateItems(const std::shared_ptr<arrow::RecordBatch> &batch,
 //   bind_opaque_data: binary|null
 //! Build the inner ``TableFunctionPlanRequest`` record (see the .cpp for why
 //! row_limit is absent and target_split_bytes is omitted when 0).
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
                               const std::vector<uint8_t> &bind_opaque_data,
                               const std::vector<int32_t> &projection_ids,
@@ -347,7 +345,7 @@ BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
                               int64_t min_splits, int64_t target_split_bytes,
                               const std::vector<uint8_t> &cursor);
 
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(
+VgiBatchPtr BuildTableFunctionCardinalityRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &bind_opaque_data = {});
 
@@ -360,7 +358,7 @@ struct TableFunctionCardinalityResult {
 // Parse TableCardinality from a deserialized RecordBatch (1 row).
 // Fields: estimate: int64|null, max: int64|null
 TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(
-    const std::shared_ptr<arrow::RecordBatch> &batch,
+    const VgiBatchPtr &batch,
     const std::string &worker_path = "");
 
 // ============================================================================
@@ -373,7 +371,7 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(
 // so the worker sees the user's original arguments (e.g. count=10000).
 //   bind_call: binary (BindRequest as IPC bytes)
 //   bind_opaque_data: binary|null
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(
+VgiBatchPtr BuildTableFunctionStatisticsRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &bind_opaque_data = {});
 
@@ -387,7 +385,7 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(
 //   bind_call: binary (BindRequest as IPC bytes)
 //   bind_opaque_data: binary|null
 //   global_execution_id: binary
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionDynamicToStringRequest(
+VgiBatchPtr BuildTableFunctionDynamicToStringRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &bind_opaque_data,
     const std::vector<uint8_t> &global_execution_id);
@@ -396,7 +394,7 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionDynamicToStringRequest(
 // is parallel ``keys: list<utf8>`` / ``values: list<utf8>`` — order on the wire is
 // the order the user emitted from their dynamic_to_string hook.
 InsertionOrderPreservingMap<std::string> ParseTableFunctionDynamicToStringResult(
-    const std::shared_ptr<arrow::RecordBatch> &batch,
+    const VgiBatchPtr &batch,
     const std::string &worker_path = "");
 
 // ============================================================================
@@ -415,7 +413,7 @@ InsertionOrderPreservingMap<std::string> ParseTableFunctionDynamicToStringResult
 
 // Build the inner CatalogAttachRequest batch. Caller serialises and wraps
 // with ``generated::BuildCatalogAttachParams`` to produce the wire params.
-std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
+VgiBatchPtr BuildCatalogAttachRequest(
     const std::string &name,
     const std::vector<uint8_t> &options_ipc_bytes = {},
     const std::string &data_version_spec = "",
@@ -425,9 +423,9 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 // Build the inner TableCreateRequest batch (catalog_table_create's payload).
 // Fields match Python TableCreateRequest dataclass; serialise + wrap with
 // ``generated::BuildCatalogTableCreateParams`` for the wire params.
-std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
+VgiBatchPtr BuildTableCreateRequest(
     const std::vector<uint8_t> &attach_opaque_data, const std::vector<std::string> &schema_path,
-    const std::string &name, const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
+    const std::string &name, const VgiSchemaPtr &columns_schema, const std::string &on_conflict,
     const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
     const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
     const std::vector<std::vector<uint8_t>> &foreign_key_constraints,

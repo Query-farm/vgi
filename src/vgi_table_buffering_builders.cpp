@@ -14,7 +14,7 @@ namespace vgi {
 // Table sink+source inner builders (new buffered API).
 // ----------------------------------------------------------------------------
 
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableBufferingProcessInner(const std::string &function_name,
                                   const std::string &schema_name,
                                   const std::vector<uint8_t> &execution_id,
@@ -33,7 +33,7 @@ BuildTableBufferingProcessInner(const std::string &function_name,
 	return generated::BuildTableBufferingProcessParams(SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableBufferingCombineInner(const std::string &function_name,
                                   const std::string &schema_name,
                                   const std::vector<uint8_t> &execution_id,
@@ -48,7 +48,7 @@ BuildTableBufferingCombineInner(const std::string &function_name,
 	return generated::BuildTableBufferingCombineParams(SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableBufferingDestructorInner(const std::string &function_name,
                                      const std::string &schema_name,
                                      const std::vector<uint8_t> &execution_id,

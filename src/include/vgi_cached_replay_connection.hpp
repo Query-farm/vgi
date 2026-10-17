@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 // CachedReplayConnection — an IFunctionConnection that replays a cached result
 // instead of talking to a worker. On a cache hit the scan's global state hands
 // each (single, in v1) local state one of these in place of a real connection,
@@ -38,7 +40,7 @@ public:
 	~CachedReplayConnection() override;
 
 	// The only methods the scan actually drives on a hit:
-	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override;
+	VgiBatchPtr ReadDataBatch() override;
 	idx_t GetLastBatchIndex() const override {
 		return last_batch_index_;
 	}
@@ -94,10 +96,10 @@ public:
 		return {};
 	}
 	void EnsureWorkerSpawned() override {}
-	void SetInputSchema(const std::shared_ptr<arrow::Schema> &) override {}
-	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &) override {}
+	void SetInputSchema(const VgiSchemaPtr &) override {}
+	void UpdateInputSchemaForExecution(const VgiSchemaPtr &) override {}
 	InitResult PerformInit(const BindResult &, const std::vector<int32_t> &,
-	                       std::shared_ptr<arrow::Buffer>, std::vector<std::shared_ptr<arrow::Buffer>>,
+	                       VgiBufferPtr, std::vector<VgiBufferPtr>,
 	                       const std::string &, const std::optional<OrderByHint> &,
 	                       const std::optional<TableSampleHint> &, const std::vector<uint8_t> &,
 	                       const std::optional<std::vector<uint8_t>> &,
@@ -106,10 +108,10 @@ public:
 	}
 	void PerformFinalizeInit(const BindResult &) override {}
 	void OpenInputWriter() override {}
-	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &) override {}
+	void WriteInputBatch(const VgiBatchPtr &) override {}
 	void CloseInputWriter() override {}
 	std::vector<uint8_t> RpcTableBufferingProcess(const std::string &, const std::vector<uint8_t> &,
-	                                              const std::shared_ptr<arrow::RecordBatch> &,
+	                                              const VgiBatchPtr &,
 	                                              std::optional<int64_t>) override {
 		return {};
 	}

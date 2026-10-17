@@ -2,8 +2,6 @@
 #include "vgi_streaming_window_operator.hpp"
 #include "vgi_batch_validation.hpp"
 
-#include <arrow/c/bridge.h>
-
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -115,7 +113,7 @@ struct VgiStreamingWindowOperatorState : public OperatorState {
 	// All expressions in the same operator share the same partition/order
 	// keys (DuckDB's planner separates by partition equivalence into different
 	// LogicalWindow nodes), but value-col types differ per expression.
-	vector<std::shared_ptr<arrow::Schema>> chunk_input_schema_per_expr;
+	vector<VgiSchemaPtr> chunk_input_schema_per_expr;
 	idx_t partition_key_count = 0;
 	idx_t order_key_count = 0;
 	// DatabaseInstance pointer captured at OpenSessions time so the

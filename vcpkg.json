@@ -1,26 +1,26 @@
 {
-        "dependencies": [
-                "openssl",
-                "curl",
-                {
-                        "name": "arrow",
-                        "default-features": false,
-                        "features": [
-                                { "name": "mimalloc", "platform": "(linux | (osx & arm64)) & !emscripten" }
-                        ]
-                },
-                {
-                        "name": "sqlite3",
-                        "platform": "!emscripten"
-                }
-        ],
-        "vcpkg-configuration": {
-                "overlay-ports": [
-                        "./vcpkg_ports",
-                        "./extension-ci-tools/vcpkg_ports"
-                ],
-                "overlay-triplets": [
-                        "./extension-ci-tools/toolchains"
-                ]
-        }
+	"dependencies": [
+		"openssl",
+		"curl",
+		{
+			"name": "zstd",
+			"platform": "!emscripten"
+		},
+		{
+			"name": "lz4",
+			"platform": "!emscripten"
+		},
+		{
+			"name": "sqlite3",
+			"platform": "!emscripten"
+		}
+	],
+	"vcpkg-configuration": {
+		"overlay-ports": [
+			"./extension-ci-tools/vcpkg_ports"
+		],
+		"overlay-triplets": [
+			"./extension-ci-tools/toolchains"
+		]
+	}
 }

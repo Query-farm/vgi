@@ -3,9 +3,7 @@
 #include "vgi_table_buffering_impl.hpp"
 #include "vgi_batch_validation.hpp"
 
-#include <arrow/c/bridge.h>
 #include <exception>
-#include <arrow/util/byte_size.h> // TotalBufferSize — bound the whole-input RAM capture
 
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -301,7 +299,7 @@ public:
 	bool capturing = false;
 	VgiCacheControl capture_cc;
 	bool capture_cc_latched = false;
-	std::vector<std::shared_ptr<arrow::RecordBatch>> capture_batches;
+	std::vector<VgiBatchPtr> capture_batches;
 	size_t total_finalize_states = 0;
 	std::atomic<size_t> finalize_eos_count {0};
 	// Set if the worker's finalize output is not cacheable (no vgi.cache.* advertised),
@@ -1258,7 +1256,7 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 			// process-global in-flight budget aborts to uncached — drop what we've
 			// accumulated (freeing RAM now) and release any reserved budget; the dtor
 			// then won't commit. The query keeps streaming to DuckDB unaffected.
-			int64_t sz = arrow::util::TotalBufferSize(*batch);
+			int64_t sz = batch->TotalBufferSize();
 			if (gstate.capture_bytes + sz > gstate.cache_max_entry_bytes ||
 			    !GetResultCache(*gstate.db).TryReserveInflightCapture(sz)) {
 				gstate.capture_aborted.store(true);

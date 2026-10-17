@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -9,7 +11,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -58,7 +59,7 @@ constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.str
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
-                                     const std::shared_ptr<arrow::RecordBatch> &params,
+                                     const VgiBatchPtr &params,
                                      const std::shared_ptr<CatalogAuth> &auth = nullptr,
                                      const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
                                      const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
@@ -180,7 +181,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &worker_path = "",
                                              const std::string &execution_id_hex = "",
                                              const std::string &attach_opaque_data_digest = "",
-                                             const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata = nullptr,
+                                             const VgiMetadataPtr &pointer_metadata = nullptr,
                                              const std::atomic<bool> *cancellation = nullptr,
                                              const std::string &conn_id_hex = "",
                                              const std::string &transaction_opaque_data_digest = "");
@@ -233,7 +234,7 @@ void HttpPutBytes(ClientContext &context, const std::string &url,
 // Optionally includes the stream_state (cursor) and call_state tokens; both
 // have to ride the pointer batch, since the worker reads them off the request
 // metadata and a token omitted here is simply absent from the request.
-std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> &schema,
+std::vector<uint8_t> SerializePointerBatch(const VgiSchemaPtr &schema,
                                              const std::string &location_url,
                                              const std::string &stream_state_token = "",
                                              const std::string &call_state_token = "");

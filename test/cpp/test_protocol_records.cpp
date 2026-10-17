@@ -7,7 +7,7 @@
 // - Every record encodes with EXACTLY the schema vgi_protocol_schemas.hpp declares for it
 //   (names, order, types, nullability, metadata): peers such as vgi-rpc-go compare request
 //   schemas with arrow.Schema.Equal, so "close enough" fails every call.
-// - Records round-trip: ToBatch -> ValidateFull -> FromBatch gives back an equal record, for
+// - Records round-trip: ToBatch -> ValidateBatch(FULL) -> FromBatch gives back an equal record, for
 //   every shape the protocol uses (maps, nested lists, list<struct>, enums, timestamps,
 //   large_binary, optional members).
 // - Decoding keeps the client's compatibility contract: a missing nullable column is absent,
@@ -21,7 +21,9 @@
 
 #include "duckdb/common/exception.hpp"
 
-#include <arrow/api.h>
+#include "vgi_arrow.hpp"
+
+#include "nanoarrow/nanoarrow.h"
 
 #include <functional>
 #include <string>
@@ -31,8 +33,8 @@ using namespace duckdb::vgi::generated;
 
 namespace {
 
-std::shared_ptr<arrow::Buffer> Buf(const std::string &s) {
-	return arrow::Buffer::FromString(s);
+LargeBytes Buf(const std::string &s) {
+	return VgiBuffer::FromString(s);
 }
 
 template <class T>
@@ -40,10 +42,89 @@ T RoundTrip(const T &value) {
 	auto batch = ToBatch(value);
 	REQUIRE(batch);
 	REQUIRE(batch->num_rows() == 1);
-	auto status = batch->ValidateFull();
-	INFO(status.ToString());
-	REQUIRE(status.ok());
+	REQUIRE_NOTHROW(ValidateBatch(*batch, VgiValidation::FULL));
 	return Decode<T>(batch, 0, "test-worker");
+}
+
+// A one-row batch of `schema` whose column j is row 0 of `batch`'s column
+// `sources[j]`, or -- when sources[j] < 0 -- whatever `fill(j, array)` appends.
+VgiBatchPtr Rebuild(const VgiBatchPtr &batch, const VgiSchemaPtr &schema, const std::vector<int> &sources,
+                    const std::function<void(int, ArrowArray *)> &fill = nullptr) {
+	REQUIRE(batch->num_rows() == 1);
+	REQUIRE(static_cast<int>(sources.size()) == schema->num_fields());
+	VgiBatchBuilder builder(schema);
+	for (int j = 0; j < schema->num_fields(); j++) {
+		if (sources[j] >= 0) {
+			AppendElement(builder.column(j), batch->column(sources[j]), 0);
+		} else {
+			fill(j, builder.column(j));
+		}
+	}
+	builder.FinishRow();
+	return builder.Finish(batch->metadata());
+}
+
+std::vector<int> Identity(int n) {
+	std::vector<int> out;
+	for (int i = 0; i < n; i++) {
+		out.push_back(i);
+	}
+	return out;
+}
+
+// `batch` without column `idx`.
+VgiBatchPtr RemoveColumn(const VgiBatchPtr &batch, int idx) {
+	REQUIRE(idx >= 0);
+	auto sources = Identity(batch->num_columns());
+	sources.erase(sources.begin() + idx);
+	return Rebuild(batch, batch->schema()->RemoveField(idx), sources);
+}
+
+// `batch` with column `idx` replaced by `field`, its value appended by `fill`.
+VgiBatchPtr SetColumn(const VgiBatchPtr &batch, int idx, const ArrowSchema &field,
+                      const std::function<void(ArrowArray *)> &fill) {
+	REQUIRE(idx >= 0);
+	auto sources = Identity(batch->num_columns());
+	sources[idx] = -1;
+	return Rebuild(batch, batch->schema()->SetField(idx, field), sources, [&](int, ArrowArray *a) { fill(a); });
+}
+
+// `batch` with `field` appended as its last column, its value appended by `fill`.
+VgiBatchPtr AddColumn(const VgiBatchPtr &batch, const ArrowSchema &field,
+                      const std::function<void(ArrowArray *)> &fill) {
+	auto sources = Identity(batch->num_columns());
+	sources.push_back(-1);
+	return Rebuild(batch, batch->schema()->AddField(batch->num_columns(), field), sources,
+	               [&](int, ArrowArray *a) { fill(a); });
+}
+
+// The schema with its schema- and field-level metadata, for failure diagnostics.
+std::string Describe(const VgiSchema &schema) {
+	auto pairs = [](const VgiMetadata &md) {
+		std::string out;
+		for (int64_t i = 0; i < md.size(); i++) {
+			out += (i ? ", " : "") + md.key(i) + "=" + md.value(i);
+		}
+		return out;
+	};
+	std::string out;
+	for (int i = 0; i < schema.num_fields(); i++) {
+		out += "\n  " + schema.field_name(i) + ": " + TypeToString(schema.field(i)) +
+		       (schema.field_nullable(i) ? "" : " not null");
+		auto md = schema.field_metadata(i);
+		if (!md.empty()) {
+			out += " {" + pairs(md) + "}";
+		}
+	}
+	if (!schema.metadata().empty()) {
+		out += "\n  -- schema metadata: " + pairs(schema.metadata());
+	}
+	return out;
+}
+
+// A standalone field description, as a schema node.
+VgiSchemaPtr FieldOf(const VgiField &field) {
+	return MakeSchema({field});
 }
 
 std::string ErrorOf(const std::function<void()> &fn) {
@@ -61,7 +142,7 @@ TEST_CASE("Every record encodes with its protocol schema", "[protocol-records]")
 	auto pairs = RecordSchemaPairsForTesting();
 	REQUIRE(pairs.size() > 50);
 	for (auto &p : pairs) {
-		INFO(p.name << "\n record:  " << p.record->ToString(true) << "\n factory: " << p.factory->ToString(true));
+		INFO(p.name << "\n record:  " << Describe(*p.record) << "\n factory: " << Describe(*p.factory));
 		CHECK(p.record->Equals(*p.factory, /*check_metadata=*/true));
 	}
 }
@@ -71,9 +152,7 @@ TEST_CASE("Default-constructed records encode valid one-row batches", "[protocol
 		INFO(entry.first);
 		REQUIRE(entry.second);
 		CHECK(entry.second->num_rows() == 1);
-		auto status = entry.second->ValidateFull();
-		INFO(status.ToString());
-		CHECK(status.ok());
+		CHECK_NOTHROW(ValidateBatch(*entry.second, VgiValidation::FULL));
 	}
 }
 
@@ -135,13 +214,13 @@ TEST_CASE("Records round-trip through ToBatch/FromBatch", "[protocol-records]") 
 		req.phase = VgiInitPhase::Finalize;
 		auto batch = ToBatch(req);
 		auto column = batch->GetColumnByName("phase");
-		REQUIRE(column->type_id() == arrow::Type::DICTIONARY);
-		const auto &dict = static_cast<const arrow::DictionaryArray &>(*column);
-		const auto &values = static_cast<const arrow::StringArray &>(*dict.dictionary());
+		REQUIRE(column);
+		REQUIRE(column.is_dictionary());
+		auto values = column.dictionary();
 		REQUIRE(values.length() == 4);
 		CHECK(values.GetString(0) == "INPUT");
 		CHECK(values.GetString(3) == "TABLE_BUFFERING_FINALIZE");
-		CHECK(dict.GetValueIndex(0) == 1);
+		CHECK(column.GetInt(0) == 1);
 		CHECK(std::string(ToWire(VgiInitPhase::Finalize)) == "FINALIZE");
 		CHECK(VgiInitPhaseFromWire("INPUT") == VgiInitPhase::Input);
 		CHECK(!VgiInitPhaseFromWire("NOPE").has_value());
@@ -165,7 +244,7 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 
 	SECTION("a missing nullable column is absent") {
 		auto idx = full->schema()->GetFieldIndex("estimated_object_count");
-		auto batch = full->RemoveColumn(idx).ValueOrDie();
+		auto batch = RemoveColumn(full, idx);
 		auto decoded = Decode<SchemaInfo>(batch, 0, "w");
 		CHECK(!decoded.estimated_object_count.has_value());
 		CHECK(decoded.path == info.path);
@@ -173,7 +252,7 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 
 	SECTION("a missing required column names the column, record and worker") {
 		auto idx = full->schema()->GetFieldIndex("attach_opaque_data");
-		auto batch = full->RemoveColumn(idx).ValueOrDie();
+		auto batch = RemoveColumn(full, idx);
 		auto msg = ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "the-worker"); });
 		CHECK(msg.find("Required column 'attach_opaque_data' not found in SchemaInfo response") != std::string::npos);
 		CHECK(msg.find("the-worker") != std::string::npos);
@@ -181,39 +260,33 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 
 	SECTION("a null in a required column is an error") {
 		auto idx = full->schema()->GetFieldIndex("attach_opaque_data");
-		auto nulls = arrow::MakeArrayOfNull(arrow::binary(), 1).ValueOrDie();
-		auto field = arrow::field("attach_opaque_data", arrow::binary(), /*nullable=*/true);
-		auto batch = full->SetColumn(idx, field, nulls).ValueOrDie();
+		auto field = FieldOf(type::Binary().Named("attach_opaque_data", /*is_nullable=*/true));
+		auto batch = SetColumn(full, idx, field->field(0), [](ArrowArray *a) { append::Null(a); });
 		auto msg = ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "w"); });
 		CHECK(msg.find("unexpected null value") != std::string::npos);
 	}
 
 	SECTION("a null non-nullable list, map or list item is an error") {
 		auto path_idx = full->schema()->GetFieldIndex("path");
-		auto null_list = arrow::MakeArrayOfNull(arrow::list(arrow::utf8()), 1).ValueOrDie();
-		auto batch =
-		    full->SetColumn(path_idx, arrow::field("path", arrow::list(arrow::utf8()), true), null_list).ValueOrDie();
+		auto list_field = FieldOf(type::List(type::Utf8()).Named("path", true));
+		auto batch = SetColumn(full, path_idx, list_field->field(0), [](ArrowArray *a) { append::Null(a); });
 		CHECK(ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "w"); }).find("unexpected null value") != std::string::npos);
 
 		auto tags_idx = full->schema()->GetFieldIndex("tags");
-		auto null_map = arrow::MakeArrayOfNull(arrow::map(arrow::utf8(), arrow::utf8()), 1).ValueOrDie();
-		batch = full->SetColumn(tags_idx, arrow::field("tags", arrow::map(arrow::utf8(), arrow::utf8()), true),
-		                        null_map)
-		            .ValueOrDie();
+		auto map_field = FieldOf(type::Map(type::Utf8(), type::Utf8()).Named("tags", true));
+		batch = SetColumn(full, tags_idx, map_field->field(0), [](ArrowArray *a) { append::Null(a); });
 		CHECK(ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "w"); }).find("unexpected null value") != std::string::npos);
 
-		auto missing = full->RemoveColumn(path_idx).ValueOrDie();
+		auto missing = RemoveColumn(full, path_idx);
 		CHECK(ErrorOf([&] { Decode<SchemaInfo>(missing, 0, "w"); }).find("Required column 'path'") !=
 		      std::string::npos);
 
-		arrow::StringBuilder items;
-		REQUIRE(items.Append("a").ok());
-		REQUIRE(items.AppendNull().ok());
-		auto values = items.Finish().ValueOrDie();
-		arrow::Int32Builder offsets;
-		REQUIRE(offsets.AppendValues({0, 2}).ok());
-		auto list = arrow::ListArray::FromArrays(*offsets.Finish().ValueOrDie(), *values).ValueOrDie();
-		auto with_null_item = full->SetColumn(path_idx, full->schema()->field(path_idx), list).ValueOrDie();
+		// The declared `path` field (non-nullable items), carrying ["a", null].
+		auto with_null_item = SetColumn(full, path_idx, full->schema()->field(path_idx), [](ArrowArray *a) {
+			append::String(a->children[0], "a");
+			append::Null(a->children[0]);
+			append::FinishElement(a);
+		});
 		auto msg = ErrorOf([&] { Decode<SchemaInfo>(with_null_item, 0, "w"); });
 		CHECK(msg.find("unexpected null value") != std::string::npos);
 		CHECK(msg.find("path[]") != std::string::npos);
@@ -221,20 +294,17 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 
 	SECTION("a column of the wrong type is an error, not a silent default") {
 		auto idx = full->schema()->GetFieldIndex("comment");
-		arrow::Int64Builder b;
-		REQUIRE(b.Append(7).ok());
-		auto batch = full->SetColumn(idx, arrow::field("comment", arrow::int64()), b.Finish().ValueOrDie()).ValueOrDie();
+		auto field = FieldOf(type::Int64().Named("comment"));
+		auto batch = SetColumn(full, idx, field->field(0), [](ArrowArray *a) { append::Int(a, 7); });
 		auto msg = ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "w"); });
 		CHECK(msg.find("Column 'comment' in SchemaInfo") != std::string::npos);
 		CHECK(msg.find("expected utf8") != std::string::npos);
 	}
 
 	SECTION("extra columns from a newer peer are ignored") {
-		arrow::StringBuilder b;
-		REQUIRE(b.Append("future").ok());
-		auto batch =
-		    full->AddColumn(full->num_columns(), arrow::field("added_later", arrow::utf8()), b.Finish().ValueOrDie())
-		        .ValueOrDie();
+		auto field = FieldOf(type::Utf8().Named("added_later"));
+		auto batch = AddColumn(full, field->field(0), [](ArrowArray *a) { append::String(a, "future"); });
+		REQUIRE(batch->num_columns() == full->num_columns() + 1);
 		CHECK(Decode<SchemaInfo>(batch, 0, "w") == info);
 	}
 
@@ -243,15 +313,12 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 		req.phase = VgiInitPhase::Input;
 		auto batch = ToBatch(req);
 		auto idx = batch->schema()->GetFieldIndex("phase");
-		arrow::StringBuilder dict_builder;
-		REQUIRE(dict_builder.Append("SOMETHING_NEW").ok());
-		arrow::Int16Builder index_builder;
-		REQUIRE(index_builder.Append(0).ok());
-		auto column = arrow::DictionaryArray::FromArrays(batch->schema()->field(idx)->type(),
-		                                                 index_builder.Finish().ValueOrDie(),
-		                                                 dict_builder.Finish().ValueOrDie())
-		                  .ValueOrDie();
-		auto changed = batch->SetColumn(idx, batch->schema()->field(idx), column).ValueOrDie();
+		// Same dictionary<int16, utf8> field, but a dictionary holding only a value
+		// this client does not know.
+		auto changed = SetColumn(batch, idx, batch->schema()->field(idx), [](ArrowArray *a) {
+			append::String(a->dictionary, "SOMETHING_NEW");
+			append::Int(a, 0);
+		});
 		auto msg = ErrorOf([&] { Decode<InitRequest>(changed, 0, "w"); });
 		CHECK(msg.find("unknown phase 'SOMETHING_NEW' in InitRequest (not a VgiInitPhase value)") != std::string::npos);
 	}

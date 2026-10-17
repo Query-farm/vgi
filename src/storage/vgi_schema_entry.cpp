@@ -18,6 +18,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_table_entry.hpp"
 #include "storage/vgi_transaction.hpp"
+#include "nanoarrow/nanoarrow.h"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
@@ -268,20 +269,28 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	// Convert DuckDB columns to Arrow schema, then enrich with default expressions
 	auto columns_schema = vgi::DuckDBColumnsToArrowSchema(context, create_info.columns);
 	{
-		arrow::FieldVector enriched_fields;
+		// Deep copy, add each default to its field's metadata, re-adopt. Like the
+		// field-list rebuild this replaces, schema-level metadata is dropped.
+		ArrowSchema enriched;
+		columns_schema->ExportTo(&enriched);
+		if (enriched.metadata) {
+			ArrowSchemaSetMetadata(&enriched, nullptr);
+		}
 		idx_t col_idx = 0;
 		for (auto &col : create_info.columns.Logical()) {
-			auto field = columns_schema->field(static_cast<int>(col_idx));
 			if (col.HasDefaultValue()) {
-				auto default_str = col.DefaultValue().ToString();
-				auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
-				metadata->Append("default", default_str);
-				field = field->WithMetadata(metadata);
+				auto *field = enriched.children[col_idx];
+				auto metadata = vgi::VgiMetadata::FromC(field->metadata);
+				metadata.Append("default", col.DefaultValue().ToString());
+				const auto encoded = metadata.ToC();
+				if (ArrowSchemaSetMetadata(field, encoded.c_str()) != NANOARROW_OK) {
+					enriched.release(&enriched);
+					throw InternalException("VGI: failed to set column default metadata");
+				}
 			}
-			enriched_fields.push_back(field);
 			col_idx++;
 		}
-		columns_schema = arrow::schema(enriched_fields);
+		columns_schema = vgi::VgiSchema::Adopt(&enriched);
 	}
 
 	// Extract constraints

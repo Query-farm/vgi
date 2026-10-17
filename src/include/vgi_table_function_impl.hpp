@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include "vgi_settings_defaults.hpp"
 #include <atomic>
 #include <future>
@@ -575,7 +577,7 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	vector<VgiDynamicFilterInfo> dynamic_filters;
 
 	// Cached static filter bytes (serialized once, reused on every tick)
-	std::shared_ptr<arrow::Buffer> static_filter_bytes;
+	VgiBufferPtr static_filter_bytes;
 
 	// Shared tick filter state (updated by scan, read by connection for tick metadata)
 	shared_ptr<TickFilterState> tick_filter_state;
@@ -587,7 +589,7 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// (which assumes projected layout when projection_pushdown=true) reads
 	// the wrong column position.
 	std::vector<int32_t> projection_ids;
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	std::vector<VgiBufferPtr> join_keys_buffers;
 	std::optional<OrderByHint> order_by_hint;
 	std::optional<TableSampleHint> table_sample_hint;
 
@@ -692,7 +694,7 @@ struct VgiPrefetchSlot {
 	// Prefetch state machine (see ``PrefetchState`` above).
 	std::atomic<PrefetchState> state {PrefetchState::IDLE};
 	// The batch produced by the prefetch (valid when state == READY).
-	std::shared_ptr<arrow::RecordBatch> batch;
+	VgiBatchPtr batch;
 	// Any exception thrown by the prefetch (valid when state == ERROR).
 	std::exception_ptr exception;
 	// Set by the local-state destructor. A task that sees this flag must not
@@ -845,8 +847,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 //! Throws InvalidInputException if a required filter cannot be encoded exactly.
 //! Result of filter serialization — contains the filter batch and optional join keys batch.
 struct SerializedFilters {
-	std::shared_ptr<arrow::Buffer> filter_bytes;                    //! Arrow IPC bytes of the filter RecordBatch (or nullptr)
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;  //! Arrow IPC bytes per join key column (one single-column batch each)
+	VgiBufferPtr filter_bytes;                    //! Arrow IPC bytes of the filter RecordBatch (or nullptr)
+	std::vector<VgiBufferPtr> join_keys_buffers;  //! Arrow IPC bytes per join key column (one single-column batch each)
 };
 
 enum class VgiFilterColumnIndexDomain : uint8_t {
@@ -891,7 +893,7 @@ struct VgiDynamicFilterDeltaUpdate {
 };
 
 //! Serialize the advisory Top-N mutations sent in tick metadata.
-std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
+VgiBufferPtr VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
                                                               const vector<VgiDynamicFilterDeltaUpdate> &updates);
 
 //! Returns true if any descendant of ``filter`` is a DynamicFilter (Top-N

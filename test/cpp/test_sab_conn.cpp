@@ -15,8 +15,6 @@
 
 #include "duckdb.hpp"
 
-#include <arrow/api.h>
-
 #include <memory>
 #include <thread>
 #include <vector>
@@ -60,9 +58,9 @@ TEST_CASE("WebWorkerFunctionConnection drives count_to(5) over the ring", "[sab-
 	std::vector<int64_t> got;
 	while (auto batch = conn.ReadDataBatch()) {
 		REQUIRE(batch->num_columns() == 1);
-		auto col = std::static_pointer_cast<arrow::Int64Array>(batch->column(0));
-		for (int64_t i = 0; i < col->length(); i++) {
-			got.push_back(col->Value(i));
+		auto col = batch->column(0);
+		for (int64_t i = 0; i < col.length(); i++) {
+			got.push_back(col.GetInt(i));
 		}
 	}
 
@@ -99,9 +97,9 @@ TEST_CASE("WebWorkerFunctionConnection streams a multi-batch producer", "[sab-co
 	std::vector<int64_t> got;
 	while (auto batch = conn.ReadDataBatch()) {
 		num_batches++;
-		auto col = std::static_pointer_cast<arrow::Int64Array>(batch->column(0));
-		for (int64_t i = 0; i < col->length(); i++) {
-			got.push_back(col->Value(i));
+		auto col = batch->column(0);
+		for (int64_t i = 0; i < col.length(); i++) {
+			got.push_back(col.GetInt(i));
 		}
 	}
 	// Release the connection BEFORE joining: the worker serves until the c2w
@@ -207,9 +205,9 @@ TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained sp
 	auto drain = [&conn]() {
 		std::vector<int64_t> out;
 		while (auto batch = conn.ReadDataBatch()) {
-			auto col = std::static_pointer_cast<arrow::Int64Array>(batch->column(0));
-			for (int64_t i = 0; i < col->length(); i++) {
-				out.push_back(col->Value(i));
+			auto col = batch->column(0);
+			for (int64_t i = 0; i < col.length(); i++) {
+				out.push_back(col.GetInt(i));
 			}
 		}
 		return out;
@@ -262,9 +260,9 @@ TEST_CASE("WebWorkerFunctionConnection re-inits after a split whose output was n
 	conn.PerformInit(bind_result);
 	std::vector<int64_t> got;
 	while (auto batch = conn.ReadDataBatch()) {
-		auto col = std::static_pointer_cast<arrow::Int64Array>(batch->column(0));
-		for (int64_t i = 0; i < col->length(); i++) {
-			got.push_back(col->Value(i));
+		auto col = batch->column(0);
+		for (int64_t i = 0; i < col.length(); i++) {
+			got.push_back(col.GetInt(i));
 		}
 	}
 	// Release the connection BEFORE joining: the worker serves until the c2w

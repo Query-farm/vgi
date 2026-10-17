@@ -7,7 +7,6 @@
 // VGI_RPC_SHM_SIZE_BYTES. See vgi_platform.hpp.
 
 #include "vgi_platform.hpp"
-#include "vgi_nanoarrow_ipc.hpp"
 
 #if VGI_SHM_TRANSPORT
 
@@ -26,20 +25,16 @@
 #include <unistd.h>
 #endif
 
-#include <arrow/buffer.h>
-#include <arrow/io/memory.h>
-#include <arrow/ipc/reader.h>
-#include <arrow/ipc/writer.h>
-#include <arrow/type.h>
-
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "vgi_errno_name.hpp"
 #include "vgi_exception.hpp"
 
+#include "vgi_ipc.hpp"
 #include "vgi_rpc_client.hpp" // for SHM_OFFSET_KEY / SHM_LENGTH_KEY
 
 #if defined(_WIN32)
-// windows.h must come AFTER the arrow / vgi_rpc_client headers: it #defines
+// windows.h must come AFTER the IPC / vgi_rpc_client headers: it #defines
 // ERROR (and other all-caps tokens) that collide with identifiers in them.
 #include <process.h> // _getpid
 #ifndef WIN32_LEAN_AND_MEAN
@@ -56,68 +51,54 @@ namespace vgi {
 
 namespace {
 
-// An arrow::Buffer viewing one slot of the segment that co-owns the slot's
-// lease. Arrow keeps a sliced buffer's parent alive, so holding the lease here
-// is enough for every array cut from this buffer to pin the slot.
-class ShmSlotBuffer final : public arrow::Buffer {
-public:
-	ShmSlotBuffer(const uint8_t *data, int64_t size, std::shared_ptr<VgiShmSlotLease> lease)
-	    : arrow::Buffer(data, size), lease_(std::move(lease)) {
-	}
-
-private:
-	std::shared_ptr<VgiShmSlotLease> lease_;
-};
+// A buffer viewing one slot of the segment whose owner is the slot's lease.
+// VgiBuffer slices share their parent's owner, so every array the IPC reader
+// cuts from this buffer pins the slot (and the mapping) for as long as it lives.
+VgiBufferPtr MakeShmSlotBuffer(const uint8_t *data, int64_t size, std::shared_ptr<VgiShmSlotLease> lease) {
+	return std::make_shared<const VgiBuffer>(std::shared_ptr<const void>(std::move(lease)), data, size);
+}
 
 // Virtually concatenates a list of byte regions and exposes them as a single
-// arrow::io::InputStream — no allocation, no copy of the regions themselves.
+// input stream — no allocation, no copy of the regions themselves.
 // Used to splice together [schema_msg | mmap_slice | EOS] when reading a
 // dictionary-encoded batch out of the shm segment, instead of memcpy'ing the
 // whole 16 MiB slice into a fresh buffer.
-class ChainedBufferInputStream final : public arrow::io::InputStream {
+class ChainedBufferInputStream final : public VgiInputStream {
 public:
-	struct Region {
-		const uint8_t *data;
-		int64_t length;
-		// Optional buffer to pin (keeps `data` alive for the stream's lifetime).
-		std::shared_ptr<arrow::Buffer> owner;
-	};
-
-	explicit ChainedBufferInputStream(std::vector<Region> regions)
+	explicit ChainedBufferInputStream(std::vector<VgiBufferPtr> regions)
 	    : regions_(std::move(regions)), region_idx_(0), region_pos_(0), abs_pos_(0), closed_(false) {
 	}
 
-	arrow::Status Close() override {
+	void Close() override {
 		closed_ = true;
-		return arrow::Status::OK();
 	}
 
 	bool closed() const override {
 		return closed_;
 	}
 
-	arrow::Result<int64_t> Tell() const override {
+	int64_t Tell() const {
 		return abs_pos_;
 	}
 
-	arrow::Result<int64_t> Read(int64_t nbytes, void *out) override {
+	int64_t Read(int64_t nbytes, void *out) override {
 		auto *dst = static_cast<uint8_t *>(out);
 		int64_t total = 0;
 		while (nbytes > 0 && region_idx_ < regions_.size()) {
-			const auto &r = regions_[region_idx_];
-			int64_t avail = r.length - region_pos_;
+			const auto &r = *regions_[region_idx_];
+			int64_t avail = r.size() - region_pos_;
 			if (avail <= 0) {
 				region_idx_++;
 				region_pos_ = 0;
 				continue;
 			}
 			int64_t n = std::min(nbytes, avail);
-			std::memcpy(dst + total, r.data + region_pos_, static_cast<size_t>(n));
+			std::memcpy(dst + total, r.data() + region_pos_, static_cast<size_t>(n));
 			region_pos_ += n;
 			abs_pos_ += n;
 			total += n;
 			nbytes -= n;
-			if (region_pos_ == r.length) {
+			if (region_pos_ == r.size()) {
 				region_idx_++;
 				region_pos_ = 0;
 			}
@@ -125,17 +106,23 @@ public:
 		return total;
 	}
 
-	arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override {
+	VgiBufferPtr ReadBuffer(int64_t nbytes) override {
+		// Skip exhausted regions so a read that starts exactly at a region
+		// boundary still takes the zero-copy path.
+		while (region_idx_ < regions_.size() && region_pos_ >= regions_[region_idx_]->size()) {
+			region_idx_++;
+			region_pos_ = 0;
+		}
 		// Fast path: if the requested range is entirely within the current
-		// region, return a zero-copy slice of that region's owner buffer.
+		// region, return a zero-copy slice sharing that region's owner.
 		if (region_idx_ < regions_.size()) {
 			const auto &r = regions_[region_idx_];
-			int64_t avail = r.length - region_pos_;
-			if (nbytes <= avail && r.owner) {
-				auto sliced = arrow::SliceBuffer(r.owner, region_pos_, nbytes);
+			int64_t avail = r->size() - region_pos_;
+			if (nbytes <= avail) {
+				auto sliced = r->Slice(region_pos_, nbytes);
 				region_pos_ += nbytes;
 				abs_pos_ += nbytes;
-				if (region_pos_ == r.length) {
+				if (region_pos_ == r->size()) {
 					region_idx_++;
 					region_pos_ = 0;
 				}
@@ -143,14 +130,11 @@ public:
 			}
 		}
 		// Slow path: allocate and copy across regions.
-		ARROW_ASSIGN_OR_RAISE(auto out, arrow::AllocateResizableBuffer(nbytes));
-		ARROW_ASSIGN_OR_RAISE(auto n, Read(nbytes, out->mutable_data()));
-		ARROW_RETURN_NOT_OK(out->Resize(n, /*shrink_to_fit=*/false));
-		return std::shared_ptr<arrow::Buffer>(std::move(out));
+		return VgiInputStream::ReadBuffer(nbytes);
 	}
 
 private:
-	std::vector<Region> regions_;
+	std::vector<VgiBufferPtr> regions_;
 	size_t region_idx_;
 	int64_t region_pos_;
 	int64_t abs_pos_;
@@ -450,10 +434,8 @@ std::optional<uint64_t> VgiShmSegment::AllocateAndWrite(const uint8_t *data, siz
 	return offset;
 }
 
-std::shared_ptr<arrow::RecordBatch>
-VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                 const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
-                                 std::shared_ptr<VgiShmSlotLease> *out_lease) const {
+VgiBatchPtr VgiShmSegment::MaybeResolveBatch(const VgiBatchPtr &batch, const VgiMetadataPtr &custom_metadata,
+                                             std::shared_ptr<VgiShmSlotLease> *out_lease) const {
 	if (out_lease) {
 		out_lease->reset();
 	}
@@ -466,15 +448,15 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 	}
 	auto offset_str = custom_metadata->Get(SHM_OFFSET_KEY);
 	auto length_str = custom_metadata->Get(SHM_LENGTH_KEY);
-	if (!offset_str.ok() || !length_str.ok()) {
+	if (!offset_str || !length_str) {
 		return nullptr;
 	}
 
 	uint64_t offset;
 	uint64_t length;
 	try {
-		offset = std::stoull(offset_str.ValueUnsafe());
-		length = std::stoull(length_str.ValueUnsafe());
+		offset = std::stoull(*offset_str);
+		length = std::stoull(*length_str);
 	} catch (const std::exception &e) {
 		throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "VgiShmSegment: malformed pointer batch offset/length metadata: " +
 		                  std::string(e.what()));
@@ -487,11 +469,11 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 		                  ", length=" + std::to_string(length) + ", size=" + std::to_string(size_) + ")");
 	}
 
-	// Wrap the segment slice as an Arrow buffer that OWNS a lease on the slot.
-	// The IPC reader hands out zero-copy slices whose parent is this buffer
-	// (BufferReader and ChainedBufferInputStream both slice their owner), so
-	// every array of the resolved batch pins the slot — and the mapping —
-	// for as long as it lives. Nothing downstream has to know it is shm.
+	// Wrap the segment slice as a buffer whose owner is a lease on the slot.
+	// The IPC reader hands out zero-copy slices that share this owner
+	// (VgiBufferReader and ChainedBufferInputStream both slice it), so every
+	// array of the resolved batch pins the slot — and the mapping — for as
+	// long as it lives. Nothing downstream has to know it is shm.
 	auto lease = std::make_shared<VgiShmSlotLease>(VgiShmSlotLease {shared_from_this(), offset});
 	// Per vgi_rpc/shm.py:
 	//   * Non-dictionary schemas: shm slice is a complete IPC stream
@@ -499,11 +481,11 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 	//   * Dictionary schemas: shm slice contains only the dict+batch
 	//     messages (no schema, no EOS); the schema message is reconstructed
 	//     from the *pointer batch's* schema and prepended, EOS appended.
-	auto schema = batch ? batch->schema() : nullptr;
+	const VgiSchemaPtr schema = batch ? batch->schema() : nullptr;
 	bool has_dict = false;
 	if (schema) {
 		for (int i = 0; i < schema->num_fields(); ++i) {
-			if (schema->field(i)->type()->id() == arrow::Type::DICTIONARY) {
+			if (schema->field(i).dictionary != nullptr) {
 				has_dict = true;
 				break;
 			}
@@ -513,74 +495,55 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 	// Static EOS marker: continuation token 0xFFFFFFFF + 4-byte 0-length.
 	static const uint8_t kEosMarker[8] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
 
-	std::shared_ptr<arrow::io::InputStream> input;
+	auto slice_buffer = MakeShmSlotBuffer(base_ + offset, static_cast<int64_t>(length), lease);
+	std::shared_ptr<VgiInputStream> input;
 	if (!has_dict) {
 		// Non-dict: shm slice is already a complete IPC stream
-		// (schema + record batch + EOS). Wrap as a Buffer view — zero copy.
-		auto buffer = std::make_shared<ShmSlotBuffer>(base_ + offset, static_cast<int64_t>(length), lease);
-		input = std::make_shared<arrow::io::BufferReader>(buffer);
+		// (schema + record batch + EOS). Read it in place — zero copy.
+		input = std::make_shared<VgiBufferReader>(std::move(slice_buffer));
 	} else {
 		// Dict path: build/cache the schema message bytes once per scan
 		// (the same schema repeats across every batch), then virtually
 		// concatenate [schema_msg | mmap_slice | EOS] via a chained
-		// InputStream — no allocation, no copy of the slice.
-		std::shared_ptr<arrow::Buffer> schema_msg;
+		// input stream — no allocation, no copy of the slice.
+		VgiBufferPtr schema_msg;
 		if (cached_schema_ptr_ == schema.get() && cached_schema_msg_) {
 			schema_msg = cached_schema_msg_;
 		} else {
-			auto out_buffer_result = arrow::io::BufferOutputStream::Create();
-			if (!out_buffer_result.ok()) {
-				throw IOException("VgiShmSegment: BufferOutputStream::Create failed: " +
-				                  out_buffer_result.status().ToString());
+			try {
+				// An encapsulated Schema message, without an EOS marker.
+				schema_msg = SerializeSchema(*schema);
+			} catch (const std::exception &e) {
+				throw IOException("VgiShmSegment: schema message serialization failed: " +
+				                  ErrorData(e).RawMessage());
 			}
-			auto out_stream = out_buffer_result.ValueUnsafe();
-			auto schema_writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(out_stream, schema);
-			if (!schema_writer_result.ok()) {
-				throw IOException("VgiShmSegment: MakeStreamWriter failed: " +
-				                  schema_writer_result.status().ToString());
-			}
-			auto status = schema_writer_result.ValueUnsafe()->Close();
-			if (!status.ok()) {
-				throw IOException("VgiShmSegment: schema writer close failed: " + status.ToString());
-			}
-			auto finish_result = out_stream->Finish();
-			if (!finish_result.ok()) {
-				throw IOException("VgiShmSegment: BufferOutputStream::Finish failed: " +
-				                  finish_result.status().ToString());
-			}
-			auto schema_with_eos = finish_result.ValueUnsafe();
-			const int64_t schema_msg_len = schema_with_eos->size() - sizeof(kEosMarker);
-			if (schema_msg_len < 0) {
-				throw IOException("VgiShmSegment: schema message shorter than EOS marker");
-			}
-			schema_msg = arrow::SliceBuffer(schema_with_eos, 0, schema_msg_len);
 			cached_schema_ptr_ = schema.get();
 			cached_schema_msg_ = schema_msg;
 		}
 
 		// EOS marker as a tiny non-owning buffer (the byte array is static).
-		auto eos_buffer =
-		    std::make_shared<arrow::Buffer>(kEosMarker, static_cast<int64_t>(sizeof(kEosMarker)));
-		auto slice_buffer = std::make_shared<ShmSlotBuffer>(base_ + offset, static_cast<int64_t>(length), lease);
+		static const VgiBufferPtr eos_buffer = VgiBuffer::Wrap(kEosMarker, static_cast<int64_t>(sizeof(kEosMarker)));
 
-		std::vector<ChainedBufferInputStream::Region> regions;
+		std::vector<VgiBufferPtr> regions;
 		regions.reserve(3);
-		regions.push_back({schema_msg->data(), schema_msg->size(), schema_msg});
-		regions.push_back({slice_buffer->data(), slice_buffer->size(), slice_buffer});
-		regions.push_back({eos_buffer->data(), eos_buffer->size(), eos_buffer});
+		regions.push_back(std::move(schema_msg));
+		regions.push_back(std::move(slice_buffer));
+		regions.push_back(eos_buffer);
 		input = std::make_shared<ChainedBufferInputStream>(std::move(regions));
 	}
 
-	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
-	if (!reader_result.ok()) {
+	std::unique_ptr<VgiIpcReader> reader;
+	try {
+		reader = VgiIpcReader::Open(input);
+	} catch (const std::exception &e) {
 		throw IOException("VgiShmSegment: failed to open IPC stream from segment slice: " +
-		                  reader_result.status().ToString());
+		                  ErrorData(e).RawMessage());
 	}
-	auto reader = reader_result.ValueUnsafe();
-	std::shared_ptr<arrow::RecordBatch> resolved;
-	auto status = reader->ReadNext(&resolved);
-	if (!status.ok()) {
-		throw IOException("VgiShmSegment: failed to read batch from segment slice: " + status.ToString());
+	VgiBatchPtr resolved;
+	try {
+		resolved = reader->ReadNext();
+	} catch (const std::exception &e) {
+		throw IOException("VgiShmSegment: failed to read batch from segment slice: " + ErrorData(e).RawMessage());
 	}
 	if (!resolved) {
 		throw IOException("VgiShmSegment: empty IPC stream in segment slice");

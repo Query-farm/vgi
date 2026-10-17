@@ -42,7 +42,7 @@ struct VgiCopyToBindData : public FunctionData {
 	std::string function_name;                    // worker handler
 	ArrowArguments arguments;                     // resolved COPY options (for re-bind at init)
 	std::map<std::string, Value> settings;
-	std::shared_ptr<arrow::Schema> input_schema; // source columns
+	VgiSchemaPtr input_schema; // source columns
 	BindResult bind_result;                      // bind_request_bytes carries the copy_to context
 	std::string format;
 	std::string file_path;
@@ -74,7 +74,7 @@ struct OptionSpec {
 };
 
 std::map<std::string, OptionSpec> ResolveOptionSpecs(ClientContext &context,
-                                                      const std::shared_ptr<arrow::Schema> &options_schema) {
+                                                      const VgiSchemaPtr &options_schema) {
 	std::map<std::string, OptionSpec> specs;
 	if (!options_schema || options_schema->num_fields() == 0) {
 		return specs;

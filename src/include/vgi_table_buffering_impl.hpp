@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <atomic>
 #include <deque>
 #include <memory>
@@ -8,7 +10,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/buffer.h>
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -79,10 +80,10 @@ public:
 	// Serialized table_filters (Arrow IPC bytes with json filter_spec + value
 	// columns) — null if no filters. Reuses VgiSerializeFilters from the
 	// streaming pure-table path.
-	std::shared_ptr<arrow::Buffer> pushdown_filters;
+	VgiBufferPtr pushdown_filters;
 	// Per-IN-filter join-keys batches (one single-column Arrow IPC RecordBatch
 	// each). Empty when no IN filters. Mirrors the streaming convention.
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	std::vector<VgiBufferPtr> join_keys_buffers;
 	// Full worker-output schema (size matches the worker's declared output —
 	// what the worker would emit absent projection). Preserved verbatim from
 	// ``LogicalGet::returned_types`` / ``names`` at rewriter time. Used by
@@ -196,8 +197,8 @@ public:
 	bool projection_pushdown = false;
 	std::vector<int32_t> projection_ids;
 	std::vector<int32_t> column_ids;
-	std::shared_ptr<arrow::Buffer> pushdown_filters;
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	VgiBufferPtr pushdown_filters;
+	std::vector<VgiBufferPtr> join_keys_buffers;
 	vector<LogicalType> all_column_types;
 	vector<string> all_column_names;
 	std::string explain_summary;

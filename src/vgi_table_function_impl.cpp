@@ -1,6 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
-#include "vgi_nanoarrow_ipc.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_platform.hpp" // VGI_ASYNC_INIT_ENABLED
 #ifdef __EMSCRIPTEN__
@@ -26,7 +25,6 @@
 #include "vgi_protocol.hpp"
 #include "vgi_worker_pool.hpp"
 
-#include "arrow/util/byte_size.h" // TotalBufferSize (batch-shape stats)
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -58,11 +56,8 @@
 
 #include "yyjson.hpp"
 
-#include <arrow/c/bridge.h>
-#include <arrow/io/memory.h>
-#include <arrow/ipc/writer.h>
-
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <limits>
 
@@ -284,10 +279,11 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	VGI_LOG(context, "table_function.bind",
 	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
-	         {"num_args", bind_data.arguments.array ? std::to_string(bind_data.arguments.array->length()) : "0"}});
+	         {"num_args", bind_data.arguments ? std::to_string(bind_data.arguments.length()) : "0"}});
 
 	// Validate that arguments type is a struct (defensive check)
-	D_ASSERT(!bind_data.arguments.type || bind_data.arguments.type->id() == arrow::Type::STRUCT);
+	D_ASSERT(!bind_data.arguments || (bind_data.arguments.batch->num_columns() == 1 &&
+	                                  std::strcmp(bind_data.arguments.batch->schema()->field(0).format, "+s") == 0));
 
 	// Inline-bind short-circuit: when the catalog-routed scan has a
 	// `bind_result` carried on TableInfo (worker pre-bound at
@@ -302,7 +298,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 				auto resolved_secrets = vgi::ExtractVgiSecrets(context, bind_data.required_secrets);
 				auto bind_request_bytes = vgi::BuildBindRequestBytes(
 				    context, bind_data.function_name, "TABLE",
-				    bind_data.arguments.array, /*input_schema=*/nullptr,
+				    bind_data.arguments.batch, /*input_schema=*/nullptr,
 				    bind_data.attach_opaque_data, bind_data.transaction_opaque_data,
 				    bind_data.settings, resolved_secrets,
 				    /*resolved_secrets_provided=*/false,
@@ -1039,6 +1035,81 @@ private:
 // Serialize Filters - Convert TableFilterSet to Arrow IPC bytes for worker
 // ============================================================================
 
+//! DuckDB's Arrow export of `chunk` (all rows) as a batch with fields `names`.
+static VgiBatchPtr AppendChunkToBatch(ClientContext &context, DataChunk &chunk, const vector<LogicalType> &types,
+                                      const vector<string> &names, ClientProperties &client_props) {
+	const idx_t count = chunk.size();
+	ArrowAppender appender(types, count, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
+	appender.Append(chunk, 0, count, count);
+	ArrowArray arr = appender.Finalize();
+	VgiSchemaPtr schema;
+	try {
+		ArrowSchema c_schema;
+		ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
+		schema = VgiSchema::Adopt(&c_schema);
+	} catch (...) {
+		if (arr.release) {
+			arr.release(&arr);
+		}
+		throw;
+	}
+	return VgiBatch::Adopt(std::move(schema), &arr);
+}
+
+//! A one-row filter batch: `chunk` (filter_spec VARCHAR + value columns) exported by
+//! DuckDB, with column 0 as the required `filter_spec: utf8 not null` and the V2
+//! schema-level metadata. Import failures throw IOException("<import_error>: ...").
+static VgiBatchPtr MakeFilterSpecBatch(ClientContext &context, DataChunk &chunk, const vector<LogicalType> &types,
+                                       const vector<string> &names, ClientProperties &client_props,
+                                       const char *import_error) {
+	VgiBatchPtr batch;
+	try {
+		batch = AppendChunkToBatch(context, chunk, types, names, client_props);
+	} catch (const std::exception &e) {
+		throw IOException("%s: %s", import_error, ErrorData(e).RawMessage());
+	}
+	// V2 metadata is schema-level. The filter_spec cell itself is required.
+	static const VgiMetadata kFilterMetadata {{"vgi_filter_encoding", "vgi.filters.v2"},
+	                                          {"vgi_filter_version", "2"},
+	                                          {"vgi_evaluation_context", "vgi.none.v1"}};
+	ArrowSchema spec_field;
+	BuildSchema(type::Utf8().Named("filter_spec", /*is_nullable=*/false), &spec_field);
+	VgiSchemaPtr target;
+	try {
+		target = batch->schema()->SetField(0, spec_field)->WithMetadata(kFilterMetadata);
+	} catch (...) {
+		spec_field.release(&spec_field);
+		throw;
+	}
+	spec_field.release(&spec_field);
+	// Zero-copy relabel when DuckDB exported VARCHAR as utf8 (the default); converts a
+	// large_utf8 export (arrow_large_buffer_size) instead of mislabeling its buffers.
+	return ReconcileBatchToSchema(batch, target);
+}
+
+//! `batch` as a complete IPC stream (schema, the batch, EOS), uncompressed.
+static VgiBufferPtr SerializeIpcStream(const VgiBatch &batch, const char *open_error, const char *write_error,
+                                       const char *close_error) {
+	auto sink = std::make_shared<VgiBufferOutputStream>();
+	std::unique_ptr<VgiIpcWriter> writer;
+	try {
+		writer = VgiIpcWriter::Open(sink, batch.schema());
+	} catch (const std::exception &e) {
+		throw IOException("%s: %s", open_error, ErrorData(e).RawMessage());
+	}
+	try {
+		writer->Write(batch);
+	} catch (const std::exception &e) {
+		throw IOException("%s: %s", write_error, ErrorData(e).RawMessage());
+	}
+	try {
+		writer->Close();
+	} catch (const std::exception &e) {
+		throw IOException("%s: %s", close_error, ErrorData(e).RawMessage());
+	}
+	return sink->Finish();
+}
+
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
                                       optional_ptr<TableFilterSet> filters, const vector<string> &column_names,
                                       const string &worker_path, const string &rowid_column_name,
@@ -1207,70 +1278,17 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		chunk.SetValue(i + 1, 0, values[i]);
 	}
 
-	// Convert to Arrow via ArrowAppender
 	ClientProperties client_props = context.GetClientProperties();
-	ArrowAppender appender(types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
-	appender.Append(chunk, 0, 1, 1);
-	ArrowArray arr = appender.Finalize();
-
-	// Build Arrow schema via C API
-	ArrowSchema c_schema;
-	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-	// Import to Arrow C++ RecordBatch
-	auto import_result = arrow::ImportRecordBatch(&arr, &c_schema);
-	if (!import_result.ok()) {
-		throw IOException("Failed to import filter RecordBatch: %s", import_result.status().ToString());
-	}
-	auto record_batch = import_result.ValueUnsafe();
-
-	// V2 metadata is schema-level. The filter_spec cell itself is required.
-	auto metadata =
-	    arrow::KeyValueMetadata::Make({"vgi_filter_encoding", "vgi_filter_version", "vgi_evaluation_context"},
-	                                  {"vgi.filters.v2", "2", "vgi.none.v1"});
-	std::vector<std::shared_ptr<arrow::Field>> new_fields;
-	new_fields.push_back(arrow::field("filter_spec", arrow::utf8(), /*nullable=*/false));
-	for (int i = 1; i < record_batch->schema()->num_fields(); i++) {
-		new_fields.push_back(record_batch->schema()->field(i));
-	}
-	auto new_schema = arrow::schema(new_fields, metadata);
-
-	// Create new RecordBatch with updated schema
-	record_batch = arrow::RecordBatch::Make(new_schema, record_batch->num_rows(), record_batch->columns());
+	auto record_batch = MakeFilterSpecBatch(context, chunk, types, names, client_props, "Failed to import filter RecordBatch");
 
 	// Serialize to Arrow IPC stream format (schema + record batch)
-	auto buffer_result = arrow::io::BufferOutputStream::Create();
-	if (!buffer_result.ok()) {
-		throw IOException("Failed to create buffer for filter IPC: %s", buffer_result.status().ToString());
-	}
-	auto buffer_stream = buffer_result.ValueUnsafe();
-
-	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(buffer_stream, record_batch->schema());
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create IPC stream writer: %s", writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
-
-	auto write_status = writer->WriteRecordBatch(*record_batch);
-	if (!write_status.ok()) {
-		throw IOException("Failed to write filter RecordBatch to IPC stream: %s", write_status.ToString());
-	}
-
-	auto close_status = writer->Close();
-	if (!close_status.ok()) {
-		throw IOException("Failed to close IPC stream writer: %s", close_status.ToString());
-	}
-
-	auto finish_result = buffer_stream->Finish();
-	if (!finish_result.ok()) {
-		throw IOException("Failed to finish filter IPC buffer: %s", finish_result.status().ToString());
-	}
-
-	auto filter_bytes = finish_result.ValueUnsafe();
+	auto filter_bytes = SerializeIpcStream(*record_batch, "Failed to create IPC stream writer",
+	                                       "Failed to write filter RecordBatch to IPC stream",
+	                                       "Failed to close IPC stream writer");
 
 	// Build one IPC buffer per join key column (each is a single-column batch).
 	// Each IN filter gets its own batch, so different cardinalities are supported.
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	std::vector<VgiBufferPtr> join_keys_buffers;
 	if (serializer.HasJoinKeys()) {
 		auto &key_columns = serializer.GetJoinKeyColumns();
 
@@ -1288,51 +1306,21 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 			}
 
 			// Convert to Arrow via ArrowAppender
-			ArrowAppender appender(types, count, client_props,
-			                       ArrowTypeExtensionData::GetExtensionTypes(context, types));
-			appender.Append(chunk, 0, count, count);
-			ArrowArray arr = appender.Finalize();
-
-			ArrowSchema c_schema;
-			ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-			auto import_res = arrow::ImportRecordBatch(&arr, &c_schema);
-			if (!import_res.ok()) {
+			VgiBatchPtr key_batch;
+			try {
+				key_batch = AppendChunkToBatch(context, chunk, types, names, client_props);
+			} catch (const std::exception &e) {
 				throw IOException("Failed to import join keys RecordBatch for '%s': %s", kc.column_name,
-				                  import_res.status().ToString());
+				                  ErrorData(e).RawMessage());
 			}
-			auto key_batch = import_res.ValueUnsafe();
 
 			// Add version metadata
-			auto metadata = arrow::KeyValueMetadata::Make({"vgi_join_keys_version"}, {"2"});
-			key_batch = key_batch->ReplaceSchemaMetadata(metadata);
+			key_batch = key_batch->WithSchema(key_batch->schema()->WithMetadata(VgiMetadata {{"vgi_join_keys_version", "2"}}));
 
 			// Serialize to Arrow IPC
-			auto buf_result = arrow::io::BufferOutputStream::Create();
-			if (!buf_result.ok()) {
-				throw IOException("Failed to create buffer for join keys IPC: %s", buf_result.status().ToString());
-			}
-			auto buf_stream = buf_result.ValueUnsafe();
-
-			auto writer_res = ::duckdb::vgi::nanoipc::MakeStreamWriter(buf_stream, key_batch->schema());
-			if (!writer_res.ok()) {
-				throw IOException("Failed to create IPC writer for join keys: %s", writer_res.status().ToString());
-			}
-			auto writer = writer_res.ValueUnsafe();
-
-			auto write_status = writer->WriteRecordBatch(*key_batch);
-			if (!write_status.ok()) {
-				throw IOException("Failed to write join keys RecordBatch: %s", write_status.ToString());
-			}
-			auto close_status = writer->Close();
-			if (!close_status.ok()) {
-				throw IOException("Failed to close join keys IPC writer: %s", close_status.ToString());
-			}
-			auto finish_res = buf_stream->Finish();
-			if (!finish_res.ok()) {
-				throw IOException("Failed to finish join keys IPC buffer: %s", finish_res.status().ToString());
-			}
-			join_keys_buffers.push_back(finish_res.ValueUnsafe());
+			join_keys_buffers.push_back(SerializeIpcStream(*key_batch, "Failed to create IPC writer for join keys",
+			                                               "Failed to write join keys RecordBatch",
+			                                               "Failed to close join keys IPC writer"));
 		}
 	}
 
@@ -1431,7 +1419,7 @@ static bool ResolvePartitionColumns(const VgiTableFunctionBindData &bind_data,
 		if (static_cast<int>(pi) >= out_schema->num_fields()) {
 			return false;
 		}
-		const std::string nm = out_schema->field(static_cast<int>(pi))->name();
+		const std::string nm = out_schema->field_name(static_cast<int>(pi));
 		bool found = false;
 		for (idx_t c = 0; c < bind_data.all_column_names.size(); c++) {
 			if (bind_data.all_column_names[c] == nm) {
@@ -1817,7 +1805,7 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	e.key.worker_path = bind_data.worker_path();
 	e.key.function_name = bind_data.function_name;
 	e.key.schema_name = bind_data.schema_name;
-	e.key.canonical_arguments = bind_data.arguments.array ? bind_data.arguments.array->ToString() : "";
+	e.key.canonical_arguments = SerializeArgumentsForKey(bind_data.arguments.batch);
 	e.key.canonical_settings = SerializeSettingsForKey(bind_data.settings);
 	e.key.attach_options = bind_data.attach_params->attach_options_canonical();
 	e.key.projection = SerializeProjectionForKey(projection_ids);
@@ -2937,7 +2925,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 // Helper: Get next batch from worker and convert to Arrow C ABI
 // ============================================================================
 
-std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
+VgiBufferPtr VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
                                                               const vector<VgiDynamicFilterDeltaUpdate> &updates) {
 	FilterSerializer serializer(worker_path, 0, /*allow_external_sets=*/false);
 	auto document = yyjson_mut_obj(serializer.GetDoc());
@@ -2991,46 +2979,9 @@ std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &con
 	}
 
 	auto client_props = context.GetClientProperties();
-	ArrowAppender appender(types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
-	appender.Append(chunk, 0, 1, 1);
-	auto array = appender.Finalize();
-	ArrowSchema c_schema;
-	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-	auto imported = arrow::ImportRecordBatch(&array, &c_schema);
-	if (!imported.ok()) {
-		throw IOException("Failed to import dynamic filter delta: %s", imported.status().ToString());
-	}
-	auto batch = imported.ValueUnsafe();
-	auto metadata =
-	    arrow::KeyValueMetadata::Make({"vgi_filter_encoding", "vgi_filter_version", "vgi_evaluation_context"},
-	                                  {"vgi.filters.v2", "2", "vgi.none.v1"});
-	auto fields = batch->schema()->fields();
-	fields[0] = arrow::field("filter_spec", arrow::utf8(), /*nullable=*/false);
-	batch = arrow::RecordBatch::Make(arrow::schema(fields, metadata), 1, batch->columns());
-
-	auto output_result = arrow::io::BufferOutputStream::Create();
-	if (!output_result.ok()) {
-		throw IOException("Failed to create dynamic filter delta buffer: %s", output_result.status().ToString());
-	}
-	auto output = output_result.ValueUnsafe();
-	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(output, batch->schema());
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create dynamic filter delta writer: %s", writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
-	auto status = writer->WriteRecordBatch(*batch);
-	if (!status.ok()) {
-		throw IOException("Failed to write dynamic filter delta: %s", status.ToString());
-	}
-	status = writer->Close();
-	if (!status.ok()) {
-		throw IOException("Failed to close dynamic filter delta: %s", status.ToString());
-	}
-	auto finished = output->Finish();
-	if (!finished.ok()) {
-		throw IOException("Failed to finish dynamic filter delta: %s", finished.status().ToString());
-	}
-	return finished.ValueUnsafe();
+	auto batch = MakeFilterSpecBatch(context, chunk, types, names, client_props, "Failed to import dynamic filter delta");
+	return SerializeIpcStream(*batch, "Failed to create dynamic filter delta writer",
+	                          "Failed to write dynamic filter delta", "Failed to close dynamic filter delta");
 }
 
 //! Update the TickFilterState with current DynamicFilter values.
@@ -3139,7 +3090,28 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 //! DuckDB internal error.
 static constexpr idx_t VGI_BATCH_INDEX_CAP = 10000000000000ULL;  // 10^13
 
-//! Convert a 2-row ``arrow::RecordBatch`` carrying ``(min, max)`` per
+//! Type equality with Arrow C++ ``DataType::Equals`` semantics: a node's own
+//! nullability belongs to its field, not its type, so only nested children compare it.
+static bool SameDataType(const ArrowSchema &a, const ArrowSchema &b) {
+	if (std::strcmp(a.format, b.format) != 0 || a.n_children != b.n_children) {
+		return false;
+	}
+	const int64_t type_flags = ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED;
+	if ((a.flags & type_flags) != (b.flags & type_flags)) {
+		return false;
+	}
+	for (int64_t c = 0; c < a.n_children; c++) {
+		if (!TypesEqual(*a.children[c], *b.children[c])) {
+			return false;
+		}
+	}
+	if ((a.dictionary == nullptr) != (b.dictionary == nullptr)) {
+		return false;
+	}
+	return !a.dictionary || SameDataType(*a.dictionary, *b.dictionary);
+}
+
+//! Convert a 2-row batch carrying ``(min, max)`` per
 //! partition column into a ``vector<ColumnPartitionData>`` via the
 //! established VGI Arrow-conversion machinery (the same path
 //! ``VgiTableFunctionScan`` uses for data batches —
@@ -3154,7 +3126,7 @@ static constexpr idx_t VGI_BATCH_INDEX_CAP = 10000000000000ULL;  // 10^13
 //! handle) any exception bubbles up.
 static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
     ClientContext &context,
-    const std::shared_ptr<arrow::RecordBatch> &pv_batch) {
+    const VgiBatchPtr &pv_batch) {
 	// Build an ArrowTableSchema + DuckDB LogicalTypes for the
 	// partition_values schema. ``names`` is filled too but unused.
 	ArrowSchemaWrapper c_schema;
@@ -3201,18 +3173,18 @@ static bool DecodePartitionMinTuple(ClientContext &context, const std::string &p
 	if (pv_bytes.empty()) {
 		return false;
 	}
-	auto buf = arrow::Buffer::FromString(pv_bytes);
-	auto input = std::make_shared<arrow::io::BufferReader>(buf);
-	auto rr = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
-	if (!rr.ok()) {
+	// Borrowed: pv_bytes outlives the decode, and the batch never escapes this call.
+	VgiBatchPtr pv_batch;
+	try {
+		auto reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(
+		    VgiBuffer::Wrap(pv_bytes.data(), static_cast<int64_t>(pv_bytes.size()))));
+		pv_batch = reader->ReadNext();
+	} catch (const std::exception &) {
 		return false;
 	}
-	auto reader = rr.ValueUnsafe();
-	auto nr = reader->ReadNext();
-	if (!nr.ok() || !nr.ValueUnsafe().batch) {
+	if (!pv_batch) {
 		return false;
 	}
-	auto pv_batch = nr.ValueUnsafe().batch;
 	if (pv_batch->num_rows() != 2) {
 		return false;
 	}
@@ -3314,7 +3286,7 @@ static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCt
 static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                          VgiTableFunctionGlobalState &global_state,
                          VgiTableFunctionLocalState &local_state,
-                         std::shared_ptr<arrow::RecordBatch> arrow_batch) {
+                         VgiBatchPtr arrow_batch) {
 	if (!arrow_batch) {
 		local_state.done = true;
 		// Result-cache capture: this local state fully drained its stream. The
@@ -3391,25 +3363,30 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			                  "non-empty data batch without vgi_partition_values metadata",
 			                  bind_data.function_name);
 		}
-		auto buf = arrow::Buffer::FromString(pv_bytes);
-		auto input = std::make_shared<arrow::io::BufferReader>(buf);
-		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
-		if (!reader_result.ok()) {
+		// Borrowed: pv_bytes (the connection's last partition values) outlives this
+		// decode, and pv_batch is converted to Values before InstallBatch returns.
+		std::unique_ptr<VgiIpcReader> reader;
+		try {
+			reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(
+			    VgiBuffer::Wrap(pv_bytes.data(), static_cast<int64_t>(pv_bytes.size()))));
+		} catch (const std::exception &e) {
 			throw IOException(metadata_violation("vgi_partition_values#b64"),
 			                  "VGI function '%s' emitted invalid Arrow IPC payload in "
 			                  "vgi_partition_values#b64: %s",
-			                  bind_data.function_name,
-			                  reader_result.status().ToString());
+			                  bind_data.function_name, ErrorData(e).RawMessage());
 		}
-		auto reader = reader_result.ValueUnsafe();
-		auto next_result = reader->ReadNext();
-		if (!next_result.ok() || !next_result.ValueUnsafe().batch) {
+		VgiBatchPtr pv_batch;
+		try {
+			pv_batch = reader->ReadNext();
+		} catch (const std::exception &) {
+			pv_batch = nullptr;
+		}
+		if (!pv_batch) {
 			throw IOException(metadata_violation("vgi_partition_values#b64"),
 			                  "VGI function '%s' emitted empty IPC stream in "
 			                  "vgi_partition_values#b64",
 			                  bind_data.function_name);
 		}
-		auto pv_batch = next_result.ValueUnsafe().batch;
 		try {
 			ValidateWorkerBatch(&context, pv_batch.get(),
 			                    StringUtil::Format("function '%s' vgi_partition_values", bind_data.function_name));
@@ -3444,27 +3421,30 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		// column rather than surfacing from deep inside ArrowToDuckDB.
 		const auto &bind_schema = bind_data.bind_result.output_schema;
 		for (idx_t i = 0; i < declared_indices.size(); ++i) {
-			const auto &declared_field = bind_schema->field(declared_indices[i]);
+			const int declared_idx = static_cast<int>(declared_indices[i]);
+			const auto &declared_field = bind_schema->field(declared_idx);
 			const auto &pv_field = pv_batch->schema()->field(static_cast<int>(i));
-			if (pv_field->name() != declared_field->name()) {
+			const std::string declared_name = bind_schema->field_name(declared_idx);
+			const std::string pv_name = pv_batch->schema()->field_name(static_cast<int>(i));
+			if (pv_name != declared_name) {
 				throw IOException(metadata_violation("vgi_partition_values#b64")
 				                      .Set(error_key::kColumnIndex, static_cast<int64_t>(i))
-				                      .ExpectedActual(declared_field->name(), pv_field->name()),
+				                      .ExpectedActual(declared_name, pv_name),
 				                  "VGI function '%s' vgi_partition_values column %llu name "
 				                  "mismatch: declared '%s', got '%s'",
 				                  bind_data.function_name, static_cast<unsigned long long>(i),
-				                  declared_field->name(), pv_field->name());
+				                  declared_name, pv_name);
 			}
-			if (!pv_field->type()->Equals(*declared_field->type())) {
+			if (!SameDataType(pv_field, declared_field)) {
+				const std::string declared_type = TypeToString(declared_field);
+				const std::string pv_type = TypeToString(pv_field);
 				throw IOException(metadata_violation("vgi_partition_values#b64")
 				                      .Set(error_key::kColumnIndex, static_cast<int64_t>(i))
-				                      .Set(error_key::kColumnName, declared_field->name())
-				                      .ExpectedActual(declared_field->type()->ToString(), pv_field->type()->ToString()),
+				                      .Set(error_key::kColumnName, declared_name)
+				                      .ExpectedActual(declared_type, pv_type),
 				                  "VGI function '%s' vgi_partition_values column '%s' type "
 				                  "mismatch: declared %s, got %s",
-				                  bind_data.function_name, declared_field->name(),
-				                  declared_field->type()->ToString(),
-				                  pv_field->type()->ToString());
+				                  bind_data.function_name, declared_name, declared_type, pv_type);
 			}
 		}
 
@@ -3485,12 +3465,13 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				const auto &entry = local_state.current_partition_data[i];
 				if (!Value::NotDistinctFrom(entry.min_val, entry.max_val)) {
 					throw IOException(metadata_violation("vgi_partition_values#b64")
-					                      .Set(error_key::kColumnName, bind_schema->field(declared_indices[i])->name())
+					                      .Set(error_key::kColumnName,
+					                           bind_schema->field_name(static_cast<int>(declared_indices[i])))
 					                      .ExpectedActual(entry.min_val.ToString(), entry.max_val.ToString()),
 					                  "VGI function '%s' SINGLE_VALUE_PARTITIONS contract "
 					                  "violated on column '%s': min (%s) != max (%s)",
 					                  bind_data.function_name,
-					                  bind_schema->field(declared_indices[i])->name(),
+					                  bind_schema->field_name(static_cast<int>(declared_indices[i])),
 					                  entry.min_val.ToString(), entry.max_val.ToString());
 				}
 			}
@@ -3550,7 +3531,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// batch's buffer list (O(columns), not O(rows)), so this is cheap enough to
 	// run unconditionally — unlike the log below, it has no sink to check.
 	const auto batch_rows = static_cast<idx_t>(arrow_batch->num_rows());
-	const auto batch_bytes = static_cast<idx_t>(arrow::util::TotalBufferSize(*arrow_batch));
+	const auto batch_bytes = static_cast<idx_t>(arrow_batch->TotalBufferSize());
 	global_state.RecordBatchStats(batch_rows, batch_bytes);
 
 	if (VgiInfoLogActive(context)) {
@@ -3591,7 +3572,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				std::lock_guard<std::mutex> lk(cap.mu);
 				not_cacheable = cap.cc_seen && !cap.cc.Cacheable();
 			}
-			auto spill_append = [&](const std::shared_ptr<arrow::Buffer> &ipc, int64_t logical_len) -> bool {
+			auto spill_append = [&](const VgiBufferPtr &ipc, int64_t logical_len) -> bool {
 				idx_t bi = conn->GetLastBatchIndex();
 				bool has_bi = bi != DConstants::INVALID_INDEX;
 				return cap.disk_writer->AppendBatch(
@@ -3631,8 +3612,9 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					// transcode round-trip on the multi-GB spill path. logical_len is the
 					// uncompressed IPC size (cheap, no extra serialize).
 					//
-					// NOTE (bytes= unit): this uses GetRecordBatchSize (the RecordBatch IPC
-					// message size) whereas the memory-capture path (and the pre-threshold
+					// NOTE (bytes= unit): this uses the batch's buffer bytes (batch_bytes,
+					// already computed above for the batch-shape stats — the IPC body size
+					// minus padding and the message header) whereas the memory-capture path (and the pre-threshold
 					// spill drain) uses SerializeRecordBatch(uncompressed)->size(), which also
 					// counts any IPC stream framing. So the ref's logical bytes= can differ by
 					// a few hundred bytes/batch of framing between a spilled-live entry and a
@@ -3641,10 +3623,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					// every memory entry — not worth it for a sub-batch-of-framing delta. The
 					// disk byte CAP uses the on-disk COMPRESSED size (consistent), so only the
 					// advisory logical bytes= / materialize-vs-stream threshold is affected.
-					int64_t logical_len = 0;
-					if (!arrow::ipc::GetRecordBatchSize(*arrow_batch, &logical_len).ok()) {
-						logical_len = 0;
-					}
+					const int64_t logical_len = static_cast<int64_t>(batch_bytes);
 					auto ipc = SerializeRecordBatch(arrow_batch, nullptr, cap.disk_writer->CodecName(),
 					                                cap.disk_writer->Level());
 					if (!spill_append(ipc, logical_len)) {
@@ -3993,7 +3972,7 @@ void VgiPrefetchTask::Execute() {
 	try {
 		// Skip 0-row batches here so the consumer always sees either EOS or a
 		// non-empty batch, matching the sync path's invariant.
-		std::shared_ptr<arrow::RecordBatch> batch;
+		VgiBatchPtr batch;
 		while (true) {
 			// Thrown into the catch below: the consumer rethrows it from the
 			// ERROR slot, and a torn-down consumer never reads it. Either way

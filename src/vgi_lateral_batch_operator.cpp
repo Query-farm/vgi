@@ -7,10 +7,6 @@
 #include <cstring>
 #include <limits>
 
-#include <arrow/array/builder_primitive.h> // Int32Builder for the Take indices
-#include <arrow/compute/api_vector.h>       // arrow::compute::Take (dedup expansion)
-#include <arrow/record_batch.h>             // arrow::ConcatenateRecordBatches (per-value assembly)
-
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -177,6 +173,17 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	std::unique_ptr<IFunctionConnection> connection; // this thread's own worker
 	std::vector<uint8_t> substream_id;
 	VgiTableInOutLocalState scan; // drain buffer for the worker output batch
+	// [dedup] DuckDB-space expansion. When a reduced chunk's worker output fits one
+	// vector, it is converted ONCE into `expand_src` (worker columns only) and each
+	// drained slice gathers its rows through `expand_take` (worker output row per final
+	// row) with a SelectionVector copy, instead of materializing an expanded Arrow batch
+	// row by row. `expanding` is the pending-drain flag for this mode (`scan` is fully
+	// consumed by then); `expand_offset` counts final rows already emitted.
+	bool expanding = false;
+	bool expand_src_initialized = false;
+	DataChunk expand_src;
+	std::vector<int32_t> expand_take;
+	idx_t expand_offset = 0;
 	// Per-output-row parent input-row index for the batch currently in `scan`.
 	// Held across HAVE_MORE_OUTPUT slices (the input chunk is re-passed unchanged
 	// by DuckDB while draining, so stamping stays correct). Identity [0..n) when the
@@ -207,7 +214,7 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	// MISS capture: the current input chunk's full key + its accumulated POST-STAMP
 	// output slices (serialized). Committed as one entry when the chunk fully drains.
 	VgiResultCacheKey capture_key;
-	std::vector<std::shared_ptr<arrow::RecordBatch>> capture_pending;
+	std::vector<VgiBatchPtr> capture_pending;
 	bool capturing = false;
 	// HIT serve: the cached entry for the current input chunk + replay cursor.
 	std::shared_ptr<const VgiResultCacheEntry> serving;
@@ -216,7 +223,7 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	// once. Capture serializes the post-stamp chunk with `serve_schema`; replay
 	// deserializes into `serve_scan` and produces via `serve_arrow_table`.
 	bool serve_schema_built = false;
-	std::shared_ptr<arrow::Schema> serve_schema;
+	VgiSchemaPtr serve_schema;
 	ArrowSchemaWrapper serve_c_schema;
 	ArrowTableSchema serve_arrow_table;
 	VgiTableInOutLocalState serve_scan; // replay drain buffer (full output schema)
@@ -307,35 +314,64 @@ void StampProjected(DataChunk &chunk, DataChunk &input, const std::vector<int32_
 	}
 }
 
-// Gather (replicate) the worker output batch rows at `take` (dedup expansion): the
-// resulting batch has one row per FINAL output row, so the existing drain+stamp path
-// runs over it unchanged. Uses Arrow's built-in Take so all column types are handled.
-std::shared_ptr<arrow::RecordBatch> TakeRecordBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                                    const std::vector<int32_t> &take,
-                                                    const VgiTableInOutBindData &bd) {
-	arrow::Int32Builder b;
-	auto st = b.Reserve(static_cast<int64_t>(take.size()));
-	if (!st.ok()) {
-		throw IOException("vgi_batch_lateral: dedup Take index reserve failed: %s", st.ToString());
-	}
-	for (auto v : take) {
-		b.UnsafeAppend(v);
-	}
-	std::shared_ptr<arrow::Array> indices;
-	st = b.Finish(&indices);
-	if (!st.ok()) {
-		throw IOException("vgi_batch_lateral: dedup Take index build failed: %s", st.ToString());
-	}
-	// NoBoundsCheck: `take` holds worker-output row positions built from worker_parent /
-	// rows_by_d, always in [0, batch->num_rows()), so the kernel's bounds pass is wasted.
-	auto res = arrow::compute::Take(arrow::Datum(batch), arrow::Datum(indices),
-	                                arrow::compute::TakeOptions::NoBoundsCheck());
-	if (!res.ok()) {
+// Gather (replicate) the worker output batch rows at `take`: the resulting batch has one
+// row per entry of `take` (used for the per-value store gather, and for a dedup expansion
+// whose worker output exceeds one vector). TakeRows handles every column type.
+VgiBatchPtr TakeRecordBatch(const VgiBatchPtr &batch, const std::vector<int32_t> &take,
+                            const VgiTableInOutBindData &bd) {
+	// `take` holds worker-output row positions built from worker_parent / rows_by_d,
+	// always in [0, batch->num_rows()), so no bounds pass is needed.
+	std::vector<int64_t> rows(take.begin(), take.end());
+	try {
+		return TakeRows(batch, rows);
+	} catch (const std::exception &e) {
 		throw IOException(ErrorInfo().Function(bd.function_name, "TABLE_IN_OUT").Worker(bd.worker_path()),
 		                  "vgi_batch_lateral: worker '%s' function '%s' output Take (dedup expansion) failed: %s",
-		                  bd.worker_path(), bd.function_name, res.status().ToString());
+		                  bd.worker_path(), bd.function_name, ErrorData(e).RawMessage());
 	}
-	return res.ValueUnsafe().record_batch();
+}
+
+// Whether the operator state still has rows of the current input chunk's worker output
+// to emit (an Arrow batch partly drained from `scan`, or a DuckDB-space expansion).
+bool HasPendingOutput(const VgiLateralBatchOperatorState &state) {
+	return state.expanding || HasRemainingBatchData(state.scan);
+}
+
+// Emit the next slice (<= STANDARD_VECTOR_SIZE rows) of the DuckDB-space dedup expansion
+// into chunk columns [0, base_idx): final row r copies expand_src row expand_take[offset+r].
+// Returns the rows produced; clears `expanding` once the expansion is exhausted.
+idx_t EmitExpandedSlice(VgiLateralBatchOperatorState &state, DataChunk &chunk, idx_t base_idx) {
+	const idx_t total = state.expand_take.size();
+	const idx_t n = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - state.expand_offset);
+	if (n > 0) {
+		SelectionVector sel(n);
+		const int32_t *take = state.expand_take.data() + state.expand_offset;
+		for (idx_t r = 0; r < n; r++) {
+			sel.set_index(r, static_cast<idx_t>(take[r]));
+		}
+		for (idx_t c = 0; c < base_idx; c++) {
+			VectorOperations::Copy(state.expand_src.data[c], chunk.data[c], sel, n, 0, 0);
+		}
+	}
+	state.expand_offset += n;
+	if (state.expand_offset >= total) {
+		state.expanding = false;
+		state.expand_take.clear();
+		state.expand_src.Reset();
+	}
+	return n;
+}
+
+// Produce the next slice of pending output into chunk columns [0, base_idx). `start` is
+// set to the parent_index offset of the slice's first row.
+idx_t ProducePendingSlice(VgiLateralBatchOperatorState &state, const VgiTableInOutBindData &bd, DataChunk &chunk,
+                          idx_t base_idx, bool projection_pushdown, idx_t &start) {
+	if (state.expanding) {
+		start = state.expand_offset;
+		return EmitExpandedSlice(state, chunk, base_idx);
+	}
+	start = state.scan.chunk_offset; // rows already produced from this batch
+	return ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown);
 }
 
 // Build the full-output arrow schema + ArrowTableSchema once (synthetic col names).
@@ -518,7 +554,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// (A) Drain the remaining slices of the worker output batch already loaded in
 	// `scan` (a MISS in progress). DuckDB re-passes the SAME `input` chunk unchanged
 	// across HAVE_MORE_OUTPUT, so the held parent_index still refers to the right rows.
-	if (HasRemainingBatchData(state.scan)) {
+	if (HasPendingOutput(state)) {
 		// Defense-in-depth: parent_index was range-validated against input.size() at
 		// decode time. If DuckDB ever re-passed a smaller chunk during the drain, a
 		// held index could point past the input's cardinality — an OOB gather. Fail
@@ -529,14 +565,14 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			                  (unsigned long long)state.input_size_at_decode, (unsigned long long)input.size(),
 			                  bd.worker_path(), bd.function_name);
 		}
-		idx_t start = state.scan.chunk_offset; // rows already produced from this batch
-		idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown);
+		idx_t start = 0;
+		idx_t produced = ProducePendingSlice(state, bd, chunk, base_idx, projection_pushdown, start);
 		StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
 		chunk.SetCardinality(produced);
 		if (state.capturing) {
 			state.capture_pending.push_back(DataChunkToArrow(client_context, chunk, state.serve_schema));
 		}
-		if (HasRemainingBatchData(state.scan)) {
+		if (HasPendingOutput(state)) {
 			return OperatorResultType::HAVE_MORE_OUTPUT;
 		}
 		if (state.capturing) {
@@ -696,7 +732,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// hit mask, and the aggregates for the M2 cc-latch.
 	std::vector<std::string> pv_blobs;
 	std::vector<char> pv_hit;
-	std::shared_ptr<arrow::RecordBatch> pv_cached;
+	VgiBatchPtr pv_cached;
 	std::vector<int32_t> pv_cached_parent; // distinct index d per pv_cached row
 	int64_t pv_hit_count = 0;
 	ArenaProbeResult pv_probe; // carries served_bytes + latch aggregates
@@ -715,7 +751,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	}
 	const bool full_pv_hit = pv_enabled && dd.k > 0 && pv_hit_count == static_cast<int64_t>(dd.k);
 
-	std::shared_ptr<arrow::RecordBatch> output_batch;
+	VgiBatchPtr output_batch;
 	std::vector<int32_t> worker_parent; // per worker-output-row: the DEDUPED tuple index
 
 	if (full_pv_hit) {
@@ -876,7 +912,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			// the fresh rows (their sub-index remapped to the real distinct index via
 			// miss_indices). The resulting output_batch + worker_parent look exactly like a full
 			// exchange, so the store gather and the EXPAND below run unchanged.
-			std::vector<std::shared_ptr<arrow::RecordBatch>> parts;
+			std::vector<VgiBatchPtr> parts;
 			worker_parent.clear();
 			if (pv_cached && pv_cached->num_rows() > 0) {
 				worker_parent = std::move(pv_cached_parent); // already the distinct index d per row
@@ -893,12 +929,18 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			} else if (parts.size() == 1) {
 				output_batch = std::move(parts[0]);
 			} else {
-				auto cat = arrow::ConcatenateRecordBatches(parts);
-				if (!cat.ok()) {
+				try {
+					// ConcatBatches trusts equal schemas; check here (as Arrow's concat did) so
+					// fresh rows that disagree with the memoized rows' schema fail cleanly
+					// instead of misreading buffers.
+					if (!parts[0]->schema()->Equals(*parts[1]->schema())) {
+						throw InvalidInputException("Schema at index 1 does not match the first schema.");
+					}
+					output_batch = ConcatBatches(parts);
+				} catch (const std::exception &e) {
 					throw IOException("vgi_batch_lateral: partial per-value splice concat failed: %s",
-					                  cat.status().ToString());
+					                  ErrorData(e).RawMessage());
 				}
-				output_batch = cat.ValueUnsafe();
 			}
 			// A partial hit still ran the worker (for the misses), so it stays a MISS for the
 			// hit/miss counters (recorded above); this event surfaces the worker-input reduction.
@@ -992,7 +1034,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 					for (auto &sp : specs) {
 						sp.validator_ref = vref;
 					}
-					std::shared_ptr<arrow::RecordBatch> store_batch =
+					VgiBatchPtr store_batch =
 					    take_idx.empty() ? output_batch->Slice(0, 0) : TakeRecordBatch(output_batch, take_idx, bd);
 					const int64_t delta = arena->Store(store_batch, specs, expires, /*never_expires=*/false);
 					GetMemoArenaRegistry(client_context).NoteFootprintDelta(state.cache_static_fp, delta, arena.get());
@@ -1005,37 +1047,13 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		}
 	}
 
-	// EXPAND (common to the full-hit and miss paths): each worker output row (parent d)
-	// fans out to every ORIGINAL row in that tuple's group, and the worker output row is
-	// replicated (Arrow Take), so the existing drain+stamp path runs unchanged over an
-	// expanded batch whose parent_index points at ORIGINAL rows (each stamped with its OWN
-	// outer columns). Only when we reduced (duplicates present); for a trivial/all-distinct
-	// chunk each distinct tuple IS one original row, so parent_index = worker_parent directly.
-	if (needs_expand) {
-		std::vector<int32_t> take_idx; // worker output row to copy for each final row
-		std::vector<int32_t> expanded; // ORIGINAL input row to stamp for each final row
-		take_idx.reserve(worker_parent.size());
-		expanded.reserve(worker_parent.size());
-		for (idx_t m = 0; m < worker_parent.size(); m++) {
-			const auto grp = dd.Group(static_cast<idx_t>(worker_parent[m]));
-			for (idx_t o : grp) {
-				take_idx.push_back(static_cast<int32_t>(m));
-				expanded.push_back(static_cast<int32_t>(o));
-			}
-		}
-		output_batch = TakeRecordBatch(output_batch, take_idx, bd);
-		state.parent_index = std::move(expanded);
-	} else {
-		state.parent_index = std::move(worker_parent);
-	}
-	state.input_size_at_decode = input.size();
-
 	// Type-confusion guard: the worker exchange output batch's types must match
 	// what the worker declared at bind (ArrowToDuckDB below reads buffers by the
 	// bind-time type). This is always a live worker batch — the cache-serve path
 	// is EmitServedSlice, not here — but the IsCachedReplay guard keeps it
 	// uniform. Expected types come from bd.output_schema projected by the
-	// worker's column ids. See vgi_batch_validation.hpp.
+	// worker's column ids. Checked on the PRE-expand batch: the expansion only
+	// replicates rows, so the column types are the same. See vgi_batch_validation.hpp.
 	if (!state.connection || !state.connection->IsCachedReplay()) {
 		std::vector<int32_t> proj;
 		if (projection_pushdown) {
@@ -1048,9 +1066,61 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		                                bd.function_name);
 	}
 
-	LoadBatchIntoScanState(state.scan, output_batch);
-	idx_t start = state.scan.chunk_offset; // 0 for a freshly loaded batch
-	idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown); // fills [0, base_idx)
+	// EXPAND (common to the full-hit and miss paths): each worker output row (parent d)
+	// fans out to every ORIGINAL row in that tuple's group, and the worker output row is
+	// replicated, so the drain+stamp path runs over final rows whose parent_index points
+	// at ORIGINAL rows (each stamped with its OWN outer columns). Only when we reduced
+	// (duplicates present); for a trivial/all-distinct chunk each distinct tuple IS one
+	// original row, so parent_index = worker_parent directly.
+	//
+	// The replication is done in DuckDB space when the worker output fits one vector:
+	// convert the M worker rows once, then gather each emitted slice with a typed
+	// SelectionVector copy. A larger output (a wide 1->N fan-out) falls back to an Arrow
+	// row gather (TakeRows) and the ordinary batch drain.
+	idx_t start = 0;
+	idx_t produced = 0;
+	if (needs_expand) {
+		std::vector<int32_t> take_idx; // worker output row to copy for each final row
+		std::vector<int32_t> expanded; // ORIGINAL input row to stamp for each final row
+		take_idx.reserve(worker_parent.size());
+		expanded.reserve(worker_parent.size());
+		for (idx_t m = 0; m < worker_parent.size(); m++) {
+			const auto grp = dd.Group(static_cast<idx_t>(worker_parent[m]));
+			for (idx_t o : grp) {
+				take_idx.push_back(static_cast<int32_t>(m));
+				expanded.push_back(static_cast<int32_t>(o));
+			}
+		}
+		state.parent_index = std::move(expanded);
+		state.input_size_at_decode = input.size();
+		if (static_cast<idx_t>(output_batch->num_rows()) <= STANDARD_VECTOR_SIZE) {
+			if (!state.expand_src_initialized) {
+				vector<LogicalType> worker_types(types.begin(), types.begin() + static_cast<int64_t>(base_idx));
+				state.expand_src.Initialize(client_context, worker_types);
+				state.expand_src_initialized = true;
+			} else {
+				state.expand_src.Reset();
+			}
+			LoadBatchIntoScanState(state.scan, output_batch);
+			ProduceOutputFromBatch(state.scan, bd.arrow_table, state.expand_src, projection_pushdown);
+			state.expand_take = std::move(take_idx);
+			state.expand_offset = 0;
+			state.expanding = true;
+			start = 0;
+			produced = EmitExpandedSlice(state, chunk, base_idx);
+		} else {
+			output_batch = TakeRecordBatch(output_batch, take_idx, bd);
+			LoadBatchIntoScanState(state.scan, output_batch);
+			start = state.scan.chunk_offset; // 0 for a freshly loaded batch
+			produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown); // fills [0, base_idx)
+		}
+	} else {
+		state.parent_index = std::move(worker_parent);
+		state.input_size_at_decode = input.size();
+		LoadBatchIntoScanState(state.scan, output_batch);
+		start = state.scan.chunk_offset; // 0 for a freshly loaded batch
+		produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown); // fills [0, base_idx)
+	}
 	StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
 	chunk.SetCardinality(produced);
 
@@ -1072,7 +1142,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	} else {
 		state.capturing = false;
 	}
-	if (HasRemainingBatchData(state.scan)) {
+	if (HasPendingOutput(state)) {
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
 	if (state.capturing) {

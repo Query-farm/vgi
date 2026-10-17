@@ -47,31 +47,23 @@ INCLUDE_DIRS = [INCLUDE_ROOT]
 QUOTED_INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"')
 ANGLE_INCLUDE = re.compile(r'^\s*#\s*include\s*<([^>]+)>')
 
-# Heavy third-party umbrellas. A hub header reaching any of these (by the prefix
+# Heavy third-party headers. A project header reaching any of these (by the prefix
 # match below) is flagged. Keep this list aligned with the "Header hygiene" section
-# of CLAUDE.md.
+# of CLAUDE.md. Arrow C++ is gone entirely; nanoarrow's headers (nanoarrow.h carries
+# thousands of lines of inline functions) and flatcc belong in .cpp files only.
 HEAVY_INCLUDES = [
-    "arrow/api.h",
-    "arrow/ipc/",
-    "arrow/io/api.h",
-    "arrow/compute/",
+    "arrow/",
+    "nanoarrow/",
+    "flatcc/",
 ]
 
-# Hub headers whose heavy-include reach is enforced in --check mode. These are the
-# widely-reached project headers that were deliberately made Arrow-free during the
-# header-hygiene cleanup (they use Arrow only as forward-declared shared_ptr members
-# / parameters). If a future edit re-introduces a heavy include into one of these,
-# --check fails — forward-declare and push the real include into the .cpp instead.
+# Every project header is guarded in --check mode: batches, schemas and buffers cross
+# headers only as the vgi_arrow.hpp types, which need nothing but DuckDB's C data
+# interface structs. Push nanoarrow includes into the .cpp that needs them.
 # See CLAUDE.md "Header hygiene".
-#
-# NOT guarded (legitimate Arrow carriers — their consumers genuinely need Arrow, so
-# forward-declaring would only relocate the include): vgi_rpc_types.hpp,
-# vgi_arrow_utils.hpp, vgi_arrow_ipc.hpp, vgi_catalog_rpc.hpp, vgi_function_connection.hpp.
 GUARDED_HEADERS = {
-    "vgi_protocol.hpp": ["arrow/api.h", "arrow/ipc/", "arrow/io/api.h"],
-    "vgi_attach_parameters.hpp": ["arrow/api.h", "arrow/ipc/", "arrow/io/api.h"],
-    "vgi_catalog_metadata.hpp": ["arrow/api.h", "arrow/ipc/", "arrow/io/api.h"],
-    "vgi_logging.hpp": ["arrow/api.h", "arrow/ipc/", "arrow/io/api.h"],
+    path.relative_to(Path(__file__).resolve().parent.parent / "src" / "include").as_posix(): list(HEAVY_INCLUDES)
+    for path in sorted((Path(__file__).resolve().parent.parent / "src" / "include").rglob("*.hpp"))
 }
 
 

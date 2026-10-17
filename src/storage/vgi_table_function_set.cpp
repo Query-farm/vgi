@@ -206,7 +206,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// Resolve partition_column_indices by walking the bind output schema
 	// for fields whose metadata carries ``vgi.partition_column = "true"``.
 	// Per-field Arrow metadata round-trips losslessly through
-	// ``pa.Schema.serialize() -> arrow::ipc::ReadSchema``, which is what
+	// ``pa.Schema.serialize()`` -> the IPC schema reader, which is what
 	// the bind RPC uses today. Doing this once at bind keeps
 	// ``VgiGetPartitionInfo`` cheap (O(P) membership check per planner
 	// call, no schema walk).
@@ -214,13 +214,10 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 		const auto &out_schema = bind_data->bind_result.output_schema;
 		if (out_schema) {
 			for (int i = 0; i < out_schema->num_fields(); ++i) {
-				const auto &field = out_schema->field(i);
-				const auto &meta = field->metadata();
-				if (meta) {
-					int idx = meta->FindKey("vgi.partition_column");
-					if (idx >= 0 && meta->value(idx) == "true") {
-						bind_data->partition_column_indices.push_back(static_cast<idx_t>(i));
-					}
+				const auto meta = out_schema->field_metadata(i);
+				const auto idx = meta.FindKey("vgi.partition_column");
+				if (idx >= 0 && meta.value(idx) == "true") {
+					bind_data->partition_column_indices.push_back(static_cast<idx_t>(i));
 				}
 			}
 		}

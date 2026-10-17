@@ -30,6 +30,8 @@
 // never correctness. Size the segment with VGI_RPC_SHM_SIZE_BYTES.
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -37,8 +39,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/record_batch.h>
-#include <arrow/util/key_value_metadata.h>
 
 namespace duckdb {
 namespace vgi {
@@ -160,9 +160,9 @@ public:
 	// On a successful resolve, *out_lease is the slot's lease: the returned
 	// batch's buffers share it, so the caller FreeAllocation()s the slot only
 	// once out_lease->use_count() == 1, i.e. its own reference is the last.
-	std::shared_ptr<arrow::RecordBatch>
-	MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-	                  const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+	VgiBatchPtr
+	MaybeResolveBatch(const VgiBatchPtr &batch,
+	                  const VgiMetadataPtr &custom_metadata,
 	                  std::shared_ptr<VgiShmSlotLease> *out_lease) const;
 
 private:
@@ -179,10 +179,10 @@ private:
 
 	// Cached schema-message bytes for the dictionary path. The schema is
 	// constant across all batches in a scan, so serialize it once per
-	// connection. Keyed by the raw arrow::Schema pointer — schema objects
+	// connection. Keyed by the raw VgiSchema pointer — schema objects
 	// in a single scan are the same shared_ptr instance.
-	mutable const arrow::Schema *cached_schema_ptr_ = nullptr;
-	mutable std::shared_ptr<arrow::Buffer> cached_schema_msg_;
+	mutable const VgiSchema *cached_schema_ptr_ = nullptr;
+	mutable VgiBufferPtr cached_schema_msg_;
 };
 
 } // namespace vgi

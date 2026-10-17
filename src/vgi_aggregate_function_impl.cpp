@@ -1,7 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_arrow_ipc.hpp"
-#include "vgi_nanoarrow_ipc.hpp"
 #include "vgi_batch_validation.hpp"
 #include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
@@ -27,16 +26,61 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
-#include <arrow/builder.h>
-#include <arrow/c/bridge.h>
+#include "nanoarrow/nanoarrow.h"
 
 namespace duckdb {
 
 using vgi::ExtractVgiSettings;
-using vgi::ThrowOnArrowError;
-using vgi::AppendBytesOrNull;
 
 namespace {
+
+// A builder for the batch of int64 columns `schema`, each with room for `count` rows.
+void ReserveInt64Columns(vgi::VgiBatchBuilder &builder, idx_t count) {
+	for (int c = 0; c < builder.num_columns(); c++) {
+		if (ArrowArrayReserve(builder.column(c), static_cast<int64_t>(count)) != NANOARROW_OK) {
+			throw IOException("Arrow error in VGI aggregate: out of memory reserving %llu rows",
+			                  static_cast<unsigned long long>(count));
+		}
+	}
+}
+
+const vgi::VgiSchemaPtr &GroupIdSchema() {
+	static const auto schema = vgi::MakeSchema({vgi::type::Int64().Named("group_id")});
+	return schema;
+}
+
+const vgi::VgiSchemaPtr &UpdateGroupIdSchema() {
+	static const auto schema = vgi::MakeSchema({vgi::type::Int64().Named("__vgi_group_id")});
+	return schema;
+}
+
+// A one-column int64 batch (`schema`) of the group ids of `states` (through `sdata`'s selection).
+vgi::VgiBatchPtr BuildGroupIdBatch(const vgi::VgiSchemaPtr &schema, const UnifiedVectorFormat &sdata,
+                                   vgi::VgiAggregateState *const *states, idx_t count) {
+	vgi::VgiBatchBuilder builder(schema);
+	ReserveInt64Columns(builder, count);
+	auto *col = builder.column(0);
+	for (idx_t i = 0; i < count; i++) {
+		auto idx = sdata.sel->get_index(i);
+		vgi::append::Int(col, states[idx]->group_id);
+	}
+	builder.SetRows(static_cast<int64_t>(count));
+	return builder.Finish();
+}
+
+// The columns of `batch` as standalone arrays, each keeping the batch alive (zero-copy).
+std::vector<ArrowArray> ExportBatchColumns(const vgi::VgiBatch &batch) {
+	ArrowArray parent;
+	batch.ExportTo(&parent);
+	std::vector<ArrowArray> columns;
+	columns.reserve(static_cast<size_t>(parent.n_children));
+	for (int64_t i = 0; i < parent.n_children; i++) {
+		columns.push_back(*parent.children[i]);
+		parent.children[i]->release = nullptr;
+	}
+	parent.release(&parent);
+	return columns;
+}
 
 // Every aggregate request carries the owning catalog schema alongside the
 // function name: a name is unique only within a schema, so without it the
@@ -44,33 +88,26 @@ namespace {
 // schema's implementation after a bind that resolved correctly. Empty string
 // serialises as null, which is the legitimate
 // "caller names no schema" wire form — the field stays nullable.
-std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
+vgi::VgiBatchPtr BuildAggregateBindRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &attach_opaque_data,
-    const std::shared_ptr<arrow::Schema> &input_schema,
+    const vgi::VgiSchemaPtr &input_schema,
     ClientContext &context, const std::map<std::string, Value> &settings,
     const std::vector<vgi::VgiSecretRequirement> &required_secrets,
     const vgi::ArrowArguments &arrow_arguments,
     const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
 
-	auto schema_buf_result = ::duckdb::vgi::nanoipc::SerializeSchema(*input_schema);
-	ThrowOnArrowError(schema_buf_result.status());
-	auto &schema_buf = schema_buf_result.ValueUnsafe();
-	auto schema_bytes = std::vector<uint8_t>(schema_buf->data(), schema_buf->data() + schema_buf->size());
+	auto schema_bytes = vgi::SerializeSchemaToIpcBytes(input_schema);
 
 	// Serialize arguments (const values) as IPC bytes
 	std::vector<uint8_t> arguments_bytes;
-	if (arrow_arguments.array) {
-		auto args_schema = arrow::schema({arrow::field("args", arrow_arguments.type)});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, arrow_arguments.array->length(),
-		                                           {arrow_arguments.array});
-		arguments_bytes = vgi::SerializeToIpcBytes(args_batch);
+	if (arrow_arguments) {
+		// Already the one-row {args: struct} batch.
+		arguments_bytes = vgi::SerializeToIpcBytes(arrow_arguments.batch);
 	} else {
-		auto empty_struct_type = arrow::struct_({});
-		auto empty_result = arrow::MakeEmptyArray(empty_struct_type);
-		ThrowOnArrowError(empty_result.status());
-		auto args_schema = arrow::schema({arrow::field("args", empty_struct_type)});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, 0, {empty_result.ValueUnsafe()});
+		// A zero-row {args: struct<>} batch.
+		auto args_batch =
+		    vgi::VgiBatch::MakeEmpty(vgi::MakeSchema({vgi::type::Struct({}).Named("args")}));
 		arguments_bytes = vgi::SerializeToIpcBytes(args_batch);
 	}
 
@@ -97,11 +134,11 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	return vgi::generated::BuildAggregateBindParams(vgi::SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
+vgi::VgiBatchPtr BuildAggregateUpdateRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data,
-    const std::shared_ptr<arrow::RecordBatch> &input_batch) {
+    const vgi::VgiBatchPtr &input_batch) {
 
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 
@@ -114,11 +151,11 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
 	return vgi::generated::BuildAggregateUpdateParams(vgi::SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
+vgi::VgiBatchPtr BuildAggregateCombineRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data,
-    const std::shared_ptr<arrow::RecordBatch> &merge_batch) {
+    const vgi::VgiBatchPtr &merge_batch) {
 
 	auto batch_bytes = vgi::SerializeToIpcBytes(merge_batch);
 
@@ -131,18 +168,15 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
 	return vgi::generated::BuildAggregateCombineParams(vgi::SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
+vgi::VgiBatchPtr BuildAggregateFinalizeRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data,
-    const std::shared_ptr<arrow::RecordBatch> &group_ids_batch,
-    const std::shared_ptr<arrow::Schema> &output_schema) {
+    const vgi::VgiBatchPtr &group_ids_batch,
+    const vgi::VgiSchemaPtr &output_schema) {
 
 	auto gid_bytes = vgi::SerializeToIpcBytes(group_ids_batch);
-	auto os_buf_result = ::duckdb::vgi::nanoipc::SerializeSchema(*output_schema);
-	ThrowOnArrowError(os_buf_result.status());
-	auto &os_buf = os_buf_result.ValueUnsafe();
-	auto schema_bytes = std::vector<uint8_t>(os_buf->data(), os_buf->data() + os_buf->size());
+	auto schema_bytes = vgi::SerializeSchemaToIpcBytes(output_schema);
 
 	vgi::generated::AggregateFinalizeRequest request;
 	request.function_name = function_name;
@@ -154,11 +188,11 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 	return vgi::generated::BuildAggregateFinalizeParams(vgi::SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
+vgi::VgiBatchPtr BuildAggregateDestructorRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data,
-    const std::shared_ptr<arrow::RecordBatch> &group_ids_batch) {
+    const vgi::VgiBatchPtr &group_ids_batch) {
 
 	auto gid_bytes = vgi::SerializeToIpcBytes(group_ids_batch);
 
@@ -199,7 +233,7 @@ void ThrowMissingAggregateResult(const VgiAggregateBindData &bind_data, const st
 
 AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
                                       const std::string &method_name,
-                                      const std::shared_ptr<arrow::RecordBatch> &params,
+                                      const vgi::VgiBatchPtr &params,
                                       bool enable_logging) {
 	// Validate the outgoing request batch before dispatch (catches encoder drift).
 	ValidateRequestSchema(params, method_name, bind_data.attach_params->worker_path());
@@ -240,7 +274,7 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	// Outer envelope unwrap + schema validation against the registry.
 	// The registered schema for aggregate_* methods follows vgi-python's
 	// Aggregate*Response dataclasses.
-	std::shared_ptr<arrow::RecordBatch> inner;
+	VgiBatchPtr inner;
 	const auto &worker_path = bind_data.attach_params->worker_path();
 	if (response.batch && response.batch->num_rows() > 0) {
 		inner = UnwrapResultEnvelope(response.batch, method_name, AggregateViolation(bind_data, method_name),
@@ -343,14 +377,7 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 	}
 
 	// Build group_id column
-	auto gid_builder = arrow::Int64Builder();
-	ThrowOnArrowError(gid_builder.Reserve(count));
-	for (idx_t i = 0; i < count; i++) {
-		auto idx = sdata.sel->get_index(i);
-		gid_builder.UnsafeAppend(states[idx]->group_id);
-	}
-	std::shared_ptr<arrow::Array> gid_array;
-	ThrowOnArrowError(gid_builder.Finish(&gid_array));
+	auto gid_batch = BuildGroupIdBatch(UpdateGroupIdSchema(), sdata, states, count);
 
 	// Build actual input schema from runtime types (may differ from bind-time
 	// schema when varargs are present — bind schema has fixed params only)
@@ -359,7 +386,7 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 	for (idx_t i = 0; i < input_count; i++) {
 		actual_input_types.push_back(inputs[i].GetType());
 		if (i < static_cast<idx_t>(bind_data.input_schema->num_fields())) {
-			actual_input_names.push_back(bind_data.input_schema->field(i)->name());
+			actual_input_names.push_back(bind_data.input_schema->field_name(static_cast<int>(i)));
 		} else {
 			actual_input_names.push_back("col_" + std::to_string(i));
 		}
@@ -367,7 +394,7 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 	auto actual_schema = BuildArrowSchemaFromDuckDB(context, actual_input_types, actual_input_names);
 
 	// Convert input vectors to Arrow
-	std::shared_ptr<arrow::RecordBatch> input_batch;
+	vgi::VgiBatchPtr input_batch;
 	if (input_count > 0) {
 		DataChunk input_chunk;
 		input_chunk.Initialize(context, actual_input_types);
@@ -379,21 +406,15 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 	}
 
 	// Build full batch: __vgi_group_id + input columns
-	std::vector<std::shared_ptr<arrow::Field>> full_fields;
-	full_fields.push_back(arrow::field("__vgi_group_id", arrow::int64()));
-	for (int i = 0; i < actual_schema->num_fields(); i++) {
-		full_fields.push_back(actual_schema->field(i));
-	}
-	auto full_schema = arrow::schema(full_fields);
+	auto full_schema = actual_schema->AddField(0, gid_batch->schema()->field(0));
 
-	std::vector<std::shared_ptr<arrow::Array>> columns;
-	columns.push_back(gid_array);
+	auto columns = ExportBatchColumns(*gid_batch);
 	if (input_batch) {
-		for (int i = 0; i < input_batch->num_columns(); i++) {
-			columns.push_back(input_batch->column(i));
+		for (auto &column : ExportBatchColumns(*input_batch)) {
+			columns.push_back(column);
 		}
 	}
-	auto full_batch = arrow::RecordBatch::Make(full_schema, count, columns);
+	auto full_batch = vgi::VgiBatch::FromColumns(full_schema, static_cast<int64_t>(count), std::move(columns));
 
 	// Build RPC request: aggregate_update(function_name, execution_id, input_batch)
 	auto request = BuildAggregateUpdateRequest(bind_data.function_name, bind_data.schema_name,
@@ -432,25 +453,22 @@ void VgiAggregateCombine(Vector &source, Vector &combined, AggregateInputData &a
 	}
 
 	// Build merge batch: (source_group_id, target_group_id)
-	auto src_builder = arrow::Int64Builder();
-	auto tgt_builder = arrow::Int64Builder();
-	ThrowOnArrowError(src_builder.Reserve(count));
-	ThrowOnArrowError(tgt_builder.Reserve(count));
+	static const auto merge_schema = vgi::MakeSchema({
+	    vgi::type::Int64().Named("source_group_id"),
+	    vgi::type::Int64().Named("target_group_id"),
+	});
+	vgi::VgiBatchBuilder merge_builder(merge_schema);
+	ReserveInt64Columns(merge_builder, count);
+	auto *src_col = merge_builder.column(0);
+	auto *tgt_col = merge_builder.column(1);
 	for (idx_t i = 0; i < count; i++) {
 		auto src_idx = sdata.sel->get_index(i);
 		auto tgt_idx = cdata.sel->get_index(i);
-		src_builder.UnsafeAppend(src_states[src_idx]->group_id);
-		tgt_builder.UnsafeAppend(tgt_states[tgt_idx]->group_id);
+		vgi::append::Int(src_col, src_states[src_idx]->group_id);
+		vgi::append::Int(tgt_col, tgt_states[tgt_idx]->group_id);
 	}
-	std::shared_ptr<arrow::Array> src_array, tgt_array;
-	ThrowOnArrowError(src_builder.Finish(&src_array));
-	ThrowOnArrowError(tgt_builder.Finish(&tgt_array));
-
-	auto merge_schema = arrow::schema({
-	    arrow::field("source_group_id", arrow::int64()),
-	    arrow::field("target_group_id", arrow::int64()),
-	});
-	auto merge_batch = arrow::RecordBatch::Make(merge_schema, count, {src_array, tgt_array});
+	merge_builder.SetRows(static_cast<int64_t>(count));
+	auto merge_batch = merge_builder.Finish();
 
 	auto request = BuildAggregateCombineRequest(bind_data.function_name, bind_data.schema_name,
 	                                             bind_data.exec_state->execution_id,
@@ -480,17 +498,7 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 		states[idx]->tag = VgiAggregateStateTag::AGGREGATE;
 	}
 
-	auto gid_builder = arrow::Int64Builder();
-	ThrowOnArrowError(gid_builder.Reserve(count));
-	for (idx_t i = 0; i < count; i++) {
-		auto idx = sdata.sel->get_index(i);
-		gid_builder.UnsafeAppend(states[idx]->group_id);
-	}
-	std::shared_ptr<arrow::Array> gid_array;
-	ThrowOnArrowError(gid_builder.Finish(&gid_array));
-
-	auto gid_schema = arrow::schema({arrow::field("group_id", arrow::int64())});
-	auto gid_batch = arrow::RecordBatch::Make(gid_schema, count, {gid_array});
+	auto gid_batch = BuildGroupIdBatch(GroupIdSchema(), sdata, states, count);
 
 	// Call aggregate_finalize RPC
 	auto request = BuildAggregateFinalizeRequest(bind_data.function_name, bind_data.schema_name,
@@ -614,12 +622,10 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 			return; // Not the last batch — skip RPC
 		}
 
-		auto gid_builder = arrow::Int64Builder();
-		ThrowOnArrowError(gid_builder.Append(0));
-		std::shared_ptr<arrow::Array> gid_array;
-		ThrowOnArrowError(gid_builder.Finish(&gid_array));
-		auto gid_schema = arrow::schema({arrow::field("group_id", arrow::int64())});
-		auto gid_batch = arrow::RecordBatch::Make(gid_schema, 1, {gid_array});
+		vgi::VgiBatchBuilder gid_builder(GroupIdSchema());
+		vgi::append::Int(gid_builder.column(0), 0);
+		gid_builder.FinishRow();
+		auto gid_batch = gid_builder.Finish();
 
 		auto request = BuildAggregateDestructorRequest(bind_data.function_name, bind_data.schema_name,
 		                                                bind_data.exec_state->execution_id,

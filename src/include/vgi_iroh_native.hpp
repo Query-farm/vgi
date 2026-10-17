@@ -1,10 +1,10 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include "vgi_iroh_config.hpp"
 
-#include <arrow/api.h>
-#include <arrow/io/api.h>
 
 #include <cstdint>
 #include <functional>
@@ -26,8 +26,8 @@ class IrohNativeEndpoint;
 // One bidirectional QUIC stream speaking vgi-rpc/arrow-mux/1. Input and output
 // wrappers share ownership and never close the opposite half implicitly.
 struct IrohNativeDuplex {
-	std::shared_ptr<arrow::io::InputStream> input;
-	std::shared_ptr<arrow::io::OutputStream> output;
+	std::shared_ptr<VgiInputStream> input;
+	std::shared_ptr<VgiOutputStream> output;
 	// Context-free, thread-safe cancellation. The dispatcher may invoke this
 	// after the originating query's ClientContext has already been destroyed.
 	std::function<void()> cancel;

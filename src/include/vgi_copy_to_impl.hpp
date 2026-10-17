@@ -1,11 +1,12 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "duckdb/function/copy_function.hpp"
 
@@ -28,7 +29,7 @@ class VgiCopyToFunctionInfo final : public CopyFunctionInfo {
 public:
 	VgiCopyToFunctionInfo(std::string catalog_name, std::shared_ptr<VgiAttachParameters> attach_params,
 	                      std::vector<uint8_t> attach_opaque_data, std::string format_name, std::string handler,
-	                      std::shared_ptr<arrow::Schema> options_schema, std::vector<std::string> setting_names)
+	                      VgiSchemaPtr options_schema, std::vector<std::string> setting_names)
 	    : catalog_name(std::move(catalog_name)), attach_params(std::move(attach_params)),
 	      attach_opaque_data(std::move(attach_opaque_data)), format_name(std::move(format_name)),
 	      handler(std::move(handler)), options_schema(std::move(options_schema)),
@@ -41,7 +42,7 @@ public:
 	std::vector<uint8_t> attach_opaque_data;
 	std::string format_name;
 	std::string handler;
-	std::shared_ptr<arrow::Schema> options_schema; // null when the format has no options
+	VgiSchemaPtr options_schema; // null when the format has no options
 	std::vector<std::string> setting_names;
 };
 

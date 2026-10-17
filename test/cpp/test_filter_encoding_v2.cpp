@@ -21,41 +21,43 @@
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "vgi_table_function_impl.hpp"
 
-#include <arrow/api.h>
-#include <arrow/io/memory.h>
-#include <arrow/ipc/reader.h>
+#include "vgi_ipc.hpp"
+
+#include "nanoarrow/nanoarrow.h"
 
 using namespace duckdb;
 using namespace duckdb::vgi;
 
 namespace {
 
-std::shared_ptr<arrow::RecordBatch> ReadBatch(const std::shared_ptr<arrow::Buffer> &bytes) {
-	auto input = std::make_shared<arrow::io::BufferReader>(bytes);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	REQUIRE(reader_result.ok());
-	auto reader = reader_result.ValueUnsafe();
-	std::shared_ptr<arrow::RecordBatch> batch;
-	REQUIRE(reader->ReadNext(&batch).ok());
+VgiBatchPtr ReadBatch(const VgiBufferPtr &bytes) {
+	REQUIRE(bytes);
+	auto reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(bytes));
+	auto batch = reader->ReadNext();
 	REQUIRE(batch);
 	return batch;
 }
 
-std::string FilterSpec(const std::shared_ptr<arrow::RecordBatch> &batch) {
-	auto strings = std::static_pointer_cast<arrow::StringArray>(batch->column(0));
-	REQUIRE(strings->length() == 1);
-	REQUIRE(!strings->IsNull(0));
-	return strings->GetString(0);
+std::string FilterSpec(const VgiBatchPtr &batch) {
+	auto strings = batch->column(0);
+	REQUIRE(strings.length() == 1);
+	REQUIRE(!strings.IsNull(0));
+	return strings.GetString(0);
 }
 
-void RequireV2Schema(const std::shared_ptr<arrow::RecordBatch> &batch) {
-	REQUIRE(batch->schema()->field(0)->name() == "filter_spec");
-	REQUIRE_FALSE(batch->schema()->field(0)->nullable());
-	REQUIRE(batch->schema()->metadata());
-	REQUIRE(batch->schema()->metadata()->Get("vgi_filter_encoding").ValueOrDie() == "vgi.filters.v2");
-	REQUIRE(batch->schema()->metadata()->Get("vgi_filter_version").ValueOrDie() == "2");
-	REQUIRE(batch->schema()->metadata()->Get("vgi_evaluation_context").ValueOrDie() == "vgi.none.v1");
-	REQUIRE_FALSE(batch->schema()->field(0)->metadata());
+bool IsListField(const VgiBatchPtr &batch, int i) {
+	return DescribeType(batch->schema()->field(i)).type == NANOARROW_TYPE_LIST;
+}
+
+void RequireV2Schema(const VgiBatchPtr &batch) {
+	auto &schema = *batch->schema();
+	REQUIRE(schema.field_name(0) == "filter_spec");
+	REQUIRE_FALSE(schema.field_nullable(0));
+	REQUIRE_FALSE(schema.metadata().empty());
+	REQUIRE(schema.metadata().Get("vgi_filter_encoding") == std::string("vgi.filters.v2"));
+	REQUIRE(schema.metadata().Get("vgi_filter_version") == std::string("2"));
+	REQUIRE(schema.metadata().Get("vgi_evaluation_context") == std::string("vgi.none.v1"));
+	REQUIRE(schema.field_metadata(0).empty());
 }
 
 } // namespace
@@ -71,7 +73,7 @@ TEST_CASE("filter v2 snapshot uses schema metadata and unprojected column refs",
 	REQUIRE(serialized.join_keys_buffers.empty());
 	auto batch = ReadBatch(serialized.filter_bytes);
 	RequireV2Schema(batch);
-	REQUIRE(batch->schema()->field(1)->name() == "value_0");
+	REQUIRE(batch->schema()->field_name(1) == "value_0");
 	auto json = FilterSpec(batch);
 	REQUIRE(json.find("\"encoding\":\"vgi.filters.v2\"") != std::string::npos);
 	REQUIRE(json.find("\"kind\":\"snapshot\"") != std::string::npos);
@@ -180,8 +182,8 @@ TEST_CASE("filter v2 chooses exact inline and external IN encodings", "[filter-v
 	auto small = VgiSerializeFilters(*con.context, {0}, &small_filters, {"key"}, "test-worker");
 	auto small_batch = ReadBatch(small.filter_bytes);
 	REQUIRE(small.join_keys_buffers.empty());
-	REQUIRE(small_batch->schema()->field(1)->name() == "value_0");
-	REQUIRE(small_batch->schema()->field(1)->type()->id() == arrow::Type::LIST);
+	REQUIRE(small_batch->schema()->field_name(1) == "value_0");
+	REQUIRE(IsListField(small_batch, 1));
 	REQUIRE(FilterSpec(small_batch).find("\"kind\":\"literal\"") != std::string::npos);
 
 	vector<Value> values;
@@ -200,8 +202,8 @@ TEST_CASE("filter v2 chooses exact inline and external IN encodings", "[filter-v
 	REQUIRE(json.find("\"column_index\":0") != std::string::npos);
 	auto keys = ReadBatch(large.join_keys_buffers[0]);
 	REQUIRE(keys->num_rows() == 1100);
-	REQUIRE(keys->schema()->field(0)->name() == "key");
-	REQUIRE(keys->schema()->metadata()->Get("vgi_join_keys_version").ValueOrDie() == "2");
+	REQUIRE(keys->schema()->field_name(0) == "key");
+	REQUIRE(keys->schema()->metadata().Get("vgi_join_keys_version") == std::string("2"));
 
 	TableFilterSet empty_filters;
 	auto empty_in = make_uniq<InFilter>(vector<Value> {Value::INTEGER(1)});
@@ -210,7 +212,7 @@ TEST_CASE("filter v2 chooses exact inline and external IN encodings", "[filter-v
 	auto empty = VgiSerializeFilters(*con.context, {0}, &empty_filters, {"key"}, "test-worker");
 	auto empty_batch = ReadBatch(empty.filter_bytes);
 	REQUIRE(empty.join_keys_buffers.empty());
-	REQUIRE(empty_batch->schema()->field(1)->name() == "value_0");
+	REQUIRE(empty_batch->schema()->field_name(1) == "value_0");
 	REQUIRE(FilterSpec(empty_batch).find("\"node\":\"literal\",\"value_ref\":0") != std::string::npos);
 }
 
@@ -232,7 +234,7 @@ TEST_CASE("filter v2 safely serializes expression IN lists", "[filter-v2]") {
 		REQUIRE(json.find(expression_type == ExpressionType::COMPARE_NOT_IN ? "\"negated\":true"
 		                                                                      : "\"negated\":false") !=
 		        std::string::npos);
-		REQUIRE(batch->schema()->field(1)->type()->id() == arrow::Type::LIST);
+		REQUIRE(IsListField(batch, 1));
 	}
 }
 
@@ -358,7 +360,7 @@ TEST_CASE("filter v2 encodes advisory mode and canonical type references", "[fil
 	auto batch = ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"key"}, "test-worker").filter_bytes);
 	REQUIRE(batch->schema()->GetFieldIndex("type_0") >= 1);
 	REQUIRE(batch->schema()->GetFieldIndex("value_0") >= 1);
-	REQUIRE(batch->column(batch->schema()->GetFieldIndex("type_0"))->IsNull(0));
+	REQUIRE(batch->column(batch->schema()->GetFieldIndex("type_0")).IsNull(0));
 	auto json = FilterSpec(batch);
 	REQUIRE(json.find("\"type_ref\":0") != std::string::npos);
 	REQUIRE(json.find("\"value_ref\":0") != std::string::npos);

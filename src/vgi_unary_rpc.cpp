@@ -46,7 +46,7 @@ namespace {
 // retry path so a freshly-spawned worker does the work. Cross-platform: the
 // SubProcess + fd RPC layer it uses works on POSIX and Windows.
 UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
-                                     const std::shared_ptr<arrow::RecordBatch> &params, bool force_fresh) {
+                                     const VgiBatchPtr &params, bool force_fresh) {
 	std::unique_ptr<SubProcess> proc;
 	std::unique_ptr<StderrDrainer> drainer;
 	bool from_pool = false;
@@ -143,7 +143,7 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 #endif // VGI_SUBPROCESS_TRANSPORT
 
 UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const std::string &method_name,
-                                              const std::shared_ptr<arrow::RecordBatch> &params) {
+                                              const VgiBatchPtr &params) {
 	if (IsHttpTransport(opts.worker_path)) {
 		// Keep-alive: check a client out of the per-catalog pool for this call
 		// and return it only on success. If HttpInvokeUnary throws, ``pooled``
@@ -213,8 +213,8 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 		if (params) {
 			WriteRpcRequest(duplex.output, method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 		} else {
-			auto empty = arrow::RecordBatch::Make(arrow::schema({}), 1,
-			                                      std::vector<std::shared_ptr<arrow::Array>> {});
+			// Zero-field schema, one row (the no-params request shape).
+			auto empty = VgiBatch::FromColumns(VgiSchema::Empty(), 1, {});
 			WriteRpcRequest(duplex.output, method_name, empty, /*extra_metadata=*/nullptr, opts.protocol);
 		}
 		return ReadUnaryResponse(duplex.input, &opts.context, opts.worker_path);
@@ -408,7 +408,7 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 } // anonymous namespace
 
 UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
-                                          const std::shared_ptr<arrow::RecordBatch> &params) {
+                                          const VgiBatchPtr &params) {
 	auto result = InvokeUnaryRpcOnTransport(opts, method_name, params);
 	// A worker with external storage configured externalizes a large unary
 	// result on any transport, not only HTTP: resolve the vgi_rpc.location

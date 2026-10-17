@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 // ============================================================================
 // VgiMemoArena — columnar per-value memoization store
 // ============================================================================
@@ -14,7 +16,7 @@
 // expiry, validator}`. Serving K values is one gather; storing is one append.
 //
 // The arena is PURE arrow + std — no DuckDB types — so the operators convert at
-// the boundary (they already hold the worker output as an arrow::RecordBatch).
+// the boundary (they already hold the worker output as a VgiBatch).
 // Arenas live in the database-owned VgiMemoArenaRegistry, keyed by a static-key
 // fingerprint, NOT in the VgiResultCache LRU (heterogeneous per-slot expiry would
 // mis-fire the whole-entry staleness reaper).
@@ -30,8 +32,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <arrow/record_batch.h>
-#include <arrow/type.h>
 
 namespace duckdb {
 class ClientContext;
@@ -114,7 +114,7 @@ struct ArenaProbeResult {
 	// Materialized cached rows for every hit, concatenated. `parent[i]` is the index
 	// (into the probed `keys` vector) of the key that produced output row i. Null when
 	// no rows were served (all-miss, or all hits were negative memos).
-	std::shared_ptr<arrow::RecordBatch> rows;
+	VgiBatchPtr rows;
 	std::vector<int32_t> parent;
 	// Per probed key: whether it hit, and (if it hit) the validator it carried. A
 	// caller latching cache-control across a full hit compares validator_ref across
@@ -141,7 +141,7 @@ struct ArenaStoreSpec {
 
 class VgiMemoArena {
 public:
-	explicit VgiMemoArena(std::shared_ptr<arrow::Schema> schema) : schema_(std::move(schema)) {}
+	explicit VgiMemoArena(VgiSchemaPtr schema) : schema_(std::move(schema)) {}
 
 	// Attach a persistence backend + this arena's static-key fingerprint. When set, Store
 	// also persists new slots and a cold arena can be hydrated (LoadFromBackend). The
@@ -169,7 +169,7 @@ public:
 	// per spec. First-writer-wins: a spec whose key already has a live slot is skipped
 	// (its rows in `batch` become dead). Returns the net footprint delta in bytes (for
 	// the registry's global accounting).
-	int64_t Store(const std::shared_ptr<arrow::RecordBatch> &batch, const std::vector<ArenaStoreSpec> &specs,
+	int64_t Store(const VgiBatchPtr &batch, const std::vector<ArenaStoreSpec> &specs,
 	              std::chrono::steady_clock::time_point expires_at, bool never_expires);
 
 	int64_t FootprintBytes();
@@ -182,7 +182,7 @@ public:
 		int64_t footprint_bytes = 0;
 	};
 	Stats GetStats();
-	const std::shared_ptr<arrow::Schema> &schema() const { return schema_; }
+	const VgiSchemaPtr &schema() const { return schema_; }
 
 private:
 	// shared_mutex: Probe is a SHARED-lock reader (concurrent probes of a hot arena run
@@ -190,9 +190,9 @@ private:
 	// contention was Probe holding an EXCLUSIVE lock during the Take). All mutation —
 	// Store, compaction, stale reclamation, validator dedup — takes the exclusive lock.
 	std::shared_mutex mu_;
-	std::shared_ptr<arrow::Schema> schema_;
-	std::shared_ptr<arrow::RecordBatch> base_; // contiguous, immutable once published
-	std::shared_ptr<arrow::RecordBatch> tail_; // recent appends coalesced into one batch
+	VgiSchemaPtr schema_;
+	VgiBatchPtr base_; // contiguous, immutable once published
+	VgiBatchPtr tail_; // recent appends coalesced into one batch
 	int64_t base_rows_ = 0;
 	int64_t tail_rows_ = 0;
 	int64_t dead_rows_ = 0;
@@ -206,13 +206,13 @@ private:
 	// Serialize the newly-stored slots (their rows sliced from `batch`, offset held in the
 	// slot's row_start) and hand them to the backend. Called under the exclusive lock from
 	// Store when a backend is attached.
-	void PersistNewSlotsLocked(const std::shared_ptr<arrow::RecordBatch> &batch,
+	void PersistNewSlotsLocked(const VgiBatchPtr &batch,
 	                           const std::vector<std::pair<std::string, VgiMemoSlot>> &new_slots);
 
 	// Materialize `logical` rows (offsets into base∪tail) into one batch, preserving
 	// the order of `logical`. One Take when all rows are in base (the common path after
 	// a compaction); otherwise a 2-source gather (still O(#rows), never O(arena)).
-	std::shared_ptr<arrow::RecordBatch> MaterializeLocked(const std::vector<int64_t> &logical);
+	VgiBatchPtr MaterializeLocked(const std::vector<int64_t> &logical);
 	// Rebuild base_ from only the live+FRESH slots (dropping dead rows AND stale slots as
 	// of `now`) and clear tail_. Also serves as compaction. Rebases every slot's row_start.
 	void CompactLocked(std::chrono::steady_clock::time_point now);
@@ -234,7 +234,7 @@ public:
 	// used only on creation; a schema mismatch on an existing arena returns null (the
 	// caller then skips memoization — never serves the wrong shape).
 	std::shared_ptr<VgiMemoArena> GetOrCreate(const std::string &static_fp,
-	                                           const std::shared_ptr<arrow::Schema> &schema);
+	                                           const VgiSchemaPtr &schema);
 	// Fetch without creating (probe-only path). Null if absent.
 	std::shared_ptr<VgiMemoArena> Get(const std::string &static_fp);
 

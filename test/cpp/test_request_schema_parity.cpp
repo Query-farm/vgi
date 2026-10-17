@@ -52,7 +52,9 @@
 #include "vgi_table_buffering_builders.hpp"
 #include "../../src/generated/vgi_protocol_schemas.hpp"
 
-#include <arrow/api.h>
+#include "vgi_arrow.hpp"
+
+#include "nanoarrow/nanoarrow.h"
 
 #include <string>
 #include <vector>
@@ -63,21 +65,36 @@ namespace {
 
 // Every way the built record departs from the declaration, as sentences naming
 // the record and field. Reported as a list rather than a bare
-// `arrow::Schema::Equals` because the failure this guards against is a peer
+// `VgiSchema::Equals` because the failure this guards against is a peer
 // rejecting the whole batch with no detail — the diagnostics ARE the point.
 // Go's own message prints both schemas in full and leaves the reader to diff
 // nineteen lines by eye.
-std::vector<std::string> DiffSchema(const std::string &record, const arrow::Schema &declared,
-                                    const arrow::Schema &built) {
+// The field's TYPE, ignoring the field's own name and nullability (both are
+// reported separately): format, children (names and nullability included, as
+// a nested type's shape), dictionary, and the ordering/sorted flags.
+bool FieldTypesEqual(const ArrowSchema &a, const ArrowSchema &b) {
+	const auto type_flags = ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED;
+	if (std::string(a.format) != std::string(b.format) || a.n_children != b.n_children ||
+	    (a.flags & type_flags) != (b.flags & type_flags)) {
+		return false;
+	}
+	for (int64_t i = 0; i < a.n_children; i++) {
+		if (!TypesEqual(*a.children[i], *b.children[i])) {
+			return false;
+		}
+	}
+	if ((a.dictionary == nullptr) != (b.dictionary == nullptr)) {
+		return false;
+	}
+	return !a.dictionary || TypesEqual(*a.dictionary, *b.dictionary);
+}
+
+std::vector<std::string> DiffSchema(const std::string &record, const VgiSchema &declared,
+                                    const VgiSchema &built) {
 	std::vector<std::string> problems;
 
-	std::vector<std::string> want, got;
-	for (const auto &f : declared.fields()) {
-		want.push_back(f->name());
-	}
-	for (const auto &f : built.fields()) {
-		got.push_back(f->name());
-	}
+	const std::vector<std::string> &want = declared.field_names();
+	const std::vector<std::string> &got = built.field_names();
 	if (want != got) {
 		// Report the column lists whole. A missing or reordered column shifts
 		// every field after it, and a per-field diff would then read as a dozen
@@ -109,23 +126,24 @@ std::vector<std::string> DiffSchema(const std::string &record, const arrow::Sche
 	}
 
 	for (int i = 0; i < declared.num_fields(); i++) {
-		const auto &d = *declared.field(i);
-		const auto &b = *built.field(i);
-		const std::string path = record + "." + d.name();
-		if (!d.type()->Equals(*b.type())) {
-			problems.push_back(path + ": protocol declares " + d.type()->ToString() + " but the builder emits " +
-			                   b.type()->ToString());
+		const auto &d = declared.field(i);
+		const auto &b = built.field(i);
+		const std::string path = record + "." + declared.field_name(i);
+		if (!FieldTypesEqual(d, b)) {
+			problems.push_back(path + ": protocol declares " + TypeToString(d) + " but the builder emits " +
+			                   TypeToString(b));
 		}
-		if (d.nullable() != b.nullable()) {
-			problems.push_back(path + ": protocol declares nullable=" + (d.nullable() ? "true" : "false") +
-			                   " but the builder emits nullable=" + (b.nullable() ? "true" : "false"));
+		const bool d_nullable = declared.field_nullable(i);
+		const bool b_nullable = built.field_nullable(i);
+		if (d_nullable != b_nullable) {
+			problems.push_back(path + ": protocol declares nullable=" + (d_nullable ? "true" : "false") +
+			                   " but the builder emits nullable=" + (b_nullable ? "true" : "false"));
 		}
 	}
 	return problems;
 }
 
-void RequireMatches(const std::string &record, const std::shared_ptr<arrow::Schema> &declared,
-                    const std::shared_ptr<arrow::RecordBatch> &built) {
+void RequireMatches(const std::string &record, const VgiSchemaPtr &declared, const VgiBatchPtr &built) {
 	REQUIRE(built != nullptr);
 	auto problems = DiffSchema(record, *declared, *built->schema());
 	if (!problems.empty()) {
@@ -141,14 +159,13 @@ void RequireMatches(const std::string &record, const std::shared_ptr<arrow::Sche
 // inner record — the buffered-table ones serialize and wrap in one step. Pull
 // the record back out so the check runs against the bytes that actually go on
 // the wire, which is the stronger place to run it.
-std::shared_ptr<arrow::RecordBatch> UnwrapRequest(const std::shared_ptr<arrow::RecordBatch> &params) {
+VgiBatchPtr UnwrapRequest(const VgiBatchPtr &params) {
 	REQUIRE(params != nullptr);
-	int idx = params->schema()->GetFieldIndex("request");
-	REQUIRE(idx >= 0);
-	auto col = std::static_pointer_cast<arrow::BinaryArray>(params->column(idx));
-	REQUIRE(col->length() == 1);
-	REQUIRE(!col->IsNull(0));
-	auto view = col->GetView(0);
+	auto col = params->GetColumnByName("request");
+	REQUIRE(col);
+	REQUIRE(col.length() == 1);
+	REQUIRE(!col.IsNull(0));
+	auto view = col.GetView(0);
 	return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
 }
 
@@ -196,14 +213,18 @@ TEST_CASE("BuildBindRequest carries resolved argument names", "[schema-parity]")
 	                                "main", argument_names);
 	RequireMatches("BindRequest(argument_names)", generated::BindRequestSchema(), request);
 
-	auto names = std::dynamic_pointer_cast<arrow::ListArray>(request->GetColumnByName("argument_names"));
+	auto names = request->GetColumnByName("argument_names");
 	REQUIRE(names);
-	REQUIRE_FALSE(names->IsNull(0));
-	auto values = std::dynamic_pointer_cast<arrow::StringArray>(names->values());
-	REQUIRE(values);
-	REQUIRE(values->GetString(0) == "value");
-	REQUIRE(values->IsNull(1));
-	REQUIRE(values->GetString(2) == "named_tail");
+	REQUIRE(DescribeType(names.schema()).type == NANOARROW_TYPE_LIST);
+	REQUIRE_FALSE(names.IsNull(0));
+	int64_t begin = 0;
+	int64_t end = 0;
+	names.ListRange(0, begin, end);
+	REQUIRE(end - begin == 3);
+	auto values = names.child(0);
+	REQUIRE(values.GetString(begin) == "value");
+	REQUIRE(values.IsNull(begin + 1));
+	REQUIRE(values.GetString(begin + 2) == "named_tail");
 }
 
 TEST_CASE("DuckDB 1.5 schema paths preserve one component and reject nesting", "[schema-path]") {
@@ -289,10 +310,10 @@ TEST_CASE("BuildTableBufferingDestructorInner matches the declared schema", "[sc
 // ---------------------------------------------------------------------------
 
 TEST_CASE("DiffSchema catches the drift classes it exists for", "[schema-parity]") {
-	auto declared = arrow::schema({
-	    arrow::field("a", arrow::utf8(), /*nullable=*/false),
-	    arrow::field("b", arrow::binary(), /*nullable=*/true),
-	    arrow::field("c", arrow::int64(), /*nullable=*/true),
+	auto declared = MakeSchema({
+	    type::Utf8().Named("a", /*is_nullable=*/false),
+	    type::Binary().Named("b", /*is_nullable=*/true),
+	    type::Int64().Named("c", /*is_nullable=*/true),
 	});
 
 	SECTION("an exact match is clean") {
@@ -300,45 +321,45 @@ TEST_CASE("DiffSchema catches the drift classes it exists for", "[schema-parity]
 	}
 
 	SECTION("omitting a NULLABLE field is still a failure — the Go finding") {
-		auto built = arrow::schema({arrow::field("a", arrow::utf8(), false),
-		                            arrow::field("c", arrow::int64(), true)});
+		auto built = MakeSchema({type::Utf8().Named("a", false),
+		                            type::Int64().Named("c", true)});
 		auto problems = DiffSchema("R", *declared, *built);
 		REQUIRE(problems.size() == 1);
 		REQUIRE(problems[0].find("R.b: declared but the builder does not emit it") != std::string::npos);
 	}
 
 	SECTION("a wrong type is caught") {
-		auto built = arrow::schema({arrow::field("a", arrow::utf8(), false),
-		                            arrow::field("b", arrow::binary(), true),
-		                            arrow::field("c", arrow::int32(), true)});
+		auto built = MakeSchema({type::Utf8().Named("a", false),
+		                            type::Binary().Named("b", true),
+		                            type::Int32().Named("c", true)});
 		auto problems = DiffSchema("R", *declared, *built);
 		REQUIRE(problems.size() == 1);
 		REQUIRE(problems[0].find("int32") != std::string::npos);
 	}
 
 	SECTION("a wrong nullability is caught — the catalog_attach defect") {
-		auto built = arrow::schema({arrow::field("a", arrow::utf8(), false),
-		                            arrow::field("b", arrow::binary(), false),
-		                            arrow::field("c", arrow::int64(), true)});
+		auto built = MakeSchema({type::Utf8().Named("a", false),
+		                            type::Binary().Named("b", false),
+		                            type::Int64().Named("c", true)});
 		auto problems = DiffSchema("R", *declared, *built);
 		REQUIRE(problems.size() == 1);
 		REQUIRE(problems[0].find("nullable=") != std::string::npos);
 	}
 
 	SECTION("a reordering is caught — the bind defect") {
-		auto built = arrow::schema({arrow::field("a", arrow::utf8(), false),
-		                            arrow::field("c", arrow::int64(), true),
-		                            arrow::field("b", arrow::binary(), true)});
+		auto built = MakeSchema({type::Utf8().Named("a", false),
+		                            type::Int64().Named("c", true),
+		                            type::Binary().Named("b", true)});
 		auto problems = DiffSchema("R", *declared, *built);
 		REQUIRE(problems.size() == 1);
 		REQUIRE(problems[0].find("column names/order") != std::string::npos);
 	}
 
 	SECTION("a phantom column is caught") {
-		auto built = arrow::schema({arrow::field("a", arrow::utf8(), false),
-		                            arrow::field("b", arrow::binary(), true),
-		                            arrow::field("c", arrow::int64(), true),
-		                            arrow::field("zzz", arrow::utf8(), true)});
+		auto built = MakeSchema({type::Utf8().Named("a", false),
+		                            type::Binary().Named("b", true),
+		                            type::Int64().Named("c", true),
+		                            type::Utf8().Named("zzz", true)});
 		auto problems = DiffSchema("R", *declared, *built);
 		REQUIRE(problems.size() == 1);
 		REQUIRE(problems[0].find("R.zzz: emitted but the protocol declares no such field") != std::string::npos);

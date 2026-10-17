@@ -1,12 +1,14 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 // Catalog discovery metadata: the POD types the worker advertises (settings,
 // secrets, schemas, tables, views, macros, functions) and the parsers that
 // build them from Arrow RecordBatches. Split out of vgi_catalog_api.hpp.
 //
-// Arrow appears here only as `shared_ptr<arrow::Schema>` members and
-// `shared_ptr<arrow::RecordBatch>` parameters, so forward declarations suffice
+// Batches and schemas appear here only as VgiSchemaPtr / VgiBatchPtr (vgi_arrow.hpp,
+// which needs only the C data interface structs)
 // and the heavy <arrow/api.h> / arrow/ipc umbrella stays in the .cpp files that
 // actually deserialize. This is the lever that keeps metadata-only consumers
 // cheap to compile (mirrors the vgi_logging.hpp pattern). Do NOT add
@@ -33,12 +35,6 @@
 
 // Arrow types appear only as shared_ptr members / parameters below — see the
 // file header. Forward declarations only.
-namespace arrow {
-class Schema;
-class RecordBatch;
-class StructArray;
-} // namespace arrow
-
 namespace duckdb {
 
 class ClientContext;
@@ -298,7 +294,7 @@ struct VgiScanBranchesResult {
 struct VgiTableInfo {
 	std::string name;
 	std::string schema_name;
-	std::shared_ptr<arrow::Schema> arrow_schema;
+	VgiSchemaPtr arrow_schema;
 	std::string comment;
 	std::map<std::string, std::string> tags;
 	// Row ID column: index in arrow_schema marked is_row_id (-1 = none)
@@ -413,7 +409,7 @@ struct VgiMacroInfo {
 	// One nullable field per parameter (in `parameters` order) carrying the
 	// per-parameter description via the `vgi_doc` field-metadata key — mirrors
 	// VgiFunctionInfo::arguments_schema. Null on older workers that don't emit it.
-	std::shared_ptr<arrow::Schema> arguments_schema;
+	VgiSchemaPtr arguments_schema;
 	std::map<std::string, std::string> tags;
 };
 
@@ -498,7 +494,7 @@ struct VgiCopyFromFormatInfo {
 	// Option schema: deserialized Arrow schema of the format's options, built
 	// from the handler's Arg-annotated arguments (same encoding parsed by
 	// vgi_function_arguments()). Null when the format declares no options.
-	std::shared_ptr<arrow::Schema> options_schema;
+	VgiSchemaPtr options_schema;
 };
 
 // ============================================================================
@@ -555,8 +551,8 @@ struct VgiFunctionInfo {
 	std::map<std::string, std::string> tags;
 
 	// Arguments and output as deserialized Arrow schemas
-	std::shared_ptr<arrow::Schema> arguments_schema;
-	std::shared_ptr<arrow::Schema> output_schema;
+	VgiSchemaPtr arguments_schema;
+	VgiSchemaPtr output_schema;
 	// IPC-serialized one-row RecordBatch containing only parameters with
 	// defaults, in signature order. Column presence distinguishes "no default"
 	// from an explicit NULL default. DuckDB 1.5 stores this for discovery and
@@ -718,44 +714,51 @@ VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::s
                                   ClientContext &context);
 
 // Parse a CatalogAttachResult from an Arrow RecordBatch
-CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+CatalogAttachResult ParseCatalogAttachResult(const VgiBatchPtr &batch,
                                              const std::string &worker_path, ClientContext &context);
 
 // Parse a VgiSchemaInfo from an Arrow RecordBatch (single row)
-VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+VgiSchemaInfo ParseSchemaInfo(const VgiBatchPtr &batch, const std::string &worker_path);
 
 // Parse a VgiTableInfo from an Arrow RecordBatch (single row).
 // `context` is required to decode optional inlined ScanFunctionResults
 // (their nested IPC arguments need ArrowBatchToValues).
-VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
                             const std::string &worker_path);
 
 // Parse a VgiTableInfo from an Arrow RecordBatch at a specific row (for multi-row batches)
-VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
                             int64_t row_idx, const std::string &worker_path);
 
 // Parse multiple schemas from a batch (for schemas() call)
-std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,
+std::vector<VgiSchemaInfo> ParseSchemaList(const VgiBatchPtr &batch,
                                            const std::string &worker_path);
 
 // Parse a VgiFunctionInfo from an Arrow RecordBatch at a specific row
-VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
+VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
                                   const std::string &worker_path);
 
 // Parse a VgiViewInfo from an Arrow RecordBatch (single row)
-VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+VgiViewInfo ParseViewInfo(const VgiBatchPtr &batch, const std::string &worker_path);
 
 // Parse a VgiCopyFromFormatInfo from an Arrow RecordBatch (single row)
-VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const VgiBatchPtr &batch,
                                               const std::string &worker_path);
 
 // Parse a VgiMacroInfo from an Arrow RecordBatch (single row)
-VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+VgiMacroInfo ParseMacroInfo(const VgiBatchPtr &batch, const std::string &worker_path);
 
 // Parse a VgiScanFunctionResult from an Arrow RecordBatch (single row)
 // The arguments field is a nested IPC batch with arg_0, arg_1, ... for positional args and named args by name
-VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const VgiBatchPtr &batch,
                                                const std::string &worker_path);
+
+// Row `row` of every column of `batch` as DuckDB Values (one per column, in
+// order), converted by DuckDB's own Arrow scanner, so every type DuckDB reads
+// from Arrow is supported. Each Value has its column's ArrowSchemaToDuckDBTypes
+// type; NULL cells are NULLs of that type. Empty for a null batch, a batch with
+// no columns, or an out-of-range row.
+vector<Value> BatchRowToValues(ClientContext &context, const VgiBatchPtr &batch, int64_t row = 0);
 
 // One schema and everything in it, from catalog_contents: row `row` of the
 // response's `schemas` struct column, held in place (every schema of a
@@ -767,8 +770,13 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std:
 struct VgiSchemaContents {
 	std::string name;              // SchemaNameFromPath(path)
 	std::vector<std::string> path; // SchemaContents.path; must equal SchemaInfo.path
-	std::shared_ptr<arrow::StructArray> rows;
+	//! The catalog_contents response batch; column `rows_column` is the `schemas` struct column.
+	VgiBatchPtr rows_batch;
+	int rows_column = 0;
 	int64_t row = 0;
+	VgiColumn rows() const {
+		return rows_batch->column(rows_column);
+	}
 	std::string worker_path;
 };
 

@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 // vgi.cache.* metadata vocabulary + the parsed cache-control advertisement.
 //
 // Kept in its own lightweight header (no Arrow, no heavy deps) so the widely
@@ -12,10 +14,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-
-namespace arrow {
-class KeyValueMetadata;
-} // namespace arrow
 
 namespace duckdb {
 namespace vgi {
@@ -97,7 +95,7 @@ struct VgiCacheControl {
 
 // Parse `vgi.cache.*` keys off a batch's custom_metadata. Returns a struct with
 // present=false when the metadata is null or carries no vgi.cache.* key.
-VgiCacheControl ParseVgiCacheControl(const std::shared_ptr<const arrow::KeyValueMetadata> &metadata);
+VgiCacheControl ParseVgiCacheControl(const VgiMetadataPtr &metadata);
 
 } // namespace vgi
 } // namespace duckdb

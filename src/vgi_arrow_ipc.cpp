@@ -1,6 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_arrow_ipc.hpp"
-#include "vgi_nanoarrow_ipc.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -9,7 +8,7 @@
 #include <chrono>
 #include <cstring>
 
-#include <arrow/util/compression.h> // util::Codec (disk-tier IPC compression)
+#include "nanoarrow/nanoarrow.h"
 
 #if VGI_POSIX_TRANSPORT
 #include <sys/select.h>
@@ -57,23 +56,20 @@ static constexpr int64_t kMaxIoChunkBytes = 1LL << 30; // 1 GiB
 // Protocol State Metadata
 // ============================================================================
 
-std::shared_ptr<arrow::KeyValueMetadata> CreateProtocolStateMetadata(const char *state) {
-	return arrow::KeyValueMetadata::Make({PROTOCOL_STATE_KEY}, {state});
+VgiMetadataPtr CreateProtocolStateMetadata(const char *state) {
+	return VgiMetadata::Make({{PROTOCOL_STATE_KEY, state}});
 }
 
-std::string GetProtocolState(const std::shared_ptr<arrow::KeyValueMetadata> &metadata) {
+std::string GetProtocolState(const VgiMetadataPtr &metadata) {
 	if (!metadata) {
 		return "";
 	}
 	auto result = metadata->Get(PROTOCOL_STATE_KEY);
-	if (!result.ok()) {
-		return "";
-	}
-	return result.ValueUnsafe();
+	return result ? *result : std::string();
 }
 
-void ValidateProtocolState(const std::shared_ptr<arrow::KeyValueMetadata> &metadata, const char *expected_state,
-                           const std::string &context, const std::string &worker_path, pid_t worker_pid) {
+void ValidateProtocolState(const VgiMetadataPtr &metadata, const char *expected_state, const std::string &context,
+                           const std::string &worker_path, pid_t worker_pid) {
 	auto actual_state = GetProtocolState(metadata);
 	if (actual_state.empty()) {
 		ThrowVgiIOException("Protocol state missing in %s response (expected '%s')", worker_path, worker_pid, "",
@@ -89,41 +85,6 @@ void ValidateProtocolState(const std::shared_ptr<arrow::KeyValueMetadata> &metad
 // Serialization Functions
 // ============================================================================
 
-namespace {
-// Map a resolved codec name to Arrow's Compression enum. Returns false for
-// "none"/unknown (→ uncompressed).
-bool CodecTypeFromName(const std::string &name, arrow::Compression::type &out) {
-	if (name == "zstd") {
-		out = arrow::Compression::ZSTD;
-		return true;
-	}
-	if (name == "lz4") {
-		out = arrow::Compression::LZ4_FRAME;
-		return true;
-	}
-	return false;
-}
-
-// Build IpcWriteOptions for a resolved codec name + level. Deterministic
-// (use_threads=false) so the content-addressed disk blob's SHA is stable. The
-// caller has already resolved availability via ResolveDiskCompressionCodec, but
-// Codec::Create can still fail — fall back to uncompressed (best-effort).
-arrow::ipc::IpcWriteOptions MakeIpcWriteOptions(const std::string &codec, uint64_t level) {
-	auto opts = arrow::ipc::IpcWriteOptions::Defaults();
-	arrow::Compression::type ctype;
-	if (!CodecTypeFromName(codec, ctype)) {
-		return opts; // none / unknown → uncompressed
-	}
-	opts.use_threads = false;
-	int lvl = static_cast<int>(level == 0 ? 1 : level);
-	auto codec_res = arrow::util::Codec::Create(ctype, lvl);
-	if (codec_res.ok()) {
-		opts.codec = std::move(codec_res).ValueUnsafe();
-	}
-	return opts;
-}
-} // namespace
-
 std::string ResolveDiskCompressionCodec(const std::string &requested) {
 	std::string c;
 	c.reserve(requested.size());
@@ -133,89 +94,43 @@ std::string ResolveDiskCompressionCodec(const std::string &requested) {
 	if (c.empty() || c == "none") {
 		return "none";
 	}
-	arrow::Compression::type ctype;
-	if (!CodecTypeFromName(c, ctype)) {
-		static std::atomic<bool> warned{false};
+	if (c != "zstd" && c != "lz4") {
+		static std::atomic<bool> warned {false};
 		if (!warned.exchange(true)) {
 			VGI_STDERR_DEBUG("[VGI] result cache: unknown disk compression codec '%s' → uncompressed\n",
 			                 requested.c_str());
 		}
 		return "none";
 	}
-	if (!arrow::util::Codec::IsAvailable(ctype)) {
-		static std::atomic<bool> warned{false};
-		if (!warned.exchange(true)) {
-			VGI_STDERR_DEBUG("[VGI] result cache: Arrow built without %s codec → disk tier uncompressed\n",
-			                 c.c_str());
-		}
-		return "none";
-	}
 	return c;
 }
 
-std::shared_ptr<arrow::Buffer> TranscodeIpcWithCodec(const std::shared_ptr<arrow::Buffer> &ipc,
-                                                     const std::string &codec, uint64_t level) {
+VgiBufferPtr TranscodeIpcWithCodec(const VgiBufferPtr &ipc, const std::string &codec, uint64_t level) {
 	if (!ipc || codec.empty() || codec == "none") {
 		return ipc;
 	}
 	try {
-		auto in = std::make_shared<arrow::io::BufferReader>(ipc);
-		auto reader_res = ::duckdb::vgi::nanoipc::OpenStreamReader(in);
-		if (!reader_res.ok()) {
-			return ipc;
-		}
-		auto reader = reader_res.ValueUnsafe();
-		std::shared_ptr<arrow::RecordBatch> batch;
-		if (!reader->ReadNext(&batch).ok() || !batch) {
+		auto batch = DeserializeBatch(ipc);
+		if (!batch) {
 			return ipc;
 		}
 		// Cache batches are single-batch streams with no per-batch custom_metadata
 		// (vgi_meta lives in the blob framing), so none needs preserving.
-		auto out = SerializeRecordBatch(batch, nullptr, codec, level);
+		VgiMetadata none;
+		auto out = SerializeRecordBatch(*batch, &none, codec, level);
 		return out ? out : ipc;
 	} catch (...) {
 		return ipc; // best-effort: compression must never break caching
 	}
 }
 
-// Serialize an Arrow RecordBatch to IPC stream format bytes (optionally compressed
-// via Arrow's built-in codec — see the header).
-std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
-    const std::shared_ptr<arrow::RecordBatch> &batch,
-    const std::shared_ptr<const arrow::KeyValueMetadata> &custom_metadata, const std::string &codec,
-    uint64_t level) {
-	auto sink_result = arrow::io::BufferOutputStream::Create();
-	if (!sink_result.ok()) {
-		throw IOException("Failed to create Arrow buffer: " + sink_result.status().ToString());
-	}
-	auto sink = sink_result.ValueUnsafe();
-
-	auto write_options = MakeIpcWriteOptions(codec, level);
-	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, batch->schema(), write_options);
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create Arrow writer: " + writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
-
-	arrow::Status status;
-	if (custom_metadata) {
-		status = writer->WriteRecordBatch(*batch, custom_metadata);
-	} else {
-		status = writer->WriteRecordBatch(*batch);
-	}
-	if (!status.ok()) {
-		throw IOException("Failed to serialize Arrow batch: " + status.ToString());
-	}
-	status = writer->Close();
-	if (!status.ok()) {
-		throw IOException("Failed to close Arrow writer: " + status.ToString());
-	}
-
-	auto finish_result = sink->Finish();
-	if (!finish_result.ok()) {
-		throw IOException("Failed to finish Arrow buffer: " + finish_result.status().ToString());
-	}
-	return finish_result.ValueUnsafe();
+VgiBufferPtr SerializeRecordBatch(const VgiBatch &batch, const VgiMetadata *custom_metadata, const std::string &codec,
+                                  uint64_t level) {
+	VgiIpcWriteOptions options;
+	options.codec = ResolveIpcCodec(codec);
+	options.level = static_cast<int>(level == 0 ? 1 : level);
+	VgiMetadata none;
+	return SerializeBatch(batch, custom_metadata ? custom_metadata : &none, options);
 }
 
 // Fd-based stream I/O is the subprocess/AF_UNIX data path
@@ -244,22 +159,17 @@ FdInputStream::~FdInputStream() {
 #endif
 }
 
-arrow::Status FdInputStream::Close() {
+void FdInputStream::Close() {
 	is_open_ = false;
-	return arrow::Status::OK();
 }
 
 bool FdInputStream::closed() const {
 	return !is_open_;
 }
 
-arrow::Result<int64_t> FdInputStream::Tell() const {
-	return position_;
-}
-
-arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
+int64_t FdInputStream::Read(int64_t nbytes, void *out) {
 	if (!is_open_) {
-		return arrow::Status::Invalid("Stream is closed");
+		throw IOException("Stream is closed");
 	}
 
 	// Loop until we have all requested bytes or hit EOF.
@@ -325,7 +235,7 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 						break;
 					}
 					if (cancelled) {
-						return arrow::Status::IOError("VGI operation interrupted (query cancelled)");
+						throw IOException("VGI operation interrupted (query cancelled)");
 					}
 					if (::GetOverlappedResult(h, &ov, &got, FALSE)) {
 						bytes_read = static_cast<int>(got);
@@ -334,13 +244,13 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 						if (ge == ERROR_BROKEN_PIPE || ge == ERROR_HANDLE_EOF) {
 							bytes_read = 0;
 						} else {
-							return arrow::Status::IOError("Overlapped read failed: " + std::to_string(ge));
+							throw IOException("Overlapped read failed: " + std::to_string(ge));
 						}
 					}
 				} else if (e == ERROR_BROKEN_PIPE || e == ERROR_HANDLE_EOF) {
 					bytes_read = 0;
 				} else {
-					return arrow::Status::IOError("ReadFile failed: " + std::to_string(e));
+					throw IOException("ReadFile failed: " + std::to_string(e));
 				}
 			}
 		}
@@ -349,7 +259,7 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 			if (errno == EINTR) {
 				continue;
 			}
-			return arrow::Status::IOError("Read error: ", strerror(errno));
+			throw IOException(std::string("Read error: ") + strerror(errno));
 		}
 		if (bytes_read == 0) {
 			// EOF reached partway through. Return the bytes we did read —
@@ -365,33 +275,21 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 	return total_bytes_read;
 }
 
-arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes) {
-	ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(nbytes));
-	ARROW_ASSIGN_OR_RAISE(int64_t bytes_read, Read(nbytes, buffer->mutable_data()));
-	ARROW_RETURN_NOT_OK(buffer->Resize(bytes_read));
-	return buffer;
-}
-
 // FdOutputStream implementation
 FdOutputStream::FdOutputStream(int fd) : fd_(fd), position_(0), is_open_(true) {
 }
 
-arrow::Status FdOutputStream::Close() {
+void FdOutputStream::Close() {
 	is_open_ = false;
-	return arrow::Status::OK();
 }
 
 bool FdOutputStream::closed() const {
 	return !is_open_;
 }
 
-arrow::Result<int64_t> FdOutputStream::Tell() const {
-	return position_;
-}
-
-arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
+void FdOutputStream::Write(const void *data, int64_t nbytes) {
 	if (!is_open_) {
-		return arrow::Status::Invalid("Stream is closed");
+		throw IOException("Stream is closed");
 	}
 
 	const uint8_t *bytes = static_cast<const uint8_t *>(data);
@@ -419,10 +317,9 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 		auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
 		    deadline - std::chrono::steady_clock::now());
 		if (remaining.count() <= 0) {
-			return arrow::Status::IOError(
-			    "Write to worker timed out after ", std::to_string(kWriteTimeoutSeconds),
-			    "s (worker unresponsive); ", std::to_string(total_written), " of ",
-			    std::to_string(nbytes), " bytes written");
+			throw IOException("Write to worker timed out after " + std::to_string(kWriteTimeoutSeconds) +
+			                  "s (worker unresponsive); " + std::to_string(total_written) + " of " +
+			                  std::to_string(nbytes) + " bytes written");
 		}
 		struct timeval tv;
 		tv.tv_sec = remaining.count() / 1000000;
@@ -433,13 +330,12 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 			if (errno == EINTR) {
 				continue;
 			}
-			return arrow::Status::IOError("select() error during write: ", strerror(errno));
+			throw IOException(std::string("select() error during write: ") + strerror(errno));
 		}
 		if (sel == 0) {
-			return arrow::Status::IOError(
-			    "Write to worker timed out after ", std::to_string(kWriteTimeoutSeconds),
-			    "s (worker unresponsive); ", std::to_string(total_written), " of ",
-			    std::to_string(nbytes), " bytes written");
+			throw IOException("Write to worker timed out after " + std::to_string(kWriteTimeoutSeconds) +
+			                  "s (worker unresponsive); " + std::to_string(total_written) + " of " +
+			                  std::to_string(nbytes) + " bytes written");
 		}
 
 		// Clamped per-syscall count; see kMaxIoChunkBytes.
@@ -450,9 +346,9 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 				continue;
 			}
 			if (errno == EPIPE) {
-				return arrow::Status::IOError("Broken pipe writing to worker");
+				throw IOException("Broken pipe writing to worker");
 			}
-			return arrow::Status::IOError("Write error: ", strerror(errno));
+			throw IOException(std::string("Write error: ") + strerror(errno));
 		}
 		total_written += written;
 	}
@@ -470,21 +366,15 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 				continue;
 			}
 			if (errno == EPIPE) {
-				return arrow::Status::IOError("Broken pipe writing to worker");
+				throw IOException("Broken pipe writing to worker");
 			}
-			return arrow::Status::IOError("Write error: ", strerror(errno));
+			throw IOException(std::string("Write error: ") + strerror(errno));
 		}
 		total_written += written;
 	}
 #endif
 
 	position_ += total_written;
-	return arrow::Status::OK();
-}
-
-arrow::Status FdOutputStream::Flush() {
-	// File descriptors don't need explicit flushing
-	return arrow::Status::OK();
 }
 
 #endif // VGI_SUBPROCESS_TRANSPORT
@@ -492,120 +382,94 @@ arrow::Status FdOutputStream::Flush() {
 // Extract string values from a result batch column.
 // Returns empty vector if batch is null (protocol error) or has no rows (empty result).
 // Callers should distinguish these cases if needed by checking the batch before calling.
-std::vector<std::string> ExtractStringColumn(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                             const std::string &column_name) {
+std::vector<std::string> ExtractStringColumn(const VgiBatchPtr &batch, const std::string &column_name) {
 	std::vector<std::string> values;
-
 	if (!batch || batch->num_rows() == 0) {
 		return values;
 	}
-
-	// Find the column by name
 	auto column = batch->GetColumnByName(column_name);
 	if (!column) {
 		throw IOException("Column '%s' not found in result batch. Available columns: %s", column_name,
 		                  batch->schema()->ToString());
 	}
-
-	auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(column);
-	if (!string_array) {
-		throw IOException("Expected string array for column '%s', got %s", column_name, column->type()->ToString());
+	if (column.is_dictionary() || column.type().type != NANOARROW_TYPE_STRING) {
+		throw IOException("Expected string array for column '%s', got %s", column_name, column.type_string());
 	}
-
-	for (int64_t i = 0; i < string_array->length(); i++) {
-		if (!string_array->IsNull(i)) {
-			values.push_back(string_array->GetString(i));
+	for (int64_t i = 0; i < column.length(); i++) {
+		if (!column.IsNull(i)) {
+			values.push_back(column.GetString(i));
 		}
 	}
-
 	return values;
 }
 
-// Resolve dictionary-encoded types to their value types
-// e.g., dictionary(int8, string) → string
-static std::shared_ptr<arrow::DataType> ResolveDictionaryType(const std::shared_ptr<arrow::DataType> &type) {
-	if (type->id() == arrow::Type::DICTIONARY) {
-		auto dict_type = std::static_pointer_cast<arrow::DictionaryType>(type);
-		return ResolveDictionaryType(dict_type->value_type());
-	}
-	// Recurse into list/large_list value types
-	if (type->id() == arrow::Type::LIST) {
-		auto list_type = std::static_pointer_cast<arrow::ListType>(type);
-		auto resolved = ResolveDictionaryType(list_type->value_type());
-		if (resolved != list_type->value_type()) {
-			return arrow::list(list_type->value_field()->WithType(resolved));
-		}
-	} else if (type->id() == arrow::Type::LARGE_LIST) {
-		auto list_type = std::static_pointer_cast<arrow::LargeListType>(type);
-		auto resolved = ResolveDictionaryType(list_type->value_type());
-		if (resolved != list_type->value_type()) {
-			return arrow::large_list(list_type->value_field()->WithType(resolved));
-		}
-	} else if (type->id() == arrow::Type::MAP) {
-		auto map_type = std::static_pointer_cast<arrow::MapType>(type);
-		auto key_resolved = ResolveDictionaryType(map_type->key_type());
-		auto val_resolved = ResolveDictionaryType(map_type->item_type());
-		if (key_resolved != map_type->key_type() || val_resolved != map_type->item_type()) {
-			return arrow::map(key_resolved, map_type->item_field()->WithType(val_resolved),
-			                  map_type->keys_sorted());
-		}
-	} else if (type->id() == arrow::Type::STRUCT) {
-		arrow::FieldVector new_fields;
-		bool changed = false;
-		for (int i = 0; i < type->num_fields(); i++) {
-			auto field = type->field(i);
-			auto resolved = ResolveDictionaryType(field->type());
-			if (resolved != field->type()) {
-				new_fields.push_back(field->WithType(resolved));
-				changed = true;
-			} else {
-				new_fields.push_back(field);
-			}
-		}
-		if (changed) {
-			return arrow::struct_(new_fields);
-		}
-	}
-	return type;
-}
+namespace {
 
-std::shared_ptr<arrow::Schema> ResolveDictionaryTypes(const std::shared_ptr<arrow::Schema> &schema) {
-	if (!schema) {
-		return schema;
-	}
-	arrow::FieldVector new_fields;
+// Replace every dictionary-encoded node with its value type (keeping the node's name,
+// flags and metadata). Returns whether anything changed.
+bool ResolveDictionaryNode(ArrowSchema *node) {
 	bool changed = false;
-	for (int i = 0; i < schema->num_fields(); i++) {
-		auto field = schema->field(i);
-		auto resolved = ResolveDictionaryType(field->type());
-		if (resolved != field->type()) {
-			new_fields.push_back(field->WithType(resolved));
-			changed = true;
-		} else {
-			new_fields.push_back(field);
+	if (node->dictionary) {
+		ArrowSchema values;
+		if (ArrowSchemaDeepCopy(node->dictionary, &values) != NANOARROW_OK) {
+			throw InternalException("vgi: schema copy failed");
 		}
+		std::string name = node->name ? node->name : "";
+		int64_t flags = node->flags & ~ARROW_FLAG_DICTIONARY_ORDERED;
+		auto metadata = VgiMetadata::FromC(node->metadata).ToC();
+		node->release(node);
+		*node = values;
+		ArrowSchemaSetName(node, name.c_str());
+		node->flags = flags;
+		ArrowSchemaSetMetadata(node, metadata.empty() ? nullptr : metadata.data());
+		ResolveDictionaryNode(node);
+		changed = true;
 	}
-	if (!changed) {
-		return schema;
+	for (int64_t i = 0; i < node->n_children; i++) {
+		changed = ResolveDictionaryNode(node->children[i]) || changed;
 	}
-	return std::make_shared<arrow::Schema>(new_fields, schema->metadata());
+	return changed;
 }
 
-// Deserialize an Arrow schema from IPC format bytes
-std::shared_ptr<arrow::Schema> DeserializeSchema(const std::vector<uint8_t> &data) {
-	if (data.empty()) {
+bool HasDictionary(const ArrowSchema &node) {
+	if (node.dictionary) {
+		return true;
+	}
+	for (int64_t i = 0; i < node.n_children; i++) {
+		if (HasDictionary(*node.children[i])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+} // namespace
+
+VgiSchemaPtr ResolveDictionaryTypes(const VgiSchemaPtr &schema) {
+	if (!schema || !HasDictionary(schema->c_schema())) {
+		return schema;
+	}
+	ArrowSchema copy;
+	schema->ExportTo(&copy);
+	ResolveDictionaryNode(&copy);
+	return VgiSchema::Adopt(&copy);
+}
+
+VgiSchemaPtr DeserializeSchema(const void *data, int64_t size) {
+	if (size == 0) {
 		return nullptr;
 	}
-
-	auto buffer = arrow::Buffer::Wrap(data.data(), data.size());
-	arrow::io::BufferReader reader(buffer);
-	arrow::ipc::DictionaryMemo dict_memo;
-	auto schema_result = ::duckdb::vgi::nanoipc::ReadSchema(&reader, &dict_memo);
-	if (!schema_result.ok()) {
-		throw IOException("Failed to deserialize Arrow schema: " + schema_result.status().ToString());
+	VgiSchemaPtr schema;
+	try {
+		schema = ReadSchemaBytes(data, size);
+	} catch (const std::exception &e) {
+		throw IOException(std::string("Failed to deserialize Arrow schema: ") + e.what());
 	}
+	return ResolveDictionaryTypes(schema);
+}
 
-	return ResolveDictionaryTypes(schema_result.ValueUnsafe());
+VgiSchemaPtr DeserializeSchema(const std::vector<uint8_t> &data) {
+	return DeserializeSchema(data.data(), static_cast<int64_t>(data.size()));
 }
 
 } // namespace vgi

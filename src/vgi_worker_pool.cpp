@@ -62,13 +62,10 @@ pid_t PooledWorker::GetPid() const {
 //===--------------------------------------------------------------------===//
 
 VgiWorkerPool &VgiWorkerPool::Instance() {
-	// Intentionally leaked: pooled workers hold Arrow IPC objects that call
-	// arrow::default_memory_pool() in their destructors. If this singleton
-	// is destroyed after Arrow's function-local statics
-	// (SupportedBackends / UserSelectedBackend), reads of those destroyed
-	// statics return garbage, occasionally landing on the FATAL `default:`
-	// arm of memory_pool.cc's switch. Leaking sidesteps the whole
-	// destruction-order question.
+	// Intentionally leaked: pooled workers hold IPC stream objects and
+	// threads whose destructors may run after other function-local statics
+	// have been destroyed (this used to crash inside the Arrow memory pool
+	// at exit). Leaking sidesteps the whole destruction-order question.
 	static VgiWorkerPool *instance = new VgiWorkerPool();
 	return *instance;
 }

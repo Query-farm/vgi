@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <functional>
 #include <map>
 #include <memory>
@@ -8,7 +10,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "vgi_protocol.hpp"
 
@@ -29,7 +30,7 @@ struct CopyToBindContext;
 
 // Callback type: given serialized bind request bytes, sends them via transport
 // and returns the deserialized bind response RecordBatch.
-using BindTransportFn = std::function<std::shared_ptr<arrow::RecordBatch>(const std::vector<uint8_t> &request_bytes)>;
+using BindTransportFn = std::function<VgiBatchPtr(const std::vector<uint8_t> &request_bytes)>;
 
 // Orchestrates the full bind protocol:
 // 1. Serialize arguments, settings, input_schema, secrets
@@ -44,8 +45,8 @@ BindResult PerformBindProtocol(
     ClientContext &context,
     const std::string &function_name,
     const std::string &function_type,
-    const std::shared_ptr<arrow::Array> &arguments_array,
-    const std::shared_ptr<arrow::Schema> &input_schema,
+    const VgiBatchPtr &arguments_batch,
+    const VgiSchemaPtr &input_schema,
     const std::vector<uint8_t> &attach_opaque_data,
     const std::vector<uint8_t> &transaction_opaque_data,
     const std::map<std::string, Value> &settings,
@@ -72,8 +73,8 @@ std::vector<uint8_t> BuildBindRequestBytes(
     ClientContext &context,
     const std::string &function_name,
     const std::string &function_type,
-    const std::shared_ptr<arrow::Array> &arguments_array,
-    const std::shared_ptr<arrow::Schema> &input_schema,
+    const VgiBatchPtr &arguments_batch,
+    const VgiSchemaPtr &input_schema,
     const std::vector<uint8_t> &attach_opaque_data,
     const std::vector<uint8_t> &transaction_opaque_data,
     const std::map<std::string, Value> &settings,

@@ -64,47 +64,6 @@ VgiMacroSet::VgiMacroSet(Catalog &catalog, VgiSchemaEntry &schema, CatalogType m
     : VgiCatalogSet(catalog, &schema), schema_(schema), macro_catalog_type_(macro_type) {
 }
 
-// Helper to extract a DuckDB Value from an Arrow array at a given row index
-static Value ExtractDefaultValue(const std::shared_ptr<arrow::Array> &array, int64_t row_idx) {
-	if (!array || array->IsNull(row_idx)) {
-		return Value();
-	}
-
-	switch (array->type()->id()) {
-	case arrow::Type::BOOL: {
-		auto typed = std::static_pointer_cast<arrow::BooleanArray>(array);
-		return Value::BOOLEAN(typed->Value(row_idx));
-	}
-	case arrow::Type::INT8:
-		return Value::TINYINT(std::static_pointer_cast<arrow::Int8Array>(array)->Value(row_idx));
-	case arrow::Type::INT16:
-		return Value::SMALLINT(std::static_pointer_cast<arrow::Int16Array>(array)->Value(row_idx));
-	case arrow::Type::INT32:
-		return Value::INTEGER(std::static_pointer_cast<arrow::Int32Array>(array)->Value(row_idx));
-	case arrow::Type::INT64:
-		return Value::BIGINT(std::static_pointer_cast<arrow::Int64Array>(array)->Value(row_idx));
-	case arrow::Type::FLOAT:
-		return Value::FLOAT(std::static_pointer_cast<arrow::FloatArray>(array)->Value(row_idx));
-	case arrow::Type::DOUBLE:
-		return Value::DOUBLE(std::static_pointer_cast<arrow::DoubleArray>(array)->Value(row_idx));
-	case arrow::Type::STRING: {
-		auto typed = std::static_pointer_cast<arrow::StringArray>(array);
-		return Value(typed->GetString(row_idx));
-	}
-	case arrow::Type::LARGE_STRING: {
-		auto typed = std::static_pointer_cast<arrow::LargeStringArray>(array);
-		return Value(typed->GetString(row_idx));
-	}
-	default: {
-		auto scalar_result = array->GetScalar(row_idx);
-		if (scalar_result.ok()) {
-			return Value(scalar_result.ValueUnsafe()->ToString());
-		}
-		return Value();
-	}
-	}
-}
-
 void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
@@ -164,9 +123,12 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 				auto defaults_batch =
 				    vgi::DeserializeFromIpcBytes(macro_info.parameter_default_values_bytes);
 				if (defaults_batch && defaults_batch->num_rows() > 0) {
+					auto values = vgi::BatchRowToValues(context, defaults_batch, 0);
 					for (int i = 0; i < defaults_batch->num_columns(); i++) {
-						auto col_name = defaults_batch->schema()->field(i)->name();
-						auto value = ExtractDefaultValue(defaults_batch->column(i), 0);
+						const auto &col_name = defaults_batch->column_name(i);
+						// A NULL default is an untyped NULL constant.
+						auto value = values[static_cast<size_t>(i)].IsNull() ? Value()
+						                                                     : std::move(values[static_cast<size_t>(i)]);
 						macro_func->default_parameters[col_name] =
 						    make_uniq<ConstantExpression>(std::move(value));
 					}

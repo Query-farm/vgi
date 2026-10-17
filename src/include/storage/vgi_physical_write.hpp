@@ -11,6 +11,8 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include "duckdb.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -42,7 +44,7 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 	idx_t changed_count;
 
 	// Arrow schema for converting DuckDB DataChunks → Arrow batches (input to worker)
-	std::shared_ptr<arrow::Schema> send_schema;
+	vgi::VgiSchemaPtr send_schema;
 
 	// Expected schema for RETURNING-mode response batches (table user-column
 	// schema, sans rowid). Sink validates each non-empty worker response against
@@ -50,7 +52,7 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 	// batch instead of the table-row schema would otherwise read past the end
 	// of the conversion column metadata and crash.
 	// Only set when return_chunk is true.
-	std::shared_ptr<arrow::Schema> expected_returning_schema;
+	vgi::VgiSchemaPtr expected_returning_schema;
 
 	// True if the write function declared has_finalize=true on its catalog
 	// metadata. When set, ``FinalizeWriteConnection`` invokes
@@ -64,7 +66,7 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 // Local sink state for RETURNING — holds persistent ArrowScanLocalState so that
 // ArrowToDuckDB auxiliary data stays alive during ColumnDataCollection::Append.
 struct VgiWriteLocalSinkState : public LocalSinkState {
-	VgiWriteLocalSinkState(ClientContext &context, const std::shared_ptr<arrow::Schema> &response_schema,
+	VgiWriteLocalSinkState(ClientContext &context, const vgi::VgiSchemaPtr &response_schema,
 	                       const vector<LogicalType> &return_types)
 	    : arrow_state(make_uniq<ArrowArrayWrapper>(), context) {
 		vector<LogicalType> resp_types;

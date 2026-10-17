@@ -1,6 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
-#include "vgi_nanoarrow_ipc.hpp"
 #include "vgi_http_client.hpp"
 
 #include <algorithm>
@@ -26,6 +25,7 @@
 #include "vgi_transport.hpp"
 
 #include "mbedtls_wrapper.hpp"
+#include "nanoarrow/nanoarrow.h"
 
 namespace duckdb {
 namespace vgi {
@@ -586,26 +586,21 @@ static std::string HttpPostArrowIpcInternal(
 					const auto &batch = error_result.batch;
 					for (int c = 0; c < batch->num_columns() && body_preview.size() < 1024; ++c) {
 						auto col = batch->column(c);
-						auto name = batch->schema()->field(c)->name();
-						auto str = std::dynamic_pointer_cast<arrow::StringArray>(col);
-						auto lstr = std::dynamic_pointer_cast<arrow::LargeStringArray>(col);
-						auto bin = std::dynamic_pointer_cast<arrow::BinaryArray>(col);
-						auto lbin = std::dynamic_pointer_cast<arrow::LargeBinaryArray>(col);
-						for (int64_t i = 0; i < col->length() && body_preview.size() < 1024; ++i) {
-							std::string val;
-							if (str && !str->IsNull(i)) {
-								val = str->GetString(i);
-							} else if (lstr && !lstr->IsNull(i)) {
-								val = lstr->GetString(i);
-							} else if (bin && !bin->IsNull(i)) {
-								auto view = bin->GetView(i);
-								val = std::string(view.data(), view.size());
-							} else if (lbin && !lbin->IsNull(i)) {
-								auto view = lbin->GetView(i);
-								val = std::string(view.data(), view.size());
-							} else {
+						const auto &name = batch->column_name(c);
+						// Only plain (large) string / binary columns are previewed;
+						// a dictionary column reports its index type as storage.
+						const int storage = col.storage_type();
+						const bool textual = !col.is_dictionary() &&
+						                     (storage == NANOARROW_TYPE_STRING || storage == NANOARROW_TYPE_LARGE_STRING ||
+						                      storage == NANOARROW_TYPE_BINARY || storage == NANOARROW_TYPE_LARGE_BINARY);
+						if (!textual) {
+							continue;
+						}
+						for (int64_t i = 0; i < col.length() && body_preview.size() < 1024; ++i) {
+							if (col.IsNull(i)) {
 								continue;
 							}
+							std::string val = col.GetString(i);
 							if (!body_preview.empty())
 								body_preview += "; ";
 							body_preview += name + "=" + val;
@@ -865,7 +860,7 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 }
 
 UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &worker_path,
-                                    const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params,
+                                    const std::string &method_name, const VgiBatchPtr &params,
                                      const std::shared_ptr<CatalogAuth> &auth,
                                      const std::shared_ptr<SessionCookieJar> &cookie_jar,
                                      const std::shared_ptr<HTTPParams> &cached_http_params,
@@ -1011,7 +1006,7 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, const s
 UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::string &location_url,
                                             const std::string &worker_path, const std::string &execution_id_hex,
                                              const std::string &attach_opaque_data_digest,
-                                             const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata,
+                                             const VgiMetadataPtr &pointer_metadata,
                                              const std::atomic<bool> *cancellation, const std::string &conn_id_hex,
                                              const std::string &transaction_opaque_data_digest) {
 	// The fetched URL is a pre-signed object, not the worker; name both.
@@ -1037,7 +1032,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 
 	// Verify SHA-256 checksum if present in pointer batch metadata
 	if (pointer_metadata) {
-		int sha_idx = pointer_metadata->FindKey(RPC_LOCATION_SHA256_KEY);
+		int64_t sha_idx = pointer_metadata->FindKey(RPC_LOCATION_SHA256_KEY);
 		if (sha_idx >= 0) {
 			auto expected_hex = pointer_metadata->value(sha_idx);
 			// Compute SHA-256 of the fetched body bytes
@@ -1064,7 +1059,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 	// Adopt the fetched body as the owning Arrow buffer — this is the
 	// large-batch path, so avoiding a full alloc+memcpy of the payload matters.
 	// The SHA-256 check above already consumed ``body`` by reference.
-	auto owned = arrow::Buffer::FromString(std::move(body));
+	auto owned = VgiBuffer::FromString(std::move(body));
 
 	// Errors name the fetched URL; log records keep the worker that pointed at it.
 	WorkerStreamOptions opts;
@@ -1078,7 +1073,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 	opts.attach_opaque_data_digest = attach_opaque_data_digest;
 	opts.transaction_opaque_data_digest = transaction_opaque_data_digest;
 	opts.conn_id_hex = conn_id_hex;
-	auto result = ReadWorkerUnaryStream(std::make_shared<arrow::io::BufferReader>(owned), opts);
+	auto result = ReadWorkerUnaryStream(std::make_shared<VgiBufferReader>(std::move(owned)), opts);
 	if (result.batch && ClassifyBatch(result.batch, result.metadata) == RpcBatchType::EXTERNAL_LOCATION) {
 		throw IOException(location_error(http_error::kProtocolViolation),
 		                  "VGI external location redirect loop: resolved batch from %s "
@@ -1102,7 +1097,7 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context, UnaryRe
 	if (!result.metadata) {
 		return std::move(result);
 	}
-	int loc_idx = result.metadata->FindKey(RPC_LOCATION_KEY);
+	int64_t loc_idx = result.metadata->FindKey(RPC_LOCATION_KEY);
 	if (loc_idx < 0) {
 		return std::move(result);
 	}
@@ -1415,13 +1410,11 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
                                                const std::shared_ptr<CatalogAuth> &auth,
                                                const std::shared_ptr<IrohClientConfig> &iroh_config) {
 	// Serialize Arrow batch {count: int64}
-	auto count_field = arrow::field("count", arrow::int64());
-	auto schema = arrow::schema({count_field});
-	auto count_array_result = arrow::MakeArrayFromScalar(arrow::Int64Scalar(count), 1);
-	if (!count_array_result.ok()) {
-		throw IOException("Failed to create count array for upload URL request");
-	}
-	auto batch = arrow::RecordBatch::Make(schema, 1, {count_array_result.ValueUnsafe()});
+	static const VgiSchemaPtr schema = MakeSchema({type::Int64().Named("count")});
+	VgiBatchBuilder builder(schema);
+	append::Int(builder.column(0), count);
+	builder.FinishRow();
+	auto batch = builder.Finish();
 
 	// POST to __upload_url__/init (HttpInvokeUnary normalizes base_url internally)
 	auto result = HttpInvokeUnary(context, base_url, UPLOAD_URL_METHOD, batch, auth, nullptr, nullptr,
@@ -1433,8 +1426,8 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 	}
 
 	// Parse response: {upload_url: utf8, download_url: utf8, expires_at: timestamp}
-	auto upload_col = std::static_pointer_cast<arrow::StringArray>(result.batch->GetColumnByName("upload_url"));
-	auto download_col = std::static_pointer_cast<arrow::StringArray>(result.batch->GetColumnByName("download_url"));
+	auto upload_col = result.batch->GetColumnByName("upload_url");
+	auto download_col = result.batch->GetColumnByName("download_url");
 
 	if (!upload_col || !download_col) {
 		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
@@ -1443,7 +1436,7 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 
 	std::vector<UploadUrl> urls;
 	for (int64_t i = 0; i < result.batch->num_rows(); i++) {
-		urls.push_back({upload_col->GetString(i), download_col->GetString(i)});
+		urls.push_back({upload_col.GetString(i), download_col.GetString(i)});
 	}
 	return urls;
 }
@@ -1486,57 +1479,27 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const std::vec
 	}
 }
 
-std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> &schema,
+std::vector<uint8_t> SerializePointerBatch(const VgiSchemaPtr &schema,
                                            const std::string &location_url, const std::string &stream_state_token,
                                              const std::string &call_state_token) {
-	// Build zero-row batch with empty arrays matching the schema
-	std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
-	for (int i = 0; i < schema->num_fields(); i++) {
-		auto empty_result = arrow::MakeEmptyArray(schema->field(i)->type());
-		if (!empty_result.ok()) {
-			throw IOException("Failed to create empty array for pointer batch: %s", empty_result.status().ToString());
-		}
-		empty_arrays.push_back(empty_result.ValueUnsafe());
-	}
-	auto zero_batch = arrow::RecordBatch::Make(schema, 0, empty_arrays);
+	// Zero-row batch matching the schema
+	auto zero_batch = VgiBatch::MakeEmpty(schema);
 
 	// Build metadata: location key + optional stream_state / call_state.
 	// Both tokens have to ride the pointer batch: the worker strips the
 	// location and reads the request's metadata, so a token left off here is
 	// simply absent from the request.
-	auto metadata = arrow::KeyValueMetadata::Make({RPC_LOCATION_KEY}, {location_url});
+	VgiMetadata metadata {{RPC_LOCATION_KEY, location_url}};
 	if (!stream_state_token.empty()) {
-		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make({RPC_STREAM_STATE_KEY}, {stream_state_token}));
+		metadata.Set(RPC_STREAM_STATE_KEY, stream_state_token);
 	}
 	if (!call_state_token.empty()) {
-		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make({RPC_CALL_STATE_KEY}, {call_state_token}));
+		metadata.Set(RPC_CALL_STATE_KEY, call_state_token);
 	}
 
 	// Serialize as IPC stream
-	auto sink_result = arrow::io::BufferOutputStream::Create();
-	if (!sink_result.ok()) {
-		throw IOException("Failed to create buffer for pointer batch: %s", sink_result.status().ToString());
-	}
-	auto sink = sink_result.ValueUnsafe();
-	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, schema);
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create IPC writer for pointer batch: %s", writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
-	auto status = writer->WriteRecordBatch(*zero_batch, metadata);
-	if (!status.ok()) {
-		throw IOException("Failed to write pointer batch: %s", status.ToString());
-	}
-	status = writer->Close();
-	if (!status.ok()) {
-		throw IOException("Failed to close pointer batch writer: %s", status.ToString());
-	}
-	auto finish_result = sink->Finish();
-	if (!finish_result.ok()) {
-		throw IOException("Failed to finish pointer batch buffer: %s", finish_result.status().ToString());
-	}
-	auto buffer = finish_result.ValueUnsafe();
-	return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
+	auto buffer = SerializeBatch(*zero_batch, &metadata);
+	return buffer->ToVector();
 }
 
 } // namespace vgi

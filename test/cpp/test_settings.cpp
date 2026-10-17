@@ -1,7 +1,6 @@
 // © Copyright 2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 #include "catch.hpp"
-#include <arrow/api.h>
 #include <filesystem>
 #include "vgi_arrow_ipc.hpp"
 #include "duckdb.hpp"
@@ -188,10 +187,10 @@ TEST_CASE("VGI disk replay does not exceed retained memory budget", "[settings][
 	settings.disk_dir = dir.string();
 	settings.disk_max_bytes = 1024 * 1024;
 	cache.Configure(settings);
-	arrow::Int64Builder builder;
-	REQUIRE(builder.Append(42).ok());
-	auto array = builder.Finish().ValueOrDie();
-	auto batch = arrow::RecordBatch::Make(arrow::schema({arrow::field("value", arrow::int64())}), 1, {array});
+	VgiBatchBuilder builder(MakeSchema({type::Int64().Named("value")}));
+	append::Int(builder.column(0), 42);
+	builder.FinishRow();
+	auto batch = builder.Finish();
 	auto ipc = SerializeRecordBatch(batch);
 	auto entry = Entry("disk", ipc->size());
 	entry->key.identity_scope = "settings-test";

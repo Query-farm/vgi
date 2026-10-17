@@ -1,6 +1,5 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vgi_webworker_function_connection.hpp"
-#include "vgi_nanoarrow_ipc.hpp"
 
 // The `worker:` SAB transport is compiled only for the wasm extension
 // (__EMSCRIPTEN__) and the native SAB unit-test binary (-DVGI_SAB_NATIVE_TEST,
@@ -13,6 +12,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/types/blob.hpp"
 
+#include "vgi_arrow_utils.hpp"
 #include "vgi_bind_protocol.hpp"
 #include "vgi_cache_control.hpp"
 #include "vgi_catalog_metadata.hpp"
@@ -119,10 +119,15 @@ StreamHeaderResult SabReadStreamHeader(int region_offset, int slot, ClientContex
 // Decode the outer-envelope response for a buffered-table unary RPC. Mirrors
 // DecodeOuterResponse in vgi_function_connection.cpp: the 'result' column of the
 // outer envelope is a binary blob containing the IPC-serialized inner batch.
-std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResult &response,
-                                                        const std::string &method_name,
-                                                        const std::string &worker_path) {
+VgiBatchPtr DecodeOuterResponse(const UnaryResponseResult &response, const std::string &method_name,
+                                const std::string &worker_path) {
 	return UnwrapResultEnvelope(response.batch, method_name, ErrorInfo().Worker(worker_path), /*null_result_ok=*/true);
+}
+
+// The zero-row, zero-column tick batch (immutable; shared by every producer stream).
+const VgiBatchPtr &EmptyTickBatch() {
+	static const VgiBatchPtr batch = VgiBatch::MakeEmpty(VgiSchema::Empty());
+	return batch;
 }
 
 } // namespace
@@ -161,7 +166,7 @@ void VgiSabEnsureChannelOnRealm(int) {
 // natively too.
 UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::string &worker_path,
                                          const std::string &method_name,
-                                         const std::shared_ptr<arrow::RecordBatch> &params,
+                                         const VgiBatchPtr &params,
                                          const VgiProtocolId &protocol) {
 	const std::string location = CanonicalizeBrowserWorkerTarget(worker_path);
 	int region_offset = 0;
@@ -190,9 +195,10 @@ UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::stri
 	std::vector<uint8_t> request = params ? SerializeRpcRequest(method_name, params, protocol)
 	                                      : SerializeEmptyRpcRequest(method_name, protocol);
 	auto out = std::make_shared<SabOutputStream>(region_offset, slot);
-	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
-	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write unary request: %s", location, -1, "", write_status.ToString());
+	try {
+		out->Write(request.data(), static_cast<int64_t>(request.size()));
+	} catch (const std::exception &e) {
+		ThrowVgiIOException("Failed to write unary request: %s", location, -1, "", RawMessageOf(e));
 	}
 	// EOS on c2w so the worker's serve loop reads exactly this one request,
 	// responds on w2c, then returns (transient slot = one request lifecycle).
@@ -210,8 +216,8 @@ WebWorkerFunctionConnection::WebWorkerFunctionConnection(
     ClientContext &context, const std::string &function_type, const std::vector<uint8_t> &global_execution_id,
     const std::map<std::string, Value> &settings, const std::vector<VgiSecretRequirement> &required_secrets)
     : conn_id_hex_(VgiGenerateConnId()), location_(CanonicalizeBrowserWorkerTarget(location)),
-      function_name_(function_name), function_type_(function_type), arguments_type_(arguments.type),
-      arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
+      function_name_(function_name), function_type_(function_type), arguments_batch_(arguments.batch),
+      attach_opaque_data_(attach_opaque_data),
       transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
       settings_(settings), required_secrets_(required_secrets) {
 }
@@ -348,20 +354,23 @@ void AppendBytes(std::vector<uint8_t> &out, const std::string &value) {
 }
 
 void WriteAll(SabOutputStream &out, const uint8_t *data, size_t size, const std::string &url) {
-	auto status = out.Write(data, static_cast<int64_t>(size));
-	if (!status.ok()) {
-		throw IOException("VGI HTTPI request write failed: %s [url: %s]", status.ToString(), url);
+	try {
+		out.Write(data, static_cast<int64_t>(size));
+	} catch (const std::exception &e) {
+		throw IOException("VGI HTTPI request write failed: %s [url: %s]", RawMessageOf(e), url);
 	}
 }
 
 void ReadExact(SabInputStream &in, void *data, size_t size, const std::string &url) {
-	auto result = in.Read(static_cast<int64_t>(size), data);
-	if (!result.ok()) {
-		throw IOException("VGI HTTPI response read failed: %s [url: %s]", result.status().ToString(), url);
+	int64_t got = 0;
+	try {
+		got = in.Read(static_cast<int64_t>(size), data);
+	} catch (const std::exception &e) {
+		throw IOException("VGI HTTPI response read failed: %s [url: %s]", RawMessageOf(e), url);
 	}
-	if (static_cast<size_t>(*result) != size) {
+	if (static_cast<size_t>(got) != size) {
 		throw IOException("VGI HTTPI response ended early (wanted %llu bytes, got %llu) [url: %s]",
-		                  static_cast<unsigned long long>(size), static_cast<unsigned long long>(*result), url);
+		                  static_cast<unsigned long long>(size), static_cast<unsigned long long>(got), url);
 	}
 }
 
@@ -677,7 +686,7 @@ void WebWorkerFunctionConnection::EnsureWorkerSpawned() {
 BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 	EnsureWorkerSpawned();
 
-	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
+	int64_t num_args = arguments_batch_ ? arguments_batch_->num_rows() : 0;
 	{
 		auto fields = BuildConnLogFields(*this);
 		fields.emplace_back("function_name", function_name_);
@@ -687,15 +696,16 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 	}
 
 	// Transport: send bind over the SAB ring (request on c2w, response on w2c).
-	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
+	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> VgiBatchPtr {
 		auto rpc_params = generated::BuildBindParams(request_bytes);
 		ValidateRequestSchema(rpc_params, "bind", location_);
 
 		auto request = SerializeRpcRequest("bind", rpc_params);
 		auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
-		auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
-		if (!write_status.ok()) {
-			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write bind request: %s", location_, -1, "", write_status.ToString());
+		try {
+			out->Write(request.data(), static_cast<int64_t>(request.size()));
+		} catch (const std::exception &e) {
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write bind request: %s", location_, -1, "", RawMessageOf(e));
 		}
 
 		auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_);
@@ -706,7 +716,7 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 	};
 
 	auto bind_result = PerformBindProtocol(
-	    context_, function_name_, function_type_, arguments_array_, input_schema_, attach_opaque_data_,
+	    context_, function_name_, function_type_, arguments_batch_, input_schema_, attach_opaque_data_,
 	    transaction_opaque_data_, settings_, required_secrets_, location_, transport_fn, at_unit_, at_value_,
 	    copy_from_ ? &*copy_from_ : nullptr, copy_to_ ? &*copy_to_ : nullptr, schema_name_, argument_names_);
 
@@ -722,7 +732,7 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 
 InitResult WebWorkerFunctionConnection::PerformInit(
     const BindResult &bind_result, const std::vector<int32_t> &projection_ids,
-    std::shared_ptr<arrow::Buffer> pushdown_filters, std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
+    VgiBufferPtr pushdown_filters, std::vector<VgiBufferPtr> join_keys,
     const std::string &phase, const std::optional<OrderByHint> &order_by,
     const std::optional<TableSampleHint> &table_sample, const std::vector<uint8_t> &init_opaque_data,
     const std::optional<std::vector<uint8_t>> &finalize_state_id, const std::vector<std::string> &split_tokens) {
@@ -775,10 +785,11 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 	{
 		auto request = SerializeRpcRequest("init", rpc_params);
 		auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
-		auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
-		if (!write_status.ok()) {
+		try {
+			out->Write(request.data(), static_cast<int64_t>(request.size()));
+		} catch (const std::exception &e) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write init request: %s", location_, -1, GetExecutionIdHex(),
-			                    write_status.ToString());
+			                    RawMessageOf(e));
 		}
 	}
 
@@ -796,59 +807,56 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 	bool producer_phase_override = (phase == "FINALIZE" || phase == "TABLE_BUFFERING_FINALIZE");
 	if (!input_schema_ || producer_phase_override) {
 		is_producer_mode_ = true;
-		tick_schema_ = arrow::schema({});
+		const auto &tick_batch = EmptyTickBatch();
+		tick_schema_ = tick_batch->schema();
 
 		auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
-		auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, tick_schema_);
-		if (!writer_result.ok()) {
+		try {
+			input_writer_ = VgiIpcWriter::Open(sink, tick_schema_);
+		} catch (const std::exception &e) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create tick writer: %s", location_, -1, GetExecutionIdHex(),
-			                    writer_result.status().ToString());
+			                    RawMessageOf(e));
 		}
-		input_writer_ = writer_result.ValueUnsafe();
 		input_writer_opened_ = true;
 
 		// Send the first tick immediately. Conditional-revalidation validators
 		// (M6) ride the FIRST tick's custom_metadata.
-		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>> {});
-		std::shared_ptr<const arrow::KeyValueMetadata> first_tick_metadata;
+		std::optional<VgiMetadata> first_tick_metadata;
 		if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
-			std::vector<std::string> keys, vals;
+			first_tick_metadata.emplace();
 			if (!cond_if_none_match_.empty()) {
-				keys.emplace_back(VGI_CACHE_IF_NONE_MATCH_KEY);
-				vals.push_back(cond_if_none_match_);
+				first_tick_metadata->Append(VGI_CACHE_IF_NONE_MATCH_KEY, cond_if_none_match_);
 			}
 			if (!cond_if_modified_since_.empty()) {
-				keys.emplace_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY);
-				vals.push_back(cond_if_modified_since_);
+				first_tick_metadata->Append(VGI_CACHE_IF_MODIFIED_SINCE_KEY, cond_if_modified_since_);
 			}
-			first_tick_metadata = arrow::KeyValueMetadata::Make(std::move(keys), std::move(vals));
 		}
-		auto write_status = first_tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
-		                        : input_writer_->WriteRecordBatch(*tick_batch);
-		if (!write_status.ok()) {
+		try {
+			input_writer_->Write(*tick_batch, first_tick_metadata ? &*first_tick_metadata : nullptr);
+		} catch (const std::exception &e) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write initial tick batch: %s", location_, -1, GetExecutionIdHex(),
-			                    write_status.ToString());
+			                    RawMessageOf(e));
 		}
 
 		// Open the data reader — the worker has processed the tick and flushed
 		// the output schema + first data batch.
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
-		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
-		if (!reader_result.ok()) {
+		try {
+			data_reader_ = VgiIpcReader::Open(data_stream_);
+		} catch (const std::exception &e) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
-			                    reader_result.status().ToString());
+			                    RawMessageOf(e));
 		}
-		data_reader_ = reader_result.ValueUnsafe();
 	} else {
 		is_producer_mode_ = false;
 
 		auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
-		auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, input_schema_);
-		if (!writer_result.ok()) {
+		try {
+			input_writer_ = VgiIpcWriter::Open(sink, input_schema_);
+		} catch (const std::exception &e) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create input writer: %s", location_, -1, GetExecutionIdHex(),
-			                    writer_result.status().ToString());
+			                    RawMessageOf(e));
 		}
-		input_writer_ = writer_result.ValueUnsafe();
 		input_writer_opened_ = true;
 		// data_reader_ opened lazily in ReadDataBatch (after first input batch).
 	}
@@ -881,10 +889,11 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 
 	// Close current data exchange streams.
 	if (input_writer_ && !input_writer_closed_) {
-		auto close_status = input_writer_->Close();
-		if (!close_status.ok()) {
+		try {
+			input_writer_->Close();
+		} catch (const std::exception &e) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer for finalize: %s", location_, -1, GetExecutionIdHex(),
-			                    close_status.ToString());
+			                    RawMessageOf(e));
 		}
 	}
 	input_writer_.reset();
@@ -897,14 +906,18 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	// INPUT-phase output instead of the FINALIZE header.
 	if (!data_reader_ && slot_ >= 0) {
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
-		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
-		if (reader_result.ok()) {
-			data_reader_ = reader_result.ValueUnsafe();
+		try {
+			data_reader_ = VgiIpcReader::Open(data_stream_);
+		} catch (const std::exception &) {
+			// Nothing readable to drain.
 		}
 	}
 	while (data_reader_) {
-		auto drain_result = data_reader_->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+		try {
+			if (!data_reader_->ReadNext()) {
+				break;
+			}
+		} catch (const std::exception &) {
 			break;
 		}
 	}
@@ -921,9 +934,9 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	global_execution_id_ = execution_id_;
 
 	struct RestoreGuard {
-		std::shared_ptr<arrow::Schema> &input_schema;
+		VgiSchemaPtr &input_schema;
 		std::vector<uint8_t> &global_exec_id;
-		std::shared_ptr<arrow::Schema> saved_schema;
+		VgiSchemaPtr saved_schema;
 		std::vector<uint8_t> saved_id;
 		~RestoreGuard() {
 			input_schema = std::move(saved_schema);
@@ -952,14 +965,15 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	// the same ring while the old stream is still open, and the next init request
 	// lands inside an unterminated tick stream.
 	if (input_writer_ && !input_writer_closed_) {
-		auto close_status = input_writer_->Close();
-		if (!close_status.ok()) {
+		try {
+			input_writer_->Close();
+		} catch (const std::exception &e) {
 			// No poison flag here, unlike the subprocess connection: the SAB
 			// transport is never pooled (ReleaseForPooling returns nullptr — the JS
 			// bridge owns worker lifecycle), so there is no later checkout to
 			// protect. The throw is the whole remedy.
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer between splits: %s", location_, -1, GetExecutionIdHex(),
-			                    close_status.ToString());
+			                    RawMessageOf(e));
 		}
 	}
 	input_writer_.reset();
@@ -974,14 +988,18 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	// empty split is the likelier shape, since a filter only has to prune one.
 	if (!data_reader_ && slot_ >= 0) {
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
-		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
-		if (reader_result.ok()) {
-			data_reader_ = reader_result.ValueUnsafe();
+		try {
+			data_reader_ = VgiIpcReader::Open(data_stream_);
+		} catch (const std::exception &) {
+			// Nothing readable to drain.
 		}
 	}
 	while (data_reader_) {
-		auto drain_result = data_reader_->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+		try {
+			if (!data_reader_->ReadNext()) {
+				break;
+			}
+		} catch (const std::exception &) {
 			break;
 		}
 	}
@@ -1002,7 +1020,7 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	// (one reader keeps one identity across every split it claims).
 }
 
-std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch() {
+VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 	if (!init_done_) {
 		ThrowVgiIOException("WebWorkerFunctionConnection::ReadDataBatch called before PerformInit", location_, -1,
 		                    GetExecutionIdHex());
@@ -1018,12 +1036,12 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			                    GetExecutionIdHex());
 		}
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
-		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
-		if (!reader_result.ok()) {
+		try {
+			data_reader_ = VgiIpcReader::Open(data_stream_);
+		} catch (const std::exception &e) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
-			                    reader_result.status().ToString());
+			                    RawMessageOf(e));
 		}
-		data_reader_ = reader_result.ValueUnsafe();
 	}
 
 	// Producer mode one-ahead pipeline: the first tick was sent during
@@ -1034,19 +1052,19 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		if (!(is_producer_mode_ && input_writer_ && !input_writer_closed_)) {
 			return;
 		}
-		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-		std::shared_ptr<const arrow::KeyValueMetadata> tick_metadata;
+		std::optional<VgiMetadata> tick_metadata;
 		if (tick_filter_state_) {
 			// Only a delta this stream has not been sent yet; an unchanged filter
 			// rides no tick at all (see UpdateDynamicFilterState).
 			auto delta = tick_filter_cursor_.Take(*tick_filter_state_);
 			if (!delta.empty()) {
-				tick_metadata = arrow::KeyValueMetadata::Make({"vgi_pushdown_filters"}, {std::move(delta)});
+				tick_metadata.emplace();
+				tick_metadata->Append("vgi_pushdown_filters", std::move(delta));
 			}
 		}
-		auto write_status = tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, tick_metadata)
-		                                  : input_writer_->WriteRecordBatch(*tick_batch);
-		if (!write_status.ok()) {
+		try {
+			input_writer_->Write(*EmptyTickBatch(), tick_metadata ? &*tick_metadata : nullptr);
+		} catch (const std::exception &) {
 			// Tick write can fail if the worker already finished (e.g. finalize
 			// with no output). Not an error — mark the writer closed; the next
 			// read returns EOS.
@@ -1071,7 +1089,11 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 	// belongs, in the destructor.
 	auto finish_producer_input = [this]() {
 		if (is_producer_mode_ && input_writer_ && !input_writer_closed_) {
-			(void)input_writer_->Close();
+			try {
+				input_writer_->Close();
+			} catch (const std::exception &) {
+				// Best-effort: the worker may already have gone; the stream is over.
+			}
 			input_writer_closed_ = true;
 		}
 	};
@@ -1088,27 +1110,29 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 	};
 
 	while (true) {
-		auto read_result = data_reader_->ReadNext();
-		if (!read_result.ok()) {
-			// A non-OK status means truncated bytes. There is no worker process
-			// to liveness-probe here (the JS bridge owns lifecycle), so mirror the
-			// tolerant HTTP/no-proc path: treat it as end-of-stream.
-			auto status = read_result.status();
-			if (status.IsInvalid()) {
-				finish_producer_input();
-				data_finished_ = true;
-				return nullptr;
-			}
-			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to read data batch: %s", location_, -1, GetExecutionIdHex(), status.ToString());
+		VgiBatchPtr batch;
+		try {
+			batch = data_reader_->ReadNext();
+		} catch (const InvalidInputException &) {
+			// Malformed / truncated IPC (Arrow's Status::Invalid). There is no
+			// worker process to liveness-probe here (the JS bridge owns
+			// lifecycle), so mirror the tolerant HTTP/no-proc path: treat it as
+			// end-of-stream.
+			finish_producer_input();
+			data_finished_ = true;
+			return nullptr;
+		} catch (const std::exception &e) {
+			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to read data batch: %s", location_, -1, GetExecutionIdHex(), RawMessageOf(e));
 		}
-		auto result = read_result.ValueUnsafe();
 
 		// Null batch = EOS (clean stream end).
-		if (!result.batch) {
+		if (!batch) {
 			finish_producer_input();
 			data_finished_ = true;
 			return nullptr;
 		}
+
+		const VgiMetadataPtr &batch_metadata = batch->metadata();
 
 		// Skip log/error batches. HandleBatchLogMessage THROWS on an EXCEPTION-level
 		// batch (a worker error). On that throw the producer's tick stream is still
@@ -1117,7 +1141,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// so the worker's drain returns and the slot frees, then rethrow.
 		try {
 			const auto log_error_context = WebWorkerFunctionInfo(function_name_, function_type_);
-			if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, location_, -1,
+			if (HandleBatchLogMessage(batch, batch_metadata, &context_, location_, -1,
 			                          GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 			                          &log_error_context)) {
 				continue;
@@ -1146,8 +1170,8 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// SAB worker streams its data inline over the ring and does not emit them.
 		// Fail loudly rather than pulling the HTTP/catalog resolution subtree into
 		// this transport (a documented v1 limitation of worker:).
-		if (result.custom_metadata &&
-		    ClassifyBatch(result.batch, result.custom_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
+		if (batch_metadata &&
+		    ClassifyBatch(batch, batch_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
 			throw IOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kUnsupported)
 			                      .Worker(location_, -1, GetExecutionIdHex()),
 			                  "VGI worker: external-location batches are not supported over the "
@@ -1158,7 +1182,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// Validate the batch DuckDB will read; a malformed one fails the scan with
 		// the same non-blocking slot teardown as a worker error.
 		try {
-			ValidateWorkerBatch(&context_, result.batch.get(), location_);
+			ValidateWorkerBatch(&context_, batch.get(), location_);
 		} catch (...) {
 			abandon_slot();
 			throw;
@@ -1167,10 +1191,10 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// Parse vgi_partition_values#b64 off the wire metadata. Base64-decode
 		// here; IPC decode + validation happen in InstallBatch on the consumer.
 		last_partition_values_bytes_.clear();
-		if (result.custom_metadata) {
-			int pv_idx = result.custom_metadata->FindKey("vgi_partition_values#b64");
+		if (batch_metadata) {
+			int64_t pv_idx = batch_metadata->FindKey("vgi_partition_values#b64");
 			if (pv_idx >= 0) {
-				const std::string &b64_value = result.custom_metadata->value(pv_idx);
+				const std::string &b64_value = batch_metadata->value(pv_idx);
 				try {
 					string_t b64_str(b64_value.data(), static_cast<uint32_t>(b64_value.size()));
 					idx_t decoded_size = Blob::FromBase64Size(b64_str);
@@ -1191,10 +1215,10 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 
 		// Parse vgi_batch_index off the wire metadata, if present.
 		last_batch_index_ = DConstants::INVALID_INDEX;
-		if (result.custom_metadata) {
-			int bi_idx = result.custom_metadata->FindKey("vgi_batch_index");
+		if (batch_metadata) {
+			int64_t bi_idx = batch_metadata->FindKey("vgi_batch_index");
 			if (bi_idx >= 0) {
-				const std::string &value = result.custom_metadata->value(bi_idx);
+				const std::string &value = batch_metadata->value(bi_idx);
 				try {
 					size_t pos = 0;
 					uint64_t parsed = std::stoull(value, &pos);
@@ -1227,7 +1251,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 
 		// Parse vgi.cache.* cache-control off the wire metadata (first-batch only
 		// in practice; read via GetLastCacheControl on the first batch).
-		last_cache_control_ = ParseVgiCacheControl(result.custom_metadata);
+		last_cache_control_ = ParseVgiCacheControl(batch_metadata);
 
 		// Committed to returning this batch — send the next tick now so the worker
 		// produces the next batch while DuckDB consumes this one.
@@ -1235,7 +1259,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 
 		// EOS is signaled by the IPC stream closing (null batch above), not by
 		// 0-row batches. 0-row batches are valid responses in exchange mode.
-		return result.batch;
+		return batch;
 	}
 }
 
@@ -1264,11 +1288,11 @@ std::string WebWorkerFunctionConnection::GetTransactionOpaqueDataDigest() const 
 	return OpaqueDigest(transaction_opaque_data_);
 }
 
-void WebWorkerFunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {
+void WebWorkerFunctionConnection::SetInputSchema(const VgiSchemaPtr &input_schema) {
 	input_schema_ = input_schema;
 }
 
-void WebWorkerFunctionConnection::UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) {
+void WebWorkerFunctionConnection::UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) {
 	if (input_writer_opened_) {
 		ThrowVgiIOException("WebWorkerFunctionConnection::UpdateInputSchemaForExecution called after OpenInputWriter",
 		                    location_, -1, GetExecutionIdHex());
@@ -1292,12 +1316,12 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 	}
 
 	auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
-	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, input_schema_);
-	if (!writer_result.ok()) {
+	try {
+		input_writer_ = VgiIpcWriter::Open(sink, input_schema_);
+	} catch (const std::exception &e) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create input stream writer: %s", location_, -1, GetExecutionIdHex(),
-		                    writer_result.status().ToString());
+		                    RawMessageOf(e));
 	}
-	input_writer_ = writer_result.ValueUnsafe();
 	input_writer_opened_ = true;
 
 	{
@@ -1308,7 +1332,7 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 	}
 }
 
-void WebWorkerFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
+void WebWorkerFunctionConnection::WriteInputBatch(const VgiBatchPtr &batch) {
 	if (!input_writer_opened_) {
 		ThrowVgiIOException("WebWorkerFunctionConnection::WriteInputBatch called before OpenInputWriter", location_, -1,
 		                    GetExecutionIdHex());
@@ -1326,10 +1350,11 @@ void WebWorkerFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::R
 		reconciled = ReconcileBatchToSchema(batch, input_schema_);
 	}
 
-	auto write_status = input_writer_->WriteRecordBatch(*reconciled);
-	if (!write_status.ok()) {
+	try {
+		input_writer_->Write(*reconciled);
+	} catch (const std::exception &e) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write input batch: %s", location_, -1, GetExecutionIdHex(),
-		                    write_status.ToString());
+		                    RawMessageOf(e));
 	}
 
 	{
@@ -1355,10 +1380,12 @@ void WebWorkerFunctionConnection::CancelStream(const std::vector<uint8_t> &state
 	if (!tick_schema_) {
 		return;
 	}
-	auto cancel_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-	auto metadata = arrow::KeyValueMetadata::Make({std::string(generated::VGI_RPC_CANCEL_KEY)}, {"1"});
-	auto write_status = input_writer_->WriteRecordBatch(*cancel_batch, metadata);
-	(void)write_status; // best-effort — dispatcher catches any throw
+	const VgiMetadata metadata {{std::string(generated::VGI_RPC_CANCEL_KEY), "1"}};
+	try {
+		input_writer_->Write(*EmptyTickBatch(), &metadata);
+	} catch (const std::exception &) {
+		// best-effort, as before: a failed cancel write is ignored
+	}
 }
 
 void WebWorkerFunctionConnection::CloseInputWriter() {
@@ -1371,10 +1398,11 @@ void WebWorkerFunctionConnection::CloseInputWriter() {
 	}
 
 	// Close the IPC stream writer (writes the Arrow EOS marker into the c2w ring).
-	auto close_status = input_writer_->Close();
-	if (!close_status.ok()) {
+	try {
+		input_writer_->Close();
+	} catch (const std::exception &e) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to close input stream: %s", location_, -1, GetExecutionIdHex(),
-		                    close_status.ToString());
+		                    RawMessageOf(e));
 	}
 	input_writer_.reset();
 	input_writer_closed_ = true;
@@ -1402,7 +1430,7 @@ void WebWorkerFunctionConnection::CloseInputWriter() {
 
 std::vector<uint8_t> WebWorkerFunctionConnection::RpcTableBufferingProcess(
     const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    const std::shared_ptr<arrow::RecordBatch> &input_batch, std::optional<int64_t> batch_index) {
+    const VgiBatchPtr &input_batch, std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id, batch_bytes,
 	                                                       attach_opaque_data_, batch_index);
@@ -1410,10 +1438,11 @@ std::vector<uint8_t> WebWorkerFunctionConnection::RpcTableBufferingProcess(
 
 	auto request = SerializeRpcRequest("table_buffering_process", rpc_params);
 	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
-	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
-	if (!write_status.ok()) {
+	try {
+		out->Write(request.data(), static_cast<int64_t>(request.size()));
+	} catch (const std::exception &e) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write table_buffering_process request: %s", location_, -1, GetExecutionIdHex(),
-		                    write_status.ToString());
+		                    RawMessageOf(e));
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
 	                                     GetAttachOpaqueDataDigest(), "", GetConnIdHex());
@@ -1435,10 +1464,11 @@ WebWorkerFunctionConnection::RpcTableBufferingCombine(const std::string &functio
 
 	auto request = SerializeRpcRequest("table_buffering_combine", rpc_params);
 	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
-	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
-	if (!write_status.ok()) {
+	try {
+		out->Write(request.data(), static_cast<int64_t>(request.size()));
+	} catch (const std::exception &e) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write table_buffering_combine request: %s", location_, -1, GetExecutionIdHex(),
-		                    write_status.ToString());
+		                    RawMessageOf(e));
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
 	                                     GetAttachOpaqueDataDigest(), "", GetConnIdHex());
@@ -1458,10 +1488,11 @@ void WebWorkerFunctionConnection::RpcTableBufferingDestructor(const std::string 
 
 	auto request = SerializeRpcRequest("table_buffering_destructor", rpc_params);
 	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
-	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
-	if (!write_status.ok()) {
+	try {
+		out->Write(request.data(), static_cast<int64_t>(request.size()));
+	} catch (const std::exception &e) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to write table_buffering_destructor request: %s", location_, -1,
-		                    GetExecutionIdHex(), write_status.ToString());
+		                    GetExecutionIdHex(), RawMessageOf(e));
 	}
 	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
 	                                     GetAttachOpaqueDataDigest(), "", GetConnIdHex());

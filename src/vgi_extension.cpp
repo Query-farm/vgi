@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #define DUCKDB_EXTENSION_MAIN
 
+#include "vgi_arrow.hpp"
 #include "vgi_settings_defaults.hpp"
 #include "vgi_extension.hpp"
 #include "vgi_settings.hpp"
@@ -3516,17 +3517,15 @@ static unique_ptr<FunctionData> VgiCopyFormatsBind(ClientContext &context, Table
 			vector<string> opt_names;
 			vgi::ArrowSchemaToDuckDBTypes(context, info.options_schema, c_schema, arrow_table, types, opt_names);
 			for (idx_t i = 0; i < opt_names.size(); i++) {
-				auto field = info.options_schema->field(static_cast<int>(i));
+				auto field_metadata = info.options_schema->field_metadata(static_cast<int>(i));
 				auto row = base_row();
 				row.has_option = true;
 				row.option_name = opt_names[i];
 				row.option_type = (i < types.size() ? types[i] : LogicalType::ANY).ToString();
-				if (field->HasMetadata()) {
-					auto doc = field->metadata()->Get(vgi::VGI_DOC_METADATA_KEY);
-					if (doc.ok() && !doc.ValueUnsafe().empty()) {
-						row.has_option_desc = true;
-						row.option_desc = doc.ValueUnsafe();
-					}
+				auto doc = field_metadata.Get(vgi::VGI_DOC_METADATA_KEY);
+				if (doc && !doc->empty()) {
+					row.has_option_desc = true;
+					row.option_desc = *doc;
 				}
 				data->rows.push_back(std::move(row));
 			}
@@ -3629,6 +3628,7 @@ static void VgiGlobalFunctionsScan(ClientContext &context, TableFunctionInput &d
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	vgi::CheckArrowRuntime();
 #if defined(__EMSCRIPTEN__) && VGI_ASYNC_INIT_ENABLED
 	// Pre-spawn a bounded pool of background workers at extension load. Required
 	// under MAIN_MODULE=1 + pthreads: pthread_create after side-modules are

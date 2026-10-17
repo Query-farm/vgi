@@ -1,8 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_function_connection.hpp"
-#include "vgi_nanoarrow_ipc.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/blob.hpp"
 #include "duckdb/logging/log_manager.hpp"
 
@@ -27,7 +27,6 @@
 #include "generated/vgi_request_builders.hpp"
 #include "vgi_schema_registry.hpp"
 #include "vgi_shm_segment.hpp"
-#include "arrow/util/byte_size.h"
 #include "vgi_github.hpp"
 #include "vgi_transport.hpp"
 
@@ -83,6 +82,45 @@ template <typename... ARGS>
 	info.Worker(worker_path, worker_pid, execution_id_hex);
 	throw IOException(info, BuildMessageWithContext(msg, worker_path), params...);
 }
+
+// The message of an exception thrown by the IPC / stream layer, for embedding
+// in a wrapping error.
+std::string StreamErrorText(const std::exception &e) {
+	return ErrorData(e).RawMessage();
+}
+
+// Written as an explicit (empty) message metadata so a batch's own metadata is
+// never forwarded implicitly: every write below states what it sends.
+const VgiMetadata &NoMetadata() {
+	static const VgiMetadata kNone;
+	return kNone;
+}
+
+// The batch that just came off a worker stream plus its message custom_metadata
+// (null when the message carried none).
+struct WireBatch {
+	VgiBatchPtr batch;
+	VgiMetadataPtr custom_metadata;
+};
+
+// The producer-mode tick: a zero-row batch of the empty schema. Shared and
+// immutable, so a tick costs no allocation; tick_schema_ is its schema, so the
+// writer's schema check is a pointer compare.
+const VgiBatchPtr &EmptyTick() {
+	static const VgiBatchPtr kTick = VgiBatch::MakeEmpty(VgiSchema::Empty());
+	return kTick;
+}
+
+WireBatch ToWireBatch(VgiBatchPtr batch) {
+	WireBatch out;
+	if (batch) {
+		if (!batch->metadata()->empty()) {
+			out.custom_metadata = batch->metadata();
+		}
+		out.batch = std::move(batch);
+	}
+	return out;
+}
 } // namespace
 
 // ============================================================================
@@ -116,25 +154,61 @@ namespace {
 // ENUMs). Dict inputs are kept inline: the worker resolves inbound params with a
 // null DictionaryProvider, so a dict batch couldn't be decoded — matching the
 // worker's outbound emit policy, which also skips dicts.
-bool TypeHasDictionary(const std::shared_ptr<arrow::DataType> &type) {
-	if (type->id() == arrow::Type::DICTIONARY) {
+bool TypeHasDictionary(const ArrowSchema &type) {
+	if (type.dictionary) {
 		return true;
 	}
-	for (const auto &child : type->fields()) {
-		if (TypeHasDictionary(child->type())) {
+	for (int64_t i = 0; i < type.n_children; i++) {
+		if (TypeHasDictionary(*type.children[i])) {
 			return true;
 		}
 	}
 	return false;
 }
 
-bool SchemaHasDictionary(const arrow::Schema &schema) {
-	for (const auto &field : schema.fields()) {
-		if (TypeHasDictionary(field->type())) {
+bool SchemaHasDictionary(const VgiSchema &schema) {
+	for (int i = 0; i < schema.num_fields(); i++) {
+		if (TypeHasDictionary(schema.field(i))) {
 			return true;
 		}
 	}
 	return false;
+}
+
+// Writes into a fixed region of the shm segment (a reserved slot) and refuses
+// to run past it: an overflow throws, and the caller falls back to inline.
+class ShmSlotOutputStream final : public VgiOutputStream {
+public:
+	ShmSlotOutputStream(uint8_t *data, int64_t capacity) : data_(data), capacity_(capacity) {
+	}
+	void Write(const void *data, int64_t nbytes) override {
+		if (nbytes > capacity_ - position_) {
+			throw IOException("shm slot overflow");
+		}
+		std::memcpy(data_ + position_, data, static_cast<size_t>(nbytes));
+		position_ += nbytes;
+	}
+	int64_t Tell() const override {
+		return position_;
+	}
+
+private:
+	uint8_t *data_;
+	int64_t capacity_;
+	int64_t position_ = 0;
+};
+
+// Node and buffer counts of an array tree (children and dictionaries), for the
+// IPC message-header size bound below.
+void CountArrayParts(const ArrowArray &array, int64_t &nodes, int64_t &buffers) {
+	nodes++;
+	buffers += array.n_buffers;
+	for (int64_t i = 0; i < array.n_children; i++) {
+		CountArrayParts(*array.children[i], nodes, buffers);
+	}
+	if (array.dictionary) {
+		CountArrayParts(*array.dictionary, nodes, buffers);
+	}
 }
 
 // Minimum batch size (bytes) worth shipping through shm. Below this, the pipe
@@ -179,88 +253,70 @@ static int64_t ShmMinBatchBytes() {
 // Mirrors vgi_rpc/shm.py maybe_write_to_shm and the Java worker's
 // ShmResolver.maybeWriteToShm; the worker frees the slot once it resolves the
 // pointer (client allocates → worker frees).
-std::pair<std::shared_ptr<arrow::RecordBatch>, std::shared_ptr<arrow::KeyValueMetadata>>
-MaybeWriteBatchToShm(VgiShmSegment *shm, const std::shared_ptr<arrow::RecordBatch> &batch,
-                     const std::shared_ptr<arrow::Schema> &wire_schema) {
+std::pair<VgiBatchPtr, VgiMetadataPtr> MaybeWriteBatchToShm(VgiShmSegment *shm, const VgiBatchPtr &batch,
+                                                            const VgiSchemaPtr &wire_schema) {
 	if (!shm || !batch || !wire_schema || batch->num_rows() == 0 || SchemaHasDictionary(*wire_schema)) {
+		return {nullptr, nullptr};
+	}
+	if (batch->num_columns() != wire_schema->num_fields()) {
 		return {nullptr, nullptr};
 	}
 	// Small batches are cheaper over the pipe than through shm — skip the slot
 	// allocation + pointer round trip below the measured crossover.
-	if (arrow::util::TotalBufferSize(*batch) < ShmMinBatchBytes()) {
+	const int64_t body_bytes = batch->TotalBufferSize();
+	if (body_bytes < ShmMinBatchBytes()) {
 		return {nullptr, nullptr};
 	}
 	// Build the 0-row pointer batch first (before allocating) so a failure here
-	// can't leak a segment allocation.
-	std::vector<std::shared_ptr<arrow::Array>> empty_columns;
-	empty_columns.reserve(wire_schema->num_fields());
-	for (const auto &field : wire_schema->fields()) {
-		auto empty = arrow::MakeEmptyArray(field->type());
-		if (!empty.ok()) {
-			return {nullptr, nullptr};
-		}
-		empty_columns.push_back(empty.ValueUnsafe());
+	// can't leak a segment allocation. The batch's buffers are written under
+	// wire_schema (same physical layout; names / nullability / tz may differ).
+	VgiBatchPtr pointer;
+	VgiBatchPtr to_write;
+	try {
+		pointer = VgiBatch::MakeEmpty(wire_schema);
+		to_write = batch->schema().get() == wire_schema.get() ? batch : batch->WithSchema(wire_schema);
+	} catch (const std::exception &) {
+		return {nullptr, nullptr};
 	}
 
 	// Serialize the batch under wire_schema as a full IPC stream (schema +
-	// batch + EOS) *directly into the segment*. We bypass MakeStreamWriter's
-	// IpcFormatWriter and drive the payload-level API by hand so the
-	// RecordBatchSerializer::Assemble pass runs ONCE (it builds metadata +
-	// collects body buffers). GetPayloadSize is then O(1) arithmetic on the
-	// built payload, letting us reserve the exact slot up-front. Compare:
-	// the prior implementation called Assemble twice (a MockOutputStream
-	// size pass + the real write).
-	const auto &options = arrow::ipc::IpcWriteOptions::Defaults();
-	arrow::ipc::DictionaryFieldMapper mapper(*wire_schema);
-
-	arrow::ipc::IpcPayload schema_payload;
-	if (!arrow::ipc::GetSchemaPayload(*wire_schema, options, mapper, &schema_payload).ok()) {
+	// batch + EOS) *directly into the segment*: the IPC writer's sink is the
+	// reserved slot itself, so no intermediate heap buffer is filled and then
+	// copied in. The exact stream size is only known once written, so reserve a
+	// safe upper bound — the schema message, the record-batch header (bounded
+	// by its node/buffer count), the body (every buffer padded to 64 bytes) and
+	// the 8-byte EOS — and advertise the bytes actually written. A write that
+	// would run past the reservation is refused (inline fallback).
+	int64_t nodes = 0;
+	int64_t buffers = 0;
+	CountArrayParts(to_write->c_array(), nodes, buffers);
+	VgiBufferPtr schema_msg;
+	try {
+		schema_msg = SerializeSchema(*wire_schema);
+	} catch (const std::exception &) {
 		return {nullptr, nullptr};
 	}
-	arrow::ipc::IpcPayload batch_payload;
-	if (!arrow::ipc::GetRecordBatchPayload(*batch, /*custom_metadata=*/nullptr, options, &batch_payload).ok()) {
-		return {nullptr, nullptr};
-	}
+	const int64_t header_bound = 1024 + 64 * (nodes + buffers);
+	const int64_t body_bound = body_bytes + 64 * buffers;
+	const int64_t reserve = schema_msg->size() + header_bound + body_bound + 8;
 
-	// EOS marker: 4-byte continuation token 0xFFFFFFFF + 4-byte zero length.
-	// Matches arrow::ipc PayloadStreamWriter::WriteEOS in the default
-	// (non-legacy) format. The on-wire bytes match what the read side
-	// (vgi_shm_segment.cpp) expects.
-	static constexpr uint8_t kEosMarker[8] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
-	const int64_t schema_size = arrow::ipc::GetPayloadSize(schema_payload, options);
-	const int64_t batch_size = arrow::ipc::GetPayloadSize(batch_payload, options);
-	const int64_t total = schema_size + batch_size + static_cast<int64_t>(sizeof(kEosMarker));
-
-	auto offset = shm->Allocate(static_cast<size_t>(total));
+	auto offset = shm->Allocate(static_cast<size_t>(reserve));
 	if (!offset) {
 		return {nullptr, nullptr}; // segment / alloc-table full → inline fallback
 	}
-
-	// Write into the slot in three pieces: [schema | batch | EOS]. Each
-	// piece goes through a FixedSizeBufferWriter view over the right
-	// sub-range, so WriteIpcPayload writes exactly its computed size into
-	// the slot and refuses any drift.
-	uint8_t *slot_data = shm->MutableData(*offset);
-	int32_t mlen = 0; // discarded; we only need it to satisfy the API
-	{
-		auto schema_slice = std::make_shared<arrow::MutableBuffer>(slot_data, schema_size);
-		auto schema_sink = std::make_shared<arrow::io::FixedSizeBufferWriter>(schema_slice);
-		if (!arrow::ipc::WriteIpcPayload(schema_payload, options, schema_sink.get(), &mlen).ok()) {
-			return {nullptr, nullptr};
-		}
+	int64_t total = 0;
+	try {
+		auto sink = std::make_shared<ShmSlotOutputStream>(shm->MutableData(*offset), reserve);
+		auto writer = VgiIpcWriter::Open(sink, wire_schema);
+		writer->Write(*to_write, &NoMetadata());
+		writer->Close(); // EOS marker
+		total = sink->Tell();
+	} catch (const std::exception &) {
+		shm->FreeAllocation(*offset);
+		return {nullptr, nullptr};
 	}
-	{
-		auto batch_slice = std::make_shared<arrow::MutableBuffer>(slot_data + schema_size, batch_size);
-		auto batch_sink = std::make_shared<arrow::io::FixedSizeBufferWriter>(batch_slice);
-		if (!arrow::ipc::WriteIpcPayload(batch_payload, options, batch_sink.get(), &mlen).ok()) {
-			return {nullptr, nullptr};
-		}
-	}
-	std::memcpy(slot_data + schema_size + batch_size, kEosMarker, sizeof(kEosMarker));
-	auto pointer = arrow::RecordBatch::Make(wire_schema, 0, std::move(empty_columns));
-	auto metadata =
-	    arrow::KeyValueMetadata::Make({std::string(SHM_OFFSET_KEY), std::string(SHM_LENGTH_KEY)},
-	    {std::to_string(*offset), std::to_string(static_cast<uint64_t>(total))});
+	auto metadata = VgiMetadata::Make({{std::string(SHM_OFFSET_KEY), std::to_string(*offset)},
+	                                   {std::string(SHM_LENGTH_KEY), std::to_string(static_cast<uint64_t>(total))}});
 	if (std::getenv("VGI_RPC_SHM_DEBUG")) {
 		fprintf(stderr, "[shm] wrote input off=%llu len=%lld (direct)\n", static_cast<unsigned long long>(*offset),
 		        static_cast<long long>(total));
@@ -298,14 +354,13 @@ bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &work
 	try {
 		// Zero-field, 1-row params batch (the worker decodes empty kwargs); the
 		// client's capabilities ride as metadata under vgi_rpc.transport.*.
-		auto empty_params =
-		    arrow::RecordBatch::Make(arrow::schema({}), 1, std::vector<std::shared_ptr<arrow::Array>> {});
-		auto client_caps = arrow::KeyValueMetadata::Make({TRANSPORT_CAP_SHM_KEY}, {"true"});
+		auto empty_params = VgiBatch::FromColumns(VgiSchema::Empty(), 1, {});
+		auto client_caps = VgiMetadata::Make({{TRANSPORT_CAP_SHM_KEY, "true"}});
 		WriteRpcRequest(in_fd, TRANSPORT_OPTIONS_METHOD, empty_params, client_caps);
 		auto resp = ReadUnaryResponse(out_fd, &context, worker_path, pid);
 		if (resp.metadata) {
 			auto v = resp.metadata->Get(TRANSPORT_CAP_SHM_KEY);
-			capable = v.ok() && v.ValueUnsafe() == "true";
+			capable = v && *v == "true";
 		}
 	} catch (const std::exception &e) {
 		capable = false; // old worker / unknown method / transport error → inline
@@ -490,7 +545,7 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
                                        std::shared_ptr<IrohClientConfig> iroh_config)
     : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), data_version_spec_(data_version_spec),
       implementation_version_(implementation_version), function_name_(function_name), function_type_(function_type),
-      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
+      arguments_batch_(arguments.batch), attach_opaque_data_(attach_opaque_data),
       transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
       iroh_config_(std::move(iroh_config)) {
@@ -506,7 +561,7 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
     : conn_id_hex_(VgiGenerateConnId()), worker_path_(pooled_worker->GetKey().worker_path),
       data_version_spec_(pooled_worker->GetKey().data_version_spec),
       implementation_version_(pooled_worker->GetKey().implementation_version), function_name_(function_name),
-      function_type_(function_type), arguments_type_(arguments.type), arguments_array_(arguments.array),
+      function_type_(function_type), arguments_batch_(arguments.batch),
       attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data),
       global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
       required_secrets_(required_secrets), proc_(pooled_worker->Release()) {
@@ -528,7 +583,7 @@ FunctionConnection::FunctionConnection(std::unique_ptr<SubProcess> proc, const s
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets)
     : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), function_name_(function_name),
-      function_type_(function_type), arguments_type_(arguments.type), arguments_array_(arguments.array),
+      function_type_(function_type), arguments_batch_(arguments.batch),
       attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data),
       global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
       required_secrets_(required_secrets), proc_(std::move(proc)) {
@@ -562,7 +617,7 @@ pid_t FunctionConnection::TransportPid() const {
 	return proc_ ? proc_->GetPid() : -1;
 }
 
-std::shared_ptr<arrow::io::InputStream> FunctionConnection::TransportInput() {
+std::shared_ptr<VgiInputStream> FunctionConnection::TransportInput() {
 	if (transport_input_) {
 		return transport_input_;
 	}
@@ -572,7 +627,7 @@ std::shared_ptr<arrow::io::InputStream> FunctionConnection::TransportInput() {
 	return std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_);
 }
 
-std::shared_ptr<arrow::io::OutputStream> FunctionConnection::TransportOutput() {
+std::shared_ptr<VgiOutputStream> FunctionConnection::TransportOutput() {
 	if (transport_output_) {
 		return transport_output_;
 	}
@@ -583,8 +638,8 @@ std::shared_ptr<arrow::io::OutputStream> FunctionConnection::TransportOutput() {
 }
 
 void FunctionConnection::WriteTransportRpc(
-    const std::string &method, const std::shared_ptr<arrow::RecordBatch> &params,
-    const std::shared_ptr<arrow::KeyValueMetadata> &metadata) {
+    const std::string &method, const VgiBatchPtr &params,
+    const VgiMetadataPtr &metadata) {
 	WriteRpcRequest(TransportOutput(), method, params, metadata);
 }
 
@@ -645,7 +700,7 @@ BindResult FunctionConnection::PerformBindRpc() {
 	// Spawn the worker process (unless we already have one from the pool).
 	EnsureWorkerSpawned();
 
-	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
+	int64_t num_args = arguments_batch_ ? arguments_batch_->num_rows() : 0;
 	{
 		auto fields = BuildConnLogFields(*this);
 		fields.emplace_back("function_name", function_name_);
@@ -655,7 +710,7 @@ BindResult FunctionConnection::PerformBindRpc() {
 	}
 
 	// Transport: send bind via subprocess stdin/stdout
-	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
+	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> VgiBatchPtr {
 		auto rpc_params = generated::BuildBindParams(request_bytes);
 		ValidateRequestSchema(rpc_params, "bind", worker_path_);
 		try {
@@ -686,7 +741,7 @@ BindResult FunctionConnection::PerformBindRpc() {
 	};
 
 	auto bind_result = PerformBindProtocol(
-	    context_, function_name_, function_type_, arguments_array_, input_schema_, attach_opaque_data_,
+	    context_, function_name_, function_type_, arguments_batch_, input_schema_, attach_opaque_data_,
 	    transaction_opaque_data_, settings_, required_secrets_, worker_path_, transport_fn, at_unit_, at_value_,
 	    copy_from_ ? &*copy_from_ : nullptr, copy_to_ ? &*copy_to_ : nullptr, schema_name_, argument_names_);
 
@@ -704,8 +759,8 @@ BindResult FunctionConnection::PerformBindRpc() {
 }
 
 InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const std::vector<int32_t> &projection_ids,
-                                           std::shared_ptr<arrow::Buffer> pushdown_filters,
-                                           std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
+                                           VgiBufferPtr pushdown_filters,
+                                           std::vector<VgiBufferPtr> join_keys,
                                            const std::string &phase, const std::optional<OrderByHint> &order_by,
                                            const std::optional<TableSampleHint> &table_sample,
                                            const std::vector<uint8_t> &init_opaque_data,
@@ -750,7 +805,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		ts_seed = table_sample->seed;
 	}
 
-	// Build InitRequest — pass arrow::Buffer directly to avoid copying
+	// Build InitRequest — pass the buffers directly to avoid copying
 	auto init_request = BuildInitRequest(bind_result.bind_request_bytes, bind_result.output_schema_bytes,
 	                                     bind_result.opaque_data, projection_ids_64, pushdown_filters, join_keys, phase,
 	                                     execution_id, init_opaque_data, ob_col, ob_dir, ob_null, ob_limit,
@@ -765,7 +820,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 	// before each request so the worker starts fresh.
 	auto rpc_params = generated::BuildInitParams(init_request_bytes);
 	ValidateRequestSchema(rpc_params, "init", worker_path_);
-	std::shared_ptr<arrow::KeyValueMetadata> shm_metadata;
+	VgiMetadataPtr shm_metadata;
 #if VGI_SHM_TRANSPORT // shared-memory side-channel (shm_open/mmap) is POSIX-only
 	// Only create + advertise the segment if shm is requested AND the worker
 	// confirmed (once, cached) it can do shm via __transport_options__. A worker
@@ -799,8 +854,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 			if (!py_name.empty() && py_name[0] == '/') {
 				py_name.erase(0, 1);
 			}
-			shm_metadata = arrow::KeyValueMetadata::Make({SHM_SEGMENT_NAME_KEY, SHM_SEGMENT_SIZE_KEY},
-			    {py_name, std::to_string(shm_segment_->size())});
+			shm_metadata = VgiMetadata::Make(
+			    {{SHM_SEGMENT_NAME_KEY, py_name}, {SHM_SEGMENT_SIZE_KEY, std::to_string(shm_segment_->size())}});
 		} catch (const std::exception &e) {
 			// Best-effort: fall back to inline transport if shm setup fails.
 			// (Dropping our leases does not unmap under a retained batch: each
@@ -865,16 +920,17 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 	if (!input_schema_ || producer_phase_override) {
 		// Regular table function: producer mode (tick-based)
 		is_producer_mode_ = true;
-		tick_schema_ = arrow::schema({});
+		tick_schema_ = EmptyTick()->schema();
 
-		// Create tick writer on stdin (C++ MakeStreamWriter writes schema immediately)
+		// Create the tick writer on stdin. Like Arrow's stream writer it writes
+		// the (empty) schema with the first batch, i.e. the tick just below.
 		auto sink = TransportOutput();
-		auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, tick_schema_);
-		if (!writer_result.ok()) {
+		try {
+			input_writer_ = VgiIpcWriter::Open(sink, tick_schema_);
+		} catch (const std::exception &e) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create tick writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
-			                    writer_result.status().ToString());
+			                    StreamErrorText(e));
 		}
-		input_writer_ = writer_result.ValueUnsafe();
 		input_writer_opened_ = true;
 
 		// Send the first tick batch immediately. The server needs to receive and
@@ -885,48 +941,43 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		// custom_metadata (where the worker's process() reads them, mirroring
 		// vgi_pushdown_filters) so the worker can answer 304-style with a 0-row
 		// vgi.cache.not_modified batch instead of re-streaming the payload.
-		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>> {});
-		std::shared_ptr<const arrow::KeyValueMetadata> first_tick_metadata;
-		if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
-			std::vector<std::string> keys, vals;
-			if (!cond_if_none_match_.empty()) {
-				keys.emplace_back(VGI_CACHE_IF_NONE_MATCH_KEY);
-				vals.push_back(cond_if_none_match_);
-			}
-			if (!cond_if_modified_since_.empty()) {
-				keys.emplace_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY);
-				vals.push_back(cond_if_modified_since_);
-			}
-			first_tick_metadata = arrow::KeyValueMetadata::Make(std::move(keys), std::move(vals));
+		const auto &tick_batch = EmptyTick();
+		VgiMetadata first_tick_metadata;
+		if (!cond_if_none_match_.empty()) {
+			first_tick_metadata.Append(VGI_CACHE_IF_NONE_MATCH_KEY, cond_if_none_match_);
 		}
-		auto write_status = first_tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
-		    : input_writer_->WriteRecordBatch(*tick_batch);
-		if (!write_status.ok()) {
+		if (!cond_if_modified_since_.empty()) {
+			first_tick_metadata.Append(VGI_CACHE_IF_MODIFIED_SINCE_KEY, cond_if_modified_since_);
+		}
+		try {
+			input_writer_->Write(*tick_batch, &first_tick_metadata);
+		} catch (const std::exception &e) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to write initial tick batch: %s", worker_path_, TransportPid(),
-			                    GetExecutionIdHex(), write_status.ToString());
+			                    GetExecutionIdHex(), StreamErrorText(e));
 		}
 
 		// Now open data reader on stdout — the server has processed the tick and
 		// flushed the output schema + first data batch to stdout
 		data_stream_ = TransportInput();
-		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
-		if (!reader_result.ok()) {
+		try {
+			data_reader_ = VgiIpcReader::Open(data_stream_);
+		} catch (const std::exception &e) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
-			                    reader_result.status().ToString());
+			                    StreamErrorText(e));
 		}
-		data_reader_ = reader_result.ValueUnsafe();
 	} else {
 		// Scalar or table-in-out function: exchange mode
 		is_producer_mode_ = false;
 
-		// Create input writer on stdin (writes schema immediately)
+		// Create input writer on stdin (the schema goes out with the first input
+		// batch, or at CloseInputWriter when there is none)
 		auto sink = TransportOutput();
-		auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, input_schema_);
-		if (!writer_result.ok()) {
+		try {
+			input_writer_ = VgiIpcWriter::Open(sink, input_schema_);
+		} catch (const std::exception &e) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create input writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
-			                    writer_result.status().ToString());
+			                    StreamErrorText(e));
 		}
-		input_writer_ = writer_result.ValueUnsafe();
 		input_writer_opened_ = true;
 
 		// Do NOT open data_reader_ here. The server's output schema is only flushed
@@ -966,10 +1017,11 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 
 	// Close current data exchange streams
 	if (input_writer_ && !input_writer_closed_) {
-		auto close_status = input_writer_->Close();
-		if (!close_status.ok()) {
+		try {
+			input_writer_->Close();
+		} catch (const std::exception &e) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer for finalize: %s", worker_path_,
-			                    TransportPid(), GetExecutionIdHex(), close_status.ToString());
+			                    TransportPid(), GetExecutionIdHex(), StreamErrorText(e));
 		}
 	}
 	input_writer_.reset();
@@ -983,39 +1035,39 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	// read the leftover INPUT-phase output instead of the FINALIZE response header.
 	if (!data_reader_ && TransportReady()) {
 		data_stream_ = TransportInput();
-		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
-		if (reader_result.ok()) {
-			data_reader_ = reader_result.ValueUnsafe();
-		} else if (iroh_config_) {
-			auto status = reader_result.status();
-			if (status.IsCancelled()) {
-				throw InterruptException();
+		try {
+			data_reader_ = VgiIpcReader::Open(data_stream_);
+		} catch (const InterruptException &) {
+			throw; // cancellation (raw Iroh streams) always interrupts
+		} catch (const std::exception &e) {
+			if (iroh_config_) {
+				// The next bytes cannot be assumed to begin FINALIZE when the
+				// preceding stateful stream failed before even yielding its schema.
+				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open Iroh output stream before finalize: %s", worker_path_,
+				                    TransportPid(), GetExecutionIdHex(), StreamErrorText(e));
 			}
-			// The next bytes cannot be assumed to begin FINALIZE when the
-			// preceding stateful stream failed before even yielding its schema.
-			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open Iroh output stream before finalize: %s", worker_path_,
-			                    TransportPid(), GetExecutionIdHex(), status.ToString());
+			// Other transports: nothing to drain.
 		}
 	}
 
 	// Drain remaining output from current stream
 	while (data_reader_) {
-		auto drain_result = data_reader_->ReadNext();
-		if (!drain_result.ok()) {
-			auto status = drain_result.status();
-			if (status.IsCancelled()) {
-				throw InterruptException();
-			}
+		VgiBatchPtr drained;
+		try {
+			drained = data_reader_->ReadNext();
+		} catch (const InterruptException &) {
+			throw;
+		} catch (const std::exception &e) {
 			// A raw Iroh stream is a persistent stateful byte transport. Any
-			// failure before Arrow's explicit EOS marker leaves the next RPC
-			// boundary unknowable, so it cannot be treated as an empty drain.
+			// failure before the IPC stream's explicit EOS marker leaves the next
+			// RPC boundary unknowable, so it cannot be treated as an empty drain.
 			if (iroh_config_) {
 				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed while draining Iroh output before finalize: %s", worker_path_,
-				                    TransportPid(), GetExecutionIdHex(), status.ToString());
+				                    TransportPid(), GetExecutionIdHex(), StreamErrorText(e));
 			}
 			break;
 		}
-		if (!drain_result.ValueUnsafe().batch) {
+		if (!drained) {
 			break;
 		}
 	}
@@ -1035,9 +1087,9 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 
 	// RAII scope guard to restore state even if PerformInit throws
 	struct RestoreGuard {
-		std::shared_ptr<arrow::Schema> &input_schema;
+		VgiSchemaPtr &input_schema;
 		std::vector<uint8_t> &global_exec_id;
-		std::shared_ptr<arrow::Schema> saved_schema;
+		VgiSchemaPtr saved_schema;
 		std::vector<uint8_t> saved_id;
 		~RestoreGuard() {
 			input_schema = std::move(saved_schema);
@@ -1066,13 +1118,14 @@ void FunctionConnection::ResetForNextSplit() {
 	// init request's bytes land inside an unterminated tick stream. Same ordering
 	// as PerformFinalizeInit, for the same reason.
 	if (input_writer_ && !input_writer_closed_) {
-		auto close_status = input_writer_->Close();
-		if (!close_status.ok()) {
+		try {
+			input_writer_->Close();
+		} catch (const std::exception &e) {
 			// Poison: the stream is in an unknown state, so the connection must not
 			// go back to the pool looking idle.
 			split_reset_failed_ = true;
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer between splits: %s", worker_path_,
-			                    TransportPid(), GetExecutionIdHex(), close_status.ToString());
+			                    TransportPid(), GetExecutionIdHex(), StreamErrorText(e));
 		}
 	}
 	input_writer_.reset();
@@ -1082,21 +1135,21 @@ void FunctionConnection::ResetForNextSplit() {
 	// Drain any unread output from this split before the next init request goes
 	// out, or ReadStreamHeader would read the leftover data as the new response.
 	while (data_reader_) {
-		auto drain_result = data_reader_->ReadNext();
-		if (!drain_result.ok()) {
-			auto status = drain_result.status();
-			if (status.IsCancelled()) {
-				split_reset_failed_ = true;
-				throw InterruptException();
-			}
+		VgiBatchPtr drained;
+		try {
+			drained = data_reader_->ReadNext();
+		} catch (const InterruptException &) {
+			split_reset_failed_ = true;
+			throw;
+		} catch (const std::exception &e) {
 			if (iroh_config_) {
 				split_reset_failed_ = true;
 				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed while draining Iroh output between splits: %s", worker_path_,
-				                    TransportPid(), GetExecutionIdHex(), status.ToString());
+				                    TransportPid(), GetExecutionIdHex(), StreamErrorText(e));
 			}
 			break;
 		}
-		if (!drain_result.ValueUnsafe().batch) {
+		if (!drained) {
 			break;
 		}
 	}
@@ -1124,7 +1177,7 @@ void FunctionConnection::ResetForNextSplit() {
 	// across the splits it claims).
 }
 
-std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
+VgiBatchPtr FunctionConnection::ReadDataBatch() {
 	if (!init_done_) {
 		ThrowVgiIOException("FunctionConnection::ReadDataBatch called before PerformInit", worker_path_,
 		                    TransportPid(), GetExecutionIdHex());
@@ -1140,12 +1193,12 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			                    GetExecutionIdHex());
 		}
 		data_stream_ = TransportInput();
-		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
-		if (!reader_result.ok()) {
+		try {
+			data_reader_ = VgiIpcReader::Open(data_stream_);
+		} catch (const std::exception &e) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
-			                    reader_result.status().ToString());
+			                    StreamErrorText(e));
 		}
-		data_reader_ = reader_result.ValueUnsafe();
 	}
 
 	// For producer mode (table functions): each call sends the NEXT tick and
@@ -1172,22 +1225,22 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		if (!(is_producer_mode_ && input_writer_ && !input_writer_closed_)) {
 			return;
 		}
-		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+		const auto &tick_batch = *EmptyTick();
 
 		// Attach dynamic filter metadata as IPC custom metadata if available
-		std::shared_ptr<const arrow::KeyValueMetadata> tick_metadata;
+		VgiMetadata tick_metadata;
 		if (tick_filter_state_) {
 			// Only a delta this stream has not been sent yet; an unchanged filter
 			// rides no tick at all (see UpdateDynamicFilterState).
 			auto delta = tick_filter_cursor_.Take(*tick_filter_state_);
 			if (!delta.empty()) {
-				tick_metadata = arrow::KeyValueMetadata::Make({"vgi_pushdown_filters"}, {std::move(delta)});
+				tick_metadata.Append("vgi_pushdown_filters", std::move(delta));
 			}
 		}
 
-		auto write_status = tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, tick_metadata)
-		    : input_writer_->WriteRecordBatch(*tick_batch);
-		if (!write_status.ok()) {
+		try {
+			input_writer_->Write(tick_batch, &tick_metadata);
+		} catch (const std::exception &) {
 			// Tick write can fail with EPIPE/broken pipe if the server has already
 			// finished (e.g., finalize with no output). This is not an error — just
 			// mark the writer closed; the next read will return EOS.
@@ -1210,23 +1263,25 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		}
 
 		// Read from the data stream reader
-		auto read_result = data_reader_->ReadNext();
-		if (!read_result.ok()) {
-			auto status = read_result.status();
-			if (status.IsCancelled()) {
-				throw InterruptException();
-			}
+		VgiBatchPtr read_batch;
+		try {
+			read_batch = data_reader_->ReadNext();
+		} catch (const InterruptException &) {
+			throw; // cancellation (raw Iroh streams) always interrupts
+		} catch (const std::exception &e) {
+			const std::string error_text = StreamErrorText(e);
 			// QUIC FIN is only transport EOF. Raw Arrow-mux still requires the
-			// Arrow IPC EOS marker; accepting Invalid here would silently return
-			// a truncated result and leave this stateful connection desynchronized.
+			// IPC EOS marker; accepting a truncated stream here would silently
+			// return a truncated result and leave this stateful connection
+			// desynchronized.
 			if (iroh_config_) {
 				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Iroh data stream ended before the Arrow EOS marker: %s", worker_path_,
-				                    TransportPid(), GetExecutionIdHex(), status.ToString());
+				                    TransportPid(), GetExecutionIdHex(), error_text);
 			}
-			// Arrow's IPC stream uses an explicit EOS marker (0xFFFFFFFF +
-			// 0-length); a clean stream-end surfaces *below* as Status::OK
-			// + batch == nullptr. A non-OK status here means the bytes
-			// were truncated — almost always because the worker died or
+			// The IPC stream uses an explicit EOS marker (0xFFFFFFFF +
+			// 0-length); a clean stream-end surfaces *below* as a null
+			// batch. A truncated / invalid stream here means the bytes
+			// were cut short — almost always because the worker died or
 			// closed stdout *before* writing the EOS marker.
 			//
 			// We can't entirely abandon the tolerant behaviour: some HTTP
@@ -1236,18 +1291,18 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			// (killed by signal, or exited non-zero), surface a real
 			// error. Otherwise fall through to the legacy tolerant path
 			// so we don't regress healthy producers.
-			if (status.IsInvalid()) {
+			if (IsIpcStreamInvalid(e)) {
 				int exit_status = 0;
 				if (proc_ && proc_->TryWait(&exit_status)) {
 					if (exit_status < 0) {
 						ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Worker killed by signal %d before EOS marker; result was truncated: %s",
 						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), -exit_status,
-						    status.ToString());
+						    error_text);
 					}
 					if (exit_status != 0) {
 						ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Worker exited with status %d before EOS marker; result was truncated: %s",
 						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), exit_status,
-						    status.ToString());
+						    error_text);
 					}
 					// exit_status == 0: worker exited cleanly without EOS.
 				}
@@ -1257,14 +1312,14 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 				return nullptr;
 			}
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to read data batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
-			                    GetExecutionIdHex(), status.ToString());
+			                    GetExecutionIdHex(), error_text);
 		}
-		auto result = read_result.ValueUnsafe();
+		auto result = ToWireBatch(std::move(read_batch));
 
 		// Null batch means end of stream (EOS). Apply the same liveness
-		// probe as the Invalid-status branch above: some Arrow versions
-		// treat EOF-at-message-boundary as silent EOS, so a SIGKILL'd
-		// worker's truncated stream can surface here too.
+		// probe as the truncation branch above: EOF at a message boundary
+		// is a silent EOS, so a SIGKILL'd worker's truncated stream can
+		// surface here too.
 		//
 		// Limitation: if the user's LOCATION wraps the worker behind a
 		// shell or launcher (e.g., ``uv run ...``), proc_ is the wrapper,
@@ -1310,7 +1365,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		if (result.custom_metadata &&
 		    ClassifyBatch(result.batch, result.custom_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
 			resolved_external = true;
-			int loc_idx = result.custom_metadata->FindKey(RPC_LOCATION_KEY);
+			auto loc_idx = result.custom_metadata->FindKey(RPC_LOCATION_KEY);
 			const std::string location_url = result.custom_metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_, GetExecutionIdHex(),
 			                                        GetAttachOpaqueDataDigest(), result.custom_metadata,
@@ -1366,7 +1421,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// the consumer thread (uniform error reporting across transports).
 		last_partition_values_bytes_.clear();
 		if (result.custom_metadata) {
-			int pv_idx = result.custom_metadata->FindKey("vgi_partition_values#b64");
+			auto pv_idx = result.custom_metadata->FindKey("vgi_partition_values#b64");
 			if (pv_idx >= 0) {
 				const std::string &b64_value = result.custom_metadata->value(pv_idx);
 				try {
@@ -1393,7 +1448,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// Empty = no provenance on this batch (identity mapping assumed).
 		last_parent_row_bytes_.clear();
 		if (result.custom_metadata) {
-			int pr_idx = result.custom_metadata->FindKey("vgi_rpc.parent_row#b64");
+			auto pr_idx = result.custom_metadata->FindKey("vgi_rpc.parent_row#b64");
 			if (pr_idx >= 0) {
 				const std::string &b64_value = result.custom_metadata->value(pr_idx);
 				try {
@@ -1421,7 +1476,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// converts that into a typed IOException when the function opted in.
 		last_batch_index_ = DConstants::INVALID_INDEX;
 		if (result.custom_metadata) {
-			int bi_idx = result.custom_metadata->FindKey("vgi_batch_index");
+			auto bi_idx = result.custom_metadata->FindKey("vgi_batch_index");
 			if (bi_idx >= 0) {
 				const std::string &value = result.custom_metadata->value(bi_idx);
 				try {
@@ -1501,7 +1556,7 @@ std::string FunctionConnection::GetTransactionOpaqueDataDigest() const {
 	return OpaqueDigest(transaction_opaque_data_);
 }
 
-void FunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {
+void FunctionConnection::SetInputSchema(const VgiSchemaPtr &input_schema) {
 	// No guard: pooled connections start with proc_ already set from
 	// construction, so a "post-spawn" check would falsely reject every
 	// pool-acquired bind. The schema is committed to the wire by the next
@@ -1510,7 +1565,7 @@ void FunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &in
 	input_schema_ = input_schema;
 }
 
-void FunctionConnection::UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) {
+void FunctionConnection::UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) {
 	// Allow updating input schema after bind but before OpenInputWriter.
 	// Used when reusing a bind connection and the actual DataChunk types
 	// differ from the bind-time expression types (e.g., DECIMAL vs DOUBLE).
@@ -1538,12 +1593,12 @@ void FunctionConnection::OpenInputWriter() {
 
 	// Create an IPC stream writer for stdin
 	auto sink = TransportOutput();
-	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, input_schema_);
-	if (!writer_result.ok()) {
+	try {
+		input_writer_ = VgiIpcWriter::Open(sink, input_schema_);
+	} catch (const std::exception &e) {
 		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create input stream writer: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
-		                    GetExecutionIdHex(), writer_result.status().ToString());
+		                    GetExecutionIdHex(), StreamErrorText(e));
 	}
-	input_writer_ = writer_result.ValueUnsafe();
 	input_writer_opened_ = true;
 
 	{
@@ -1554,7 +1609,7 @@ void FunctionConnection::OpenInputWriter() {
 	}
 }
 
-void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
+void FunctionConnection::WriteInputBatch(const VgiBatchPtr &batch) {
 	if (!input_writer_opened_) {
 		ThrowVgiIOException("FunctionConnection::WriteInputBatch called before OpenInputWriter", worker_path_,
 		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
@@ -1570,7 +1625,7 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 	// TIMESTAMP_TZ unit/tz), so a batch produced by DataChunkToArrow may not
 	// match the schema the IPC stream was opened with even when the data
 	// would round-trip cleanly. ReconcileBatchToSchema handles the metadata
-	// reshape (no copy) and any genuine type cast (arrow::compute::Cast)
+	// reshape (no copy) and any genuine type cast
 	// recursively into nested types. Fast-path returns the batch unchanged
 	// when schemas already match.
 	auto reconciled = batch;
@@ -1583,7 +1638,7 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 	// (carrying shm_offset/shm_length) in its place. The worker resolves it and
 	// frees the slot. Falls back to writing the batch inline.
 	auto to_write = reconciled;
-	std::shared_ptr<arrow::KeyValueMetadata> write_meta;
+	VgiMetadataPtr write_meta;
 #if VGI_SHM_TRANSPORT
 	// Serialize under input_schema_ — the schema input_writer_ declares on the
 	// wire — so the worker reads back exactly what it expects (no cast).
@@ -1600,29 +1655,24 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 	// sets them per input unit via SetConditionalRequest and clears them after, so
 	// they never leak to the next unit. Merged with any shm pointer metadata.
 	if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
-		std::vector<std::string> keys, vals;
+		std::vector<std::pair<std::string, std::string>> pairs;
 		if (write_meta) {
-			for (int64_t i = 0; i < write_meta->size(); i++) {
-				keys.push_back(write_meta->key(i));
-				vals.push_back(write_meta->value(i));
-			}
+			pairs = write_meta->pairs();
 		}
 		if (!cond_if_none_match_.empty()) {
-			keys.emplace_back(VGI_CACHE_IF_NONE_MATCH_KEY);
-			vals.push_back(cond_if_none_match_);
+			pairs.emplace_back(VGI_CACHE_IF_NONE_MATCH_KEY, cond_if_none_match_);
 		}
 		if (!cond_if_modified_since_.empty()) {
-			keys.emplace_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY);
-			vals.push_back(cond_if_modified_since_);
+			pairs.emplace_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY, cond_if_modified_since_);
 		}
-		write_meta = arrow::KeyValueMetadata::Make(std::move(keys), std::move(vals));
+		write_meta = VgiMetadata::Make(std::move(pairs));
 	}
 
-	auto write_status = write_meta ? input_writer_->WriteRecordBatch(*to_write, write_meta)
-	                               : input_writer_->WriteRecordBatch(*to_write);
-	if (!write_status.ok()) {
+	try {
+		input_writer_->Write(*to_write, write_meta ? write_meta.get() : &NoMetadata());
+	} catch (const std::exception &e) {
 		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to write input batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
-		                    GetExecutionIdHex(), write_status.ToString());
+		                    GetExecutionIdHex(), StreamErrorText(e));
 	}
 
 	{
@@ -1663,12 +1713,14 @@ void FunctionConnection::CancelStream(const std::vector<uint8_t> &state_token, C
 	if (!tick_schema_) {
 		return;
 	}
-	auto cancel_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-	auto metadata = arrow::KeyValueMetadata::Make({std::string(generated::VGI_RPC_CANCEL_KEY)}, {"1"});
-	auto write_status = input_writer_->WriteRecordBatch(*cancel_batch, metadata);
-	// Best-effort — dispatcher catches any throw; here we just swallow
-	// to keep the signature simple (status itself isn't an exception).
-	(void)write_status;
+	const auto &cancel_batch = EmptyTick();
+	const VgiMetadata metadata {{std::string(generated::VGI_RPC_CANCEL_KEY), "1"}};
+	// Best-effort — dispatcher catches any throw; here we just swallow a
+	// failed write (the worker learns of teardown via pipe close anyway).
+	try {
+		input_writer_->Write(*cancel_batch, &metadata);
+	} catch (const std::exception &) {
+	}
 }
 
 void FunctionConnection::CloseInputWriter() {
@@ -1682,10 +1734,11 @@ void FunctionConnection::CloseInputWriter() {
 	}
 
 	// Close the IPC stream writer (sends end-of-stream marker)
-	auto close_status = input_writer_->Close();
-	if (!close_status.ok()) {
+	try {
+		input_writer_->Close();
+	} catch (const std::exception &e) {
 		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to close input stream: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
-		                    GetExecutionIdHex(), close_status.ToString());
+		                    GetExecutionIdHex(), StreamErrorText(e));
 	}
 	input_writer_.reset();
 	input_writer_closed_ = true;
@@ -1765,9 +1818,8 @@ namespace {
 // Decode the outer-envelope response into the registered result schema.
 // The 'result' column of the outer envelope is a binary blob containing
 // the IPC-serialized inner RecordBatch (matches what the worker emits).
-std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResult &response,
-                                                         const std::string &method_name,
-                                                         const std::string &worker_path) {
+VgiBatchPtr DecodeOuterResponse(const UnaryResponseResult &response, const std::string &method_name,
+                                const std::string &worker_path) {
 	// Empty-schema responses (e.g. table_buffering_destructor) emit a null result;
 	// return null so the caller can skip column lookup.
 	return UnwrapResultEnvelope(response.batch, method_name, ErrorInfo().Worker(worker_path), /*null_result_ok=*/true);
@@ -1781,7 +1833,7 @@ std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResul
 
 std::vector<uint8_t>
 FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, const std::vector<uint8_t> &execution_id,
-                                                const std::shared_ptr<arrow::RecordBatch> &input_batch,
+                                                const VgiBatchPtr &input_batch,
                                                 std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id, batch_bytes,
@@ -1792,7 +1844,7 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, c
 	// WriteRpcRequest still stamps the method/version metadata onto it, so the
 	// worker reads method + shm_offset off the pointer and resolves the params.
 	auto process_params = rpc_params;
-	std::shared_ptr<arrow::KeyValueMetadata> process_meta;
+	VgiMetadataPtr process_meta;
 #if VGI_SHM_TRANSPORT
 	// WriteRpcRequest opens the request stream with the params batch's own
 	// schema, so that's the wire schema here.
@@ -1887,16 +1939,23 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	// exits its data loop. The data reader must be drained to EOS so the
 	// stdout pipe is clean for the next operation.
 	if (input_writer_ && !input_writer_closed_) {
-		auto close_status = input_writer_->Close();
 		// Ignore close errors during cleanup (worker might have died)
-		(void)close_status;
+		try {
+			input_writer_->Close();
+		} catch (const std::exception &) {
+		}
 		input_writer_closed_ = true;
 	}
 	if (data_reader_) {
-		// Drain remaining output to EOS
+		// Drain remaining output to EOS (any read error ends the drain)
 		while (true) {
-			auto drain_result = data_reader_->ReadNext();
-			if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+			VgiBatchPtr drained;
+			try {
+				drained = data_reader_->ReadNext();
+			} catch (const std::exception &) {
+				break;
+			}
+			if (!drained) {
 				break;
 			}
 		}

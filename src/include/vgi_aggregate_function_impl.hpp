@@ -1,12 +1,13 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "duckdb/function/aggregate_function.hpp"
 
@@ -67,7 +68,7 @@ struct VgiAggregateFunctionInfo : public AggregateFunctionInfo {
 	std::map<std::string, Value> settings;
 	std::vector<std::string> setting_names;
 	std::vector<VgiSecretRequirement> required_secrets;
-	std::shared_ptr<arrow::Schema> output_schema;
+	VgiSchemaPtr output_schema;
 
 	// Const parameter support (same pattern as scalar functions)
 	std::vector<bool> positional_is_const;
@@ -109,8 +110,8 @@ struct VgiAggregateBindData : public FunctionData {
 	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<VgiSecretRequirement> required_secrets;
-	std::shared_ptr<arrow::Schema> resolved_output_schema;
-	std::shared_ptr<arrow::Schema> input_schema;
+	VgiSchemaPtr resolved_output_schema;
+	VgiSchemaPtr input_schema;
 	optional_ptr<Catalog> catalog;
 	// Weak reference to the ClientContext that produced this bind_data.
 	// Used by the destructor RPC path: late-firing destructors on a
@@ -160,12 +161,12 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 
 struct AggregateRpcResult {
 	// Outer vgi_rpc unary envelope: {result: Binary}.
-	std::shared_ptr<arrow::RecordBatch> response_batch;
+	VgiBatchPtr response_batch;
 	// Inner response batch, already unwrapped from the envelope and validated
 	// against the method's registered schema. May be null if the envelope's
 	// result column is null or the batch is empty. Decode it with
 	// DecodeAggregateResult<generated::...Result>().
-	std::shared_ptr<arrow::RecordBatch> inner_batch;
+	VgiBatchPtr inner_batch;
 };
 
 // Dispatch an aggregate-flavored unary RPC. Handles subprocess or HTTP
@@ -179,7 +180,7 @@ struct AggregateRpcResult {
 // thread during teardown.
 AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
                                       const std::string &method_name,
-                                      const std::shared_ptr<arrow::RecordBatch> &params,
+                                      const VgiBatchPtr &params,
                                       bool enable_logging = true);
 
 // extra_info for a malformed aggregate (incl. window / streaming) RPC response.

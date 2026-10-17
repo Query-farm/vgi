@@ -17,19 +17,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
 # Note that it should also be removed from vcpkg.json to prevent needlessly installing it..
-if(DEFINED DUCKDB_WASM_ARROW_PREFIX)
-    # WASM build: use Arrow from duckdb-wasm's vendored build
-    message(STATUS "VGI: Using duckdb-wasm Arrow from ${DUCKDB_WASM_ARROW_PREFIX}")
-    include_directories(${DUCKDB_WASM_ARROW_PREFIX}/include)
-    add_library(arrow_wasm STATIC IMPORTED)
-    set_target_properties(arrow_wasm PROPERTIES IMPORTED_LOCATION ${DUCKDB_WASM_ARROW_PREFIX}/lib/libarrow.a)
-    set(VGI_ARROW_LIB arrow_wasm)
+if(EMSCRIPTEN)
     # OpenSSL not needed in WASM (emscripten handles TLS via XHR)
     set(VGI_SSL_LIBS "")
 else()
     find_package(OpenSSL REQUIRED)
-    find_package(Arrow REQUIRED)
-    set(VGI_ARROW_LIB Arrow::arrow_static)
     set(VGI_SSL_LIBS OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
@@ -39,7 +31,6 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 
 option(BUILD_VGI_BENCHMARKS "Build the Linux CPU/memory benchmark host" OFF)
-option(VGI_BENCH_ARROW_PROBE "Expose Arrow allocator diagnostics in the benchmark extension only" OFF)
 if(BUILD_VGI_BENCHMARKS)
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "VGI benchmarks require Linux resource accounting")
@@ -324,7 +315,8 @@ src/vgi_named_pipe.cpp
 src/vgi_logging.cpp
 src/vgi_subprocess.cpp
 src/vgi_arrow_ipc.cpp
-src/vgi_nanoarrow_ipc.cpp
+src/vgi_arrow.cpp
+src/vgi_ipc.cpp
 src/vgi_arrow_utils.cpp
 src/vgi_rpc_client.cpp
 src/vgi_rpc_types.cpp
@@ -427,16 +419,9 @@ endif()
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-if(VGI_BENCH_ARROW_PROBE)
-  if(NOT BUILD_VGI_BENCHMARKS)
-    message(FATAL_ERROR "VGI_BENCH_ARROW_PROBE requires BUILD_VGI_BENCHMARKS")
-  endif()
-  target_sources(${LOADABLE_EXTENSION_NAME} PRIVATE benchmarks/arrow_probe.cpp)
-endif()
-
 # Link OpenSSL in both the static library as the loadable extension
-target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB} vgi_nanoarrow)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB} vgi_nanoarrow)
+target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} vgi_nanoarrow)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} vgi_nanoarrow)
 
 if(VGI_ENABLE_IROH)
   add_dependencies(${EXTENSION_NAME} vgi_iroh_rust)
@@ -522,6 +507,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_attach_credentials.cpp
     test/cpp/test_request_schema_parity.cpp
     test/cpp/test_protocol_records.cpp
+    test/cpp/test_vgi_arrow.cpp
     test/cpp/test_protocol_routing.cpp
     test/cpp/test_hosted_protocols.cpp
     test/cpp/test_sab_stream.cpp
@@ -546,7 +532,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_table_buffering_builders.cpp
     src/vgi_schema_registry.cpp
     src/vgi_arrow_ipc.cpp
-    src/vgi_nanoarrow_ipc.cpp
+    src/vgi_arrow.cpp
+    src/vgi_ipc.cpp
     src/vgi_logging.cpp
     src/vgi_telemetry_util.cpp
     src/vgi_oauth_env.cpp
@@ -587,7 +574,6 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     duckdb_static
     dummy_static_extension_loader
     duckdb_mbedtls
-    ${VGI_ARROW_LIB}
     vgi_nanoarrow
     ${SABFFI_LIB}
     ${SABTABLE_LIB})

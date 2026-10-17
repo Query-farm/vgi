@@ -1,11 +1,12 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/window/window_aggregator.hpp"

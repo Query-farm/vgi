@@ -19,6 +19,8 @@
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
+#include <cstring>
+
 namespace duckdb {
 
 // Resolve a write-function discovery result, preferring the inlined value on
@@ -93,12 +95,8 @@ static string ResolveWriteFunctionSchema(ClientContext &context, Catalog &catalo
 
 // Build a one-row Arrow RecordBatch of write options to pass to the worker.
 // The batch is self-describing and extensible — new options are just new fields.
-static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
-                                                              OnConflictAction action_type,
-                                                              const vector<string> &conflict_columns) {
-	auto result_mode_arr =
-	    arrow::MakeArrayFromScalar(*arrow::MakeScalar(return_chunk ? "rows" : "count"), 1).ValueOrDie();
-
+static VgiBatchPtr BuildWriteOptions(bool return_chunk, OnConflictAction action_type,
+                                     const vector<string> &conflict_columns) {
 	string action_str;
 	switch (action_type) {
 	case OnConflictAction::THROW:
@@ -110,24 +108,25 @@ static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
 	default:
 		throw InternalException("Unsupported OnConflictAction for VGI tables");
 	}
-	auto action_arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(action_str), 1).ValueOrDie();
 
-	// Build conflict columns as list<string>
-	arrow::StringBuilder col_builder;
-	auto list_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), std::make_shared<arrow::StringBuilder>());
-	auto &col_value_builder = dynamic_cast<arrow::StringBuilder &>(*list_builder->value_builder());
-	(void)list_builder->Append();
-	for (auto &col : conflict_columns) {
-		(void)col_value_builder.Append(col);
-	}
-	auto conflict_cols_arr = list_builder->Finish().ValueOrDie();
-
-	auto schema = arrow::schema({
-	    arrow::field("result_mode", arrow::utf8(), false),
-	    arrow::field("on_conflict", arrow::utf8()),
-	    arrow::field("on_conflict_columns", arrow::list(arrow::utf8())),
+	// The wire shape the worker expects: result_mode: utf8 not null, on_conflict: utf8,
+	// on_conflict_columns: list<item: utf8> (nullable fields, nullable items).
+	static const VgiSchemaPtr schema = MakeSchema({
+	    type::Utf8().Named("result_mode", /*is_nullable=*/false),
+	    type::Utf8().Named("on_conflict"),
+	    type::List(type::Utf8()).Named("on_conflict_columns"),
 	});
-	return arrow::RecordBatch::Make(schema, 1, {result_mode_arr, action_arr, conflict_cols_arr});
+	VgiBatchBuilder builder(schema);
+	append::String(builder.column(0), return_chunk ? "rows" : "count");
+	append::String(builder.column(1), action_str);
+	// Build conflict columns as list<string>
+	auto *conflict_cols = builder.column(2);
+	for (auto &col : conflict_columns) {
+		append::String(conflict_cols->children[0], col);
+	}
+	append::FinishElement(conflict_cols);
+	builder.FinishRow();
+	return builder.Finish();
 }
 
 struct SetupWriteResult {
@@ -137,8 +136,8 @@ struct SetupWriteResult {
 
 static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEntry &table,
                                               const VgiWriteFunctionResult &write_func,
-                                              const std::shared_ptr<arrow::Schema> &input_schema,
-                                              const std::shared_ptr<arrow::RecordBatch> &write_options,
+                                              const VgiSchemaPtr &input_schema,
+                                              const VgiBatchPtr &write_options,
                                               const std::vector<uint8_t> &transaction_opaque_data) {
 	auto &catalog = table.GetCatalog().Cast<VgiCatalog>();
 	auto &params = catalog.attach_parameters();
@@ -192,8 +191,28 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
 //
 // We compare field count + per-field name + type. Nullability is intentionally
 // ignored because DuckDB's Arrow exporter forces nullable=true on every field.
-static void ValidateReturningSchema(const std::shared_ptr<arrow::Schema> &expected,
-                                     const std::shared_ptr<arrow::Schema> &actual,
+//! Type equality with Arrow C++ ``DataType::Equals`` semantics: a node's own
+//! nullability belongs to its field, not its type, so only nested children compare it.
+static bool SameDataType(const ArrowSchema &a, const ArrowSchema &b) {
+	if (std::strcmp(a.format, b.format) != 0 || a.n_children != b.n_children) {
+		return false;
+	}
+	const int64_t type_flags = ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED;
+	if ((a.flags & type_flags) != (b.flags & type_flags)) {
+		return false;
+	}
+	for (int64_t c = 0; c < a.n_children; c++) {
+		if (!TypesEqual(*a.children[c], *b.children[c])) {
+			return false;
+		}
+	}
+	if ((a.dictionary == nullptr) != (b.dictionary == nullptr)) {
+		return false;
+	}
+	return !a.dictionary || SameDataType(*a.dictionary, *b.dictionary);
+}
+
+static void ValidateReturningSchema(const VgiSchemaPtr &expected, const VgiSchemaPtr &actual,
                                      const string &op_name, const string &table_name) {
 	if (!expected) {
 		throw InternalException("ValidateReturningSchema called without expected schema (op=%s table=%s)",
@@ -216,26 +235,29 @@ static void ValidateReturningSchema(const std::shared_ptr<arrow::Schema> &expect
 		fail(StringUtil::Format("expected %d field(s), got %d", expected->num_fields(), actual->num_fields()));
 	}
 	for (int i = 0; i < expected->num_fields(); i++) {
-		auto &ef = expected->field(i);
-		auto &af = actual->field(i);
-		if (ef->name() != af->name()) {
-			fail(StringUtil::Format("field %d name mismatch (expected '%s', got '%s')", i, ef->name(), af->name()));
+		const auto &ef = expected->field(i);
+		const auto &af = actual->field(i);
+		const string ef_name = expected->field_name(i);
+		const string af_name = actual->field_name(i);
+		if (ef_name != af_name) {
+			fail(StringUtil::Format("field %d name mismatch (expected '%s', got '%s')", i, ef_name, af_name));
 		}
-		if (!ef->type()->Equals(*af->type())) {
-			fail(StringUtil::Format("field '%s' type mismatch (expected %s, got %s)", ef->name(),
-			                        ef->type()->ToString(), af->type()->ToString()));
+		if (!SameDataType(ef, af)) {
+			fail(StringUtil::Format("field '%s' type mismatch (expected %s, got %s)", ef_name, TypeToString(ef),
+			                        TypeToString(af)));
 		}
 	}
 }
 
 // Helper: Read the count from a response batch (count column)
-static idx_t ReadCountFromBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
+static idx_t ReadCountFromBatch(const VgiBatchPtr &batch) {
 	if (!batch || batch->num_rows() == 0) {
 		return 0;
 	}
-	auto schema = batch->schema();
-	if (!schema || schema->num_fields() != 1 || schema->field(0)->name() != "count" ||
-	    schema->field(0)->type()->id() != arrow::Type::INT64 || schema->field(0)->nullable()) {
+	const auto &schema = batch->schema();
+	if (!schema || schema->num_fields() != 1 || schema->field_name(0) != "count" ||
+	    std::strcmp(schema->field(0).format, "l") != 0 || schema->field(0).dictionary != nullptr ||
+	    schema->field_nullable(0)) {
 		throw IOException(
 		    ErrorInfo(error_subtype::kProtocolViolation)
 		        .Set(error_key::kField, "count")
@@ -243,18 +265,19 @@ static idx_t ReadCountFromBatch(const std::shared_ptr<arrow::RecordBatch> &batch
 		    "VGI worker emitted an incompatible count result: expected exactly 'count: int64 not null', got %s",
 		    schema ? schema->ToString() : "<null>");
 	}
-	auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(batch->column(0));
-	if (!int_array) {
+	auto count_col = batch->column(0);
+	if (!count_col) {
 		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kField, "count"),
 		                  "VGI worker emitted an incompatible count result array");
 	}
 	idx_t total = 0;
-	for (int64_t i = 0; i < int_array->length(); i++) {
-		if (int_array->IsNull(i)) {
+	const int64_t n = count_col.length();
+	for (int64_t i = 0; i < n; i++) {
+		if (count_col.IsNull(i)) {
 			throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kField, "count"),
 			                  "VGI worker emitted a null count result");
 		}
-		total += NumericCast<idx_t>(int_array->Value(i));
+		total += NumericCast<idx_t>(count_col.GetInt(i));
 	}
 	return total;
 }
@@ -296,7 +319,7 @@ static idx_t FinalizeWriteConnection(VgiWriteGlobalState &gstate) {
 // Helper: Load an Arrow RecordBatch into an ArrowScanLocalState.
 // Same pattern as LoadBatchIntoScanState in vgi_table_in_out_impl.cpp.
 static void LoadResponseBatch(ArrowScanLocalState &scan_state,
-                               const std::shared_ptr<arrow::RecordBatch> &batch) {
+                               const VgiBatchPtr &batch) {
 	auto chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(batch, *chunk);
 	scan_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
@@ -483,9 +506,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	auto &table_info = table->GetTableInfo();
 	auto input_schema = table_info.arrow_schema;
 	if (table_info.row_id_column >= 0) {
-		auto fields = input_schema->fields();
-		fields.erase(fields.begin() + table_info.row_id_column);
-		input_schema = arrow::schema(fields);
+		// A fresh schema of the remaining fields (no schema-level metadata).
+		input_schema = input_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 	}
 
 	// Build conflict target column names from column IDs
@@ -524,14 +546,13 @@ unique_ptr<LocalSinkState> VgiPhysicalInsert::GetLocalSinkState(ExecutionContext
 		auto &table_info = insert_table->GetTableInfo();
 		auto response_schema = table_info.arrow_schema;
 		if (table_info.row_id_column >= 0) {
-			auto fields = response_schema->fields();
-			fields.erase(fields.begin() + table_info.row_id_column);
-			response_schema = arrow::schema(fields);
+			response_schema =
+			    response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 		}
 		return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 	}
 	// CTAS: use a minimal schema — RETURNING is never used for CTAS
-	auto empty_schema = arrow::schema({});
+	auto empty_schema = VgiSchema::Empty();
 	return make_uniq<VgiWriteLocalSinkState>(context.client, empty_schema, GetTypes());
 }
 
@@ -641,8 +662,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	    });
 
 	auto &table_info = table.GetTableInfo();
-	auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
-	auto input_schema = arrow::schema({rowid_field});
+	auto input_schema = table_info.arrow_schema->Select({table_info.row_id_column})->WithMetadata(VgiMetadata());
 
 	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
 
@@ -653,9 +673,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 		// schema (sans rowid). Same shape used by GetLocalSinkState below.
 		auto response_schema = table_info.arrow_schema;
 		if (table_info.row_id_column >= 0) {
-			auto fields = response_schema->fields();
-			fields.erase(fields.begin() + table_info.row_id_column);
-			response_schema = arrow::schema(fields);
+			response_schema =
+			    response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 		}
 		gstate->expected_returning_schema = response_schema;
 	}
@@ -676,9 +695,7 @@ unique_ptr<LocalSinkState> VgiPhysicalDelete::GetLocalSinkState(ExecutionContext
 	auto &table_info = table.GetTableInfo();
 	auto response_schema = table_info.arrow_schema;
 	if (table_info.row_id_column >= 0) {
-		auto fields = response_schema->fields();
-		fields.erase(fields.begin() + table_info.row_id_column);
-		response_schema = arrow::schema(fields);
+		response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 	}
 	return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 }
@@ -789,21 +806,19 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	// silently widen the worker's contract. The C++
 	// ReconcileBatchToSchema helper reshapes incoming batches to match
 	// this declared schema before they hit the IPC writer.
-	std::vector<std::shared_ptr<arrow::Field>> send_fields;
+	VgiSchemaPtr input_schema = VgiSchema::Empty();
 	for (auto &col_idx : columns) {
 		auto &col = table_columns.GetColumn(col_idx);
 		auto declared_idx = table_info.arrow_schema->GetFieldIndex(col.Name());
 		if (declared_idx >= 0) {
-			send_fields.push_back(table_info.arrow_schema->field(declared_idx));
+			input_schema = input_schema->AddField(input_schema->num_fields(), table_info.arrow_schema->field(declared_idx));
 		} else {
 			auto arrow_type = BuildArrowSchemaFromDuckDB(context, {col.Type()}, {col.Name()});
-			send_fields.push_back(arrow_type->field(0));
+			input_schema = input_schema->AddField(input_schema->num_fields(), arrow_type->field(0));
 		}
 	}
-	auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
-	send_fields.push_back(rowid_field);
-
-	auto input_schema = arrow::schema(send_fields);
+	input_schema =
+	    input_schema->AddField(input_schema->num_fields(), table_info.arrow_schema->field(table_info.row_id_column));
 
 	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
 
@@ -814,9 +829,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 		// schema (sans rowid). Same shape used by GetLocalSinkState below.
 		auto response_schema = table_info.arrow_schema;
 		if (table_info.row_id_column >= 0) {
-			auto fields = response_schema->fields();
-			fields.erase(fields.begin() + table_info.row_id_column);
-			response_schema = arrow::schema(fields);
+			response_schema =
+			    response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 		}
 		gstate->expected_returning_schema = response_schema;
 	}
@@ -837,9 +851,7 @@ unique_ptr<LocalSinkState> VgiPhysicalUpdate::GetLocalSinkState(ExecutionContext
 	auto &table_info = table.GetTableInfo();
 	auto response_schema = table_info.arrow_schema;
 	if (table_info.row_id_column >= 0) {
-		auto fields = response_schema->fields();
-		fields.erase(fields.begin() + table_info.row_id_column);
-		response_schema = arrow::schema(fields);
+		response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 	}
 	return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 }

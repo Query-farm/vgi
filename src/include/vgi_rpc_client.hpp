@@ -1,10 +1,10 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
-#include <arrow/api.h>
-#include <arrow/io/api.h>
-#include <arrow/ipc/api.h>
+#include "vgi_ipc.hpp"
 
+
+#include <exception>
 #include <memory>
 #include <functional>
 #include <string>
@@ -173,8 +173,8 @@ enum class RpcBatchType {
 
 // Classify a batch according to the vgi_rpc wire protocol.
 // Does NOT throw or dispatch - just classifies.
-RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata);
+RpcBatchType ClassifyBatch(const VgiBatchPtr &batch,
+                           const VgiMetadataPtr &custom_metadata);
 
 // ============================================================================
 // Request Writing
@@ -184,17 +184,17 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // Creates an IPC stream: schema (from params_batch) + 1-row batch with method metadata + EOS.
 // The params_batch must have exactly 1 row with one field per method parameter.
 void WriteRpcRequest(int fd, const std::string &method_name,
-                     const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr,
+                     const VgiBatchPtr &params_batch,
+                     const VgiMetadataPtr &extra_metadata = nullptr,
                      const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL);
 
 // Stream-based form used by transports that are not represented by an OS file
 // descriptor (notably native Iroh QUIC streams). The framing is byte-for-byte
 // identical to the fd form above.
-void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
+void WriteRpcRequest(const std::shared_ptr<VgiOutputStream> &sink,
                      const std::string &method_name,
-                     const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr,
+                     const VgiBatchPtr &params_batch,
+                     const VgiMetadataPtr &extra_metadata = nullptr,
                      const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL);
 
 // Write an RPC request with no parameters (zero-field schema, 1-row batch).
@@ -238,14 +238,14 @@ struct WorkerStreamOptions {
 
 // If `batch` is a log or error batch, handle it (log it, or throw the worker's
 // error) and return true; return false for a data batch.
-bool DispatchWorkerBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                         const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+bool DispatchWorkerBatch(const VgiBatchPtr &batch,
+                         const VgiMetadataPtr &custom_metadata,
                          const WorkerStreamOptions &opts);
 
 // Result from reading a unary response
 struct UnaryResponseResult {
-	std::shared_ptr<arrow::RecordBatch> batch;           // The data batch (1-row with "result" column, or empty for void)
-	std::shared_ptr<arrow::KeyValueMetadata> metadata;   // Custom metadata from the data batch
+	VgiBatchPtr batch;           // The data batch (1-row with "result" column, or empty for void)
+	VgiMetadataPtr metadata;   // Custom metadata from the data batch
 };
 
 // Read a unary RPC response from a file descriptor.
@@ -271,7 +271,7 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 // Stream-based response reader. Cancellation/deadline polling is provided by
 // the InputStream implementation; the native Iroh stream uses short timed
 // reads and cancels its QUIC stream when ClientContext is interrupted.
-UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStream> &input,
+UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<VgiInputStream> &input,
                                       ClientContext *context,
                                       const std::string &worker_path = "",
                                       pid_t worker_pid = -1,
@@ -282,17 +282,24 @@ UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStre
 
 // Result from reading a stream header
 struct StreamHeaderResult {
-	std::shared_ptr<arrow::RecordBatch> header_batch;    // The header data batch (1-row)
-	std::shared_ptr<arrow::KeyValueMetadata> metadata;   // Custom metadata from the header batch
+	VgiBatchPtr header_batch;    // The header data batch (1-row)
+	VgiMetadataPtr metadata;   // Custom metadata from the header batch
 };
+
+// True when an IPC read/open failure means the stream was truncated or is not
+// valid IPC (what Arrow C++ reported as Status::Invalid): end of input before a
+// complete message, an unparseable message, or a closed stream. False for
+// transport errors (a stream's own IOException, e.g. a read error). Callers that
+// tolerate a stream ending without its EOS marker classify with this.
+bool IsIpcStreamInvalid(const std::exception &e);
 
 // Read a unary response / stream header from any worker stream. The fd, buffer
 // and SAB entry points are thin wrappers over these. The stream-header reader
 // leaves `input` positioned just past the header stream, where the data stream
 // begins.
-UnaryResponseResult ReadWorkerUnaryStream(const std::shared_ptr<arrow::io::InputStream> &input,
+UnaryResponseResult ReadWorkerUnaryStream(const std::shared_ptr<VgiInputStream> &input,
                                           const WorkerStreamOptions &opts);
-StreamHeaderResult ReadWorkerStreamHeader(const std::shared_ptr<arrow::io::InputStream> &input,
+StreamHeaderResult ReadWorkerStreamHeader(const std::shared_ptr<VgiInputStream> &input,
                                           const WorkerStreamOptions &opts);
 
 // Read a stream header (phase 1.5) from a file descriptor.
@@ -303,7 +310,7 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
                                     const std::string &worker_path = "",
                                     pid_t worker_pid = -1);
 
-StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream> &input,
+StreamHeaderResult ReadStreamHeader(const std::shared_ptr<VgiInputStream> &input,
                                     ClientContext *context,
                                     const std::string &worker_path = "",
                                     pid_t worker_pid = -1);
@@ -324,7 +331,7 @@ StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream
 // / if_modified_since) on the `/init` request, since over HTTP the worker's first
 // producer turn runs inside /init and must see the validators before it produces.
 std::vector<uint8_t> SerializeRpcRequest(
-    const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params_batch,
+    const std::string &method_name, const VgiBatchPtr &params_batch,
     const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL,
     const std::vector<std::pair<std::string, std::string>> &extra_metadata = {});
 
@@ -377,7 +384,7 @@ void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientConte
                                     const std::string &url = "", const RpcErrorContext *call = nullptr);
 
 // Move-in overload: adopts the response body string as the owning Arrow buffer
-// (arrow::Buffer::FromString) instead of allocating + memcpying a copy of the
+// (VgiBuffer::FromString) instead of allocating + memcpying a copy of the
 // whole payload. Prefer this whenever the caller owns the body and is done
 // with it — e.g. HttpInvokeUnary handing over the decompressed HTTP response.
 UnaryResponseResult ReadUnaryResponseFromBuffer(std::string &&body,
@@ -407,7 +414,7 @@ BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t 
 // caller already owns the response body as an Arrow buffer (HTTP /init path:
 // wrap the body once, parse the header here, then slice the data section at
 // data_offset — the whole response is materialized exactly once).
-BufferStreamHeaderResult ReadStreamHeaderFromBuffer(std::shared_ptr<arrow::Buffer> buffer,
+BufferStreamHeaderResult ReadStreamHeaderFromBuffer(VgiBufferPtr buffer,
                                                      ClientContext *context,
                                                      const std::string &url = "");
 

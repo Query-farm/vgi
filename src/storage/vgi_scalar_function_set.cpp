@@ -54,17 +54,16 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 		}
 
 		// Check if output type is marked as "any" type (dynamic output type)
-		auto output_field = func_info.output_schema->field(0);
+		auto metadata = func_info.output_schema->field_metadata(0);
 		bool is_any_output = false;
-		if (output_field->HasMetadata()) {
-			auto metadata = output_field->metadata();
-			auto type_idx = metadata->FindKey("vgi:any");
+		if (!metadata.empty()) {
+			auto type_idx = metadata.FindKey("vgi:any");
 			if (type_idx >= 0) {
 				is_any_output = true;
 			}
 			// Also check vgi_type metadata
-			type_idx = metadata->FindKey("vgi_type");
-			if (type_idx >= 0 && metadata->value(type_idx) == "any") {
+			type_idx = metadata.FindKey("vgi_type");
+			if (type_idx >= 0 && metadata.value(type_idx) == "any") {
 				is_any_output = true;
 			}
 		}

@@ -41,7 +41,7 @@ struct OptionSpec {
 };
 
 std::map<std::string, OptionSpec> ResolveOptionSpecs(ClientContext &context,
-                                                      const std::shared_ptr<arrow::Schema> &options_schema) {
+                                                      const VgiSchemaPtr &options_schema) {
 	std::map<std::string, OptionSpec> specs;
 	if (!options_schema || options_schema->num_fields() == 0) {
 		return specs;

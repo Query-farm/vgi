@@ -787,13 +787,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// is the space ``VgiGetPartitionData`` maps the sink's request into.
 	if (scan_partition_kind != vgi::VgiPartitionKind::NotPartitioned && table_info_.arrow_schema) {
 		for (int i = 0; i < table_info_.arrow_schema->num_fields(); ++i) {
-			const auto &field = table_info_.arrow_schema->field(i);
-			const auto &meta = field->metadata();
-			if (!meta) {
-				continue;
-			}
-			int idx = meta->FindKey("vgi.partition_column");
-			if (idx >= 0 && meta->value(idx) == "true") {
+			auto meta = table_info_.arrow_schema->field_metadata(i);
+			auto idx = meta.FindKey("vgi.partition_column");
+			if (idx >= 0 && meta.value(idx) == "true") {
 				scan_bind_data->partition_column_indices.push_back(static_cast<idx_t>(i));
 			}
 		}
