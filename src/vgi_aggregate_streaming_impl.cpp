@@ -45,43 +45,17 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingOpenRequest(
     int64_t order_key_count,
     const std::shared_ptr<arrow::Schema> &output_schema,
     const std::vector<uint8_t> &attach_opaque_data) {
-
-	auto input_schema_bytes = SerializeSchemaBytes(input_schema);
-	auto output_schema_bytes = SerializeSchemaBytes(output_schema);
-
-	arrow::StringBuilder fn_b;
-	arrow::BinaryBuilder args_b, input_schema_b, output_schema_b, settings_b, secrets_b, aid_b;
-	arrow::Int64Builder pkc_b, okc_b;
-
-	ThrowOnArrowError(fn_b.Append(function_name));
-	ThrowOnArrowError(args_b.Append(arguments.data(), arguments.size()));
-	ThrowOnArrowError(input_schema_b.Append(input_schema_bytes.data(), input_schema_bytes.size()));
-	ThrowOnArrowError(pkc_b.Append(partition_key_count));
-	ThrowOnArrowError(okc_b.Append(order_key_count));
-	ThrowOnArrowError(output_schema_b.Append(output_schema_bytes.data(), output_schema_bytes.size()));
-	ThrowOnArrowError(settings_b.AppendNull());
-	ThrowOnArrowError(secrets_b.AppendNull());
-	if (attach_opaque_data.empty()) {
-		ThrowOnArrowError(aid_b.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_a, args_a, is_a, pkc_a, okc_a, os_a, st_a, sc_a, aid_a;
-	ThrowOnArrowError(fn_b.Finish(&fn_a));
-	ThrowOnArrowError(args_b.Finish(&args_a));
-	ThrowOnArrowError(input_schema_b.Finish(&is_a));
-	ThrowOnArrowError(pkc_b.Finish(&pkc_a));
-	ThrowOnArrowError(okc_b.Finish(&okc_a));
-	ThrowOnArrowError(output_schema_b.Finish(&os_a));
-	ThrowOnArrowError(settings_b.Finish(&st_a));
-	ThrowOnArrowError(secrets_b.Finish(&sc_a));
-	ThrowOnArrowError(aid_b.Finish(&aid_a));
-
-	auto request = arrow::RecordBatch::Make(generated::AggregateStreamingOpenRequestSchema(), 1,
-	                                        {fn_a, args_a, is_a, pkc_a, okc_a, os_a, st_a, sc_a, aid_a,
-	                                         BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
-	return generated::BuildAggregateStreamingOpenParams(SerializeToIpcBytes(request));
+	generated::AggregateStreamingOpenRequest request;
+	request.function_name = function_name;
+	request.arguments = arguments;
+	request.input_schema = SerializeSchemaBytes(input_schema);
+	request.partition_key_count = partition_key_count;
+	request.order_key_count = order_key_count;
+	request.output_schema = SerializeSchemaBytes(output_schema);
+	// settings / secrets are not wired through the streaming operator yet.
+	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
+	request.schema_path = OptionalSingleSchemaPath(schema_name);
+	return generated::BuildAggregateStreamingOpenParams(SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
@@ -90,31 +64,13 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
     const std::vector<uint8_t> &execution_id,
     const std::shared_ptr<arrow::RecordBatch> &input_batch,
     const std::vector<uint8_t> &attach_opaque_data) {
-
-	auto batch_bytes = SerializeToIpcBytes(input_batch);
-
-	arrow::StringBuilder fn_b;
-	arrow::BinaryBuilder eid_b, batch_b, aid_b;
-
-	ThrowOnArrowError(fn_b.Append(function_name));
-	ThrowOnArrowError(eid_b.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(batch_b.Append(batch_bytes.data(), batch_bytes.size()));
-	if (attach_opaque_data.empty()) {
-		ThrowOnArrowError(aid_b.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_a, eid_a, batch_a, aid_a;
-	ThrowOnArrowError(fn_b.Finish(&fn_a));
-	ThrowOnArrowError(eid_b.Finish(&eid_a));
-	ThrowOnArrowError(batch_b.Finish(&batch_a));
-	ThrowOnArrowError(aid_b.Finish(&aid_a));
-
-	auto request = arrow::RecordBatch::Make(
-	    generated::AggregateStreamingChunkRequestSchema(), 1,
-	    {fn_a, eid_a, batch_a, aid_a, BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
-	return generated::BuildAggregateStreamingChunkParams(SerializeToIpcBytes(request));
+	generated::AggregateStreamingChunkRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.input_batch = SerializeToIpcBytes(input_batch);
+	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
+	request.schema_path = OptionalSingleSchemaPath(schema_name);
+	return generated::BuildAggregateStreamingChunkParams(SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
@@ -122,27 +78,12 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
     const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data) {
-
-	arrow::StringBuilder fn_b;
-	arrow::BinaryBuilder eid_b, aid_b;
-
-	ThrowOnArrowError(fn_b.Append(function_name));
-	ThrowOnArrowError(eid_b.Append(execution_id.data(), execution_id.size()));
-	if (attach_opaque_data.empty()) {
-		ThrowOnArrowError(aid_b.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_a, eid_a, aid_a;
-	ThrowOnArrowError(fn_b.Finish(&fn_a));
-	ThrowOnArrowError(eid_b.Finish(&eid_a));
-	ThrowOnArrowError(aid_b.Finish(&aid_a));
-
-	auto request = arrow::RecordBatch::Make(
-	    generated::AggregateStreamingCloseRequestSchema(), 1,
-	    {fn_a, eid_a, aid_a, BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
-	return generated::BuildAggregateStreamingCloseParams(SerializeToIpcBytes(request));
+	generated::AggregateStreamingCloseRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
+	request.schema_path = OptionalSingleSchemaPath(schema_name);
+	return generated::BuildAggregateStreamingCloseParams(SerializeRecord(request));
 }
 
 } // anonymous namespace

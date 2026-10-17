@@ -138,44 +138,19 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
     const std::vector<uint8_t> &filter_mask_bytes,
     const std::vector<uint8_t> &frame_stats_bytes,
     const std::vector<uint8_t> &all_valid_bytes) {
-	auto batch_bytes = SerializeToIpcBytes(partition_batch);
-	auto output_schema_bytes = SerializeSchemaBytes(output_schema);
-
-	arrow::StringBuilder fn_b;
-	arrow::BinaryBuilder eid_b, batch_b, os_b, fm_b, fs_b, av_b, aid_b;
-	arrow::Int64Builder pid_b, rc_b;
-
-	ThrowOnArrowError(fn_b.Append(function_name));
-	ThrowOnArrowError(eid_b.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(pid_b.Append(partition_id));
-	ThrowOnArrowError(rc_b.Append(row_count));
-	ThrowOnArrowError(batch_b.Append(batch_bytes.data(), batch_bytes.size()));
-	ThrowOnArrowError(os_b.Append(output_schema_bytes.data(), output_schema_bytes.size()));
-	ThrowOnArrowError(fm_b.Append(filter_mask_bytes.data(), filter_mask_bytes.size()));
-	ThrowOnArrowError(fs_b.Append(frame_stats_bytes.data(), frame_stats_bytes.size()));
-	ThrowOnArrowError(av_b.Append(all_valid_bytes.data(), all_valid_bytes.size()));
-	if (attach_opaque_data.empty()) {
-		ThrowOnArrowError(aid_b.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_a, eid_a, pid_a, rc_a, batch_a, os_a, fm_a, fs_a, av_a, aid_a;
-	ThrowOnArrowError(fn_b.Finish(&fn_a));
-	ThrowOnArrowError(eid_b.Finish(&eid_a));
-	ThrowOnArrowError(pid_b.Finish(&pid_a));
-	ThrowOnArrowError(rc_b.Finish(&rc_a));
-	ThrowOnArrowError(batch_b.Finish(&batch_a));
-	ThrowOnArrowError(os_b.Finish(&os_a));
-	ThrowOnArrowError(fm_b.Finish(&fm_a));
-	ThrowOnArrowError(fs_b.Finish(&fs_a));
-	ThrowOnArrowError(av_b.Finish(&av_a));
-	ThrowOnArrowError(aid_b.Finish(&aid_a));
-
-	auto request = arrow::RecordBatch::Make(generated::AggregateWindowInitRequestSchema(), 1,
-	                                        {fn_a, eid_a, pid_a, rc_a, batch_a, os_a, fm_a, fs_a, av_a, aid_a,
-	                                         BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
-	return generated::BuildAggregateWindowInitParams(SerializeToIpcBytes(request));
+	generated::AggregateWindowInitRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.partition_id = partition_id;
+	request.row_count = row_count;
+	request.partition_batch = SerializeToIpcBytes(partition_batch);
+	request.output_schema = SerializeSchemaBytes(output_schema);
+	request.filter_mask = filter_mask_bytes;
+	request.frame_stats = frame_stats_bytes;
+	request.all_valid = all_valid_bytes;
+	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
+	request.schema_path = OptionalSingleSchemaPath(schema_name);
+	return generated::BuildAggregateWindowInitParams(SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
@@ -183,45 +158,18 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id, int64_t rid,
     const SubFrames &subframes) {
-	arrow::StringBuilder fn_b;
-	arrow::BinaryBuilder eid_b, aid_b;
-	arrow::Int64Builder pid_b, rid_b;
-	auto starts_values = std::make_shared<arrow::Int64Builder>();
-	auto ends_values = std::make_shared<arrow::Int64Builder>();
-	arrow::ListBuilder starts_b(arrow::default_memory_pool(), starts_values);
-	arrow::ListBuilder ends_b(arrow::default_memory_pool(), ends_values);
-
-	ThrowOnArrowError(fn_b.Append(function_name));
-	ThrowOnArrowError(eid_b.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(pid_b.Append(partition_id));
-	ThrowOnArrowError(rid_b.Append(rid));
-
-	ThrowOnArrowError(starts_b.Append());
-	ThrowOnArrowError(ends_b.Append());
+	generated::AggregateWindowRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.partition_id = partition_id;
+	request.rid = rid;
 	for (const auto &fb : subframes) {
-		ThrowOnArrowError(starts_values->Append(static_cast<int64_t>(fb.start)));
-		ThrowOnArrowError(ends_values->Append(static_cast<int64_t>(fb.end)));
+		request.frame_starts.push_back(static_cast<int64_t>(fb.start));
+		request.frame_ends.push_back(static_cast<int64_t>(fb.end));
 	}
-
-	if (attach_opaque_data.empty()) {
-		ThrowOnArrowError(aid_b.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_a, eid_a, pid_a, rid_a, starts_a, ends_a, aid_a;
-	ThrowOnArrowError(fn_b.Finish(&fn_a));
-	ThrowOnArrowError(eid_b.Finish(&eid_a));
-	ThrowOnArrowError(pid_b.Finish(&pid_a));
-	ThrowOnArrowError(rid_b.Finish(&rid_a));
-	ThrowOnArrowError(starts_b.Finish(&starts_a));
-	ThrowOnArrowError(ends_b.Finish(&ends_a));
-	ThrowOnArrowError(aid_b.Finish(&aid_a));
-
-	auto request = arrow::RecordBatch::Make(generated::AggregateWindowRequestSchema(), 1,
-	                                        {fn_a, eid_a, pid_a, rid_a, starts_a, ends_a, aid_a,
-	                                         BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
-	return generated::BuildAggregateWindowParams(SerializeToIpcBytes(request));
+	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
+	request.schema_path = OptionalSingleSchemaPath(schema_name);
+	return generated::BuildAggregateWindowParams(SerializeRecord(request));
 }
 
 // Batched window request — sends all (rid, subframes) tuples for one
@@ -233,84 +181,36 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id,
     const SubFrames *subframes_per_row, idx_t count, idx_t row_idx) {
-	arrow::StringBuilder fn_b;
-	arrow::BinaryBuilder eid_b, aid_b;
-	arrow::Int64Builder pid_b, row_idx_b, count_b;
-	auto fpr_values = std::make_shared<arrow::Int64Builder>();
-	auto starts_values = std::make_shared<arrow::Int64Builder>();
-	auto ends_values = std::make_shared<arrow::Int64Builder>();
-	arrow::ListBuilder fpr_b(arrow::default_memory_pool(), fpr_values);
-	arrow::ListBuilder starts_b(arrow::default_memory_pool(), starts_values);
-	arrow::ListBuilder ends_b(arrow::default_memory_pool(), ends_values);
-
-	ThrowOnArrowError(fn_b.Append(function_name));
-	ThrowOnArrowError(eid_b.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(pid_b.Append(partition_id));
-	ThrowOnArrowError(row_idx_b.Append(static_cast<int64_t>(row_idx)));
-	ThrowOnArrowError(count_b.Append(static_cast<int64_t>(count)));
-
-	ThrowOnArrowError(fpr_b.Append());
-	ThrowOnArrowError(starts_b.Append());
-	ThrowOnArrowError(ends_b.Append());
+	generated::AggregateWindowBatchRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.partition_id = partition_id;
+	request.row_idx = static_cast<int64_t>(row_idx);
+	request.count = static_cast<int64_t>(count);
 	for (idx_t r = 0; r < count; r++) {
 		const auto &subframes = subframes_per_row[r];
-		ThrowOnArrowError(fpr_values->Append(static_cast<int64_t>(subframes.size())));
+		request.frames_per_row.push_back(static_cast<int64_t>(subframes.size()));
 		for (const auto &fb : subframes) {
-			ThrowOnArrowError(starts_values->Append(static_cast<int64_t>(fb.start)));
-			ThrowOnArrowError(ends_values->Append(static_cast<int64_t>(fb.end)));
+			request.frame_starts.push_back(static_cast<int64_t>(fb.start));
+			request.frame_ends.push_back(static_cast<int64_t>(fb.end));
 		}
 	}
-
-	if (attach_opaque_data.empty()) {
-		ThrowOnArrowError(aid_b.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_a, eid_a, pid_a, row_idx_a, count_a, fpr_a, starts_a, ends_a, aid_a;
-	ThrowOnArrowError(fn_b.Finish(&fn_a));
-	ThrowOnArrowError(eid_b.Finish(&eid_a));
-	ThrowOnArrowError(pid_b.Finish(&pid_a));
-	ThrowOnArrowError(row_idx_b.Finish(&row_idx_a));
-	ThrowOnArrowError(count_b.Finish(&count_a));
-	ThrowOnArrowError(fpr_b.Finish(&fpr_a));
-	ThrowOnArrowError(starts_b.Finish(&starts_a));
-	ThrowOnArrowError(ends_b.Finish(&ends_a));
-	ThrowOnArrowError(aid_b.Finish(&aid_a));
-
-	auto request = arrow::RecordBatch::Make(generated::AggregateWindowBatchRequestSchema(), 1,
-	                                        {fn_a, eid_a, pid_a, row_idx_a, count_a, fpr_a, starts_a, ends_a, aid_a,
-	                                         BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
-	return generated::BuildAggregateWindowBatchParams(SerializeToIpcBytes(request));
+	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
+	request.schema_path = OptionalSingleSchemaPath(schema_name);
+	return generated::BuildAggregateWindowBatchParams(SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id) {
-	arrow::StringBuilder fn_b;
-	arrow::BinaryBuilder eid_b, aid_b;
-	arrow::Int64Builder pid_b;
-
-	ThrowOnArrowError(fn_b.Append(function_name));
-	ThrowOnArrowError(eid_b.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(pid_b.Append(partition_id));
-	if (attach_opaque_data.empty()) {
-		ThrowOnArrowError(aid_b.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_a, eid_a, pid_a, aid_a;
-	ThrowOnArrowError(fn_b.Finish(&fn_a));
-	ThrowOnArrowError(eid_b.Finish(&eid_a));
-	ThrowOnArrowError(pid_b.Finish(&pid_a));
-	ThrowOnArrowError(aid_b.Finish(&aid_a));
-
-	auto request = arrow::RecordBatch::Make(
-	    generated::AggregateWindowDestructorRequestSchema(), 1,
-	    {fn_a, eid_a, pid_a, aid_a, BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
-	return generated::BuildAggregateWindowDestructorParams(SerializeToIpcBytes(request));
+	generated::AggregateWindowDestructorRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.partition_id = partition_id;
+	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
+	request.schema_path = OptionalSingleSchemaPath(schema_name);
+	return generated::BuildAggregateWindowDestructorParams(SerializeRecord(request));
 }
 
 } // anonymous namespace

@@ -1811,10 +1811,7 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, c
 	if (!inner || inner->num_rows() == 0) {
 		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_process response missing data", worker_path_, TransportPid(), "");
 	}
-	auto col = inner->GetColumnByName("state_id");
-	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
-	auto view = bin_array->GetView(0);
-	return std::vector<uint8_t>(view.data(), view.data() + view.size());
+	return vgi::generated::Decode<vgi::generated::TableBufferingProcessResult>(inner, 0, worker_path_).state_id;
 }
 
 std::vector<std::vector<uint8_t>>
@@ -1833,18 +1830,7 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name, c
 	if (!inner || inner->num_rows() == 0) {
 		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_combine response missing data", worker_path_, TransportPid(), "");
 	}
-	auto col = inner->GetColumnByName("finalize_state_ids");
-	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
-	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
-	auto offset = list_array->value_offset(0);
-	auto length = list_array->value_length(0);
-	std::vector<std::vector<uint8_t>> result;
-	result.reserve(length);
-	for (int64_t i = 0; i < length; ++i) {
-		auto v = values->GetView(offset + i);
-		result.emplace_back(v.data(), v.data() + v.size());
-	}
-	return result;
+	return vgi::generated::Decode<vgi::generated::TableBufferingCombineResult>(inner, 0, worker_path_).finalize_state_ids;
 }
 
 void FunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,

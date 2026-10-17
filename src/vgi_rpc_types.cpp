@@ -841,14 +841,6 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::sh
 
 namespace {
 
-std::optional<generated::Bytes> BytesOrNull(const std::vector<uint8_t> &bytes) {
-	return bytes.empty() ? std::nullopt : std::make_optional(bytes);
-}
-
-std::optional<std::string> StringOrNull(const std::string &value) {
-	return value.empty() ? std::nullopt : std::make_optional(value);
-}
-
 std::optional<int64_t> NonNegativeOrNull(int64_t value) {
 	return value < 0 ? std::nullopt : std::make_optional(value);
 }

@@ -823,10 +823,7 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 		                      .Rpc("table_buffering_process"),
 		                  "table_buffering_process response missing data [url: %s]", base_url_);
 	}
-	auto col = inner->GetColumnByName("state_id");
-	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
-	auto view = bin_array->GetView(0);
-	return std::vector<uint8_t>(view.data(), view.data() + view.size());
+	return vgi::generated::Decode<vgi::generated::TableBufferingProcessResult>(inner, 0, base_url_).state_id;
 }
 
 std::vector<std::vector<uint8_t>>
@@ -853,18 +850,7 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 		                      .Rpc("table_buffering_combine"),
 		                  "table_buffering_combine response missing data [url: %s]", base_url_);
 	}
-	auto col = inner->GetColumnByName("finalize_state_ids");
-	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
-	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
-	auto offset = list_array->value_offset(0);
-	auto length = list_array->value_length(0);
-	std::vector<std::vector<uint8_t>> result;
-	result.reserve(length);
-	for (int64_t i = 0; i < length; ++i) {
-		auto v = values->GetView(offset + i);
-		result.emplace_back(v.data(), v.data() + v.size());
-	}
-	return result;
+	return vgi::generated::Decode<vgi::generated::TableBufferingCombineResult>(inner, 0, base_url_).finalize_state_ids;
 }
 
 void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,

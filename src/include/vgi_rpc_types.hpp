@@ -66,6 +66,14 @@ std::shared_ptr<arrow::RecordBatch> UnwrapResultEnvelope(const std::shared_ptr<a
                                                          WorkerBatchValidation validation = WorkerBatchValidation::FULL,
                                                          std::shared_ptr<arrow::KeyValueMetadata> *custom_metadata = nullptr);
 
+// The callers' "empty means absent" convention, for nullable record members.
+inline std::optional<std::vector<uint8_t>> BytesOrNull(const std::vector<uint8_t> &bytes) {
+	return bytes.empty() ? std::nullopt : std::make_optional(bytes);
+}
+inline std::optional<std::string> StringOrNull(const std::string &value) {
+	return value.empty() ? std::nullopt : std::make_optional(value);
+}
+
 // A generated protocol record carried as an IPC blob (the "dataclass-as-binary"
 // pattern: list<binary> items, nested specs). Protocol errors name `worker_path`.
 template <class T>

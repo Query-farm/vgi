@@ -84,19 +84,16 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	auto secrets = vgi::ExtractVgiSecrets(context, required_secrets);
 	auto secrets_ipc_bytes = vgi::BuildSecretsBatch(context, secrets);
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateBindRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(arguments_bytes),
-	                                 vgi::MakeSingleBinaryArray(schema_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(settings_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(secrets_ipc_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                                 vgi::BuildNullableStringListScalar(argument_names),
-	                             });
-	return vgi::generated::BuildAggregateBindParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateBindRequest request;
+	request.function_name = function_name;
+	request.arguments = std::move(arguments_bytes);
+	request.input_schema = std::move(schema_bytes);
+	request.settings = vgi::BytesOrNull(settings_bytes);
+	request.secrets = vgi::BytesOrNull(secrets_ipc_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	request.argument_names = argument_names;
+	return vgi::generated::BuildAggregateBindParams(vgi::SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
@@ -107,16 +104,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
 
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateUpdateRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(execution_id),
-	                                 vgi::MakeSingleBinaryArray(batch_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                             });
-	return vgi::generated::BuildAggregateUpdateParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateUpdateRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.input_batch = std::move(batch_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	return vgi::generated::BuildAggregateUpdateParams(vgi::SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
@@ -127,16 +121,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
 
 	auto batch_bytes = vgi::SerializeToIpcBytes(merge_batch);
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateCombineRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(execution_id),
-	                                 vgi::MakeSingleBinaryArray(batch_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                             });
-	return vgi::generated::BuildAggregateCombineParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateCombineRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.merge_batch = std::move(batch_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	return vgi::generated::BuildAggregateCombineParams(vgi::SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
@@ -152,17 +143,14 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 	auto &os_buf = os_buf_result.ValueUnsafe();
 	auto schema_bytes = std::vector<uint8_t>(os_buf->data(), os_buf->data() + os_buf->size());
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateFinalizeRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(execution_id),
-	                                 vgi::MakeSingleBinaryArray(gid_bytes),
-	                                 vgi::MakeSingleBinaryArray(schema_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                             });
-	return vgi::generated::BuildAggregateFinalizeParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateFinalizeRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.group_ids_batch = std::move(gid_bytes);
+	request.output_schema = std::move(schema_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	return vgi::generated::BuildAggregateFinalizeParams(vgi::SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
@@ -173,16 +161,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
 
 	auto gid_bytes = vgi::SerializeToIpcBytes(group_ids_batch);
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateDestructorRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(execution_id),
-	                                 vgi::MakeSingleBinaryArray(gid_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                             });
-	return vgi::generated::BuildAggregateDestructorParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateDestructorRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.group_ids_batch = std::move(gid_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	return vgi::generated::BuildAggregateDestructorParams(vgi::SerializeRecord(request));
 }
 
 } // anonymous namespace
