@@ -322,6 +322,8 @@ src/vgi_arrow_ipc.cpp
 src/vgi_arrow_utils.cpp
 src/vgi_rpc_client.cpp
 src/vgi_rpc_types.cpp
+src/vgi_wire_codec.cpp
+src/generated/vgi_protocol_records.cpp
 src/vgi_schema_registry.cpp
 src/vgi_stderr_drainer.cpp
 src/vgi_unary_rpc.cpp
@@ -513,6 +515,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_telemetry.cpp
     test/cpp/test_attach_credentials.cpp
     test/cpp/test_request_schema_parity.cpp
+    test/cpp/test_protocol_records.cpp
     test/cpp/test_protocol_routing.cpp
     test/cpp/test_hosted_protocols.cpp
     test/cpp/test_sab_stream.cpp
@@ -525,6 +528,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_webworker_function_connection.cpp
     src/vgi_rpc_client.cpp
     src/vgi_rpc_types.cpp
+    src/vgi_wire_codec.cpp
+    src/generated/vgi_protocol_records.cpp
     src/vgi_batch_validation.cpp
     src/vgi_bind_protocol.cpp
     src/vgi_arrow_utils.cpp

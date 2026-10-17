@@ -678,22 +678,8 @@ BindResult FunctionConnection::PerformBindRpc() {
 			throw;
 		}
 
-		if (!response.batch || response.batch->num_rows() == 0) {
-			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Empty bind response from worker", worker_path_, TransportPid(), "");
-		}
-
-		auto result_col = response.batch->GetColumnByName("result");
-		if (!result_col) {
-			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response missing 'result' column", worker_path_, TransportPid(), "");
-		}
-
-		auto bin_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-		if (!bin_array || bin_array->IsNull(0)) {
-			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response 'result' column is null", worker_path_, TransportPid(), "");
-		}
-
-		auto v = bin_array->GetView(0);
-		auto bind_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+		auto bind_batch = UnwrapResultEnvelope(
+		    response.batch, "bind", FunctionInfo(function_name_, function_type_, nullptr).Worker(worker_path_, TransportPid()));
 		ValidateResponseSchema(bind_batch, "bind", worker_path_);
 		return bind_batch;
 	};
@@ -1781,24 +1767,9 @@ namespace {
 std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResult &response,
                                                          const std::string &method_name,
                                                          const std::string &worker_path) {
-	if (!response.batch || response.batch->num_rows() == 0) {
-		ThrowVgiIOException("Empty response from " + method_name, worker_path, -1, "");
-	}
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		ThrowVgiIOException("Response missing 'result' column from " + method_name, worker_path, -1, "");
-	}
-	if (result_col->type()->id() != arrow::Type::BINARY) {
-		ThrowVgiIOException("Response 'result' column has wrong type from " + method_name, worker_path, -1, "");
-	}
-	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-	if (bin->IsNull(0)) {
-		// Empty-schema responses (e.g. table_buffering_destructor) emit null
-		// result; return null so caller can detect and skip column lookup.
-		return nullptr;
-	}
-	auto v = bin->GetView(0);
-	return vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+	// Empty-schema responses (e.g. table_buffering_destructor) emit a null result;
+	// return null so the caller can skip column lookup.
+	return UnwrapResultEnvelope(response.batch, method_name, ErrorInfo().Worker(worker_path), /*null_result_ok=*/true);
 }
 
 } // namespace

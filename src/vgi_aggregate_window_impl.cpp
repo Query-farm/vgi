@@ -24,14 +24,6 @@ namespace vgi {
 
 namespace {
 
-// extra_info for a malformed aggregate window RPC response.
-ErrorInfo AggregateWindowViolation(const VgiAggregateBindData &bind_data, const char *method_name) {
-	return std::move(ErrorInfo(error_subtype::kProtocolViolation)
-	                     .Rpc(method_name)
-	                     .Function(bind_data.function_name, "AGGREGATE")
-	                     .Worker(bind_data.attach_params->worker_path()));
-}
-
 void ThrowOnArrowError(const arrow::Status &status) {
 	if (!status.ok()) {
 		throw IOException("Arrow error in VGI aggregate window: %s", status.ToString());
@@ -401,40 +393,11 @@ void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartiti
 	    global->partition_id, static_cast<int64_t>(rid), subframes);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_window", request);
-
-	if (!rpc_result.response_batch || rpc_result.response_batch->num_rows() == 0) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window"), "VGI aggregate_window returned empty response for '%s'",
-		                  bind_data.function_name);
-	}
-
-	// Standard vgi_rpc response envelope: {result: binary} wrapping
-	// AggregateWindowResponse{result_batch: binary}.
-	auto response_result_col = rpc_result.response_batch->GetColumnByName("result");
-	if (!response_result_col) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window"), "VGI aggregate_window response missing 'result' column");
-	}
-	auto response_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(response_result_col);
-	if (!response_binary || response_binary->IsNull(0)) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window"), "VGI aggregate_window response has null result");
-	}
-	auto response_view = response_binary->GetView(0);
-	auto response_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(response_view.data()), response_view.size());
-
-	auto rb_col = response_batch->GetColumnByName("result_batch");
-	if (!rb_col) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window"), "VGI aggregate_window response missing 'result_batch' field");
-	}
-	auto rb_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(rb_col);
-	if (!rb_binary || rb_binary->IsNull(0)) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window"), "VGI aggregate_window response has null result_batch");
-	}
-	auto rb_view = rb_binary->GetView(0);
-	auto result_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(), GetWorkerBatchValidation(&context));
+	auto window_result = DecodeAggregateResult<generated::AggregateWindowResult>(rpc_result, bind_data, "aggregate_window");
+	auto result_batch = DeserializeFromIpcBytes(window_result.result_batch, GetWorkerBatchValidation(&context));
 
 	if (!result_batch || result_batch->num_rows() != 1 || result_batch->num_columns() != 1) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window"), "VGI aggregate_window returned invalid one-row result");
+		throw IOException(AggregateViolation(bind_data, "aggregate_window"), "VGI aggregate_window returned invalid one-row result");
 	}
 
 	// Convert the one-row Arrow result to a DuckDB Vector and copy into result[rid].
@@ -490,42 +453,14 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 	    global->partition_id, subframes_per_row, count, row_idx);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_window_batch", request);
-
-	if (!rpc_result.response_batch || rpc_result.response_batch->num_rows() == 0) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window_batch"), "VGI aggregate_window_batch returned empty response for '%s'",
-		                  bind_data.function_name);
-	}
-
-	// Unwrap {result: binary} envelope -> AggregateWindowBatchResponse{result_batch: binary}.
-	auto response_result_col = rpc_result.response_batch->GetColumnByName("result");
-	if (!response_result_col) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window_batch"), "VGI aggregate_window_batch response missing 'result' column");
-	}
-	auto response_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(response_result_col);
-	if (!response_binary || response_binary->IsNull(0)) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window_batch"), "VGI aggregate_window_batch response has null result");
-	}
-	auto response_view = response_binary->GetView(0);
-	auto response_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(response_view.data()), response_view.size());
-
-	auto rb_col = response_batch->GetColumnByName("result_batch");
-	if (!rb_col) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window_batch"), "VGI aggregate_window_batch response missing 'result_batch' field");
-	}
-	auto rb_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(rb_col);
-	if (!rb_binary || rb_binary->IsNull(0)) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window_batch"), "VGI aggregate_window_batch response has null result_batch");
-	}
-	auto rb_view = rb_binary->GetView(0);
-	auto result_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(), GetWorkerBatchValidation(&context));
+	auto window_result = DecodeAggregateResult<generated::AggregateWindowBatchResult>(rpc_result, bind_data, "aggregate_window_batch");
+	auto result_batch = DeserializeFromIpcBytes(window_result.result_batch, GetWorkerBatchValidation(&context));
 
 	if (!result_batch || result_batch->num_columns() != 1) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window_batch"), "VGI aggregate_window_batch returned invalid result");
+		throw IOException(AggregateViolation(bind_data, "aggregate_window_batch"), "VGI aggregate_window_batch returned invalid result");
 	}
 	if (static_cast<idx_t>(result_batch->num_rows()) != count) {
-		throw IOException(AggregateWindowViolation(bind_data, "aggregate_window_batch")
+		throw IOException(AggregateViolation(bind_data, "aggregate_window_batch")
 		                      .ExpectedActual(std::to_string(count) + " rows",
 		                                      std::to_string(result_batch->num_rows()) + " rows"),
 		                  "VGI aggregate_window_batch expected %lld rows, got %lld for '%s'",

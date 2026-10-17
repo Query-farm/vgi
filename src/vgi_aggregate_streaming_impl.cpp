@@ -145,35 +145,6 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
 	return generated::BuildAggregateStreamingCloseParams(SerializeToIpcBytes(request));
 }
 
-// extra_info for a malformed streaming-aggregate RPC response.
-ErrorInfo StreamingViolation(const VgiAggregateBindData &bind_data, const std::string &method) {
-	return std::move(ErrorInfo(error_subtype::kProtocolViolation)
-	                     .Rpc(method)
-	                     .Function(bind_data.function_name, "AGGREGATE")
-	                     .Worker(bind_data.attach_params->worker_path()));
-}
-
-// Standard envelope unwrap: outer {result: binary} wrapping the
-// method-specific response RecordBatch.
-std::shared_ptr<arrow::RecordBatch> UnwrapResponse(
-    const VgiAggregateBindData &bind_data,
-    const std::shared_ptr<arrow::RecordBatch> &response_batch,
-    const std::string &method) {
-	if (!response_batch || response_batch->num_rows() == 0) {
-		throw IOException(StreamingViolation(bind_data, method), "VGI %s returned empty response", method);
-	}
-	auto col = response_batch->GetColumnByName("result");
-	if (!col) {
-		throw IOException(StreamingViolation(bind_data, method), "VGI %s response missing 'result' column", method);
-	}
-	auto bin = std::dynamic_pointer_cast<arrow::BinaryArray>(col);
-	if (!bin || bin->IsNull(0)) {
-		throw IOException(StreamingViolation(bind_data, method), "VGI %s response has null result", method);
-	}
-	auto view = bin->GetView(0);
-	return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
-}
-
 } // anonymous namespace
 
 // ============================================================================
@@ -217,20 +188,11 @@ VgiStreamingSession VgiAggregateStreamingOpen(
 	    bind_data.attach_opaque_data);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_streaming_open", request);
-	auto inner = UnwrapResponse(bind_data, rpc_result.response_batch, "aggregate_streaming_open");
-
-	auto eid_col = inner->GetColumnByName("execution_id");
-	if (!eid_col) {
-		throw IOException(StreamingViolation(bind_data, "aggregate_streaming_open"), "VGI aggregate_streaming_open response missing 'execution_id'");
-	}
-	auto eid_bin = std::dynamic_pointer_cast<arrow::BinaryArray>(eid_col);
-	if (!eid_bin || eid_bin->IsNull(0)) {
-		throw IOException(StreamingViolation(bind_data, "aggregate_streaming_open"), "VGI aggregate_streaming_open returned null execution_id");
-	}
-	auto eid_view = eid_bin->GetView(0);
+	auto open = DecodeAggregateResult<generated::AggregateStreamingOpenResult>(rpc_result, bind_data,
+	                                                                           "aggregate_streaming_open");
 
 	VgiStreamingSession session;
-	session.execution_id.assign(eid_view.data(), eid_view.data() + eid_view.size());
+	session.execution_id = std::move(open.execution_id);
 	session.function_name = bind_data.function_name;
 	session.schema_name = bind_data.schema_name;
 	session.attach_opaque_data = bind_data.attach_opaque_data;
@@ -248,29 +210,19 @@ std::shared_ptr<arrow::RecordBatch> VgiAggregateStreamingChunk(
 	    session.attach_opaque_data);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_streaming_chunk", request);
-	auto inner = UnwrapResponse(bind_data, rpc_result.response_batch, "aggregate_streaming_chunk");
-
-	auto rb_col = inner->GetColumnByName("result_batch");
-	if (!rb_col) {
-		throw IOException(StreamingViolation(bind_data, "aggregate_streaming_chunk"), "VGI aggregate_streaming_chunk response missing 'result_batch'");
-	}
-	auto rb_bin = std::dynamic_pointer_cast<arrow::BinaryArray>(rb_col);
-	if (!rb_bin || rb_bin->IsNull(0)) {
-		throw IOException(StreamingViolation(bind_data, "aggregate_streaming_chunk"), "VGI aggregate_streaming_chunk response has null result_batch");
-	}
-	auto rb_view = rb_bin->GetView(0);
-	auto result_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(), GetWorkerBatchValidation(&context));
+	auto chunk = DecodeAggregateResult<generated::AggregateStreamingChunkResult>(rpc_result, bind_data,
+	                                                                             "aggregate_streaming_chunk");
+	auto result_batch = DeserializeFromIpcBytes(chunk.result_batch, GetWorkerBatchValidation(&context));
 
 	if (!result_batch) {
 		throw IOException(
-		    StreamingViolation(bind_data, "aggregate_streaming_chunk"),
+		    AggregateViolation(bind_data, "aggregate_streaming_chunk"),
 		    "VGI aggregate_streaming_chunk returned no result batch for %lld input rows",
 		    static_cast<long long>(input_batch->num_rows()));
 	}
 	if (result_batch->num_rows() != input_batch->num_rows()) {
 		throw IOException(
-		    StreamingViolation(bind_data, "aggregate_streaming_chunk")
+		    AggregateViolation(bind_data, "aggregate_streaming_chunk")
 		        .ExpectedActual(std::to_string(input_batch->num_rows()) + " rows",
 		                        std::to_string(result_batch->num_rows()) + " rows"),
 		    "VGI aggregate_streaming_chunk returned %lld rows for %lld input rows",

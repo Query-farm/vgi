@@ -450,18 +450,8 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		                             attach_params_ ? attach_params_->iroh() : nullptr,
 		                             &call_error_fields);
 		PublishHarvestedCapabilities(b_caps);
-		if (!resp.batch || resp.batch->num_rows() == 0) {
-			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Empty bind response from HTTP server [url: %s]", base_url_);
-		}
-		auto rcol = resp.batch->GetColumnByName("result");
-		if (!rcol) {
-			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Bind response missing 'result' column [url: %s]", base_url_);
-		}
-		auto bin_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(rcol);
-		if (!bin_arr || bin_arr->IsNull(0)) {
-			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Bind response 'result' column is null [url: %s]", base_url_);
-		}
-		return DeserializeFromIpcBytesZeroCopy(*bin_arr, 0);
+		return UnwrapResultEnvelope(resp.batch, "bind",
+		                            HttpFunctionInfo(nullptr, base_url_, function_name_, function_type_));
 	};
 
 	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
@@ -795,21 +785,9 @@ namespace {
 std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseResult &response,
                                                               const std::string &method_name,
                                                               const std::string &base_url) {
-	if (!response.batch || response.batch->num_rows() == 0) {
-		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Empty response from %s [url: %s]", method_name, base_url);
-	}
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Response missing 'result' column from %s [url: %s]", method_name, base_url);
-	}
-	if (result_col->type()->id() != arrow::Type::BINARY) {
-		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Response 'result' column has wrong type from %s [url: %s]", method_name, base_url);
-	}
-	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-	if (bin->IsNull(0)) {
-		return nullptr;
-	}
-	return vgi::DeserializeFromIpcBytesZeroCopy(*bin, 0);
+	return UnwrapResultEnvelope(response.batch, method_name,
+	                            HttpFunctionInfo(nullptr, base_url, std::string(), std::string()),
+	                            /*null_result_ok=*/true);
 }
 
 } // namespace

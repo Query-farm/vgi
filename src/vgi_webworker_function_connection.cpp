@@ -121,22 +121,7 @@ StreamHeaderResult SabReadStreamHeader(int region_offset, int slot, ClientContex
 std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResult &response,
                                                         const std::string &method_name,
                                                         const std::string &worker_path) {
-	if (!response.batch || response.batch->num_rows() == 0) {
-		ThrowVgiIOException("Empty response from " + method_name, worker_path, -1, "");
-	}
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		ThrowVgiIOException("Response missing 'result' column from " + method_name, worker_path, -1, "");
-	}
-	if (result_col->type()->id() != arrow::Type::BINARY) {
-		ThrowVgiIOException("Response 'result' column has wrong type from " + method_name, worker_path, -1, "");
-	}
-	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-	if (bin->IsNull(0)) {
-		return nullptr;
-	}
-	auto v = bin->GetView(0);
-	return vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+	return UnwrapResultEnvelope(response.batch, method_name, ErrorInfo().Worker(worker_path), /*null_result_ok=*/true);
 }
 
 } // namespace
@@ -713,19 +698,8 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 		}
 
 		auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_);
-		if (!response.batch || response.batch->num_rows() == 0) {
-			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Empty bind response from worker", location_, -1, "");
-		}
-		auto result_col = response.batch->GetColumnByName("result");
-		if (!result_col) {
-			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response missing 'result' column", location_, -1, "");
-		}
-		auto bin_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-		if (!bin_array || bin_array->IsNull(0)) {
-			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response 'result' column is null", location_, -1, "");
-		}
-		auto v = bin_array->GetView(0);
-		auto bind_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+		auto bind_batch = UnwrapResultEnvelope(response.batch, "bind",
+		                                       WebWorkerFunctionInfo(function_name_, function_type_, nullptr).Worker(location_));
 		ValidateResponseSchema(bind_batch, "bind", location_);
 		return bind_batch;
 	};

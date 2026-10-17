@@ -283,19 +283,7 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 
 		auto response = InvokePooledUnaryRpc(opts, "secret_lookup", params);
 
-		if (!response.batch || response.batch->num_rows() == 0) {
-			throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "empty response");
-		}
-		auto result_col = response.batch->GetColumnByName("result");
-		if (!result_col || result_col->type()->id() != arrow::Type::BINARY) {
-			throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "response missing a Binary 'result' column");
-		}
-		auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-		if (binary_array->IsNull(0)) {
-			throw IOException(ErrorInfo(error_subtype::kProtocolViolation), "response 'result' column was null");
-		}
-		auto view = binary_array->GetView(0);
-		auto inner = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
+		auto inner = UnwrapResultEnvelope(response.batch, "secret_lookup", ErrorInfo().Url(endpoint_));
 
 		// Validate against our own schema — the secret protocol deliberately does
 		// NOT enter the shared catalog schema registry.

@@ -479,6 +479,56 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow:
 	return batch;
 }
 
+std::shared_ptr<arrow::RecordBatch> UnwrapResultEnvelope(const std::shared_ptr<arrow::RecordBatch> &envelope,
+                                                         const std::string &method,
+                                                         const std::unordered_map<std::string, std::string> &info,
+                                                         bool null_result_ok, WorkerBatchValidation validation,
+                                                         std::shared_ptr<arrow::KeyValueMetadata> *custom_metadata) {
+	auto violation = [&]() {
+		return ErrorInfo(error_subtype::kProtocolViolation).Merge(info).Rpc(method);
+	};
+	// Name the worker in the message too (it is also in extra_info).
+	auto worker_it = info.find(error_key::kWorkerPath);
+	const std::string where = worker_it == info.end() ? std::string() : " [worker: " + worker_it->second + "]";
+	if (!envelope || envelope->num_rows() == 0) {
+		throw IOException(violation(), "VGI %s returned an empty response%s", method, where);
+	}
+	auto column = envelope->GetColumnByName("result");
+	if (!column) {
+		throw IOException(violation().Set(error_key::kField, "result"), "VGI %s response is missing its 'result' column%s",
+		                  method, where);
+	}
+	// Compare type ids: arrow::StringArray derives from arrow::BinaryArray, so a cast
+	// would accept a utf8 column and feed its bytes to the IPC decoder.
+	if (column->type_id() != arrow::Type::BINARY) {
+		throw IOException(violation().Set(error_key::kField, "result").ExpectedActual("binary", column->type()->ToString()),
+		                  "VGI %s response 'result' column has type %s, expected binary%s", method,
+		                  column->type()->ToString(), where);
+	}
+	const auto &binary = static_cast<const arrow::BinaryArray &>(*column);
+	if (binary.IsNull(0)) {
+		if (null_result_ok) {
+			return nullptr;
+		}
+		throw IOException(violation().Set(error_key::kField, "result"), "VGI %s response has a null 'result'%s", method, where);
+	}
+	try {
+		if (custom_metadata) {
+			auto view = binary.GetView(0);
+			auto decoded = DeserializeFromIpcBytesWithMetadata(reinterpret_cast<const uint8_t *>(view.data()),
+			                                                   view.size(), validation);
+			*custom_metadata = std::move(decoded.custom_metadata);
+			return std::move(decoded.batch);
+		}
+		return DeserializeFromIpcBytesZeroCopy(binary, 0, validation);
+	} catch (const std::exception &e) {
+		throw IOException(violation().Merge(ExtraInfoOf(e)),
+		                  "VGI %s response could not be decoded%s: %s. The worker likely returned a malformed or "
+		                  "out-of-date response shape for this method.",
+		                  method, where, RawMessageOf(e));
+	}
+}
+
 DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len,
                                                       WorkerBatchValidation validation) {
 	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));

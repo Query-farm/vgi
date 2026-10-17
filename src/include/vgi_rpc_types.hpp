@@ -9,10 +9,12 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "vgi_batch_validation.hpp"
+#include "../generated/vgi_protocol_records.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -49,6 +51,34 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data,
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow::BinaryArray &bin,
                                                                      int64_t index,
                                                                      WorkerBatchValidation validation = WorkerBatchValidation::FULL);
+
+// The inner batch of a unary response envelope: a one-row ``{result: binary}``
+// batch whose cell is the IPC-serialized method result. Decoded zero-copy and
+// validated at `validation`. A missing envelope, a missing/non-binary `result`
+// column or an undecodable payload is a protocol error carrying `info` (plus
+// the RPC name); a NULL `result` is too, unless `null_result_ok` (methods whose
+// result is empty), in which case nullptr is returned. `custom_metadata`, when
+// given, receives the inner batch message's custom metadata.
+std::shared_ptr<arrow::RecordBatch> UnwrapResultEnvelope(const std::shared_ptr<arrow::RecordBatch> &envelope,
+                                                         const std::string &method,
+                                                         const std::unordered_map<std::string, std::string> &info,
+                                                         bool null_result_ok = false,
+                                                         WorkerBatchValidation validation = WorkerBatchValidation::FULL,
+                                                         std::shared_ptr<arrow::KeyValueMetadata> *custom_metadata = nullptr);
+
+// A generated protocol record carried as an IPC blob (the "dataclass-as-binary"
+// pattern: list<binary> items, nested specs). Protocol errors name `worker_path`.
+template <class T>
+T DecodeIpcRecord(const std::vector<uint8_t> &bytes, const std::string &worker_path,
+                  WorkerBatchValidation validation = WorkerBatchValidation::FULL) {
+	return generated::Decode<T>(DeserializeFromIpcBytes(bytes, validation), 0, worker_path);
+}
+
+// A generated protocol record as an IPC blob (the inverse of DecodeIpcRecord).
+template <class T>
+std::vector<uint8_t> SerializeRecord(const T &value) {
+	return SerializeToIpcBytes(generated::ToBatch(value));
+}
 
 // Deserialized batch with optional custom metadata from the IPC message.
 struct DeserializedBatch {
