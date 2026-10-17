@@ -2010,7 +2010,7 @@ static AggregateDistinctDependent FromWire(generated::AggregateDistinctDependent
 }
 
 // ============================================================================
-// Result parsing using RecordBatchSingleRow
+// Result parsing
 // ============================================================================
 
 // Helper to extract a single value from an Arrow array at given row index

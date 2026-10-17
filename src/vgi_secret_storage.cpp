@@ -293,27 +293,22 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 			                  generated::SecretLookupResultSchema()->ToString(), inner->schema()->ToString());
 		}
 
-		RecordBatchSingleRow row(inner, 0, "SecretLookupResponse", endpoint_);
+		auto wire = generated::Decode<generated::SecretLookupResult>(inner, 0, endpoint_);
 		FetchResult fr;
-		fr.found = row["found"].value_not_null<bool>();
-		fr.ttl_seconds = row["ttl_seconds"].value_or(static_cast<int64_t>(0));
-		fr.expires_at_unix = row["expires_at_unix"].value_or(static_cast<int64_t>(0));
-
+		fr.found = wire.found;
+		fr.ttl_seconds = wire.ttl_seconds;
+		fr.expires_at_unix = wire.expires_at_unix;
 		if (fr.found) {
-			auto provider = row["provider"].value_or(std::string("orchard"));
-			auto name = row["name"].value_or(std::string(""));
-			auto scope = row["scope"].value_or(std::vector<std::string> {});
-			auto redact = row["redact_keys"].value_or(std::vector<std::string> {});
+			auto provider = wire.provider.empty() ? std::string("orchard") : std::move(wire.provider);
 			// `values` is the one-row RecordBatch (IPC bytes) of typed key→value
-			// columns; empty when the worker shipped no values.
+			// columns; absent when the worker shipped no values.
 			std::shared_ptr<arrow::RecordBatch> values_batch;
-			auto values_bytes = row["values"].value_or(std::vector<uint8_t> {});
-			if (!values_bytes.empty()) {
-				values_batch = DeserializeFromIpcBytes(values_bytes.data(), values_bytes.size());
+			if (wire.values && !wire.values->empty()) {
+				values_batch = DeserializeFromIpcBytes(*wire.values);
 			}
 			// Synthesize with the REQUESTED type so KeyValueSecretReader's probe
 			// (which breaks on first type match without re-checking) lines up.
-			fr.secret = Synthesize(*ctx, type, provider, name, scope, values_batch, redact);
+			fr.secret = Synthesize(*ctx, type, provider, wire.name, wire.scope, values_batch, wire.redact_keys);
 		}
 
 		const double duration_ms =
