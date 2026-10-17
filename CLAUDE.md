@@ -189,7 +189,9 @@ plus `AllMethodSchemas()`, the per-method schema table the schema registry is bu
 codecs call the runtime in `vgi_wire_codec.{hpp,cpp}` — the only code that touches Arrow arrays
 for protocol records. Decoding is by column name: a missing nullable column is absent; a missing
 or null required column, a wrongly typed column, an unknown enum value or a repeated map key is a
-protocol error. Use `DecodeIpcRecord<T>` / `SerializeRecord` for records carried as IPC blobs and
+protocol error — except that, for compatibility with SDKs that send them, a null non-nullable
+list/map reads as empty and a null list item as a default value, and `function_type` /
+`macro_type` also accept the lower-case spellings vgi-go/-rust/-java send. Use `DecodeIpcRecord<T>` / `SerializeRecord` for records carried as IPC blobs and
 `UnwrapResultEnvelope` for a unary `{result: binary}` response — never read a protocol column by
 hand. Deliberately hand-written: the zero-copy plan-page and `catalog_contents` decoders, and the
 attach-ticket / Identity / Reflection protocols.

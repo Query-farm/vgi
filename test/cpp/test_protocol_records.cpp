@@ -177,10 +177,10 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 	}
 
 	SECTION("a missing required column names the column, record and worker") {
-		auto idx = full->schema()->GetFieldIndex("path");
+		auto idx = full->schema()->GetFieldIndex("attach_opaque_data");
 		auto batch = full->RemoveColumn(idx).ValueOrDie();
 		auto msg = ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "the-worker"); });
-		CHECK(msg.find("Required column 'path' not found in SchemaInfo response") != std::string::npos);
+		CHECK(msg.find("Required column 'attach_opaque_data' not found in SchemaInfo response") != std::string::npos);
 		CHECK(msg.find("the-worker") != std::string::npos);
 	}
 
@@ -191,6 +191,31 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 		auto batch = full->SetColumn(idx, field, nulls).ValueOrDie();
 		auto msg = ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "w"); });
 		CHECK(msg.find("unexpected null value") != std::string::npos);
+	}
+
+	SECTION("a null non-nullable list or map reads as empty; a null list item as a default") {
+		auto path_idx = full->schema()->GetFieldIndex("path");
+		auto null_list = arrow::MakeArrayOfNull(arrow::list(arrow::utf8()), 1).ValueOrDie();
+		auto batch =
+		    full->SetColumn(path_idx, arrow::field("path", arrow::list(arrow::utf8()), true), null_list).ValueOrDie();
+		auto tags_idx = batch->schema()->GetFieldIndex("tags");
+		auto null_map = arrow::MakeArrayOfNull(arrow::map(arrow::utf8(), arrow::utf8()), 1).ValueOrDie();
+		batch = batch->SetColumn(tags_idx, arrow::field("tags", arrow::map(arrow::utf8(), arrow::utf8()), true),
+		                         null_map)
+		            .ValueOrDie();
+		auto decoded = Decode<SchemaInfo>(batch, 0, "w");
+		CHECK(decoded.path.empty());
+		CHECK(decoded.tags.empty());
+
+		arrow::StringBuilder items;
+		REQUIRE(items.Append("a").ok());
+		REQUIRE(items.AppendNull().ok());
+		auto values = items.Finish().ValueOrDie();
+		arrow::Int32Builder offsets;
+		REQUIRE(offsets.AppendValues({0, 2}).ok());
+		auto list = arrow::ListArray::FromArrays(*offsets.Finish().ValueOrDie(), *values).ValueOrDie();
+		auto with_null_item = full->SetColumn(path_idx, full->schema()->field(path_idx), list).ValueOrDie();
+		CHECK(Decode<SchemaInfo>(with_null_item, 0, "w").path == std::vector<std::string> {"a", ""});
 	}
 
 	SECTION("a column of the wrong type is an error, not a silent default") {
