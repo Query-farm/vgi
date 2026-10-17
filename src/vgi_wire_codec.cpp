@@ -52,10 +52,12 @@ void ThrowType(const Ctx &ctx, const arrow::DataType &actual, const char *expect
 }
 
 void ThrowBadEnum(const Ctx &ctx, const char *enum_name, const std::string &value) {
+	// "unknown <field> '<value>'": the field is what a reader recognizes.
+	auto leaf = ctx.field.substr(ctx.field.find_last_of('.') + 1);
 	throw InvalidInputException(
 	    ProtocolInfo(ctx).Set(error_key::kActual, value),
-	    StringUtil::Format("VGI protocol error: Column '%s' in %s response from worker '%s' has unknown %s value '%s'",
-	                       ctx.field, ctx.record, WorkerOf(ctx), enum_name, value));
+	    StringUtil::Format("VGI protocol error: worker '%s' returned unknown %s '%s' in %s (not a %s value)",
+	                       WorkerOf(ctx), leaf, value, ctx.record, enum_name));
 }
 
 void ThrowDuplicateKey(const Ctx &ctx) {

@@ -430,9 +430,6 @@ enum class VgiFunctionType {
 	Aggregate       // Aggregate function: many inputs → one output
 };
 
-// Parse VgiFunctionType from wire format string
-// Returns nullopt for unrecognized values
-std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value);
 
 // Convert VgiFunctionType to string for error messages
 std::string VgiFunctionTypeToString(VgiFunctionType type);
@@ -449,9 +446,6 @@ enum class VgiOrderPreservation {
 	FixedOrder         // Output is in a fixed mandatory order; DuckDB serializes
 };
 
-// Parse VgiOrderPreservation from wire format string
-// Returns nullopt for unrecognized values
-std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string &value);
 
 // Partition shape declared by a table function over its
 // vgi.partition_column-annotated bind-schema fields. Mirrors DuckDB's
@@ -473,10 +467,6 @@ enum class VgiPartitionKind {
 	DisjointPartitions,
 };
 
-// Parse VgiPartitionKind from wire format string. Returns nullopt for
-// unrecognized values (treated as NotPartitioned by callers, matching
-// older-worker compatibility).
-std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value);
 
 // Scalar-function monotonicity in one argument while all other arguments are
 // held constant. This VGI-owned enum deliberately avoids DuckDB 2.0 headers so

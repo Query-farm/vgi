@@ -212,7 +212,7 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 		                  .ValueOrDie();
 		auto changed = batch->SetColumn(idx, batch->schema()->field(idx), column).ValueOrDie();
 		auto msg = ErrorOf([&] { Decode<InitRequest>(changed, 0, "w"); });
-		CHECK(msg.find("unknown VgiInitPhase value 'SOMETHING_NEW'") != std::string::npos);
+		CHECK(msg.find("unknown phase 'SOMETHING_NEW' in InitRequest (not a VgiInitPhase value)") != std::string::npos);
 	}
 
 	SECTION("a row outside the batch is an error") {

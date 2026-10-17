@@ -1939,20 +1939,6 @@ static T RequireKnownEnum(std::optional<T> parsed, const std::string &raw, const
 	return *parsed;
 }
 
-std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value) {
-	if (value == "scalar" || value == "SCALAR") {
-		return VgiFunctionType::Scalar;
-	} else if (value == "table" || value == "TABLE" || value == "table_in_out") {
-		// Both "table" and the legacy "table_in_out" map to streaming Table.
-		return VgiFunctionType::Table;
-	} else if (value == "table_buffering" || value == "TABLE_BUFFERING") {
-		return VgiFunctionType::TableBuffering;
-	} else if (value == "aggregate" || value == "AGGREGATE") {
-		return VgiFunctionType::Aggregate;
-	}
-	return std::nullopt;
-}
-
 std::string VgiFunctionTypeToString(VgiFunctionType type) {
 	switch (type) {
 	case VgiFunctionType::Scalar:
@@ -1966,30 +1952,6 @@ std::string VgiFunctionTypeToString(VgiFunctionType type) {
 	default:
 		return "unknown";
 	}
-}
-
-// Parse FunctionStability from wire format (Python enum .name)
-// Wire format: "CONSISTENT", "VOLATILE", "CONSISTENT_WITHIN_QUERY"
-static std::optional<FunctionStability> ParseFunctionStability(const std::string &value) {
-	if (value == "CONSISTENT") {
-		return FunctionStability::CONSISTENT;
-	} else if (value == "VOLATILE") {
-		return FunctionStability::VOLATILE;
-	} else if (value == "CONSISTENT_WITHIN_QUERY") {
-		return FunctionStability::CONSISTENT_WITHIN_QUERY;
-	}
-	return std::nullopt;
-}
-
-// Parse FunctionNullHandling from wire format (Python enum .name)
-// Wire format: "DEFAULT", "SPECIAL"
-static std::optional<FunctionNullHandling> ParseFunctionNullHandling(const std::string &value) {
-	if (value == "DEFAULT") {
-		return FunctionNullHandling::DEFAULT_NULL_HANDLING;
-	} else if (value == "SPECIAL") {
-		return FunctionNullHandling::SPECIAL_HANDLING;
-	}
-	return std::nullopt;
 }
 
 std::optional<VgiArgumentMonotonicity> ParseVgiArgumentMonotonicity(const std::string &value) {
@@ -2009,52 +1971,79 @@ std::optional<VgiArgumentMonotonicity> ParseVgiArgumentMonotonicity(const std::s
 	return std::nullopt;
 }
 
-std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string &value) {
-	if (value == "PRESERVES_ORDER") {
+// Protocol enums (generated, wire order) to the extension's / DuckDB's enums.
+static VgiFunctionType FromWire(generated::FunctionType v) {
+	switch (v) {
+	case generated::FunctionType::Scalar:
+		return VgiFunctionType::Scalar;
+	case generated::FunctionType::Table:
+		return VgiFunctionType::Table;
+	case generated::FunctionType::TableBuffering:
+		return VgiFunctionType::TableBuffering;
+	case generated::FunctionType::Aggregate:
+		return VgiFunctionType::Aggregate;
+	}
+	throw InternalException("unhandled FunctionType");
+}
+
+static FunctionStability FromWire(generated::FunctionStability v) {
+	switch (v) {
+	case generated::FunctionStability::Consistent:
+		return FunctionStability::CONSISTENT;
+	case generated::FunctionStability::Volatile:
+		return FunctionStability::VOLATILE;
+	case generated::FunctionStability::ConsistentWithinQuery:
+		return FunctionStability::CONSISTENT_WITHIN_QUERY;
+	}
+	throw InternalException("unhandled FunctionStability");
+}
+
+static FunctionNullHandling FromWire(generated::FunctionNullHandling v) {
+	switch (v) {
+	case generated::FunctionNullHandling::Default:
+		return FunctionNullHandling::DEFAULT_NULL_HANDLING;
+	case generated::FunctionNullHandling::Special:
+		return FunctionNullHandling::SPECIAL_HANDLING;
+	}
+	throw InternalException("unhandled FunctionNullHandling");
+}
+
+static VgiOrderPreservation FromWire(generated::VgiOrderPreservation v) {
+	switch (v) {
+	case generated::VgiOrderPreservation::PreservesOrder:
 		return VgiOrderPreservation::PreservesOrder;
-	} else if (value == "NO_ORDER_GUARANTEE") {
+	case generated::VgiOrderPreservation::NoOrderGuarantee:
 		return VgiOrderPreservation::NoOrderGuarantee;
-	} else if (value == "FIXED_ORDER") {
+	case generated::VgiOrderPreservation::FixedOrder:
 		return VgiOrderPreservation::FixedOrder;
 	}
-	return std::nullopt;
+	throw InternalException("unhandled VgiOrderPreservation");
 }
 
-std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value) {
-	if (value == "NOT_PARTITIONED") {
+static VgiPartitionKind FromWire(generated::VgiPartitionKind v) {
+	switch (v) {
+	case generated::VgiPartitionKind::NotPartitioned:
 		return VgiPartitionKind::NotPartitioned;
-	} else if (value == "SINGLE_VALUE_PARTITIONS") {
+	case generated::VgiPartitionKind::SingleValuePartitions:
 		return VgiPartitionKind::SingleValuePartitions;
-	} else if (value == "OVERLAPPING_PARTITIONS") {
+	case generated::VgiPartitionKind::OverlappingPartitions:
 		return VgiPartitionKind::OverlappingPartitions;
-	} else if (value == "DISJOINT_PARTITIONS") {
+	case generated::VgiPartitionKind::DisjointPartitions:
 		return VgiPartitionKind::DisjointPartitions;
 	}
-	return std::nullopt;
+	throw InternalException("unhandled VgiPartitionKind");
 }
 
-// Parse AggregateOrderDependent from wire format (Python enum .name)
-// Wire format: "ORDER_DEPENDENT", "NOT_ORDER_DEPENDENT"
-static std::optional<AggregateOrderDependent> ParseAggregateOrderDependent(const std::string &value) {
-	if (value == "ORDER_DEPENDENT") {
-		return AggregateOrderDependent::ORDER_DEPENDENT;
-	} else if (value == "NOT_ORDER_DEPENDENT") {
-		return AggregateOrderDependent::NOT_ORDER_DEPENDENT;
-	}
-	return std::nullopt;
+static AggregateOrderDependent FromWire(generated::AggregateOrderDependent v) {
+	return v == generated::AggregateOrderDependent::OrderDependent ? AggregateOrderDependent::ORDER_DEPENDENT
+	                                                               : AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 }
 
-// Parse AggregateDistinctDependent from wire format (Python enum .name)
-// Wire format: "DISTINCT_DEPENDENT", "NOT_DISTINCT_DEPENDENT"
-static std::optional<AggregateDistinctDependent> ParseAggregateDistinctDependent(const std::string &value) {
-	if (value == "DISTINCT_DEPENDENT") {
-		return AggregateDistinctDependent::DISTINCT_DEPENDENT;
-	} else if (value == "NOT_DISTINCT_DEPENDENT") {
-		return AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
-	}
-	return std::nullopt;
+static AggregateDistinctDependent FromWire(generated::AggregateDistinctDependent v) {
+	return v == generated::AggregateDistinctDependent::DistinctDependent
+	           ? AggregateDistinctDependent::DISTINCT_DEPENDENT
+	           : AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
 }
-
 
 // ============================================================================
 // Result parsing using RecordBatchSingleRow
@@ -2942,121 +2931,38 @@ static ErrorInfo FunctionInfoViolation(const std::string &worker_path, const std
 
 VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
                                   const std::string &worker_path) {
+	auto wire = generated::Decode<generated::FunctionInfo>(batch, row_idx, worker_path);
 	VgiFunctionInfo info;
-
-	if (!batch || batch->num_rows() == 0) {
-		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from function_get");
+	info.name = std::move(wire.name);
+	info.schema_name = SchemaNameFromPath(wire.schema_path, "FunctionInfo.schema_path");
+	info.tags = std::move(wire.tags);
+	info.function_type = FromWire(wire.function_type);
+	info.description = std::move(wire.description);
+	// Nullable on the wire; empty == unset, the convention tables/views use.
+	info.comment = wire.comment.value_or("");
+	// Nullable enums: absent leaves the default.
+	if (wire.stability) {
+		info.stability = FromWire(*wire.stability);
+	}
+	if (wire.null_handling) {
+		info.null_handling = FromWire(*wire.null_handling);
+	}
+	if (wire.order_preservation) {
+		info.order_preservation = FromWire(*wire.order_preservation);
 	}
 
-	if (row_idx >= batch->num_rows()) {
-		throw IOException("Row index %lld out of range (batch has %lld rows)", row_idx, batch->num_rows());
+	// Documentation: the SQL of each example, plus categories.
+	for (auto &example : wire.examples) {
+		info.examples.push_back(std::move(example.sql));
+	}
+	info.categories = std::move(wire.categories);
+
+	// `arguments` / `output_schema` are serialized Arrow schemas.
+	if (!wire.arguments.empty()) {
+		info.arguments_schema = DeserializeSchema(wire.arguments);
 	}
 
-	RecordBatchSingleRow row(batch, row_idx, "FunctionInfo", worker_path);
-
-	// Required fields (non-nullable per protocol)
-	info.name = row["name"].value_not_null<std::string>();
-	info.schema_name =
-	    SchemaNameFromPath(row["schema_path"].value_not_null<std::vector<std::string>>(), "FunctionInfo.schema_path");
-	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
-
-	// Parse function_type as enum (required, non-nullable)
-	auto function_type_str = row["function_type"].value_not_null<std::string>();
-	info.function_type = RequireKnownEnum(ParseVgiFunctionType(function_type_str), function_type_str, "function_type",
-	                                      worker_path, info.name);
-
-	// Optional string field for description
-	info.description = row["description"].value_or("");
-
-	// Optional string field for comment (nullable on the wire — no worker sets
-	// it yet unless it declares Meta.comment; empty == unset, same convention
-	// tables/views use).
-	info.comment = row["comment"].value_or("");
-
-	// Parse optional enum fields (nullable per protocol). A missing field is
-	// legitimate ("leave default"); a present-but-unrecognized string throws.
-	auto stability_str = row["stability"].as<std::string>();
-	if (stability_str) {
-		info.stability = RequireKnownEnum(ParseFunctionStability(*stability_str), *stability_str, "stability",
-		                                  worker_path, info.name);
-	}
-
-	auto null_handling_str = row["null_handling"].as<std::string>();
-	if (null_handling_str) {
-		info.null_handling = RequireKnownEnum(ParseFunctionNullHandling(*null_handling_str), *null_handling_str,
-		                                      "null_handling", worker_path, info.name);
-	}
-
-	auto order_preservation_str = row["order_preservation"].as<std::string>();
-	if (order_preservation_str) {
-		info.order_preservation = RequireKnownEnum(ParseVgiOrderPreservation(*order_preservation_str),
-		                                           *order_preservation_str, "order_preservation", worker_path,
-		                                           info.name);
-	}
-
-	// Documentation fields
-	// examples is a list of structs with {sql, description, expected_output} - extract sql strings.
-	// Some Arrow producers (depending on version / language binding) emit
-	// LargeListArray instead of ListArray; handle both so a wire-format
-	// drift doesn't silently drop the examples list.
-	auto examples_col = batch->GetColumnByName("examples");
-	auto extract_examples = [&](auto list_array) {
-		if (!list_array || list_array->IsNull(row_idx)) {
-			return;
-		}
-		auto start = list_array->value_offset(row_idx);
-		auto end = list_array->value_offset(row_idx + 1);
-		auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-		if (!struct_array) {
-			return;
-		}
-		auto sql_field = struct_array->GetFieldByName("sql");
-		auto sql_array = std::dynamic_pointer_cast<arrow::StringArray>(sql_field);
-		if (!sql_array) {
-			return;
-		}
-		for (auto i = start; i < end; i++) {
-			if (!sql_array->IsNull(i)) {
-				info.examples.push_back(sql_array->GetString(i));
-			}
-		}
-	};
-	if (examples_col) {
-		if (auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(examples_col)) {
-			extract_examples(list_array);
-		} else if (auto large_list_array =
-		               std::dynamic_pointer_cast<arrow::LargeListArray>(examples_col)) {
-			extract_examples(large_list_array);
-		}
-	}
-	// categories is a simple list of strings
-	info.categories = row["categories"].value_or(std::vector<std::string> {});
-
-	// Parse the arguments field which contains a serialized Arrow schema (non-nullable)
-	auto args_data = row["arguments"].value_not_null<std::vector<uint8_t>>();
-	if (!args_data.empty()) {
-		info.arguments_schema = DeserializeSchema(args_data);
-	}
-
-	std::optional<std::vector<std::string>> argument_monotonicity;
-	auto argument_monotonicity_column = batch->GetColumnByName("argument_monotonicity");
-	if (argument_monotonicity_column && !argument_monotonicity_column->IsNull(row_idx)) {
-		auto list = std::dynamic_pointer_cast<arrow::ListArray>(argument_monotonicity_column);
-		auto values = list ? std::dynamic_pointer_cast<arrow::StringArray>(list->values()) : nullptr;
-		if (!list || !values) {
-			throw IOException(FunctionInfoViolation(worker_path, info.name, "argument_monotonicity"), "Function '%s' argument_monotonicity has an invalid Arrow type", info.name);
-		}
-		argument_monotonicity.emplace();
-		const auto start = list->value_offset(row_idx);
-		const auto end = list->value_offset(row_idx + 1);
-		argument_monotonicity->reserve(static_cast<idx_t>(end - start));
-		for (auto value_idx = start; value_idx < end; value_idx++) {
-			if (values->IsNull(value_idx)) {
-				throw IOException(FunctionInfoViolation(worker_path, info.name, "argument_monotonicity"), "Function '%s' argument_monotonicity contains a null entry", info.name);
-			}
-			argument_monotonicity->push_back(values->GetString(value_idx));
-		}
-	}
+	const auto &argument_monotonicity = wire.argument_monotonicity;
 	if (argument_monotonicity) {
 		if (info.function_type != VgiFunctionType::Scalar) {
 			throw IOException(FunctionInfoViolation(worker_path, info.name, "argument_monotonicity"), "Function '%s' declares argument_monotonicity but is not scalar", info.name);
@@ -3077,19 +2983,16 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		info.argument_monotonicity = std::move(parsed);
 	}
 
-	// Parse the output_schema field which contains a serialized Arrow schema (non-nullable)
-	auto output_data = row["output_schema"].value_not_null<std::vector<uint8_t>>();
-	if (!output_data.empty()) {
-		info.output_schema = DeserializeSchema(output_data);
+	if (!wire.output_schema.empty()) {
+		info.output_schema = DeserializeSchema(wire.output_schema);
 	}
 
-	// Typed parameter defaults are transported as an IPC-serialized one-row
-	// RecordBatch. Keep the bytes on VgiFunctionInfo so DuckDB 1.5 can preserve
-	// the VGI 2.0 contract even though its scalar/aggregate registration API
-	// cannot install defaults yet.
-	auto parameter_defaults = row["parameter_default_values"].as<std::vector<uint8_t>>();
+	// Typed parameter defaults ride as an IPC-serialized one-row RecordBatch. Keep
+	// the bytes on VgiFunctionInfo so DuckDB 1.5 can preserve the VGI 2.0 contract
+	// even though its scalar/aggregate registration API cannot install defaults yet.
+	auto &parameter_defaults = wire.parameter_default_values;
 	if (parameter_defaults) {
-		auto defaults_batch = DeserializeFromIpcBytes(parameter_defaults->data(), parameter_defaults->size());
+		auto defaults_batch = DeserializeFromIpcBytes(*parameter_defaults);
 		if (!defaults_batch || defaults_batch->num_rows() != 1) {
 			throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' parameter_default_values must contain exactly one row", info.name);
 		}
@@ -3143,160 +3046,57 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		info.parameter_default_values_bytes = std::move(*parameter_defaults);
 	}
 
-	// Table function capabilities (nullable booleans, stored as optional)
-	info.projection_pushdown = row["projection_pushdown"].as<bool>();
-	info.filter_pushdown = row["filter_pushdown"].as<bool>();
-	info.sampling_pushdown = row["sampling_pushdown"].as<bool>();
-	// nullopt for older workers whose metadata schema lacks the column — the
-	// gate in vgi_table_entry.cpp treats that as "not capable".
-	info.late_materialization = row["late_materialization"].as<bool>();
-	info.filter_semantic_profiles = row["filter_semantic_profiles"].value_or(std::vector<std::string> {});
-
-	auto additional_functions = batch->GetColumnByName("additional_filter_functions");
-	auto extract_filter_functions = [&](auto list_array) {
-		if (!list_array || list_array->IsNull(row_idx)) {
-			return;
-		}
-		auto values = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-		if (!values) {
-			throw IOException(FunctionInfoViolation(worker_path, info.name, "additional_filter_functions"), "Function '%s' additional_filter_functions must contain structs", info.name);
-		}
-		auto namespaces = std::dynamic_pointer_cast<arrow::StringArray>(values->GetFieldByName("namespace"));
-		auto names = std::dynamic_pointer_cast<arrow::StringArray>(values->GetFieldByName("name"));
-		auto versions = std::dynamic_pointer_cast<arrow::UInt64Array>(values->GetFieldByName("version"));
-		if (!namespaces || !names || !versions) {
-			throw IOException(FunctionInfoViolation(worker_path, info.name, "additional_filter_functions"), "Function '%s' additional_filter_functions has an invalid struct schema", info.name);
-		}
-		for (auto i = list_array->value_offset(row_idx); i < list_array->value_offset(row_idx + 1); i++) {
-			if (values->IsNull(i) || namespaces->IsNull(i) || names->IsNull(i) || versions->IsNull(i)) {
-				throw IOException(FunctionInfoViolation(worker_path, info.name, "additional_filter_functions"), "Function '%s' additional_filter_functions contains NULL", info.name);
-			}
-			info.additional_filter_functions.push_back(
-			    {namespaces->GetString(i), names->GetString(i), versions->Value(i)});
-		}
-	};
-	if (additional_functions) {
-		if (auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(additional_functions)) {
-			extract_filter_functions(list_array);
-		} else if (auto list_array = std::dynamic_pointer_cast<arrow::LargeListArray>(additional_functions)) {
-			extract_filter_functions(list_array);
-		} else {
-			throw IOException(FunctionInfoViolation(worker_path, info.name, "additional_filter_functions"), "Function '%s' additional_filter_functions must be a list", info.name);
-		}
+	// Table function capabilities. late_materialization is nullopt for workers whose
+	// metadata predates it; the gate in vgi_table_entry.cpp treats that as "not capable".
+	info.projection_pushdown = wire.projection_pushdown;
+	info.filter_pushdown = wire.filter_pushdown;
+	info.sampling_pushdown = wire.sampling_pushdown;
+	info.late_materialization = wire.late_materialization;
+	info.filter_semantic_profiles = std::move(wire.filter_semantic_profiles);
+	for (auto &fn : wire.additional_filter_functions) {
+		info.additional_filter_functions.push_back({std::move(fn.namespace_), std::move(fn.name), fn.version});
 	}
 
-	// max_workers (nullable int, stored as optional)
-	info.max_workers = row["max_workers"].as<int32_t>();
+	info.max_workers = wire.max_workers;
+	// supports_batch_index: the function emits ``vgi_batch_index`` in each batch's
+	// metadata, threaded through ``TableFunction::get_partition_data`` so ordered
+	// sinks can reassemble parallel output (and skips the FIXED_ORDER
+	// MaxThreads=1 clamp — see vgi_table_function_set.cpp).
+	info.supports_batch_index = wire.supports_batch_index;
+	// split_token_ttl_seconds: nullopt means unbounded, NOT "expires immediately".
+	info.supports_splits = wire.supports_splits;
+	info.filters_exactly_applied = wire.filters_exactly_applied;
+	info.supports_positions = wire.supports_positions;
+	info.split_token_ttl_seconds = wire.split_token_ttl_seconds;
+	// partition_kind mirrors DuckDB's TablePartitionInfo; only SINGLE_VALUE_PARTITIONS
+	// materially affects planning today (vgi_table_function_set.cpp).
+	info.partition_kind = FromWire(wire.partition_kind);
+	info.order_dependent = FromWire(wire.order_dependent);
+	info.distinct_dependent = FromWire(wire.distinct_dependent);
+	info.supports_window = wire.supports_window;
+	// streaming_partitioned: the aggregate_streaming_open/_chunk/_close protocol, which
+	// the optimizer may use for eligible LogicalWindow nodes.
+	info.streaming_partitioned = wire.streaming_partitioned;
+	// has_finalize=false omits in_out_function_final, so the function can run under
+	// LATERAL with correlated input.
+	info.has_finalize = wire.has_finalize;
+	// TableBuffering only: ParallelSource / ParallelSink / RequiredPartitionInfo.
+	info.source_order_dependent = wire.source_order_dependent;
+	info.sink_order_dependent = wire.sink_order_dependent;
+	info.requires_input_batch_index = wire.requires_input_batch_index;
+	// A blended ("UNNEST-style") table-in-out whose positional args ARE its input.
+	info.input_from_args = wire.input_from_args;
 
-	// supports_batch_index — optional bool (defaults to false for older
-	// workers). When true, the function emits ``vgi_batch_index`` in each
-	// Arrow batch's KeyValueMetadata; the extension threads the value
-	// through ``TableFunction::get_partition_data`` so ordered sinks can
-	// reassemble parallel output. Also skips the FIXED_ORDER MaxThreads=1
-	// clamp — see vgi_table_function_set.cpp.
-	info.supports_batch_index = row["supports_batch_index"].value_or(false);
-
-	// supports_splits / filters_exactly_applied / supports_positions — optional
-	// bools, false for pre-1.4.0 workers. split_token_ttl_seconds is nullable and
-	// nullopt means unbounded, NOT "expires immediately".
-	info.supports_splits = row["supports_splits"].value_or(false);
-	info.filters_exactly_applied = row["filters_exactly_applied"].value_or(false);
-	info.supports_positions = row["supports_positions"].value_or(false);
-	info.split_token_ttl_seconds = row["split_token_ttl_seconds"].as<int64_t>();
-
-	// partition_kind — optional string mirroring DuckDB's
-	// TablePartitionInfo enum. Defaults to NOT_PARTITIONED for older
-	// workers. When non-default, vgi_table_function_set.cpp installs
-	// ``TableFunction::get_partition_info`` returning the corresponding
-	// value so the planner can pick PhysicalPartitionedAggregate for
-	// matching GROUP BY queries. Only ``SINGLE_VALUE_PARTITIONS``
-	// materially affects planner behavior today.
-	// .value_or() supplies a valid default when the field is absent, so any
-	// parse failure here is a genuinely unrecognized non-empty wire string.
-	auto partition_kind_str = row["partition_kind"].value_or(std::string {"NOT_PARTITIONED"});
-	info.partition_kind = RequireKnownEnum(ParseVgiPartitionKind(partition_kind_str), partition_kind_str,
-	                                       "partition_kind", worker_path, info.name);
-
-	// Aggregate function fields (non-nullable with defaults)
-	auto order_dependent_str = row["order_dependent"].value_or(std::string {"NOT_ORDER_DEPENDENT"});
-	info.order_dependent = RequireKnownEnum(ParseAggregateOrderDependent(order_dependent_str), order_dependent_str,
-	                                        "order_dependent", worker_path, info.name);
-
-	auto distinct_dependent_str = row["distinct_dependent"].value_or(std::string {"NOT_DISTINCT_DEPENDENT"});
-	info.distinct_dependent = RequireKnownEnum(ParseAggregateDistinctDependent(distinct_dependent_str),
-	                                           distinct_dependent_str, "distinct_dependent", worker_path, info.name);
-
-	// supports_window — optional bool (defaults to false for older workers).
-	info.supports_window = row["supports_window"].value_or(false);
-
-	// streaming_partitioned — optional bool (defaults to false for older
-	// workers). When true, the function declares the
-	// aggregate_streaming_open/_chunk/_close protocol; the extension's
-	// optimizer rule may rewrite eligible LogicalWindow nodes to use it.
-	info.streaming_partitioned = row["streaming_partitioned"].value_or(false);
-
-	// has_finalize — optional bool (defaults to false for older workers).
-	// When false, the table-in-out registration omits in_out_function_final,
-	// which lets the function be used under LATERAL with correlated input.
-	info.has_finalize = row["has_finalize"].value_or(false);
-
-	// Whether the function uses the buffered Sink+Source path is encoded in
-	// ``function_type`` (TableBuffering vs Table) — parsed above. No
-	// separate boolean column on the wire.
-
-	// source_order_dependent — optional bool. Only meaningful when
-	// function_type == TableBuffering; controls ParallelSource on the buffered op.
-	info.source_order_dependent = row["source_order_dependent"].value_or(false);
-
-	// sink_order_dependent — optional bool. Only meaningful when
-	// function_type == TableBuffering; controls ParallelSink (single-thread ingest).
-	info.sink_order_dependent = row["sink_order_dependent"].value_or(false);
-
-	// requires_input_batch_index — optional bool. Only meaningful when
-	// function_type == TableBuffering; advertises RequiredPartitionInfo()=BatchIndex()
-	// so DuckDB threads source-position metadata to every Sink call.
-	info.requires_input_batch_index = row["requires_input_batch_index"].value_or(false);
-
-	// input_from_args — optional bool (defaults to false for older workers). A
-	// blended ("UNNEST-style") table-in-out whose positional args ARE its per-row
-	// input columns.
-	info.input_from_args = row["input_from_args"].value_or(false);
-
-	// Required settings for this function (list of strings)
-	info.required_settings = row["required_settings"].value_or(std::vector<std::string> {});
-
-	// Required secrets for this function (list of struct<secret_type, secret_name, scope>)
-	// Parse from the Arrow list<struct> column
-	auto secrets_col = batch->GetColumnByName("required_secrets");
-	if (secrets_col && !secrets_col->IsNull(row_idx)) {
-		auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(secrets_col);
-		if (list_array) {
-			auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-			if (struct_array) {
-				int64_t start = list_array->value_offset(row_idx);
-				int64_t end = list_array->value_offset(row_idx + 1);
-
-				auto type_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("secret_type"));
-				auto name_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("secret_name"));
-				auto scope_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("scope"));
-
-				for (int64_t i = start; i < end; i++) {
-					VgiSecretRequirement req;
-					if (type_col && !type_col->IsNull(i)) {
-						req.secret_type = type_col->GetString(i);
-					}
-					if (name_col && !name_col->IsNull(i)) {
-						req.name = name_col->GetString(i);
-					}
-					if (scope_col && !scope_col->IsNull(i)) {
-						req.scope = scope_col->GetString(i);
-					}
-					if (!req.secret_type.empty()) {
-						info.required_secrets.push_back(std::move(req));
-					}
-				}
-			}
+	info.required_settings = std::move(wire.required_settings);
+	for (auto &secret : wire.required_secrets) {
+		if (secret.secret_type.empty()) {
+			continue;
 		}
+		VgiSecretRequirement req;
+		req.secret_type = std::move(secret.secret_type);
+		req.name = secret.secret_name.value_or("");
+		req.scope = secret.scope.value_or("");
+		info.required_secrets.push_back(std::move(req));
 	}
 
 	return info;
