@@ -425,5 +425,6 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
     const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
     const std::vector<uint8_t> &transaction_opaque_data = {});
 
+
 } // namespace vgi
 } // namespace duckdb

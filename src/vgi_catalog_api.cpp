@@ -414,58 +414,23 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 	std::vector<VgiCatalogInfo> out;
 	out.reserve(info_batches.size());
 	for (const auto &info_batch : info_batches) {
-		RecordBatchSingleRow row(info_batch, 0, "CatalogInfo", worker_path);
+		auto wire = generated::Decode<generated::CatalogInfo>(info_batch, 0, worker_path);
 		VgiCatalogInfo info;
-		info.name = row["name"].value_not_null<std::string>();
-		info.implementation_version = row["implementation_version"].value_or(std::string(""));
-		info.data_version_spec = row["data_version_spec"].value_or(std::string(""));
-
-		// Parse attach_option_specs (list[bytes] of serialized AttachOptionSpec).
-		// Older workers that predate attach-option discovery omit this field — treat as empty.
-		auto spec_bytes_list = row["attach_option_specs"].value_or(std::vector<std::vector<uint8_t>> {});
-		for (const auto &spec_bytes : spec_bytes_list) {
+		info.name = std::move(wire.name);
+		info.implementation_version = wire.implementation_version.value_or("");
+		info.data_version_spec = wire.data_version_spec.value_or("");
+		for (const auto &spec_bytes : wire.attach_option_specs) {
 			info.attach_option_specs.push_back(ParseAttachOptionSpec(spec_bytes, worker_path, context));
 		}
-
-		// Parse releases (list<struct<version, released_at, summary, notes_url>>).
-		// Older workers that predate release-history discovery omit this field — treat as empty.
-		auto releases_col = info_batch->GetColumnByName("releases");
-		if (releases_col) {
-			auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(releases_col);
-			if (list_array && !list_array->IsNull(0)) {
-				auto start = list_array->value_offset(0);
-				auto end = list_array->value_offset(1);
-				auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-				if (struct_array) {
-					auto version_array =
-					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("version"));
-					auto released_at_array =
-					    std::dynamic_pointer_cast<arrow::TimestampArray>(struct_array->GetFieldByName("released_at"));
-					auto summary_array =
-					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("summary"));
-					auto notes_url_array =
-					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("notes_url"));
-					for (auto i = start; i < end; i++) {
-						VgiCatalogReleaseInfo release;
-						if (version_array && !version_array->IsNull(i)) {
-							release.version = version_array->GetString(i);
-						}
-						if (released_at_array && !released_at_array->IsNull(i)) {
-							release.released_at_us = released_at_array->Value(i);
-						}
-						if (summary_array && !summary_array->IsNull(i)) {
-							release.summary = summary_array->GetString(i);
-						}
-						if (notes_url_array && !notes_url_array->IsNull(i)) {
-							release.notes_url = notes_url_array->GetString(i);
-						}
-						info.releases.push_back(std::move(release));
-					}
-				}
-			}
+		for (auto &release : wire.releases) {
+			VgiCatalogReleaseInfo r;
+			r.version = std::move(release.version);
+			r.released_at_us = release.released_at.value_or(0);
+			r.summary = std::move(release.summary);
+			r.notes_url = release.notes_url.value_or("");
+			info.releases.push_back(std::move(r));
 		}
-
-		info.source_url = row["source_url"].value_or(std::string(""));
+		info.source_url = wire.source_url.value_or("");
 
 		out.push_back(std::move(info));
 	}
@@ -1046,8 +1011,7 @@ int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &contex
 		if (!result_batch || result_batch->num_rows() == 0) {
 			return 0;  // Not implemented by worker
 		}
-		RecordBatchSingleRow row(result_batch, 0, "CatalogVersionResponse", worker_path);
-		return row["version"].value_not_null<int64_t>();
+		return generated::Decode<generated::CatalogVersionResponse>(result_batch, 0, worker_path).version;
 	} catch (const VgiRpcException &e) {
 		// Only a worker that does not implement catalog_version maps to 0
 		// ("unknown version": the caller clears its cache as a safe fallback).
@@ -1076,8 +1040,8 @@ std::vector<uint8_t> InvokeCatalogTransactionBegin(const CatalogRpcContext &ctx,
 		return {};  // Transaction not supported
 	}
 
-	RecordBatchSingleRow row(result_batch, 0, "TransactionBeginResponse", worker_path);
-	return row["transaction_opaque_data"].value_or(std::vector<uint8_t>{});
+	return generated::Decode<generated::TransactionBeginResponse>(result_batch, 0, worker_path)
+	    .transaction_opaque_data.value_or(generated::Bytes {});
 }
 
 void InvokeCatalogTransactionCommit(const CatalogRpcContext &ctx, ClientContext &context) {
