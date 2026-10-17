@@ -2,8 +2,6 @@
 #include "vgi_attach_tickets.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <limits>
 #include <vector>
 
 #include <arrow/api.h>
@@ -53,19 +51,26 @@ std::string ReplyString(const std::shared_ptr<arrow::RecordBatch> &payload, cons
 	return std::static_pointer_cast<arrow::StringArray>(column)->GetString(0);
 }
 
-double ReplyDouble(const std::shared_ptr<arrow::RecordBatch> &payload, const char *field, const char *what) {
+// A timestamp[us, tz=UTC] field of a one-row reply payload, read by name; nullopt when null.
+std::optional<int64_t> ReplyTimestampMicros(const std::shared_ptr<arrow::RecordBatch> &payload, const char *field,
+                                            const char *what) {
 	auto column = payload->GetColumnByName(field);
-	if (!column || column->IsNull(0)) {
+	if (!column) {
 		throw IOException("vgi: the %s reply carries no '%s'", what, field);
 	}
-	switch (column->type_id()) {
-	case arrow::Type::DOUBLE:
-		return std::static_pointer_cast<arrow::DoubleArray>(column)->Value(0);
-	case arrow::Type::INT64:
-		return static_cast<double>(std::static_pointer_cast<arrow::Int64Array>(column)->Value(0));
-	default:
-		throw IOException("vgi: the %s reply's '%s' is not a number", what, field);
+	if (column->type_id() != arrow::Type::TIMESTAMP) {
+		throw IOException("vgi: the %s reply's '%s' is %s, expected timestamp[us, tz=UTC]", what, field,
+		                  column->type()->ToString());
 	}
+	const auto &type = static_cast<const arrow::TimestampType &>(*column->type());
+	if (type.unit() != arrow::TimeUnit::MICRO || type.timezone() != "UTC") {
+		throw IOException("vgi: the %s reply's '%s' is %s, expected timestamp[us, tz=UTC]", what, field,
+		                  type.ToString());
+	}
+	if (column->IsNull(0)) {
+		return std::nullopt;
+	}
+	return std::static_pointer_cast<arrow::TimestampArray>(column)->Value(0);
 }
 
 } // namespace
@@ -89,7 +94,11 @@ VgiIssuedGrant InvokeIssueGrant(const CatalogRpcContext &ctx, ClientContext &con
 	auto payload = InvokeProtocolUnary(ctx, context, identity, "issue_grant", params);
 	VgiIssuedGrant grant;
 	grant.token = ReplyString(payload, "token", "issue_grant");
-	grant.expires_at = ReplyDouble(payload, "expires_at", "issue_grant");
+	auto expires_at = ReplyTimestampMicros(payload, "expires_at", "issue_grant");
+	if (!expires_at) {
+		throw IOException("vgi: the issue_grant reply carries no 'expires_at'");
+	}
+	grant.expires_at_us = *expires_at;
 	auto grant_id = payload->GetColumnByName("grant_id");
 	if (grant_id && grant_id->type_id() == arrow::Type::STRING && !grant_id->IsNull(0)) {
 		grant.grant_id = std::static_pointer_cast<arrow::StringArray>(grant_id)->GetString(0);
@@ -139,7 +148,7 @@ VgiAttachTicket InvokeSealAttach(const CatalogRpcContext &ctx, ClientContext &co
 	auto payload = InvokeProtocolUnary(ctx, context, kTickets, "seal_attach", params);
 	VgiAttachTicket ticket;
 	ticket.ticket = ReplyString(payload, "ticket", "seal_attach");
-	ticket.expires_at = ReplyDouble(payload, "expires_at", "seal_attach");
+	ticket.expires_at_us = ReplyTimestampMicros(payload, "expires_at", "seal_attach");
 	return ticket;
 }
 
@@ -212,11 +221,11 @@ std::string ErrorMessage(const std::exception &e) {
 	return error.RawMessage();
 }
 
-Value ExpiryValue(double seconds) {
-	if (!std::isfinite(seconds) || seconds <= 0) {
+Value ExpiryValue(std::optional<int64_t> micros) {
+	if (!micros) {
 		return Value(LogicalType::TIMESTAMP_TZ);
 	}
-	return Value::TIMESTAMPTZ(timestamp_tz_t(static_cast<int64_t>(seconds * 1000000.0)));
+	return Value::TIMESTAMPTZ(timestamp_tz_t(*micros));
 }
 
 void ExportCatalog(ClientContext &context, VgiCatalog &catalog, const VgiExportSessionBindData &bind, ExportRow &row) {
@@ -276,11 +285,9 @@ void ExportCatalog(ClientContext &context, VgiCatalog &catalog, const VgiExportS
 	row.grant = Value(grant.token);
 	row.ticket = Value(ticket.ticket);
 	// The entry is usable until the first half expires.
-	double expires = std::numeric_limits<double>::infinity();
-	for (double candidate : {grant.expires_at, ticket.expires_at}) {
-		if (std::isfinite(candidate) && candidate > 0) {
-			expires = std::min(expires, candidate);
-		}
+	std::optional<int64_t> expires = grant.expires_at_us;
+	if (ticket.expires_at_us) {
+		expires = std::min(*expires, *ticket.expires_at_us);
 	}
 	row.expires_at = ExpiryValue(expires);
 	row.status = "ok";
@@ -357,7 +364,7 @@ void RegisterVgiExportSessionFunction(ExtensionLoader &loader) {
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "Export each attached catalog (or each alias given) for unattended reattach: a sealed grant (who, from "
-	    "vgi_rpc.Identity.v1 issue_grant) and an attach ticket (what, from vgi.attach_tickets.v1 seal_attach, "
+	    "vgi_rpc.Identity.v2 issue_grant) and an attach ticket (what, from vgi.attach_tickets.v1 seal_attach, "
 	    "carrying the original ATTACH options including secret ones). Reattach with bearer_token = grant and "
 	    "attach_ticket = ticket. One row per catalog: alias, location, catalog_name, grant, ticket, expires_at "
 	    "(the earlier of the two), status (ok, not_vgi, not_supported, stale_login, refused, error) and message. "

@@ -50,18 +50,6 @@ void CheckArrow(const arrow::Status &status, const char *what);
 // Decoding
 // ============================================================================
 
-//! Compatibility: a null (or, for a top-level column, missing) non-nullable list or map reads
-//! as empty, and a null list item as a default value, as the hand-written client always
-//! did (some SDKs send nulls there). Scalars and binary values stay strict.
-template <class T>
-struct EmptyWhenNull : std::false_type {};
-template <class T>
-struct EmptyWhenNull<std::vector<T>> : std::true_type {};
-template <>
-struct EmptyWhenNull<std::vector<uint8_t>> : std::false_type {};
-template <class K, class V>
-struct EmptyWhenNull<std::map<K, V>> : std::true_type {};
-
 template <class T>
 struct IsOptional : std::false_type {};
 template <class T>
@@ -114,10 +102,6 @@ void ReadValue(const arrow::Array &array, int64_t i, std::optional<T> &out, cons
 template <class T>
 void ReadValue(const arrow::Array &array, int64_t i, std::vector<T> &out, const Ctx &ctx) {
 	if (array.IsNull(i)) {
-		if (EmptyWhenNull<std::vector<T>>::value) {
-			out.clear();
-			return;
-		}
 		ThrowNull(ctx);
 	}
 	int64_t begin = 0;
@@ -130,7 +114,7 @@ void ReadValue(const arrow::Array &array, int64_t i, std::vector<T> &out, const 
 	out.resize(static_cast<size_t>(end - begin));
 	for (int64_t k = begin; k < end; k++) {
 		if (!IsOptional<T>::value && child->IsNull(k)) {
-			continue; // a null item reads as a default value (out was value-initialized)
+			ThrowNull(item);
 		}
 		ReadValue(*child, k, out[static_cast<size_t>(k - begin)], item);
 	}
@@ -139,8 +123,7 @@ void ReadValue(const arrow::Array &array, int64_t i, std::vector<T> &out, const 
 template <class K, class V>
 void ReadValue(const arrow::Array &array, int64_t i, std::map<K, V> &out, const Ctx &ctx) {
 	if (array.IsNull(i)) {
-		out.clear();
-		return;
+		ThrowNull(ctx);
 	}
 	int64_t begin = 0;
 	int64_t end = 0;
@@ -175,9 +158,6 @@ public:
 	void Required(const char *name, T &out) const {
 		auto column = Column(name);
 		Ctx ctx = Child(name);
-		if (EmptyWhenNull<T>::value && (!column || column->IsNull(row_))) {
-			return;
-		}
 		if (!column) {
 			ThrowMissing(ctx);
 		}
