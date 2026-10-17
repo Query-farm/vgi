@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_arrow_ipc.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 #include "vgi_batch_validation.hpp"
 #include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
@@ -52,7 +53,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
     const vgi::ArrowArguments &arrow_arguments,
     const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
 
-	auto schema_buf_result = arrow::ipc::SerializeSchema(*input_schema);
+	auto schema_buf_result = ::duckdb::vgi::nanoipc::SerializeSchema(*input_schema);
 	ThrowOnArrowError(schema_buf_result.status());
 	auto &schema_buf = schema_buf_result.ValueUnsafe();
 	auto schema_bytes = std::vector<uint8_t>(schema_buf->data(), schema_buf->data() + schema_buf->size());
@@ -138,7 +139,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
     const std::shared_ptr<arrow::Schema> &output_schema) {
 
 	auto gid_bytes = vgi::SerializeToIpcBytes(group_ids_batch);
-	auto os_buf_result = arrow::ipc::SerializeSchema(*output_schema);
+	auto os_buf_result = ::duckdb::vgi::nanoipc::SerializeSchema(*output_schema);
 	ThrowOnArrowError(os_buf_result.status());
 	auto &os_buf = os_buf_result.ValueUnsafe();
 	auto schema_bytes = std::vector<uint8_t>(os_buf->data(), os_buf->data() + os_buf->size());

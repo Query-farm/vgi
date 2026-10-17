@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_exchange_cache_key.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -402,7 +403,7 @@ std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiResult
 		throw IOException("VGI exchange cache: cached batch has neither in-memory nor on-disk IPC bytes");
 	}
 	auto input = std::make_shared<arrow::io::BufferReader>(ipc);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
 	if (!reader_result.ok()) {
 		throw IOException("VGI exchange cache: failed to open cached batch IPC stream: %s",
 		                  reader_result.status().ToString());

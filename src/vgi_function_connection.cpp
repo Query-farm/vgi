@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_function_connection.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/blob.hpp"
@@ -868,7 +869,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 
 		// Create tick writer on stdin (C++ MakeStreamWriter writes schema immediately)
 		auto sink = TransportOutput();
-		auto writer_result = arrow::ipc::MakeStreamWriter(sink, tick_schema_);
+		auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, tick_schema_);
 		if (!writer_result.ok()) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create tick writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    writer_result.status().ToString());
@@ -908,7 +909,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		// Now open data reader on stdout — the server has processed the tick and
 		// flushed the output schema + first data batch to stdout
 		data_stream_ = TransportInput();
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
 		if (!reader_result.ok()) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    reader_result.status().ToString());
@@ -920,7 +921,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 
 		// Create input writer on stdin (writes schema immediately)
 		auto sink = TransportOutput();
-		auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
+		auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, input_schema_);
 		if (!writer_result.ok()) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create input writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    writer_result.status().ToString());
@@ -982,7 +983,7 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	// read the leftover INPUT-phase output instead of the FINALIZE response header.
 	if (!data_reader_ && TransportReady()) {
 		data_stream_ = TransportInput();
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
 		if (reader_result.ok()) {
 			data_reader_ = reader_result.ValueUnsafe();
 		} else if (iroh_config_) {
@@ -1139,7 +1140,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			                    GetExecutionIdHex());
 		}
 		data_stream_ = TransportInput();
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
 		if (!reader_result.ok()) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    reader_result.status().ToString());
@@ -1537,7 +1538,7 @@ void FunctionConnection::OpenInputWriter() {
 
 	// Create an IPC stream writer for stdin
 	auto sink = TransportOutput();
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
+	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, input_schema_);
 	if (!writer_result.ok()) {
 		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to create input stream writer: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
 		                    GetExecutionIdHex(), writer_result.status().ToString());

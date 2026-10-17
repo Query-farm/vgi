@@ -298,6 +298,11 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# nanoarrow (vendored bundle): Arrow IPC encode/decode for the wire. Its own
+# directory scope keeps DuckDB's vendored zstd.h off its include path.
+add_subdirectory(third_party/nanoarrow)
+include_directories(third_party/nanoarrow/include)
+
 include_directories(src/include)
 include_directories(duckdb/third_party/mbedtls/include)
 include_directories(duckdb/third_party/httplib)
@@ -319,6 +324,7 @@ src/vgi_named_pipe.cpp
 src/vgi_logging.cpp
 src/vgi_subprocess.cpp
 src/vgi_arrow_ipc.cpp
+src/vgi_nanoarrow_ipc.cpp
 src/vgi_arrow_utils.cpp
 src/vgi_rpc_client.cpp
 src/vgi_rpc_types.cpp
@@ -429,8 +435,8 @@ if(VGI_BENCH_ARROW_PROBE)
 endif()
 
 # Link OpenSSL in both the static library as the loadable extension
-target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
+target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB} vgi_nanoarrow)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB} vgi_nanoarrow)
 
 if(VGI_ENABLE_IROH)
   add_dependencies(${EXTENSION_NAME} vgi_iroh_rust)
@@ -463,7 +469,7 @@ if(NOT EMSCRIPTEN)
 endif()
 
 install(
-  TARGETS ${EXTENSION_NAME}
+  TARGETS ${EXTENSION_NAME} vgi_nanoarrow
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -540,6 +546,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_table_buffering_builders.cpp
     src/vgi_schema_registry.cpp
     src/vgi_arrow_ipc.cpp
+    src/vgi_nanoarrow_ipc.cpp
     src/vgi_logging.cpp
     src/vgi_telemetry_util.cpp
     src/vgi_oauth_env.cpp
@@ -581,6 +588,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     dummy_static_extension_loader
     duckdb_mbedtls
     ${VGI_ARROW_LIB}
+    vgi_nanoarrow
     ${SABFFI_LIB}
     ${SABTABLE_LIB})
   if(APPLE)

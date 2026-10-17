@@ -1,5 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "vgi_webworker_function_connection.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 // The `worker:` SAB transport is compiled only for the wasm extension
 // (__EMSCRIPTEN__) and the native SAB unit-test binary (-DVGI_SAB_NATIVE_TEST,
@@ -798,7 +799,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		tick_schema_ = arrow::schema({});
 
 		auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
-		auto writer_result = arrow::ipc::MakeStreamWriter(sink, tick_schema_);
+		auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, tick_schema_);
 		if (!writer_result.ok()) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create tick writer: %s", location_, -1, GetExecutionIdHex(),
 			                    writer_result.status().ToString());
@@ -832,7 +833,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		// Open the data reader — the worker has processed the tick and flushed
 		// the output schema + first data batch.
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
 		if (!reader_result.ok()) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
 			                    reader_result.status().ToString());
@@ -842,7 +843,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		is_producer_mode_ = false;
 
 		auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
-		auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
+		auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, input_schema_);
 		if (!writer_result.ok()) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create input writer: %s", location_, -1, GetExecutionIdHex(),
 			                    writer_result.status().ToString());
@@ -896,7 +897,7 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	// INPUT-phase output instead of the FINALIZE header.
 	if (!data_reader_ && slot_ >= 0) {
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
 		if (reader_result.ok()) {
 			data_reader_ = reader_result.ValueUnsafe();
 		}
@@ -973,7 +974,7 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	// empty split is the likelier shape, since a filter only has to prune one.
 	if (!data_reader_ && slot_ >= 0) {
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
 		if (reader_result.ok()) {
 			data_reader_ = reader_result.ValueUnsafe();
 		}
@@ -1017,7 +1018,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			                    GetExecutionIdHex());
 		}
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(data_stream_);
 		if (!reader_result.ok()) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
 			                    reader_result.status().ToString());
@@ -1291,7 +1292,7 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 	}
 
 	auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
+	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, input_schema_);
 	if (!writer_result.ok()) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to create input stream writer: %s", location_, -1, GetExecutionIdHex(),
 		                    writer_result.status().ToString());

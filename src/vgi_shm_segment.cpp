@@ -7,6 +7,7 @@
 // VGI_RPC_SHM_SIZE_BYTES. See vgi_platform.hpp.
 
 #include "vgi_platform.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #if VGI_SHM_TRANSPORT
 
@@ -533,7 +534,7 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 				                  out_buffer_result.status().ToString());
 			}
 			auto out_stream = out_buffer_result.ValueUnsafe();
-			auto schema_writer_result = arrow::ipc::MakeStreamWriter(out_stream, schema);
+			auto schema_writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(out_stream, schema);
 			if (!schema_writer_result.ok()) {
 				throw IOException("VgiShmSegment: MakeStreamWriter failed: " +
 				                  schema_writer_result.status().ToString());
@@ -570,7 +571,7 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 		input = std::make_shared<ChainedBufferInputStream>(std::move(regions));
 	}
 
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
 	if (!reader_result.ok()) {
 		throw IOException("VgiShmSegment: failed to open IPC stream from segment slice: " +
 		                  reader_result.status().ToString());

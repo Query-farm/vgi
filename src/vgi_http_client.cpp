@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 #include "vgi_http_client.hpp"
 
 #include <algorithm>
@@ -1517,7 +1518,7 @@ std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> 
 		throw IOException("Failed to create buffer for pointer batch: %s", sink_result.status().ToString());
 	}
 	auto sink = sink_result.ValueUnsafe();
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
+	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, schema);
 	if (!writer_result.ok()) {
 		throw IOException("Failed to create IPC writer for pointer batch: %s", writer_result.status().ToString());
 	}

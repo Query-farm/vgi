@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_aggregate_window_impl.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 #include "vgi_batch_validation.hpp"
 
 #include <cstring>
@@ -67,7 +68,7 @@ std::vector<uint8_t> PackValidityMask(const ValidityMask &mask, idx_t row_count)
 }
 
 std::vector<uint8_t> SerializeSchemaBytes(const std::shared_ptr<arrow::Schema> &schema) {
-	auto buf = arrow::ipc::SerializeSchema(*schema);
+	auto buf = ::duckdb::vgi::nanoipc::SerializeSchema(*schema);
 	ThrowOnArrowError(buf.status());
 	auto &b = buf.ValueUnsafe();
 	return std::vector<uint8_t>(b->data(), b->data() + b->size());

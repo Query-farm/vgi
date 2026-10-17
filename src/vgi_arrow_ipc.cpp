@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_arrow_ipc.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -159,7 +160,7 @@ std::shared_ptr<arrow::Buffer> TranscodeIpcWithCodec(const std::shared_ptr<arrow
 	}
 	try {
 		auto in = std::make_shared<arrow::io::BufferReader>(ipc);
-		auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(in);
+		auto reader_res = ::duckdb::vgi::nanoipc::OpenStreamReader(in);
 		if (!reader_res.ok()) {
 			return ipc;
 		}
@@ -190,7 +191,7 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
 	auto sink = sink_result.ValueUnsafe();
 
 	auto write_options = MakeIpcWriteOptions(codec, level);
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, batch->schema(), write_options);
+	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, batch->schema(), write_options);
 	if (!writer_result.ok()) {
 		throw IOException("Failed to create Arrow writer: " + writer_result.status().ToString());
 	}
@@ -599,7 +600,7 @@ std::shared_ptr<arrow::Schema> DeserializeSchema(const std::vector<uint8_t> &dat
 	auto buffer = arrow::Buffer::Wrap(data.data(), data.size());
 	arrow::io::BufferReader reader(buffer);
 	arrow::ipc::DictionaryMemo dict_memo;
-	auto schema_result = arrow::ipc::ReadSchema(&reader, &dict_memo);
+	auto schema_result = ::duckdb::vgi::nanoipc::ReadSchema(&reader, &dict_memo);
 	if (!schema_result.ok()) {
 		throw IOException("Failed to deserialize Arrow schema: " + schema_result.status().ToString());
 	}

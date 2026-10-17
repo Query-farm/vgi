@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_rpc_client.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_ipc.hpp"
@@ -130,7 +131,7 @@ OpenWorkerStream(const std::shared_ptr<arrow::io::InputStream> &input, const Wor
 	if (opts.before_read) {
 		opts.before_read();
 	}
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();
 		if (status.IsInvalid()) {
@@ -286,7 +287,7 @@ void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
                      const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata,
                      const VgiProtocolId &protocol) {
 	// Create an IPC stream writer with the params schema
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, params_batch->schema());
+	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, params_batch->schema());
 	if (!writer_result.ok()) {
 		throw IOException("Failed to create RPC request writer: " + writer_result.status().ToString());
 	}
@@ -519,7 +520,7 @@ void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientConte
 	while (offset < total) {
 		auto buffer = CopyToOwnedBuffer(data + offset, static_cast<size_t>(total - offset));
 		auto input = std::make_shared<arrow::io::BufferReader>(buffer);
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
 		if (!reader_result.ok()) {
 			// Trailing bytes that are not an IPC stream: nothing more to find.
 			return;

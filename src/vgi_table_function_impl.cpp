@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_platform.hpp" // VGI_ASYNC_INIT_ENABLED
 #ifdef __EMSCRIPTEN__
@@ -1244,7 +1245,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	}
 	auto buffer_stream = buffer_result.ValueUnsafe();
 
-	auto writer_result = arrow::ipc::MakeStreamWriter(buffer_stream, record_batch->schema());
+	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(buffer_stream, record_batch->schema());
 	if (!writer_result.ok()) {
 		throw IOException("Failed to create IPC stream writer: %s", writer_result.status().ToString());
 	}
@@ -1313,7 +1314,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 			}
 			auto buf_stream = buf_result.ValueUnsafe();
 
-			auto writer_res = arrow::ipc::MakeStreamWriter(buf_stream, key_batch->schema());
+			auto writer_res = ::duckdb::vgi::nanoipc::MakeStreamWriter(buf_stream, key_batch->schema());
 			if (!writer_res.ok()) {
 				throw IOException("Failed to create IPC writer for join keys: %s", writer_res.status().ToString());
 			}
@@ -3012,7 +3013,7 @@ std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &con
 		throw IOException("Failed to create dynamic filter delta buffer: %s", output_result.status().ToString());
 	}
 	auto output = output_result.ValueUnsafe();
-	auto writer_result = arrow::ipc::MakeStreamWriter(output, batch->schema());
+	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(output, batch->schema());
 	if (!writer_result.ok()) {
 		throw IOException("Failed to create dynamic filter delta writer: %s", writer_result.status().ToString());
 	}
@@ -3202,7 +3203,7 @@ static bool DecodePartitionMinTuple(ClientContext &context, const std::string &p
 	}
 	auto buf = arrow::Buffer::FromString(pv_bytes);
 	auto input = std::make_shared<arrow::io::BufferReader>(buf);
-	auto rr = arrow::ipc::RecordBatchStreamReader::Open(input);
+	auto rr = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
 	if (!rr.ok()) {
 		return false;
 	}
@@ -3392,7 +3393,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		}
 		auto buf = arrow::Buffer::FromString(pv_bytes);
 		auto input = std::make_shared<arrow::io::BufferReader>(buf);
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+		auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
 		if (!reader_result.ok()) {
 			throw IOException(metadata_violation("vgi_partition_values#b64"),
 			                  "VGI function '%s' emitted invalid Arrow IPC payload in "

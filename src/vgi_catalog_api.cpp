@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 #include "vgi_catalog_api.hpp"
 
 #include "duckdb.hpp"

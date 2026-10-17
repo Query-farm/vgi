@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_http_function_connection.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/blob.hpp"
@@ -314,7 +315,7 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 	// copy of the payload is made here.
 	auto buffer = arrow::SliceBuffer(std::move(owned), static_cast<int64_t>(offset));
 	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
 	if (!reader_result.ok()) {
 		// Empty data stream is valid (no output yet)
 		return;
@@ -1015,7 +1016,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
 	auto buffer = arrow::Buffer::FromString(std::move(response_body));
 	auto input_stream = std::make_shared<arrow::io::BufferReader>(buffer);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input_stream);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input_stream);
 	if (!reader_result.ok()) {
 		// Empty response in exchange mode means no output for this input
 		return arrow::RecordBatch::Make(
@@ -1137,7 +1138,7 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 		return;
 	}
 	auto sink = sink_result.ValueUnsafe();
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
+	auto writer_result = ::duckdb::vgi::nanoipc::MakeStreamWriter(sink, schema);
 	if (!writer_result.ok()) {
 		return;
 	}

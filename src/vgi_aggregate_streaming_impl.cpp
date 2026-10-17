@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_aggregate_streaming_impl.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include <cstring>
 
@@ -25,7 +26,7 @@ namespace {
 // arrow::Result<T>::status() is passed.
 
 std::vector<uint8_t> SerializeSchemaBytes(const std::shared_ptr<arrow::Schema> &schema) {
-	auto buf = arrow::ipc::SerializeSchema(*schema);
+	auto buf = ::duckdb::vgi::nanoipc::SerializeSchema(*schema);
 	ThrowOnArrowError(buf.status());
 	auto &b = buf.ValueUnsafe();
 	return std::vector<uint8_t>(b->data(), b->data() + b->size());

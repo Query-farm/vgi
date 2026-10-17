@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_memo_arena.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include <stdexcept>
 #include <utility>
@@ -58,7 +59,7 @@ std::shared_ptr<arrow::RecordBatch> ConcatBatches(const std::vector<std::shared_
 // (the same bytes the pre-arena per-value entries used), which the backend stores.
 std::string SerializeBatchToIpc(const std::shared_ptr<arrow::RecordBatch> &batch) {
 	auto sink = Unwrap(arrow::io::BufferOutputStream::Create(), "ipc sink");
-	auto writer = Unwrap(arrow::ipc::MakeStreamWriter(sink, batch->schema(), arrow::ipc::IpcWriteOptions::Defaults()),
+	auto writer = Unwrap(::duckdb::vgi::nanoipc::MakeStreamWriter(sink, batch->schema(), arrow::ipc::IpcWriteOptions::Defaults()),
 	                     "ipc writer");
 	Check(writer->WriteRecordBatch(*batch), "ipc write");
 	Check(writer->Close(), "ipc close");
@@ -74,7 +75,7 @@ int64_t NowUnix() {
 std::shared_ptr<arrow::RecordBatch> DeserializeBatchFromIpc(const std::string &ipc) {
 	auto buf = arrow::Buffer::FromString(ipc);
 	auto in = std::make_shared<arrow::io::BufferReader>(buf);
-	auto reader = Unwrap(arrow::ipc::RecordBatchStreamReader::Open(in), "ipc open");
+	auto reader = Unwrap(::duckdb::vgi::nanoipc::OpenStreamReader(in), "ipc open");
 	std::shared_ptr<arrow::RecordBatch> batch;
 	Check(reader->ReadNext(&batch), "ipc readnext");
 	return batch; // schema included; may be a 0-row batch (a negative memo)

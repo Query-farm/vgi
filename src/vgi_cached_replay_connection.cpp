@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_cached_replay_connection.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include <algorithm>
 
@@ -84,7 +85,7 @@ std::shared_ptr<arrow::RecordBatch> CachedReplayConnection::ReadDataBatch() {
 
 	// Deserialize the self-contained per-batch IPC stream blob.
 	auto input = std::make_shared<arrow::io::BufferReader>(ipc);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(input);
 	if (!reader_result.ok()) {
 		throw IOException("VGI result cache: failed to open cached batch IPC stream: %s",
 		                  reader_result.status().ToString());

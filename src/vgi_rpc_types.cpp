@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_rpc_types.hpp"
+#include "vgi_nanoarrow_ipc.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_ipc.hpp"
@@ -434,7 +435,7 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data,
 	auto buffer = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
 	memcpy(const_cast<uint8_t *>(buffer->data()), data, len);
 	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(buffer);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(buffer_reader);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(buffer_reader);
 	if (!reader_result.ok()) {
 		throw IOException("Failed to open IPC stream from bytes: %s", reader_result.status().ToString());
 	}
@@ -464,7 +465,7 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow:
 	auto slice = arrow::SliceBuffer(bin.value_data(), bin.value_offset(index),
 	                                 bin.value_length(index));
 	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(std::move(slice));
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(buffer_reader);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(buffer_reader);
 	if (!reader_result.ok()) {
 		throw IOException("Failed to open IPC stream from bytes: %s", reader_result.status().ToString());
 	}
@@ -539,7 +540,7 @@ DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_
 	auto buffer = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
 	memcpy(const_cast<uint8_t *>(buffer->data()), data, len);
 	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(buffer);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(buffer_reader);
+	auto reader_result = ::duckdb::vgi::nanoipc::OpenStreamReader(buffer_reader);
 	if (!reader_result.ok()) {
 		throw IOException("Failed to open IPC stream from bytes: %s", reader_result.status().ToString());
 	}
@@ -556,7 +557,7 @@ DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_
 }
 
 std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Schema> &schema) {
-	auto serialize_result = arrow::ipc::SerializeSchema(*schema);
+	auto serialize_result = ::duckdb::vgi::nanoipc::SerializeSchema(*schema);
 	if (!serialize_result.ok()) {
 		throw IOException("Failed to serialize schema: %s", serialize_result.status().ToString());
 	}
@@ -629,7 +630,7 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 	auto schema_buffer = arrow::Buffer::Wrap(wire.output_schema.data(), wire.output_schema.size());
 	arrow::io::BufferReader reader(schema_buffer);
 	arrow::ipc::DictionaryMemo dict_memo;
-	auto schema_result = arrow::ipc::ReadSchema(&reader, &dict_memo);
+	auto schema_result = ::duckdb::vgi::nanoipc::ReadSchema(&reader, &dict_memo);
 	if (!schema_result.ok()) {
 		throw IOException("Failed to deserialize output schema: %s [worker: %s]", schema_result.status().ToString(),
 		                  worker_path);
