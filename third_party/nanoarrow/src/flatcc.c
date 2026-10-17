@@ -2520,7 +2520,14 @@ static int verify_field(flatcc_table_verifier_descriptor_t *td,
      */
     k = vte;
     k2 = k + size;
-    verify(k2 <= td->tsize, flatcc_verify_error_table_field_out_of_range);
+    /*
+     * VGI patch: arrow-go (flatbuffers-go vtable deduplication) can reuse a vtable whose
+     * declared object size is smaller than a table that shares it, so a field may run past
+     * td->tsize while still lying inside the buffer. Arrow C++'s verifier accepts such
+     * messages (it bounds fields by the buffer), so do the same: still memory safe.
+     */
+    verify(k2 <= td->tsize || (k2 <= td->end && td->table <= td->end - k2),
+           flatcc_verify_error_table_field_out_of_range);
     /* This normally optimizes to nop. */
     verify(uoffset_size > voffset_size || k <= k2, flatcc_verify_error_table_field_size_overflow);
     trace_verify("table + vte", vte + td->table);
@@ -2555,7 +2562,14 @@ static int get_offset_field(flatcc_table_verifier_descriptor_t *td, voffset_t id
      */
     k = vte;
     k2 = k + offset_size;
-    verify(k2 <= td->tsize, flatcc_verify_error_table_field_out_of_range);
+    /*
+     * VGI patch: arrow-go (flatbuffers-go vtable deduplication) can reuse a vtable whose
+     * declared object size is smaller than a table that shares it, so a field may run past
+     * td->tsize while still lying inside the buffer. Arrow C++'s verifier accepts such
+     * messages (it bounds fields by the buffer), so do the same: still memory safe.
+     */
+    verify(k2 <= td->tsize || (k2 <= td->end && td->table <= td->end - k2),
+           flatcc_verify_error_table_field_out_of_range);
     /* This normally optimizes to nop. */
     verify(uoffset_size > voffset_size || k <= k2, flatcc_verify_error_table_field_size_overflow);
     k += td->table;

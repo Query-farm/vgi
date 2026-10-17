@@ -6,3 +6,8 @@ branch: vgi/writer-message-metadata
   + empty-array zero offset fix
 commit: 5597c059e785b29dace9690b41e6d98a632d1ad7
 bundled: python3 ci/scripts/bundle.py --symbol-namespace VgiNanoarrow --with-ipc --with-flatcc
+local patches (re-apply after re-bundling):
+  src/flatcc.c: table field bounds checked against the buffer end, not only the vtable's
+    object size (arrow-go writes DictionaryEncoding tables that share a too-small vtable;
+    Arrow C++ accepts them). Two `table_field_out_of_range` checks in verify_field /
+    verify_offset_field.
