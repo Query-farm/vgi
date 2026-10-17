@@ -10,7 +10,7 @@ Two credentials, minted together while the user is attached and logged in:
 
 | | From | Says |
 | --- | --- | --- |
-| **grant** | `vgi_rpc.Identity.v1` `issue_grant` | *who* attaches. Presented later as `bearer_token`. |
+| **grant** | `vgi_rpc.Identity.v2` `issue_grant` | *who* attaches. Presented later as `bearer_token`. |
 | **ticket** | `vgi.attach_tickets.v1` `seal_attach` | *what* to attach: the catalog, its options (secret ones included) and version specs, sealed so only that worker can open them, and only for the same principal. |
 
 ```sql
@@ -41,7 +41,7 @@ One row per attached catalog (sorted by alias), or per alias in `aliases`:
 | --- | --- |
 | `ok` | Both halves minted. |
 | `not_vgi` | The catalog is not `TYPE vgi`. |
-| `not_supported` | The worker's reflection lists no `vgi.attach_tickets.v1` or no `vgi_rpc.Identity.v1` (tickets need an HTTP worker with a configured signing key and grant keys), `issue_grant` is not implemented, or the catalog was itself attached with a ticket (its original options were never in this session). |
+| `not_supported` | The worker's reflection lists no `vgi.attach_tickets.v1` or no `vgi_rpc.Identity.v2` (tickets need an HTTP worker with a configured signing key and grant keys), `issue_grant` is not implemented, or the catalog was itself attached with a ticket (its original options were never in this session). |
 | `stale_login` | `issue_grant` answered `stale_auth`: the session is not a fresh login (for example it authenticated with a grant; grants never mint grants). Re-authenticate and export again. |
 | `refused` | The worker refused `issue_grant` or `seal_attach`. |
 | `error` | Anything else for that row: an unknown alias, an unreachable worker. |

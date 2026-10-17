@@ -148,18 +148,13 @@ TEST_CASE("Records round-trip through ToBatch/FromBatch", "[protocol-records]") 
 	}
 }
 
-TEST_CASE("FunctionType accepts the spellings peers send", "[protocol-records]") {
-	// vgi-go, vgi-rust and vgi-java send function_type in lower case; table_in_out is the
-	// legacy name of TABLE. Encoding always writes the canonical name.
+TEST_CASE("Enums accept only their canonical member names", "[protocol-records]") {
 	CHECK(FunctionTypeFromWire("TABLE") == FunctionType::Table);
-	CHECK(FunctionTypeFromWire("table") == FunctionType::Table);
-	CHECK(FunctionTypeFromWire("table_in_out") == FunctionType::Table);
-	CHECK(FunctionTypeFromWire("scalar") == FunctionType::Scalar);
-	CHECK(FunctionTypeFromWire("table_buffering") == FunctionType::TableBuffering);
-	CHECK(FunctionTypeFromWire("aggregate") == FunctionType::Aggregate);
-	CHECK(!FunctionTypeFromWire("Table").has_value());
+	CHECK(FunctionTypeFromWire("TABLE_BUFFERING") == FunctionType::TableBuffering);
+	CHECK(!FunctionTypeFromWire("table").has_value());
+	CHECK(!FunctionTypeFromWire("table_in_out").has_value());
+	CHECK(!MacroTypeFromWire("scalar").has_value());
 	CHECK(std::string(ToWire(FunctionType::Table)) == "TABLE");
-	// Other enums keep their canonical spelling only.
 	CHECK(!VgiInitPhaseFromWire("input").has_value());
 }
 
@@ -193,19 +188,23 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 		CHECK(msg.find("unexpected null value") != std::string::npos);
 	}
 
-	SECTION("a null non-nullable list or map reads as empty; a null list item as a default") {
+	SECTION("a null non-nullable list, map or list item is an error") {
 		auto path_idx = full->schema()->GetFieldIndex("path");
 		auto null_list = arrow::MakeArrayOfNull(arrow::list(arrow::utf8()), 1).ValueOrDie();
 		auto batch =
 		    full->SetColumn(path_idx, arrow::field("path", arrow::list(arrow::utf8()), true), null_list).ValueOrDie();
-		auto tags_idx = batch->schema()->GetFieldIndex("tags");
+		CHECK(ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "w"); }).find("unexpected null value") != std::string::npos);
+
+		auto tags_idx = full->schema()->GetFieldIndex("tags");
 		auto null_map = arrow::MakeArrayOfNull(arrow::map(arrow::utf8(), arrow::utf8()), 1).ValueOrDie();
-		batch = batch->SetColumn(tags_idx, arrow::field("tags", arrow::map(arrow::utf8(), arrow::utf8()), true),
-		                         null_map)
+		batch = full->SetColumn(tags_idx, arrow::field("tags", arrow::map(arrow::utf8(), arrow::utf8()), true),
+		                        null_map)
 		            .ValueOrDie();
-		auto decoded = Decode<SchemaInfo>(batch, 0, "w");
-		CHECK(decoded.path.empty());
-		CHECK(decoded.tags.empty());
+		CHECK(ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "w"); }).find("unexpected null value") != std::string::npos);
+
+		auto missing = full->RemoveColumn(path_idx).ValueOrDie();
+		CHECK(ErrorOf([&] { Decode<SchemaInfo>(missing, 0, "w"); }).find("Required column 'path'") !=
+		      std::string::npos);
 
 		arrow::StringBuilder items;
 		REQUIRE(items.Append("a").ok());
@@ -215,7 +214,9 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 		REQUIRE(offsets.AppendValues({0, 2}).ok());
 		auto list = arrow::ListArray::FromArrays(*offsets.Finish().ValueOrDie(), *values).ValueOrDie();
 		auto with_null_item = full->SetColumn(path_idx, full->schema()->field(path_idx), list).ValueOrDie();
-		CHECK(Decode<SchemaInfo>(with_null_item, 0, "w").path == std::vector<std::string> {"a", ""});
+		auto msg = ErrorOf([&] { Decode<SchemaInfo>(with_null_item, 0, "w"); });
+		CHECK(msg.find("unexpected null value") != std::string::npos);
+		CHECK(msg.find("path[]") != std::string::npos);
 	}
 
 	SECTION("a column of the wrong type is an error, not a silent default") {
