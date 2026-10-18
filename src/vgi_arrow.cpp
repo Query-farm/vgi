@@ -2,6 +2,7 @@
 #include "vgi_arrow.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -10,6 +11,10 @@
 #include "duckdb/common/exception.hpp"
 
 #include "nanoarrow/nanoarrow.h"
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace duckdb {
 namespace vgi {
@@ -63,6 +68,24 @@ VgiBufferPtr VgiBuffer::Wrap(const void *data, int64_t size) {
 
 VgiBufferPtr VgiBuffer::Allocate(int64_t size, uint8_t **out) {
 	// Uninitialized: callers overwrite every byte (reads off the wire).
+#if defined(__linux__)
+	// A large IPC body (one worker batch can be hundreds of MB) is faulted in a page at a
+	// time as read() fills it. With THP in `madvise` mode (the Amazon Linux default) glibc
+	// malloc never gets huge pages, so a 780 MB body took ~195k minor faults where Arrow
+	// C++'s allocator, which madvises, took ~8k. Ask for 2 MB pages explicitly.
+	constexpr size_t kHugePage = size_t(2) << 20;
+	if (size >= static_cast<int64_t>(4 * kHugePage)) {
+		const size_t bytes = (static_cast<size_t>(size) + kHugePage - 1) & ~(kHugePage - 1);
+		void *raw = nullptr;
+		if (posix_memalign(&raw, kHugePage, bytes) == 0) {
+			(void)madvise(raw, bytes, MADV_HUGEPAGE);
+			std::shared_ptr<uint8_t> owner(static_cast<uint8_t *>(raw), [](uint8_t *p) { std::free(p); });
+			*out = owner.get();
+			auto *data = owner.get();
+			return std::make_shared<const VgiBuffer>(std::move(owner), data, size);
+		}
+	}
+#endif
 	std::shared_ptr<uint8_t> owner(new uint8_t[static_cast<size_t>(size > 0 ? size : 1)],
 	                               std::default_delete<uint8_t[]>());
 	*out = owner.get();
