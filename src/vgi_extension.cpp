@@ -2420,11 +2420,12 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// unsatisfiable requests; that surfaces as the ATTACH failure. The
 	// launcher_*_for_attach optionals were already built above (alongside the
 	// InvokeCatalogs path) so the override flows into both RPCs identically.
+	vgi::ServerCapabilities attach_capabilities;
 	auto invoke_attach = [&]() {
 		return vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
 		                                data_version_spec, implementation_version, cookie_jar, attach_options,
 		                                launcher_idle_for_attach, launcher_state_dir_for_attach, worker_artifact_anchor,
-		                                tcp_proxy, iroh_config);
+		                                tcp_proxy, iroh_config, &attach_capabilities);
 	};
 	vgi::CatalogAttachResult attach_result;
 	if (!attach_ticket_given) {
@@ -2599,6 +2600,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	attach_cfg.attach_options_canonical = vgi::CanonicalAttachOptions(key_options);
 	attach_cfg.retained_attach = std::move(retained_attach);
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(std::move(attach_cfg));
+	// The attach RPC already negotiated HTTP capabilities on its temporary
+	// parameters. Keep that snapshot so the first catalog RPC needs no probe.
+	attach_params->StoreServerCapabilities(attach_capabilities);
 
 	// Prime the HTTPParams cache while we're outside any VGI catalog
 	// transaction. HTTPFSUtil::InitializeParameters pulls settings/secrets

@@ -65,6 +65,8 @@ inline std::string MapOnConflict(OnCreateConflict conflict) {
 // ``cookie_jar`` is the per-catalog HTTP session cookie store (null for
 // subprocess transport); if present, Set-Cookie response headers are captured
 // into it and Cookie request headers are read from it on subsequent RPCs.
+// Optionally return the temporary connection's capability snapshot for reuse
+// by the attached catalog; capabilities remain scoped to this attachment.
 CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const std::string &catalog_name,
                                         ClientContext &context, bool worker_debug = false, bool use_pool = true,
                                         const std::shared_ptr<CatalogAuth> &auth = nullptr,
@@ -76,7 +78,8 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         std::optional<std::string> launcher_state_dir = std::nullopt,
                                         std::shared_ptr<void> worker_artifact_anchor = nullptr,
                                         const std::string &tcp_proxy = "",
-                                        std::shared_ptr<IrohClientConfig> iroh = nullptr);
+                                        std::shared_ptr<IrohClientConfig> iroh = nullptr,
+                                        ServerCapabilities *discovered_capabilities = nullptr);
 
 // List catalogs exposed by a worker. Returns per-catalog discovery records
 // carrying implementation_version and data_version_spec metadata alongside the

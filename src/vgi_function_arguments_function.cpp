@@ -9,14 +9,15 @@
 // metadata). Lets an agent that discovered a function via the catalog tags
 // learn how to actually call it.
 //
-// Performance: issues a fresh catalog_schema_contents_functions RPC per
-// (schema, function-type) per attached catalog. Acceptable for a diagnostic;
-// not for a hot path. Reports each catalog's current/attached data version
-// (no time travel).
+// Reuses the schema's function/macro inventories, including catalog_contents
+// seeds. The optional catalog parameter limits discovery before any RPCs.
+// Reports each catalog's current/attached data version (no time travel).
 // =============================================================================
 
 #include <arrow/api.h>
 
+#include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -25,6 +26,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include "storage/vgi_catalog.hpp"
+#include "storage/vgi_schema_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
@@ -227,12 +229,19 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 
 	auto data = make_uniq<VgiFunctionArgumentsData>();
 
-	static const char *kFunctionTypeRequests[] = {"SCALAR_FUNCTION", "TABLE_FUNCTION", "AGGREGATE_FUNCTION"};
+	static const CatalogType kFunctionTypes[] = {CatalogType::SCALAR_FUNCTION_ENTRY,
+	                                             CatalogType::TABLE_FUNCTION_ENTRY,
+	                                             CatalogType::AGGREGATE_FUNCTION_ENTRY};
+	const auto selected_catalog = input.named_parameters.find("catalog");
 
 	auto databases = DatabaseManager::Get(context).GetDatabases(context);
 	for (auto &db : databases) {
 		auto &catalog = db->GetCatalog();
 		if (catalog.GetCatalogType() != "vgi") {
+			continue;
+		}
+		if (selected_catalog != input.named_parameters.end() && !selected_catalog->second.IsNull() &&
+		    !StringUtil::CIEquals(catalog.GetName(), selected_catalog->second.ToString())) {
 			continue;
 		}
 		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
@@ -247,13 +256,13 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 
 		vgi_catalog.ScanSchemas(context, [&](SchemaCatalogEntry &schema) {
 			const auto schema_name = schema.name;
-			for (const char *request_type : kFunctionTypeRequests) {
+			auto &vgi_schema = schema.Cast<VgiSchemaEntry>();
+			for (const auto function_type : kFunctionTypes) {
 				try {
 					CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data, transaction_opaque};
 					rpc_ctx.entity_kind = "schema";
 					rpc_ctx.entity_qualifier = schema_name;
-					auto function_list =
-					    InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_name, request_type, context);
+					auto function_list = vgi_schema.GetFunctionInventory(rpc_ctx, function_type, context);
 					for (auto &func : function_list) {
 						EmitFunctionArgs(context, catalog_name, schema_name, func, data->rows);
 					}
@@ -263,20 +272,20 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 					VGI_LOG(context, "vgi.function_arguments.skip_failed",
 					        {{"catalog", catalog_name},
 					         {"schema", schema_name},
-					         {"function_type", request_type},
+					         {"function_type", EnumUtil::ToString(function_type)},
 					         {"error", e.what()}});
 				}
 			}
 
 			// Macros: enumerate scalar + table macros and surface their per-
 			// parameter docs (arguments_schema vgi_doc field metadata).
-			static const char *kMacroTypeRequests[] = {"SCALAR_MACRO", "TABLE_MACRO"};
-			for (const char *macro_type : kMacroTypeRequests) {
+			static const CatalogType kMacroTypes[] = {CatalogType::MACRO_ENTRY, CatalogType::TABLE_MACRO_ENTRY};
+			for (const auto macro_type : kMacroTypes) {
 				try {
 					CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data, transaction_opaque};
 					rpc_ctx.entity_kind = "schema";
 					rpc_ctx.entity_qualifier = schema_name;
-					auto macro_list = InvokeCatalogSchemaContentsMacros(rpc_ctx, schema_name, macro_type, context);
+					auto macro_list = vgi_schema.GetMacroInventory(rpc_ctx, macro_type, context);
 					for (auto &macro : macro_list) {
 						EmitMacroArgs(context, catalog_name, schema_name, macro, data->rows);
 					}
@@ -284,7 +293,7 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 					VGI_LOG(context, "vgi.function_arguments.skip_failed",
 					        {{"catalog", catalog_name},
 					         {"schema", schema_name},
-					         {"function_type", macro_type},
+					         {"function_type", EnumUtil::ToString(macro_type)},
 					         {"error", e.what()}});
 				}
 			}
@@ -328,6 +337,7 @@ static void VgiFunctionArgumentsScan(ClientContext &context, TableFunctionInput 
 
 void RegisterVgiFunctionArgumentsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_function_arguments", {}, VgiFunctionArgumentsScan, VgiFunctionArgumentsBind);
+	func.named_parameters["catalog"] = LogicalType::VARCHAR;
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "Inspect the arguments of every function and macro exposed by every attached VGI catalog, one row per "
@@ -336,11 +346,12 @@ void RegisterVgiFunctionArgumentsFunction(ExtensionLoader &loader) {
 	    "varargs, table-input, any-type, function-level input_from_args correlated-input capability, the "
 	    "per-argument description (vgi_doc), and discovery-facing "
 	    "constraints (arg_default, arg_choices, arg_range, arg_pattern) so an agent can read valid inputs "
-	    "before calling. Filter with WHERE catalog_name = '...'. Reports each catalog's current data "
+	    "before calling. Pass catalog := '...' to inspect one attachment. Reuses cached catalog metadata. "
+	    "Reports each catalog's current data "
 	    "version; does not honor time travel.",
 	    {}, {},
 	    {"SELECT * FROM vgi_function_arguments();",
-	     "SELECT arg_name, arg_type, is_const, arg_description FROM vgi_function_arguments() "
+	     "SELECT arg_name, arg_type, is_const, arg_description FROM vgi_function_arguments(catalog := 'example') "
 	     "WHERE catalog_name = 'example' AND function_name = 'multiply' ORDER BY arg_position;",
 	     "SELECT arg_name, arg_range, arg_choices, arg_pattern FROM vgi_function_arguments() "
 	     "WHERE catalog_name = 'example' AND function_name = 'format_number' ORDER BY field_index;"}));

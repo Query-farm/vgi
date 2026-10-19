@@ -535,7 +535,8 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	                                    std::optional<std::string> launcher_state_dir,
 	                                    std::shared_ptr<void> worker_artifact_anchor,
 	                                    const std::string &tcp_proxy,
-	                                    std::shared_ptr<IrohClientConfig> iroh) {
+	                                    std::shared_ptr<IrohClientConfig> iroh,
+	                                    ServerCapabilities *discovered_capabilities) {
 	// Use the config struct so launcher overrides flow into the temp_params.
 	// Without these, the catalog_attach RPC would prime the launcher cache
 	// with [defaults]; the subsequent real ATTACH (carrying overrides) would
@@ -571,7 +572,11 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	if (!result_batch) {
 		throw IOException(CatalogProtocolViolation("catalog_attach", worker_path), "Empty response from catalog_attach [worker: %s]", worker_path);
 	}
-	return ParseCatalogAttachResult(result_batch, worker_path, context);
+	auto result = ParseCatalogAttachResult(result_batch, worker_path, context);
+	if (discovered_capabilities) {
+		*discovered_capabilities = temp_params->LoadServerCapabilities();
+	}
+	return result;
 }
 
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context) {
