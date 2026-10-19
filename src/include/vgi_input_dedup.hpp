@@ -31,10 +31,36 @@ struct InputDedup {
 	// Length n: for each original row, the distinct-tuple index d ∈ [0, k) it belongs to.
 	// Scatter for a 1:1 map: result[row] = worker_out[orig_to_distinct[row]].
 	std::vector<idx_t> orig_to_distinct;
-	// Length k: the original row indices sharing each distinct tuple (the inverse map).
+	// The original row indices sharing each distinct tuple (the inverse map), stored flat:
+	// group d is group_rows[group_offsets[d], group_offsets[d + 1]), rows ascending.
 	// Expansion for a 1:N map: a worker output row whose parent is d fans out to every
-	// original row in groups[d], stamped with THAT original row's outer columns.
-	std::vector<std::vector<idx_t>> groups;
+	// original row in Group(d), stamped with THAT original row's outer columns.
+	std::vector<idx_t> group_offsets; // length k + 1
+	std::vector<idx_t> group_rows;    // length n
+
+	struct GroupRows {
+		const idx_t *first;
+		const idx_t *last;
+		const idx_t *begin() const {
+			return first;
+		}
+		const idx_t *end() const {
+			return last;
+		}
+		idx_t size() const {
+			return static_cast<idx_t>(last - first);
+		}
+		bool empty() const {
+			return first == last;
+		}
+		idx_t operator[](idx_t i) const {
+			return first[i];
+		}
+	};
+	GroupRows Group(idx_t d) const {
+		const idx_t *rows = group_rows.data();
+		return GroupRows {rows + group_offsets[d], rows + group_offsets[d + 1]};
+	}
 };
 
 // Internal work limits; bypassing returns a complete identity mapping.
@@ -45,9 +71,11 @@ struct InputDedupOptions {
 	idx_t max_comparisons = 65536;
 };
 
-// VARCHAR/BLOB input buffers are hashed and compared without payload copies.
-// Large inputs are sampled before full-batch hashing. Exact equality is always
-// required after hash matches. Other types retain the canonical-key semantics.
+// VARCHAR/BLOB and plain fixed-width columns (integers, dates, timestamps, decimals,
+// UUIDs, enums) are hashed and compared in their input buffers without copies. Large
+// string inputs are sampled before full-batch hashing. Exact equality is always
+// required after hash matches. Other types (floats, intervals, nested) retain the
+// canonical-key semantics.
 // Poor sampled reduction or exhausted work budgets return an identity mapping.
 // Only `key_cols` (indices into `chunk`) participate. NULLs group together; nested
 // and numeric types use CreateSortKey. An identity result may contain duplicates:

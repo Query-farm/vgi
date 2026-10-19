@@ -1017,7 +1017,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		take_idx.reserve(worker_parent.size());
 		expanded.reserve(worker_parent.size());
 		for (idx_t m = 0; m < worker_parent.size(); m++) {
-			const auto &grp = dd.groups[static_cast<idx_t>(worker_parent[m])];
+			const auto grp = dd.Group(static_cast<idx_t>(worker_parent[m]));
 			for (idx_t o : grp) {
 				take_idx.push_back(static_cast<int32_t>(m));
 				expanded.push_back(static_cast<int32_t>(o));

@@ -59,10 +59,15 @@ A pure compute transform at each operator's exchange boundary, independent of an
 
 **Shared helper `vgi_input_dedup.{hpp,cpp}`** — `BuildInputDedup(chunk, worker_col_ids) → InputDedup`:
 - NULL-aware equality over the **worker-input columns only** (the arguments passed to the
-  function). VARCHAR and BLOB values are hashed and compared directly in their input buffers;
-  the lookup stores row indices, without copying string payloads into keys. Other columns use
-  `CreateSortKeyHelpers::CreateSortKey` to preserve numeric and nested-type equality.
-  Hash matches always require exact equality, including when hashes collide.
+  function). VARCHAR and BLOB values, and fixed-width types whose equality is bitwise
+  (integers, DATE, TIME, TIMESTAMP*, DECIMAL, UUID, ENUM), are hashed and compared directly in
+  their input buffers, a column at a time; the lookup stores row indices, without copying
+  payloads into keys. Other columns (FLOAT/DOUBLE, INTERVAL, TIME_TZ, nested) use
+  `CreateSortKeyHelpers::CreateSortKey` to preserve DuckDB's equality (NaN, -0.0, normalized
+  intervals). Hash matches always require exact equality, including when hashes collide.
+  The lookup is an open-addressing table of 8-byte slots in a per-thread buffer, and
+  `groups` is stored flat (`group_offsets` + `group_rows`, read through `Group(d)`), so a
+  chunk costs a handful of allocations rather than several per row.
 - Produces:
   - `distinct` — a `SelectionVector` picking one representative original row per distinct tuple
     (length `K`), used to build the K-row deduped input to ship.
