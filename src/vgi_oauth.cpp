@@ -2085,6 +2085,9 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 				refresh_ctx = binding;
 			}
 		}
+		// Set when the IdP refused the refresh token and the browser build goes
+		// on to interactive sign-in instead of failing (see below).
+		std::string rejected_refresh_error;
 		// Attempt token refresh if we have a refresh_token
 		if (!refresh_token.empty()) {
 			// Discover metadata if we have a token but no refresh context
@@ -2111,12 +2114,14 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					if (!lock.owns_lock()) lock.lock();
 					return StoreSuccess(std::move(tokens), refresh_ctx);
 				} catch (const std::exception &e) {
-					// Do NOT silently fall through to PerformAuthFlow.
-					// When token refresh fails (e.g., invalid_grant), rethrow
-					// immediately so the caller sees the actual refresh failure.
-					// This is critical for WASM/cupola where the origin isn't a
-					// registered OAuth client — falling through would mask the
-					// real error behind a misleading "token exchange failed" message.
+					// Natively, do NOT fall through to PerformAuthFlow: rethrow so
+					// the caller sees the actual refresh failure, and a batch run
+					// never blocks on a browser sign-in it cannot see. In the
+					// browser the host shows a sign-in popup, so a refresh token the
+					// IdP no longer honours (Entra's 24-hour cap on SPA refresh
+					// tokens, a revoked session) goes straight to interactive
+					// sign-in rather than failing this query and leaving the next
+					// one to start it.
 					std::string refresh_err = RawMessageOf(e);
 					// AttemptTokenRefresh tags an IdP rejection with the parsed
 					// RFC 6749 `oauth_error`; branch on that. The substring check
@@ -2128,20 +2133,41 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					const bool invalid_grant = oauth_error_it != refresh_info.end()
 					                               ? oauth_error_it->second == "invalid_grant"
 					                               : refresh_err.find("invalid_grant") != std::string::npos;
+#ifdef __EMSCRIPTEN__
+					const bool sign_in_instead = invalid_grant;
+#else
+					const bool sign_in_instead = false;
+#endif
 					if (!lock.owns_lock()) lock.lock();
 					if (WasCleared()) throw;
 					// Clear stale refresh token on invalid_grant
 					if (invalid_grant) {
 						state->token.refresh_token.clear();
 					}
-					// Finish the state transition before deletion, which can itself
-					// fail. Otherwise other connections remain stuck IN_PROGRESS.
-					StoreFailed(refresh_err);
-					if (invalid_grant && !canonical_key.empty()) {
-						VGI_STDERR_DEBUG("[VGI] oauth.clearing_stale_refresh_token\n");
-						DeleteOAuthRefreshToken(canonical_key, cache_mode_);
+					if (!sign_in_instead) {
+						// Finish the state transition before deletion, which can itself
+						// fail. Otherwise other connections remain stuck IN_PROGRESS.
+						StoreFailed(refresh_err);
+						if (invalid_grant && !canonical_key.empty()) {
+							VGI_STDERR_DEBUG("[VGI] oauth.clearing_stale_refresh_token\n");
+							DeleteOAuthRefreshToken(canonical_key, cache_mode_);
+						}
+						throw;
 					}
-					throw;
+					// Still IN_PROGRESS and owned by this thread: waiters keep
+					// waiting for the sign-in below.
+					rejected_refresh_error = refresh_err;
+					lock.unlock();
+					if (!canonical_key.empty()) {
+						try {
+							DeleteOAuthRefreshToken(canonical_key, cache_mode_);
+						} catch (...) {
+							// Already dropped from state; a stale cached copy only costs
+							// one more invalid_grant later.
+						}
+					}
+					DUCKDB_LOG_WARNING(context,
+					    "VGI OAuth: refresh token rejected, starting interactive sign-in: " + refresh_err);
 				} catch (...) {
 					// Non-std::exception throw (rare, but possible from
 					// nested code). Without this catch the IN_PROGRESS
@@ -2155,7 +2181,8 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			}
 		}
 
-		// Full auth flow — only reached when no refresh_token was available
+		// Full auth flow: reached when no refresh_token was available, or (browser
+		// build only) when the IdP refused it.
 		try {
 			OAuthRefreshContext new_refresh_ctx;
 			auto tokens = PerformAuthFlow(challenge, context, new_refresh_ctx);
@@ -2169,8 +2196,14 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			if (!lock.owns_lock()) lock.lock();
 			if (WasCleared()) throw;
 			// Raw text: waiters re-wrap it, and e.what() is DuckDB's JSON form.
-			StoreFailed(RawMessageOf(e));
-			throw;
+			if (rejected_refresh_error.empty()) {
+				StoreFailed(RawMessageOf(e));
+				throw;
+			}
+			// Name both failures: the sign-in error alone hides why one was needed.
+			StoreFailed(RawMessageOf(e) + "\n(started because token refresh failed: " + rejected_refresh_error + ")");
+			throw IOException(ErrorInfo(error_subtype::kAuthFailed), "%s\n(started because token refresh failed: %s)",
+			                  RawMessageOf(e), rejected_refresh_error);
 		} catch (...) {
 			// Same hang-prevention as the refresh catch above.
 			if (!lock.owns_lock()) lock.lock();
