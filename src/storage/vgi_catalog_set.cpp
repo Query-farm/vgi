@@ -87,6 +87,26 @@ void VgiCatalogSet::MarkPopulatedLocked() {
 	eager_load_resolved_ = true;
 }
 
+bool VgiCatalogSet::IsKnownMissingLocked(const std::string &name) const {
+	auto &attach_result = catalog_.Cast<VgiCatalog>().attach_result();
+	return attach_result && !attach_result->supports_transactions && missing_entries_.find(name) != missing_entries_.end();
+}
+
+void VgiCatalogSet::CacheMissingEntryLocked(const std::string &name, uint64_t expected_generation) {
+	auto &attach_result = catalog_.Cast<VgiCatalog>().attach_result();
+	// Transaction-local absence must never become shared catalog state.
+	if (!attach_result || attach_result->supports_transactions ||
+	    generation_.load(std::memory_order_acquire) != expected_generation || entries_.find(name) != entries_.end()) {
+		return;
+	}
+	// Bound memory for arbitrary lookup names. Eviction only costs another RPC.
+	static constexpr idx_t MAX_MISSING_ENTRIES = 1024;
+	if (missing_entries_.size() >= MAX_MISSING_ENTRIES) {
+		missing_entries_.clear();
+	}
+	missing_entries_.insert(name);
+}
+
 // Serialize concurrent loads. First caller fires LoadEntries; later callers
 // wait on load_lock_ (no entry_lock_ held during wait), see is_loaded_=true
 // after the first finishes, and skip the load. No RPC duplication.
@@ -204,6 +224,7 @@ void VgiCatalogSet::CreateEntryLocked(unique_ptr<CatalogEntry> entry) {
 	// see ColumnIsGenerated → ColumnList::GetColumn(0) UAF that surfaces as
 	// "Logical column index 0 out of range". Refresh goes through
 	// ClearEntries() / vgi_clear_cache() at safe points instead.
+	missing_entries_.erase(entry->name);
 	if (entries_.find(entry->name) != entries_.end()) {
 		return;
 	}
@@ -213,9 +234,10 @@ void VgiCatalogSet::CreateEntryLocked(unique_ptr<CatalogEntry> entry) {
 
 void VgiCatalogSet::DropEntry(const std::string &name) {
 	std::lock_guard<std::mutex> lock(entry_lock_);
-	if (entries_.erase(name) > 0) {
-		generation_.fetch_add(1, std::memory_order_release);
-	}
+	entries_.erase(name);
+	missing_entries_.clear();
+	// Even an uncached name may have a lookup in flight.
+	generation_.fetch_add(1, std::memory_order_release);
 }
 
 void VgiCatalogSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
@@ -243,10 +265,9 @@ void VgiCatalogSet::ClearEntries() {
 		schema_entry_->DiscardSeed(CacheKindName());
 	}
 	std::lock_guard<std::mutex> lock(entry_lock_);
-	if (!entries_.empty() || is_loaded_) {
-		generation_.fetch_add(1, std::memory_order_release);
-	}
+	generation_.fetch_add(1, std::memory_order_release);
 	entries_.clear();
+	missing_entries_.clear();
 	is_loaded_ = false;
 }
 
@@ -266,6 +287,7 @@ std::vector<unique_ptr<CatalogEntry>> VgiCatalogSet::HarvestEntries() {
 		}
 	}
 	entries_.clear();
+	missing_entries_.clear();
 	is_loaded_ = false;
 	generation_.fetch_add(1, std::memory_order_release);
 	return harvested;
@@ -276,13 +298,16 @@ unique_ptr<CatalogEntry> VgiCatalogSet::HarvestEntry(const std::string &name) {
 		schema_entry_->DiscardSeed(CacheKindName());
 	}
 	std::lock_guard<std::mutex> lock(entry_lock_);
+	// A rename invalidates the old name here, but its destination may have
+	// been cached as missing. Clear all misses, even if the old name is absent.
+	missing_entries_.clear();
+	generation_.fetch_add(1, std::memory_order_release);
 	auto it = entries_.find(name);
 	if (it == entries_.end()) {
 		return nullptr;
 	}
 	auto entry = std::move(it->second);
 	entries_.erase(it);
-	generation_.fetch_add(1, std::memory_order_release);
 	return entry;
 }
 

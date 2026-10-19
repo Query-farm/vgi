@@ -173,10 +173,17 @@ protected:
 	// keyed by CacheKindName(). Idempotent. Called from ShouldEagerLoadLocked.
 	void ResolveEagerLoadParamsLocked();
 
+	// Explicit per-name RPC misses only, for workers without transactions.
+	// Caller must hold entry_lock_. A miss may be published only if no
+	// invalidation or positive insertion occurred while the RPC was in flight.
+	bool IsKnownMissingLocked(const std::string &name) const;
+	void CacheMissingEntryLocked(const std::string &name, uint64_t expected_generation);
+
 protected:
 	Catalog &catalog_;
 	VgiSchemaEntry *schema_entry_ = nullptr;
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> entries_;
+	case_insensitive_set_t missing_entries_;
 	bool is_loaded_ = false;
 	std::mutex entry_lock_;
 	std::atomic<uint64_t> generation_{0};

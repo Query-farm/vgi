@@ -78,6 +78,8 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 		if (it != GetEntries().end()) {
 			cached_result = it->second.get();
 			fast_outcome = "hit";
+		} else if (IsKnownMissingLocked(name)) {
+			fast_outcome = "negative_hit";
 		} else if (ShouldBypassRpcLocked(context, trust_empty_kinds)) {
 			is_loaded_ = true;
 			fast_outcome = "kind_empty";
@@ -179,6 +181,10 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	double rpc_ms = std::chrono::duration<double, std::milli>(rpc_end - rpc_start).count();
 
 	if (!table_info_opt) {
+		{
+			std::lock_guard<std::mutex> lock(entry_lock_);
+			CacheMissingEntryLocked(name, pre_gen);
+		}
 		VGI_LOG(context, "catalog.entry_cache",
 		        {{"set_kind", CacheKindName()},
 		         {"name", name},
@@ -206,6 +212,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 				pub_outcome = "concurrent_published";
 			} else {
 				pub_result = table_entry.get();
+				missing_entries_.erase(name);
 				GetEntries()[name] = std::move(table_entry);
 				generation_.fetch_add(1, std::memory_order_release);
 				pub_outcome = "rpc_fetched";

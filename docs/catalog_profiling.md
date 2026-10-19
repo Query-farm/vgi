@@ -42,6 +42,7 @@ Emitted by the catalog set's `GetEntry` paths — both the base `VgiCatalogSet::
 `outcome` enum values:
 
 - **`hit`** — entry was already cached, no RPC. The fast path.
+- **`negative_hit`** — a previous per-name table/view RPC explicitly returned no result, so no RPC is needed. Only used for workers without transaction support; time-travel lookups bypass it. Names are case-insensitive, with at most 1024 misses per schema and entry kind. Catalog invalidation (including DDL and cache clears) clears these misses; bulk listings alone never create them.
 - **`miss_loaded`** — entry was not in the cache; this call ran `LoadEntries()` and the entry was found in the freshly populated set. (Base path only.)
 - **`miss_not_found`** — entry was not in the cache; even after `LoadEntries()` (or with cache already loaded) it doesn't exist.
 - **`rpc_fetched`** — single-table on-demand fetch (`InvokeCatalogTableGet`) succeeded and was published into the cache.

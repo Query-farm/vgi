@@ -65,28 +65,32 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 
 	// Fast path: cache hit / bypass. Hold entry_lock_ only briefly.
 	bool eager = false;
+	uint64_t pre_gen;
 	optional_ptr<CatalogEntry> cached_result = nullptr;
-	bool bypassed = false;
+	const char *fast_outcome = nullptr;
 	{
 		std::lock_guard<std::mutex> lock(entry_lock_);
 		auto it = GetEntries().find(name);
 		if (it != GetEntries().end()) {
 			cached_result = it->second.get();
+		} else if (IsKnownMissingLocked(name)) {
+			fast_outcome = "negative_hit";
 		} else if (ShouldBypassRpcLocked(context, trust_empty_kinds)) {
 			is_loaded_ = true;
-			bypassed = true;
+			fast_outcome = "kind_empty";
 		} else {
 			eager = ShouldEagerLoadLocked();
+			pre_gen = generation_.load(std::memory_order_acquire);
 		}
 	}
 	if (cached_result) {
 		return cached_result;
 	}
-	if (bypassed) {
+	if (fast_outcome) {
 		VGI_LOG(context, "catalog.entry_cache",
 		        {{"set_kind", CacheKindName()},
 		         {"name", name},
-		         {"outcome", "kind_empty"},
+		         {"outcome", fast_outcome},
 		         {"triggered_load", "false"}});
 		return nullptr;
 	}
@@ -95,16 +99,23 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	// via EnsureLoaded (single-flight via load_lock_, RPC NOT under entry_lock_).
 	if (eager) {
 		EnsureLoaded(context);
-		std::lock_guard<std::mutex> lock(entry_lock_);
-		auto found = GetEntries().find(name);
-		if (found != GetEntries().end()) {
+		{
+			std::lock_guard<std::mutex> lock(entry_lock_);
+			auto found = GetEntries().find(name);
+			if (found != GetEntries().end()) {
+				cached_result = found->second.get();
+			} else {
+				pre_gen = generation_.load(std::memory_order_acquire);
+			}
+		}
+		if (cached_result) {
 			VGI_LOG(context, "catalog.entry_cache",
 			        {{"set_kind", CacheKindName()},
 			         {"name", name},
 			         {"outcome", "miss_loaded"},
 			         {"triggered_load", "true"},
 			         {"loaded_reason", "below_threshold"}});
-			return found->second.get();
+			return cached_result;
 		}
 		// fall through to single-entry RPC
 	}
@@ -126,6 +137,8 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	auto view_info_opt = vgi::InvokeCatalogViewGet(rpc_ctx, schema_.name, name, context);
 
 	if (!view_info_opt) {
+		std::lock_guard<std::mutex> lock(entry_lock_);
+		CacheMissingEntryLocked(name, pre_gen);
 		return nullptr;
 	}
 
@@ -138,11 +151,13 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	{
 		std::lock_guard<std::mutex> lock(entry_lock_);
 		// Re-check: another thread may have raced us. Don't overwrite.
+		missing_entries_.erase(name);
 		auto existing = GetEntries().find(name);
 		if (existing != GetEntries().end()) {
 			return existing->second.get();
 		}
 		GetEntries()[name] = std::move(view_entry);
+		generation_.fetch_add(1, std::memory_order_release);
 	}
 	return result;
 }
