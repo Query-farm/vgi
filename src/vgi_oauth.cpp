@@ -21,6 +21,7 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 #include "yyjson.hpp"
 
 #include "vgi_exception.hpp"
+#include "vgi_http_params.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth_assets.hpp" // embedded logo artwork for the callback pages
 #include "vgi_oauth_store.hpp"
@@ -451,10 +452,20 @@ static ErrorInfo DiscoveryInfo(const std::string &url) {
 	return info;
 }
 
+// A 401 from any RPC can land here, including one sent from inside
+// VgiTransaction::Start, where a secret lookup deadlocks (vgi_http_params.hpp).
+// Skip secrets on that path only.
+static std::unique_ptr<HTTPParams> OAuthHttpParams(ClientContext &context, const std::string &url) {
+	if (TransactionStartScope::Active()) {
+		return InitSecretFreeHttpParams(context);
+	}
+	return InitHttpParamsWithSecrets(context, url);
+}
+
 std::string HttpGet(ClientContext &context, const std::string &url) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = http_util.InitializeParameters(context, url);
+	auto params = OAuthHttpParams(context, url);
 	params->timeout = 30; // 30s for metadata fetches
 
 	HTTPHeaders headers;
@@ -817,7 +828,7 @@ static RawTokenResponse PostTokenRequestRaw(ClientContext &context,
                                              const std::string &body) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = http_util.InitializeParameters(context, token_endpoint);
+	auto params = OAuthHttpParams(context, token_endpoint);
 	params->timeout = 30;
 
 	HTTPHeaders headers;
@@ -839,7 +850,7 @@ static std::string PostTokenRequest(ClientContext &context,
                                      const std::string &error_context) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = http_util.InitializeParameters(context, token_endpoint);
+	auto params = OAuthHttpParams(context, token_endpoint);
 	params->timeout = 30;
 
 	HTTPHeaders headers;

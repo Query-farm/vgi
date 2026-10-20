@@ -3,6 +3,7 @@
 
 #include "storage/vgi_catalog.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_http_params.hpp"
 
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -110,7 +111,12 @@ VgiTransactionManager::VgiTransactionManager(AttachedDatabase &db_p, VgiCatalog 
 
 Transaction &VgiTransactionManager::StartTransaction(ClientContext &context) {
 	auto transaction = make_uniq<VgiTransaction>(vgi_catalog_, *this, context);
-	transaction->Start(context);
+	{
+		// DuckDB calls this from MetaTransaction::GetTransaction with the
+		// MetaTransaction mutex held; RPCs below must not look up secrets.
+		vgi::TransactionStartScope start_scope;
+		transaction->Start(context);
+	}
 	auto &result = *transaction;
 	std::lock_guard<std::mutex> l(transaction_lock_);
 	transactions_[result] = std::move(transaction);

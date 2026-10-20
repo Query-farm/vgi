@@ -330,6 +330,7 @@ src/vgi_transport.cpp
 src/vgi_container_runtime.cpp
 src/vgi_http_compression.cpp
 src/vgi_http_client.cpp
+src/vgi_http_params.cpp
 src/vgi_http_function_connection.cpp
 src/vgi_iroh_config.cpp
 src/vgi_iroh_native.cpp
@@ -653,7 +654,8 @@ if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS
     BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   add_executable(vgi_http_interrupt_tests
     test/cpp/test_main.cpp
-    test/cpp/test_http_interrupt.cpp)
+    test/cpp/test_http_interrupt.cpp
+    test/cpp/test_http_secret_free.cpp)
   target_include_directories(vgi_http_interrupt_tests PRIVATE
     src/include
     duckdb/src/include

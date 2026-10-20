@@ -364,7 +364,7 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
-			                                         bwm.custom_metadata, &context_.interrupted);
+			                                         bwm.custom_metadata, &context_.interrupted, GetConnIdHex());
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_, violation));
 			buffered_partition_values_bytes_.push_back(
@@ -625,8 +625,9 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		int loc_idx = header_result.header.metadata->FindKey(RPC_LOCATION_KEY);
 		if (loc_idx >= 0) {
 			auto location_url = header_result.header.metadata->value(loc_idx);
-			auto resolved = ResolveExternalLocation(context_, location_url, base_url_,
-			                                         "", "", header_result.header.metadata, &context_.interrupted);
+			auto resolved = ResolveExternalLocation(context_, location_url, base_url_, GetExecutionIdHex(),
+			                                         GetAttachOpaqueDataDigest(), header_result.header.metadata,
+			                                         &context_.interrupted, GetConnIdHex());
 			header_result.header.header_batch = resolved.batch;
 			header_result.header.metadata = resolved.metadata;
 		}
@@ -1077,7 +1078,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
 			break;
 		}
-		auto &bwm = read_result.ValueUnsafe();
+		auto bwm = std::move(read_result).ValueUnsafe();
 
 		// Dispatch log/error batches
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
@@ -1094,21 +1095,21 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			continue;
 		}
 
-		// Resolve external location pointer batches.
-		// Stream_state is inside the resolved data, not on the pointer batch.
+		// Resolve external location pointer batches: splice the fetched batch
+		// in, then parse it like an inline one. Stream_state, batch_index,
+		// partition_values, parent_row and cache-control all ride the
+		// RESOLVED batch's metadata, not the pointer's. (The fetching reader
+		// already validated it.)
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
-			                                         bwm.custom_metadata, &context_.interrupted);
-			if (!output_batch) {
-				output_batch = resolved.batch;
-			}
-			new_state_token = ExtractStreamStateValue(resolved.metadata);
-			continue;
+			                                         bwm.custom_metadata, &context_.interrupted, GetConnIdHex());
+			bwm.batch = std::move(resolved.batch);
+			bwm.custom_metadata = std::move(resolved.metadata);
+		} else {
+			ValidateWorkerBatch(&context_, bwm.batch.get(), base_url_);
 		}
-
-		ValidateWorkerBatch(&context_, bwm.batch.get(), base_url_);
 
 		// Data batch — extract stream_state
 		new_state_token = ExtractStreamStateValue(bwm.custom_metadata);

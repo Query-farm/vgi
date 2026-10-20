@@ -72,9 +72,54 @@ fi
 
 echo "HTTP server running on port $PORT (pid $SERVER_PID)"
 
+# VGI_TEST_TIMEOUT_SECONDS bounds the run, so a deadlock fails the lane instead
+# of hanging it. On expiry the unittest threads' stacks go to stderr first
+# (gdb, when installed) -- the evidence a hang leaves.
+TIMEOUT_CMD=()
+if [[ -n "${VGI_TEST_TIMEOUT_SECONDS:-}" ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_CMD=(timeout --signal=TERM --kill-after=30 "$VGI_TEST_TIMEOUT_SECONDS")
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_CMD=(gtimeout --signal=TERM --kill-after=30 "$VGI_TEST_TIMEOUT_SECONDS")
+    else
+        echo "WARNING: VGI_TEST_TIMEOUT_SECONDS set but no timeout(1) found; running unbounded" >&2
+    fi
+fi
+
+dump_stacks() {
+    local pid
+    for pid in $(pgrep -f "build/$BUILD_DIR/test/unittest" || true); do
+        echo "=== unittest pid $pid stacks ===" >&2
+        if command -v gdb >/dev/null 2>&1; then
+            gdb -p "$pid" -batch -ex "thread apply all bt" >&2 2>/dev/null || true
+        else
+            echo "(gdb not installed)" >&2
+        fi
+    done
+}
+
+if [[ ${#TIMEOUT_CMD[@]} -gt 0 ]]; then
+    # Watchdog: dump stacks shortly before timeout(1) fires.
+    (
+        sleep $((VGI_TEST_TIMEOUT_SECONDS > 60 ? VGI_TEST_TIMEOUT_SECONDS - 30 : VGI_TEST_TIMEOUT_SECONDS))
+        echo "ERROR: HTTP integration run exceeded ${VGI_TEST_TIMEOUT_SECONDS}s; dumping stacks" >&2
+        dump_stacks
+    ) &
+    WATCHDOG_PID=$!
+    stop_watchdog() {
+        # Kill the subshell before its sleep, or it reports "Terminated".
+        local kids
+        kids=$(pgrep -P "$WATCHDOG_PID" 2>/dev/null || true)
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+        wait "$WATCHDOG_PID" 2>/dev/null || true
+        [[ -n "$kids" ]] && kill $kids 2>/dev/null || true
+    }
+    trap 'stop_watchdog; cleanup' EXIT
+fi
+
 # Run tests. VGI_HTTP_TRANSPORT lets HTTP-only tests (e.g. bearer/OAuth identity,
 # which subprocess can't carry) gate themselves via `require-env VGI_HTTP_TRANSPORT`.
 VGI_TEST_WORKER="http://localhost:$PORT" \
 VGI_HTTP_TRANSPORT=1 \
 VGI_DATABASE_PACKAGE_WORKER="$PACKAGE_WORKER" \
-    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"
+    ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"

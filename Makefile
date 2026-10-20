@@ -80,6 +80,7 @@ VGI_NO_REFLECTION_WORKER ?= uv run --project $(HOME)/Development/vgi-python pyth
 # a vgi-python worker with writable-catalog support enabled; run them
 # explicitly via `make test_writable` when that worker is available.
 .PHONY: test_spawn test_spawn_debug test_unix test_unix_debug test_http test_http_debug \
+	test_http_demo_storage test_http_demo_storage_debug \
 	test_shm test_shm_debug \
 	test_launcher test_launcher_debug \
 	test_http_attach_ticket test_http_attach_ticket_debug \
@@ -397,6 +398,25 @@ test_http_no_compression:
 
 test_http_no_compression_debug:
 	BUILD_DIR=debug ./test/run_http_no_compression_integration.sh
+
+# HTTP suite against a server that externalizes every response (threshold
+# 1 byte) to its demo object store, so each result -- catalog RPCs included --
+# arrives as a vgi_rpc.location pointer the client fetches. The only lane that
+# reaches the externalized fetch from VgiTransaction::Start, where a secret
+# lookup self-deadlocks (duckdb#22258); hence the timeout.
+test_http_demo_storage:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 \
+	    VGI_TEST_TIMEOUT_SECONDS=$${VGI_TEST_TIMEOUT_SECONDS:-1800} \
+	    ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
+
+test_http_demo_storage_debug:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 BUILD_DIR=debug \
+	    VGI_TEST_TIMEOUT_SECONDS=$${VGI_TEST_TIMEOUT_SECONDS:-3600} \
+	    ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
 
 # Container (OCI/Docker) transport tests (uses test/run_docker_integration.sh).
 # Skips cleanly when no container runtime is present, so it's safe to run

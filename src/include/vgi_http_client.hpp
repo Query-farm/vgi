@@ -156,16 +156,23 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::atomic<bool> *cancellation = nullptr,
                               const RpcErrorContext *error_context = nullptr);
 
+// Whether HttpGetBytes resolves DuckDB "http" secrets for the URL.
+enum class HttpSecrets {
+	NONE,   // pre-signed URL; safe inside VgiTransaction::Start (vgi_http_params.hpp)
+	LOOKUP, // secret-scoped proxy etc. apply; never from VgiTransaction::Start
+};
+
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth
 // headers sent. cancellation: as for HttpPostArrowIpc.
 std::string HttpGetBytes(ClientContext &context, const std::string &url,
-                         const std::atomic<bool> *cancellation = nullptr);
+                         const std::atomic<bool> *cancellation = nullptr, HttpSecrets secrets = HttpSecrets::NONE);
 
 // Resolve an external location pointer batch by fetching and parsing the URL.
 // Returns the resolved data batch. Throws on redirect loops or fetch failures.
-// worker_path, execution_id_hex, attach_opaque_data_digest are passed to HandleBatchLogMessage
-// for any log batches embedded in the externalized IPC stream.
+// worker_path, execution_id_hex, attach_opaque_data_digest, conn_id_hex and
+// transaction_opaque_data_digest are passed to HandleBatchLogMessage for any
+// log batches embedded in the externalized IPC stream.
 // If pointer_metadata is provided and contains RPC_LOCATION_SHA256_KEY,
 // the fetched bytes are verified against the expected SHA-256 checksum.
 UnaryResponseResult ResolveExternalLocation(ClientContext &context,
@@ -174,14 +181,20 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &execution_id_hex = "",
                                              const std::string &attach_opaque_data_digest = "",
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata = nullptr,
-                                             const std::atomic<bool> *cancellation = nullptr);
+                                             const std::atomic<bool> *cancellation = nullptr,
+                                             const std::string &conn_id_hex = "",
+                                             const std::string &transaction_opaque_data_digest = "");
 
 // Check if a batch result is a pointer batch and resolve it if so.
 // Returns the original result if not a pointer batch, or the resolved result.
-// worker_path is forwarded to ResolveExternalLocation for log context.
+// worker_path and the ids are forwarded to ResolveExternalLocation for log context.
 UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
                                                    UnaryResponseResult &result,
-                                                   const std::string &worker_path = "");
+                                                   const std::string &worker_path = "",
+                                                   const std::string &execution_id_hex = "",
+                                                   const std::string &attach_opaque_data_digest = "",
+                                                   const std::string &transaction_opaque_data_digest = "",
+                                                   const std::string &conn_id_hex = "");
 
 // ServerCapabilities moved to vgi_server_capabilities.hpp (arrow-free) so the
 // per-catalog cache on VgiAttachParameters can include it without Arrow.

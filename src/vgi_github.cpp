@@ -32,6 +32,7 @@
 #include "mbedtls_wrapper.hpp"
 #include "miniz.hpp"
 #include "vgi_http_client.hpp"
+#include "vgi_http_params.hpp"
 #include "vgi_http_compression.hpp"
 #include "yyjson.hpp"
 
@@ -375,7 +376,7 @@ int RunArgvSilent(const std::vector<std::string> &argv) {
 std::string GithubApiGet(ClientContext &context, const std::string &url) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = http_util.InitializeParameters(context, url);
+	auto params = InitHttpParamsWithSecrets(context, url);
 	params->timeout = static_cast<uint64_t>(GetIntSetting(context, "vgi_http_timeout_seconds", defaults::HTTP_TIMEOUT_SECONDS));
 
 	HTTPHeaders headers;
@@ -1016,7 +1017,7 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 			                  "add #sha256= or publish the sidecar",
 			                  candidates[0].c_str(), candidates[1].c_str());
 		}
-		std::string sha_body = HttpGetBytes(context, sidecar_url);
+		std::string sha_body = HttpGetBytes(context, sidecar_url, nullptr, HttpSecrets::LOOKUP);
 		std::string token;
 		for (char ch : sha_body) {
 			if (std::isxdigit(static_cast<unsigned char>(ch))) {
@@ -1033,7 +1034,7 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 	}
 
 	// Download + verify BEFORE extracting (so the tar parser only sees trusted bytes).
-	std::string bytes = HttpGetBytes(context, dl);
+	std::string bytes = HttpGetBytes(context, dl, nullptr, HttpSecrets::LOOKUP);
 	if (bytes.empty()) {
 		throw IOException(GithubInfo(error_subtype::kProtocolViolation, c),
 		                  "github: empty download for asset '%s'", c.asset.c_str());

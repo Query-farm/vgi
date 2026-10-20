@@ -21,6 +21,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
+#include "vgi_http_params.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_protocol_constants.hpp"
@@ -162,10 +163,7 @@ std::shared_ptr<HTTPParams> VgiAttachParameters::GetOrInitHttpParams(
     ClientContext &context, const std::string &url) const {
 	std::lock_guard<std::mutex> lock(http_params_mutex_);
 	if (!cached_http_params_) {
-		auto &db = *context.db;
-		auto &http_util = HTTPUtil::Get(db);
-		auto owned = http_util.InitializeParameters(context, url);
-		cached_http_params_ = std::shared_ptr<HTTPParams>(owned.release());
+		cached_http_params_ = InitHttpParamsWithSecrets(context, url);
 		// Mirror the per-call ApplyHttpTimeout that HttpPostArrowIpcInternal
 		// used to do. Captured once at cache-init time — vgi_http_timeout_seconds
 		// changes won't be picked up without re-ATTACH. See the TODO on the

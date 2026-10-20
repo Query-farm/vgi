@@ -137,6 +137,9 @@ constexpr const char *RPC_LOCATION_SHA256_KEY = "vgi_rpc.location.sha256";
 // transport features the worker supports; capabilities ride as metadata under
 // the vgi_rpc.transport.* namespace. shm is used only when both peers report it.
 constexpr const char *TRANSPORT_OPTIONS_METHOD = "__transport_options__";
+// Mounted over HTTP at {prefix}/__upload_url__/init; the request names the
+// method itself, without the /init route suffix.
+constexpr const char *UPLOAD_URL_METHOD = "__upload_url__";
 constexpr const char *TRANSPORT_CAP_SHM_KEY = "vgi_rpc.transport.shm";
 
 // Shared-memory transport keys (mirror vgi_rpc/metadata.py).
