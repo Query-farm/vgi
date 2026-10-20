@@ -588,19 +588,31 @@ void FunctionConnection::WriteTransportRpc(
 }
 
 UnaryResponseResult FunctionConnection::ReadTransportUnary() {
-	if (transport_input_) {
-		return ReadUnaryResponse(transport_input_, &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
-		                         GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
-	}
-	return ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
-	                         GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
+	auto result =
+	    transport_input_
+	        ? ReadUnaryResponse(transport_input_, &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
+	                            GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex())
+	        : ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
+	                            GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
+	// A worker with external storage externalizes a large result over any
+	// transport; resolve its vgi_rpc.location pointer as the HTTP path does.
+	return MaybeResolveExternalLocation(context_, result, worker_path_, GetExecutionIdHex(),
+	                                    GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
 }
 
 StreamHeaderResult FunctionConnection::ReadTransportHeader() {
-	if (transport_input_) {
-		return ReadStreamHeader(transport_input_, &context_, worker_path_, TransportPid());
+	auto header = transport_input_ ? ReadStreamHeader(transport_input_, &context_, worker_path_, TransportPid())
+	                               : ReadStreamHeader(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid());
+	// An externalized stream header, as HttpFunctionConnection::PerformInit resolves it.
+	if (header.header_batch && header.metadata && header.metadata->FindKey(RPC_LOCATION_KEY) >= 0) {
+		UnaryResponseResult pointer {header.header_batch, header.metadata};
+		auto resolved = MaybeResolveExternalLocation(context_, pointer, worker_path_, GetExecutionIdHex(),
+		                                             GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(),
+		                                             GetConnIdHex());
+		header.header_batch = std::move(resolved.batch);
+		header.metadata = std::move(resolved.metadata);
 	}
-	return ReadStreamHeader(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid());
+	return header;
 }
 
 void FunctionConnection::EnsureWorkerSpawned() {

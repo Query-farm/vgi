@@ -67,6 +67,8 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 VGI_ROWID_CONSTRAINT_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/rowid_constraint_worker.py
 # Hostile-data fixture (well-framed IPC with malformed buffer contents).
 VGI_MALFORMED_BATCH_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/malformed_batch_worker.py
+# The fixture worker with every result externalized (test_launcher_external_storage).
+VGI_EXTERNAL_STORAGE_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/external_storage_worker.py
 # The fixture worker without vgi_rpc.Reflection.v1, standing in for a worker
 # that predates reflection (test/sql/integration/reflection/pre_reflection.test).
 VGI_NO_REFLECTION_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/no_reflection_worker.py
@@ -80,7 +82,7 @@ VGI_NO_REFLECTION_WORKER ?= uv run --project $(HOME)/Development/vgi-python pyth
 # a vgi-python worker with writable-catalog support enabled; run them
 # explicitly via `make test_writable` when that worker is available.
 .PHONY: test_spawn test_spawn_debug test_unix test_unix_debug test_http test_http_debug \
-	test_http_demo_storage test_http_demo_storage_debug \
+	test_http_demo_storage test_http_demo_storage_debug test_launcher_external_storage \
 	test_shm test_shm_debug \
 	test_launcher test_launcher_debug \
 	test_http_attach_ticket test_http_attach_ticket_debug \
@@ -398,6 +400,12 @@ test_http_no_compression:
 
 test_http_no_compression_debug:
 	BUILD_DIR=debug ./test/run_http_no_compression_integration.sh
+
+# Launcher suite against the fixture worker externalizing every result (unary,
+# stream header, data) over the byte transport -- externalization is a server
+# setting, not an HTTP feature. See test/support/external_storage_worker.py.
+test_launcher_external_storage:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" $(MAKE) test_launcher VGI_TEST_WORKER="$(VGI_EXTERNAL_STORAGE_WORKER)"
 
 # HTTP suite against a server that externalizes every response (threshold
 # 1 byte) to its demo object store, so each result -- catalog RPCs included --
