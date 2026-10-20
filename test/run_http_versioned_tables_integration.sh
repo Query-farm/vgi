@@ -11,7 +11,10 @@ BUILD_DIR="${BUILD_DIR:-release}"
 # Optional: pass a single test path to override; otherwise run both HTTP tests.
 OVERRIDE_FILTER="${1:-}"
 
-LOG_FILE="/tmp/vgi-http-versioned-tables-server.log"
+# Per-run log: a fixed path is shared by concurrent lanes, which then read each
+# other's PORT: line and talk to the wrong server. Override with VGI_HTTP_SERVER_LOG.
+LOG_FILE="${VGI_HTTP_SERVER_LOG:-$(mktemp "${TMPDIR:-/tmp}/vgi-http-versioned-tables-server.XXXXXX")}"
+echo "server log: $LOG_FILE"
 
 uv run --project "$VGI_PYTHON_DIR" vgi-fixture-versioned-tables-worker \
     --http --port 0 > "$LOG_FILE" 2>&1 &
@@ -48,10 +51,12 @@ echo "HTTP versioned-tables worker running on port $PORT (pid $SERVER_PID)"
 
 if [[ -n "$OVERRIDE_FILTER" ]]; then
     VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
-        ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$OVERRIDE_FILTER"
+        python3 scripts/run_tests.py --build "$BUILD_DIR" "$OVERRIDE_FILTER"
 else
-    for t in versioned_tables_http versioned_tables_spec_http versioned_tables_impl_http versioned_tables_resolved_http; do
-        VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
-            ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/attach/${t}.test"
-    done
+    VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
+        python3 scripts/run_tests.py --build "$BUILD_DIR" \
+        test/sql/integration/attach/versioned_tables_http.test \
+        test/sql/integration/attach/versioned_tables_spec_http.test \
+        test/sql/integration/attach/versioned_tables_impl_http.test \
+        test/sql/integration/attach/versioned_tables_resolved_http.test
 fi

@@ -59,20 +59,15 @@ hex32() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 GRANT_KEY="$(head -c 32 /dev/urandom | base64)"
 FOREIGN_GRANT_KEY="$(head -c 32 /dev/urandom | base64)"
 
-start_server /tmp/vgi-http-attach-ticket-server.log "$(hex32)" "$GRANT_KEY"
+start_server "$(mktemp "${TMPDIR:-/tmp}/vgi-http-attach-ticket-server.XXXXXX")" "$(hex32)" "$GRANT_KEY"
 MAIN_PORT="$PORT"
-start_server /tmp/vgi-http-attach-ticket-foreign-server.log "$(hex32)" "$FOREIGN_GRANT_KEY"
+start_server "$(mktemp "${TMPDIR:-/tmp}/vgi-http-attach-ticket-foreign-server.XXXXXX")" "$(hex32)" "$FOREIGN_GRANT_KEY"
 FOREIGN_PORT="$PORT"
 echo "attach-ticket servers: main $MAIN_PORT, foreign $FOREIGN_PORT"
 
-# Fail on every unexpected error: without a config the sqllogictest runner
-# reports any error containing "HTTP" as a skip (see test/README.md).
-CONFIG_ARGS=()
-if [[ -f test/configs/no_error_skip.json ]]; then
-    CONFIG_ARGS=(--test-config test/configs/no_error_skip.json)
-fi
-
+# run_tests.py passes test/configs/no_error_skip.json: without it the
+# sqllogictest runner reports any error containing "HTTP" as a skip.
 VGI_TEST_BEARER_TOKEN="vgi-test-alice" \
 VGI_ATTACH_TICKET_WORKER="http://localhost:$MAIN_PORT" \
 VGI_ATTACH_TICKET_FOREIGN_WORKER="http://localhost:$FOREIGN_PORT" \
-    ./build/$BUILD_DIR/test/unittest ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} "$FILTER" "$@"
+    python3 scripts/run_tests.py --build "$BUILD_DIR" "$FILTER" "$@"

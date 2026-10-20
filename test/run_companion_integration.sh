@@ -17,7 +17,7 @@ set -euo pipefail
 VGI_PYTHON_DIR="${VGI_PYTHON_DIR:-$HOME/Development/vgi-python}"
 BUILD_DIR="${BUILD_DIR:-release}"
 HAYBARN="./build/${BUILD_DIR}/haybarn"
-UNITTEST="./build/${BUILD_DIR}/test/unittest"
+RUN_TESTS=(python3 scripts/run_tests.py --build "$BUILD_DIR")
 FILTER="${1:-test/sql/integration/catalog/companion_catalogs.test}"
 shift 2>/dev/null || true
 
@@ -47,14 +47,14 @@ echo "Seeded DuckLake at ${COMPANION_TARGET}"
 
 VGI_TEST_WORKER="uv run --project ${VGI_PYTHON_DIR} vgi-fixture-companion-worker" \
 	VGI_TEST_COMPANION_TARGET="${COMPANION_TARGET}" \
-	"$UNITTEST" --test-config test/configs/no_error_skip.json "$FILTER" "$@"
+	"${RUN_TESTS[@]}" "$FILTER" "$@"
 
 # Partial-failure cleanup: a second run with a poison companion (must not leak).
 echo "Running partial-failure cleanup test (VGI_TEST_COMPANION_POISON=1)"
 VGI_TEST_WORKER="uv run --project ${VGI_PYTHON_DIR} vgi-fixture-companion-worker" \
 	VGI_TEST_COMPANION_TARGET="${COMPANION_TARGET}" \
 	VGI_TEST_COMPANION_POISON=1 \
-	"$UNITTEST" --test-config test/configs/no_error_skip.json "test/sql/integration/catalog/companion_partial_failure.test"
+	"${RUN_TESTS[@]}" "test/sql/integration/catalog/companion_partial_failure.test"
 
 # Hidden companion: a third run asserting vgi_companion_catalogs() surfaces a companion
 # that duckdb_databases() hides.
@@ -62,4 +62,4 @@ echo "Running hidden-companion test (VGI_TEST_COMPANION_HIDDEN=1)"
 VGI_TEST_WORKER="uv run --project ${VGI_PYTHON_DIR} vgi-fixture-companion-worker" \
 	VGI_TEST_COMPANION_TARGET="${COMPANION_TARGET}" \
 	VGI_TEST_COMPANION_HIDDEN=1 \
-	"$UNITTEST" --test-config test/configs/no_error_skip.json "test/sql/integration/catalog/companion_hidden.test"
+	"${RUN_TESTS[@]}" "test/sql/integration/catalog/companion_hidden.test"

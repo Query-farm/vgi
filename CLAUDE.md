@@ -86,9 +86,9 @@ is the guardrail.
 
 | Target | What it runs |
 |--------|--------------|
-| `make test_http` / `_debug` | Integration suite over HTTP (`test/run_http_integration.sh`; server log `/tmp/vgi-http-test-server.log`) |
+| `make test_http` / `_debug` | Integration suite over HTTP (`test/run_http_integration.sh`; per-run server log, path printed as `server log:`; `VGI_HTTP_SERVER_LOG` pins it) |
 | `make test_http_no_compression` | HTTP against a server advertising an **empty** `VGI-Supported-Encodings` (speaks no compression; an *absent* header means a pre-update server that still speaks zstd) |
-| `make test_http_demo_storage` | HTTP against a server that externalizes every response to its demo object store; the only lane fetching externalized results from inside `VgiTransaction::Start` (duckdb#22258 secret-lookup deadlock). Runs under `VGI_TEST_TIMEOUT_SECONDS` with a stack dump on expiry |
+| `make test_http_demo_storage` | HTTP against a server that externalizes every response to its demo object store; the only lane fetching externalized results from inside `VgiTransaction::Start` (duckdb#22258 secret-lookup deadlock). |
 | `make test_launcher_external_storage` | Launcher suite against the fixture worker externalizing every result over the byte transport (`test/support/external_storage_worker.py`) |
 | `make test_unix`, `make test_shm` | AF_UNIX transport; shared-memory side channel |
 | `make test_all` / `_debug` | spawn, shm, unix, http, plus the bearer / versioned-tables / attach-options / no-compression HTTP variants |

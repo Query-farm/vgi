@@ -15,7 +15,10 @@ VGI_PYTHON_DIR="${VGI_PYTHON_DIR:-$HOME/Development/vgi-python}"
 BUILD_DIR="${BUILD_DIR:-release}"
 OVERRIDE_FILTER="${1:-}"
 
-LOG_FILE="/tmp/vgi-http-attach-options-server.log"
+# Per-run log: a fixed path is shared by concurrent lanes, which then read each
+# other's PORT: line and talk to the wrong server. Override with VGI_HTTP_SERVER_LOG.
+LOG_FILE="${VGI_HTTP_SERVER_LOG:-$(mktemp "${TMPDIR:-/tmp}/vgi-http-attach-options-server.XXXXXX")}"
+echo "server log: $LOG_FILE"
 
 if [[ -n "${VGI_ATTACH_OPTIONS_WORKER_CMD:-}" ]]; then
     # shellcheck disable=SC2086
@@ -58,4 +61,4 @@ TEST_FILE="${OVERRIDE_FILTER:-test/sql/integration/attach/attach_options_*}"
 
 VGI_ATTACH_OPTIONS_WORKER="http://localhost:$PORT" \
 VGI_ATTACH_OPTIONS_REQUIRED_WORKER="http://localhost:$PORT" \
-    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$TEST_FILE"
+    python3 scripts/run_tests.py --build "$BUILD_DIR" "$TEST_FILE"
