@@ -47,11 +47,6 @@
 
 #include "nanoarrow/nanoarrow.h"
 
-#ifdef NANOARROW_NAMESPACE
-#define ArrowArrayInternalTryUnshare \
-  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowArrayInternalTryUnshare)
-#endif
-
 const char* ArrowNanoarrowVersion(void) { return NANOARROW_VERSION; }
 
 int ArrowNanoarrowVersionInt(void) { return NANOARROW_VERSION_INT; }
@@ -522,112 +517,6 @@ ArrowErrorCode ArrowSharedArrayBuffer(struct ArrowSharedArray* shared, int64_t i
   out->allocator = ArrowBufferDeallocator(&ArrowSharedArrayBufferFree, private_data);
   return NANOARROW_OK;
 }
-
-// ArrowArrayMoveShared() wraps each node's buffers in references to the original
-// array. When no clones of those references exist, recover the original mutable
-// array so callers can continue appending without copying its contents.
-static int ArrowArrayInternalCanUnshare(struct ArrowArray* array) {
-  if (!ArrowArrayIsInternal(array)) {
-    return 0;
-  }
-
-  if (array->n_buffers > 0) {
-    struct ArrowSharedArrayPrivate* private_data = NULL;
-    for (int64_t i = 0; i < array->n_buffers; i++) {
-      struct ArrowBuffer* buffer = ArrowArrayBuffer(array, i);
-      if (buffer->allocator.free != &ArrowSharedArrayBufferFree) {
-        return 0;
-      }
-
-      if (private_data == NULL) {
-        private_data = (struct ArrowSharedArrayPrivate*)buffer->allocator.private_data;
-      } else if (private_data != buffer->allocator.private_data) {
-        return 0;
-      }
-    }
-
-    if (private_data == NULL ||
-        ArrowSharedArrayUpdate(private_data, 0) != array->n_buffers ||
-        !ArrowArrayIsInternal(&private_data->src) ||
-        private_data->src.n_buffers != array->n_buffers) {
-      return 0;
-    }
-
-    // Appending requires reallocatable buffers. Arrays decoded as zero-copy views
-    // use a deallocator-only allocator and must take the copying path once before
-    // they can be recovered here.
-    for (int64_t i = 0; i < private_data->src.n_buffers; i++) {
-      if (ArrowArrayBuffer(&private_data->src, i)->allocator.reallocate !=
-          &ArrowBufferAllocatorMallocReallocate) {
-        return 0;
-      }
-    }
-  }
-
-  for (int64_t i = 0; i < array->n_children; i++) {
-    if (!ArrowArrayInternalCanUnshare(array->children[i])) {
-      return 0;
-    }
-  }
-
-  return array->dictionary == NULL || ArrowArrayInternalCanUnshare(array->dictionary);
-}
-
-static void ArrowArrayInternalUnshare(struct ArrowArray* array) {
-  for (int64_t i = 0; i < array->n_children; i++) {
-    ArrowArrayInternalUnshare(array->children[i]);
-  }
-
-  if (array->dictionary != NULL) {
-    ArrowArrayInternalUnshare(array->dictionary);
-  }
-
-  // Nodes without buffers (e.g., run-end encoded arrays) were never wrapped in an
-  // ArrowSharedArrayPrivate and are already mutable once their children are mutable.
-  if (array->n_buffers == 0) {
-    return;
-  }
-
-  struct ArrowSharedArrayPrivate* private_data =
-      (struct ArrowSharedArrayPrivate*)ArrowArrayBuffer(array, 0)->allocator.private_data;
-  struct ArrowArray mutable_array;
-  ArrowArrayMove(&private_data->src, &mutable_array);
-
-  // Detach the wrapper buffers without decrementing the now-exclusive owner. The
-  // original buffers have been moved into mutable_array and will own their storage.
-  for (int64_t i = 0; i < array->n_buffers; i++) {
-    ArrowBufferInit(ArrowArrayBuffer(array, i));
-  }
-  ArrowFree(private_data);
-
-  // Children were shared independently. Move their recovered mutable arrays into
-  // the original child slots before releasing the wrapper shell.
-  for (int64_t i = 0; i < array->n_children; i++) {
-    ArrowArrayMove(array->children[i], mutable_array.children[i]);
-  }
-  if (array->dictionary != NULL) {
-    ArrowArrayMove(array->dictionary, mutable_array.dictionary);
-  }
-
-  ArrowArrayRelease(array);
-  ArrowArrayMove(&mutable_array, array);
-}
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-NANOARROW_DLL int ArrowArrayInternalTryUnshare(struct ArrowArray* array) {
-  if (!ArrowArrayInternalCanUnshare(array)) {
-    return 0;
-  }
-
-  ArrowArrayInternalUnshare(array);
-  return 1;
-}
-#ifdef __cplusplus
-}
-#endif
 
 static const int kInt32DecimalDigits = 9;
 
@@ -4299,7 +4188,8 @@ static int ArrowArrayViewValidateMinimal(struct ArrowArrayView* array_view,
 
     switch (array_view->layout.buffer_type[i]) {
       case NANOARROW_BUFFER_TYPE_VALIDITY:
-        if (array_view->null_count == 0 && array_view->buffer_views[i].size_bytes == 0) {
+        // Allow a missing validity buffer unless null_count > 0
+        if (array_view->null_count <= 0 && array_view->buffer_views[i].size_bytes == 0) {
           continue;
         }
 
@@ -4506,14 +4396,16 @@ static int ArrowArrayViewValidateDefault(struct ArrowArrayView* array_view,
     case NANOARROW_TYPE_STRING:
     case NANOARROW_TYPE_BINARY:
       if (array_view->buffer_views[1].size_bytes != 0) {
-        first_offset = array_view->buffer_views[1].data.as_int32[array_view->offset];
+        first_offset = ArrowBufferViewGetInt32Unsafe(&array_view->buffer_views[1],
+                                                     array_view->offset);
         if (first_offset < 0) {
           ArrowErrorSet(error, "Expected first offset >= 0 but found %" PRId64,
                         first_offset);
           return EINVAL;
         }
 
-        last_offset = array_view->buffer_views[1].data.as_int32[offset_plus_length];
+        last_offset = ArrowBufferViewGetInt32Unsafe(&array_view->buffer_views[1],
+                                                    offset_plus_length);
         if (last_offset < 0) {
           ArrowErrorSet(error, "Expected last offset >= 0 but found %" PRId64,
                         last_offset);
@@ -4542,14 +4434,16 @@ static int ArrowArrayViewValidateDefault(struct ArrowArrayView* array_view,
     case NANOARROW_TYPE_LARGE_STRING:
     case NANOARROW_TYPE_LARGE_BINARY:
       if (array_view->buffer_views[1].size_bytes != 0) {
-        first_offset = array_view->buffer_views[1].data.as_int64[array_view->offset];
+        first_offset = ArrowBufferViewGetInt64Unsafe(&array_view->buffer_views[1],
+                                                     array_view->offset);
         if (first_offset < 0) {
           ArrowErrorSet(error, "Expected first offset >= 0 but found %" PRId64,
                         first_offset);
           return EINVAL;
         }
 
-        last_offset = array_view->buffer_views[1].data.as_int64[offset_plus_length];
+        last_offset = ArrowBufferViewGetInt64Unsafe(&array_view->buffer_views[1],
+                                                    offset_plus_length);
         if (last_offset < 0) {
           ArrowErrorSet(error, "Expected last offset >= 0 but found %" PRId64,
                         last_offset);
@@ -4591,14 +4485,16 @@ static int ArrowArrayViewValidateDefault(struct ArrowArrayView* array_view,
     case NANOARROW_TYPE_LIST:
     case NANOARROW_TYPE_MAP:
       if (array_view->buffer_views[1].size_bytes != 0) {
-        first_offset = array_view->buffer_views[1].data.as_int32[array_view->offset];
+        first_offset = ArrowBufferViewGetInt32Unsafe(&array_view->buffer_views[1],
+                                                     array_view->offset);
         if (first_offset < 0) {
           ArrowErrorSet(error, "Expected first offset >= 0 but found %" PRId64,
                         first_offset);
           return EINVAL;
         }
 
-        last_offset = array_view->buffer_views[1].data.as_int32[offset_plus_length];
+        last_offset = ArrowBufferViewGetInt32Unsafe(&array_view->buffer_views[1],
+                                                    offset_plus_length);
         if (last_offset < 0) {
           ArrowErrorSet(error, "Expected last offset >= 0 but found %" PRId64,
                         last_offset);
@@ -4619,14 +4515,16 @@ static int ArrowArrayViewValidateDefault(struct ArrowArrayView* array_view,
 
     case NANOARROW_TYPE_LARGE_LIST:
       if (array_view->buffer_views[1].size_bytes != 0) {
-        first_offset = array_view->buffer_views[1].data.as_int64[array_view->offset];
+        first_offset = ArrowBufferViewGetInt64Unsafe(&array_view->buffer_views[1],
+                                                     array_view->offset);
         if (first_offset < 0) {
           ArrowErrorSet(error, "Expected first offset >= 0 but found %" PRId64,
                         first_offset);
           return EINVAL;
         }
 
-        last_offset = array_view->buffer_views[1].data.as_int64[offset_plus_length];
+        last_offset = ArrowBufferViewGetInt64Unsafe(&array_view->buffer_views[1],
+                                                    offset_plus_length);
         if (last_offset < 0) {
           ArrowErrorSet(error, "Expected last offset >= 0 but found %" PRId64,
                         last_offset);
@@ -4723,7 +4621,8 @@ static int ArrowAssertIncreasingInt32(struct ArrowBufferView view,
   }
 
   for (int64_t i = 1; i < view.size_bytes / (int64_t)sizeof(int32_t); i++) {
-    if (view.data.as_int32[i] < view.data.as_int32[i - 1]) {
+    if (ArrowBufferViewGetInt32Unsafe(&view, i) <
+        ArrowBufferViewGetInt32Unsafe(&view, i - 1)) {
       ArrowErrorSet(error, "[%" PRId64 "] Expected element size >= 0", i);
       return EINVAL;
     }
@@ -4739,7 +4638,8 @@ static int ArrowAssertIncreasingInt64(struct ArrowBufferView view,
   }
 
   for (int64_t i = 1; i < view.size_bytes / (int64_t)sizeof(int64_t); i++) {
-    if (view.data.as_int64[i] < view.data.as_int64[i - 1]) {
+    if (ArrowBufferViewGetInt64Unsafe(&view, i) <
+        ArrowBufferViewGetInt64Unsafe(&view, i - 1)) {
       ArrowErrorSet(error, "[%" PRId64 "] Expected element size >= 0", i);
       return EINVAL;
     }
@@ -4796,14 +4696,14 @@ static int ArrowArrayViewValidateFull(struct ArrowArrayView* array_view,
         }
         if (array_view->layout.element_size_bits[i] == 32) {
           struct ArrowBufferView sliced_offsets;
-          sliced_offsets.data.as_int32 =
-              array_view->buffer_views[i].data.as_int32 + array_view->offset;
+          sliced_offsets.data.as_uint8 = array_view->buffer_views[i].data.as_uint8 +
+                                         array_view->offset * sizeof(int32_t);
           sliced_offsets.size_bytes = (array_view->length + 1) * sizeof(int32_t);
           NANOARROW_RETURN_NOT_OK(ArrowAssertIncreasingInt32(sliced_offsets, error));
         } else {
           struct ArrowBufferView sliced_offsets;
-          sliced_offsets.data.as_int64 =
-              array_view->buffer_views[i].data.as_int64 + array_view->offset;
+          sliced_offsets.data.as_uint8 = array_view->buffer_views[i].data.as_uint8 +
+                                         array_view->offset * sizeof(int64_t);
           sliced_offsets.size_bytes = (array_view->length + 1) * sizeof(int64_t);
           NANOARROW_RETURN_NOT_OK(ArrowAssertIncreasingInt64(sliced_offsets, error));
         }

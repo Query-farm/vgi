@@ -453,20 +453,14 @@ ArrowErrorCode CopyDictionaries(ArrowArray *dst, const ArrowArrayView *src, Arro
 } // namespace
 
 namespace {
-// Make the (writer-owned) view encode the way Arrow C++ writers do, which strict
-// readers (arrow-go, Apache.Arrow for .NET) depend on:
-//  * every node carries its real null count (a -1 "unknown" would be written as is);
-//  * a null-typed node's null count is its length;
-//  * an empty variable-size node still has one zero offset (nanoarrow would write a
-//    0-byte offsets buffer, which readers index at offsets[0]).
+// Make the (writer-owned) view encode the way Arrow C++ writers do: an empty
+// variable-size node still has one zero offset. nanoarrow would write a 0-byte
+// offsets buffer, which strict readers (arrow-go, Apache.Arrow for .NET) index at
+// offsets[0]. (nanoarrow's encoder writes real null counts itself since
+// apache/arrow-nanoarrow#974.)
 alignas(8) const int64_t kWriterZeroOffsets[1] = {0};
 
 void PrepareViewForWrite(ArrowArrayView *view) {
-	if (view->storage_type == NANOARROW_TYPE_NA) {
-		view->null_count = view->length;
-	} else if (view->null_count < 0) {
-		view->null_count = ArrowArrayViewComputeNullCount(view);
-	}
 	if (view->length == 0 && view->offset == 0) {
 		int64_t width = 0;
 		switch (view->storage_type) {

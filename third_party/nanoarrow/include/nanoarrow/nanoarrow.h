@@ -753,6 +753,20 @@ struct ArrowBufferView {
   int64_t size_bytes;
 };
 
+static inline int32_t ArrowBufferViewGetInt32Unsafe(const struct ArrowBufferView* view,
+                                                    int64_t i) {
+  int32_t value;
+  memcpy(&value, view->data.as_uint8 + i * sizeof(int32_t), sizeof(value));
+  return value;
+}
+
+static inline int64_t ArrowBufferViewGetInt64Unsafe(const struct ArrowBufferView* view,
+                                                    int64_t i) {
+  int64_t value;
+  memcpy(&value, view->data.as_uint8 + i * sizeof(int64_t), sizeof(value));
+  return value;
+}
+
 /// \brief Array buffer allocation and deallocation
 /// \ingroup nanoarrow-buffer
 ///
@@ -2636,14 +2650,16 @@ static inline uint16_t ArrowFloatToHalfFloat(float value) {
 
   if (exp == 0) {
     res = 0;
+    fc = 0;
   } else if (exp == 0xff) {
     res = 0x1f;
   } else if (res > 0x1e) {
     res = 0x1f;
     fc = 0;
   } else if (res < 0x01) {
+    // Restore the implicit leading bit and shift for a subnormal exponent.
+    fc = res < -9 ? 0 : (uint16_t)((fc | 0x400) >> (1 - res));
     res = 0;
-    fc = 0;
   }
 
   return (uint16_t)((sn << 15) | (uint16_t)(res << 10) | fc);
@@ -2659,6 +2675,15 @@ static inline float ArrowHalfFloatToFloat(uint16_t value) {
 
   if (exp == 0) {
     res = 0;
+    if (fc != 0) {
+      // Normalize the subnormal significand before rebiasing its exponent.
+      res = 127 - 14;
+      while ((fc & 0x400) == 0) {
+        fc <<= 1;
+        res--;
+      }
+      fc &= 0x3ff;
+    }
   } else if (exp == 0x1f) {
     res = 0xff;
   }
@@ -3862,12 +3887,18 @@ static inline ArrowErrorCode ArrowArrayAppendBytes(struct ArrowArray* array,
 
   if (private_data->storage_type == NANOARROW_TYPE_STRING_VIEW ||
       private_data->storage_type == NANOARROW_TYPE_BINARY_VIEW) {
+    if (value.size_bytes > INT32_MAX) {
+      return EOVERFLOW;
+    }
+
     struct ArrowBuffer* data_buffer = ArrowArrayBuffer(array, 1);
     union ArrowBinaryView bvt;
     bvt.inlined.size = (int32_t)value.size_bytes;
 
     if (value.size_bytes <= NANOARROW_BINARY_VIEW_INLINE_SIZE) {
-      memcpy(bvt.inlined.data, value.data.as_char, value.size_bytes);
+      if (value.size_bytes > 0) {
+        memcpy(bvt.inlined.data, value.data.as_char, value.size_bytes);
+      }
       memset(bvt.inlined.data + bvt.inlined.size, 0,
              NANOARROW_BINARY_VIEW_INLINE_SIZE - bvt.inlined.size);
     } else {
