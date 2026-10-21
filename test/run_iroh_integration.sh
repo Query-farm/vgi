@@ -90,15 +90,21 @@ PYTHONPATH="$VGI_RPC_PYTHON_DIR" \
 PIDS+=("$!")
 RAW_PORT="$(wait_for_value "$RUN_DIR/raw-worker.log" 's/^TCP:127\.0\.0\.1:\([0-9][0-9]*\)$/\1/p')"
 
-"$VGI_IROH_BRIDGE_BIN" --ephemeral --http-upstream "http://127.0.0.1:$HTTP_PORT" \
+# Both endpoints run on this host. Supply their addresses explicitly so this
+# qualification does not race public discovery or depend on relay availability.
+"$VGI_IROH_BRIDGE_BIN" --ephemeral --no-relay --print-direct-addresses \
+    --http-upstream "http://127.0.0.1:$HTTP_PORT" \
     >"$RUN_DIR/http-bridge.log" 2>&1 &
 PIDS+=("$!")
 HTTP_ENDPOINT="$(wait_for_value "$RUN_DIR/http-bridge.log" '/^[0-9a-f][0-9a-f]*$/p')"
+HTTP_ADDRESS="$(wait_for_value "$RUN_DIR/http-bridge.log" 's/^DIRECT://p')"
 
-"$VGI_IROH_BRIDGE_BIN" --ephemeral --raw-upstream "tcp://127.0.0.1:$RAW_PORT" \
+"$VGI_IROH_BRIDGE_BIN" --ephemeral --no-relay --print-direct-addresses \
+    --raw-upstream "tcp://127.0.0.1:$RAW_PORT" \
     >"$RUN_DIR/raw-bridge.log" 2>&1 &
 PIDS+=("$!")
 RAW_ENDPOINT="$(wait_for_value "$RUN_DIR/raw-bridge.log" '/^[0-9a-f][0-9a-f]*$/p')"
+RAW_ADDRESS="$(wait_for_value "$RUN_DIR/raw-bridge.log" 's/^DIRECT://p')"
 
 if [[ ${#HTTP_ENDPOINT} -ne 64 || ${#RAW_ENDPOINT} -ne 64 ]]; then
     echo "bridge emitted an invalid EndpointId" >&2
@@ -108,12 +114,12 @@ fi
 HTTP_RESULT="$($HAYBARN :memory: -csv -noheader -c "
 SET vgi_iroh_connect_timeout_seconds = 7;
 SET vgi_iroh_io_timeout_seconds = 19;
-ATTACH 'example' AS remote_a (TYPE vgi, LOCATION 'httpi://${HTTP_ENDPOINT}');
+ATTACH 'example' AS remote_a (TYPE vgi, LOCATION 'httpi://${HTTP_ENDPOINT}', IROH_NO_RELAY true, IROH_DIRECT_ADDRESSES ['${HTTP_ADDRESS}']);
 SELECT remote_a.main.double(21);
 SELECT remote_a.main.whoami(1);
 SET vgi_iroh_connect_timeout_seconds = 11;
 SET vgi_iroh_io_timeout_seconds = 23;
-ATTACH 'example' AS remote_b (TYPE vgi, LOCATION 'httpi://${HTTP_ENDPOINT}');
+ATTACH 'example' AS remote_b (TYPE vgi, LOCATION 'httpi://${HTTP_ENDPOINT}', IROH_NO_RELAY true, IROH_DIRECT_ADDRESSES ['${HTTP_ADDRESS}']);
 SELECT remote_b.main.whoami(1);
 ")"
 grep -Fxq '42' <<<"$HTTP_RESULT"
@@ -126,23 +132,22 @@ if [[ "$(wc -l <<<"$HTTP_PRINCIPALS" | tr -d ' ')" != "2" ]] || \
 fi
 
 RAW_RESULT="$($HAYBARN :memory: -csv -noheader -c "
-ATTACH 'example' AS remote (TYPE vgi, LOCATION 'iroh://${RAW_ENDPOINT}');
+ATTACH 'example' AS remote (TYPE vgi, LOCATION 'iroh://${RAW_ENDPOINT}', IROH_NO_RELAY true, IROH_DIRECT_ADDRESSES ['${RAW_ADDRESS}']);
 SELECT remote.main.double(21);
 SELECT sum(i) FROM remote.main.sequence(10000) t(i);
 ")"
 grep -Fxq '42' <<<"$RAW_RESULT"
 grep -Fxq '49995000' <<<"$RAW_RESULT"
 
-# vgi_catalogs() builds the same default Iroh configuration ATTACH does (no
-# options: scoped TYPE iroh secret, else an ephemeral identity), so discovery
-# works over both Iroh transports without an ATTACH. The named iroh_* options
-# mirror ATTACH's.
+# vgi_catalogs() resolves identities the same way ATTACH does (scoped TYPE iroh
+# secret, else an ephemeral identity). Exercise both transports without an
+# ATTACH, including relay options with an explicit direct destination.
 CATALOGS_RESULT="$($HAYBARN :memory: -csv -noheader -c "
-SELECT 'raw', catalog FROM vgi_catalogs('iroh://${RAW_ENDPOINT}');
-SELECT 'http', catalog FROM vgi_catalogs('httpi://${HTTP_ENDPOINT}');
-SELECT 'http_opts', catalog FROM vgi_catalogs('httpi://${HTTP_ENDPOINT}', iroh_no_relay := false, iroh_relay_urls := []);
+SELECT 'raw', catalog FROM vgi_catalogs('iroh://${RAW_ENDPOINT}', iroh_no_relay := true, iroh_direct_addresses := ['${RAW_ADDRESS}']);
+SELECT 'http', catalog FROM vgi_catalogs('httpi://${HTTP_ENDPOINT}', iroh_no_relay := true, iroh_direct_addresses := ['${HTTP_ADDRESS}']);
+SELECT 'http_opts', catalog FROM vgi_catalogs('httpi://${HTTP_ENDPOINT}', iroh_no_relay := false, iroh_relay_urls := [], iroh_direct_addresses := ['${HTTP_ADDRESS}']);
 CREATE SECRET iroh_raw (TYPE iroh, SCOPE 'iroh://${RAW_ENDPOINT}', SECRET_KEY '$(printf '%064x' 7)');
-SELECT 'raw_secret', catalog FROM vgi_catalogs('iroh://${RAW_ENDPOINT}');
+SELECT 'raw_secret', catalog FROM vgi_catalogs('iroh://${RAW_ENDPOINT}', iroh_no_relay := true, iroh_direct_addresses := ['${RAW_ADDRESS}']);
 ")"
 for label in raw http http_opts raw_secret; do
     if ! grep -Fxq "${label},example" <<<"$CATALOGS_RESULT"; then
