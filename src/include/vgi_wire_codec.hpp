@@ -50,6 +50,9 @@ void CheckArrow(const arrow::Status &status, const char *what);
 // Decoding
 // ============================================================================
 
+//! Logical null, including a valid dictionary index referring to a null value.
+bool IsNullValue(const arrow::Array &array, int64_t i, const Ctx &ctx);
+
 template <class T>
 struct IsOptional : std::false_type {};
 template <class T>
@@ -69,7 +72,7 @@ void ReadValue(const arrow::Array &array, int64_t i, float &out, const Ctx &ctx)
 void ReadValue(const arrow::Array &array, int64_t i, double &out, const Ctx &ctx);
 //! utf8, large_utf8, utf8_view, or a dictionary of any of them.
 void ReadValue(const arrow::Array &array, int64_t i, std::string &out, const Ctx &ctx);
-//! binary, large_binary or binary_view (copied).
+//! binary, large_binary, binary_view, or a dictionary of those (copied).
 void ReadValue(const arrow::Array &array, int64_t i, std::vector<uint8_t> &out, const Ctx &ctx);
 //! binary or large_binary, as a zero-copy slice of the array's data buffer.
 void ReadValue(const arrow::Array &array, int64_t i, std::shared_ptr<arrow::Buffer> &out, const Ctx &ctx);
@@ -90,7 +93,7 @@ void MapBounds(const arrow::Array &array, int64_t i, const Ctx &ctx, int64_t &be
 
 template <class T>
 void ReadValue(const arrow::Array &array, int64_t i, std::optional<T> &out, const Ctx &ctx) {
-	if (array.IsNull(i)) {
+	if (IsNullValue(array, i, ctx)) {
 		out.reset();
 		return;
 	}
@@ -246,7 +249,7 @@ ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const float *> &valu
 ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const double *> &values);
 //! utf8, large_utf8, or dictionary<int16, utf8> (dictionary in first-seen order).
 ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const std::string *> &values);
-//! binary or large_binary.
+//! binary, large_binary, or dictionary<int32, binary>.
 ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const std::vector<uint8_t> *> &values);
 //! large_binary or binary; a null pointer inside a present value is an empty value.
 ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const std::shared_ptr<arrow::Buffer> *> &values);

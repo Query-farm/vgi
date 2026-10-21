@@ -182,12 +182,36 @@ void ReadValue(const arrow::Array &array, int64_t i, std::string &out, const Ctx
 	}
 }
 
+bool IsNullValue(const arrow::Array &array, int64_t i, const Ctx &ctx) {
+	if (array.IsNull(i)) {
+		return true;
+	}
+	if (array.type_id() != arrow::Type::DICTIONARY) {
+		return false;
+	}
+	const auto &dictionary = static_cast<const arrow::DictionaryArray &>(array);
+	const auto index = dictionary.GetValueIndex(i);
+	if (index < 0 || index >= dictionary.dictionary()->length()) {
+		ThrowType(ctx, *array.type(), "dictionary index in range");
+	}
+	return IsNullValue(*dictionary.dictionary(), index, ctx);
+}
+
 void ReadValue(const arrow::Array &array, int64_t i, std::vector<uint8_t> &out, const Ctx &ctx) {
 	if (array.IsNull(i)) {
 		ThrowNull(ctx);
 	}
 	std::string_view view;
 	switch (array.type_id()) {
+	case arrow::Type::DICTIONARY: {
+		const auto &dictionary = static_cast<const arrow::DictionaryArray &>(array);
+		const auto index = dictionary.GetValueIndex(i);
+		if (index < 0 || index >= dictionary.dictionary()->length()) {
+			ThrowType(ctx, *array.type(), "dictionary index in range");
+		}
+		ReadValue(*dictionary.dictionary(), index, out, ctx);
+		return;
+	}
 	case arrow::Type::BINARY:
 		view = static_cast<const arrow::BinaryArray &>(array).GetView(i);
 		break;
@@ -199,6 +223,10 @@ void ReadValue(const arrow::Array &array, int64_t i, std::vector<uint8_t> &out, 
 		break;
 	default:
 		ThrowType(ctx, *array.type(), "binary");
+	}
+	if (view.empty()) {
+		out.clear();
+		return;
 	}
 	out.assign(reinterpret_cast<const uint8_t *>(view.data()),
 	           reinterpret_cast<const uint8_t *>(view.data()) + view.size());
@@ -428,6 +456,29 @@ ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const std::vector<ui
 		return ValueOrThrow(builder.Finish(), "finish");
 	};
 	switch (type->id()) {
+	case arrow::Type::DICTIONARY: {
+		const auto &dictionary_type = static_cast<const arrow::DictionaryType &>(*type);
+		if (dictionary_type.index_type()->id() != arrow::Type::INT32 || dictionary_type.value_type()->id() != arrow::Type::BINARY) {
+			TypeMismatch(type, "Bytes");
+		}
+		std::map<std::vector<uint8_t>, int32_t> positions;
+		arrow::Int32Builder indices;
+		arrow::BinaryBuilder dictionary;
+		for (const auto *value : values) {
+			if (!value) {
+				CheckArrow(indices.AppendNull(), "append binary dictionary index");
+				continue;
+			}
+			auto inserted = positions.emplace(*value, static_cast<int32_t>(positions.size()));
+			if (inserted.second) {
+				CheckArrow(dictionary.Append(value->data(), static_cast<int64_t>(value->size())), "append binary dictionary value");
+			}
+			CheckArrow(indices.Append(inserted.first->second), "append binary dictionary index");
+		}
+		auto index_array = ValueOrThrow(indices.Finish(), "finish binary dictionary indices");
+		auto dictionary_array = ValueOrThrow(dictionary.Finish(), "finish binary dictionary values");
+		return ValueOrThrow(arrow::DictionaryArray::FromArrays(type, index_array, dictionary_array), "make binary dictionary array");
+	}
 	case arrow::Type::BINARY: {
 		arrow::BinaryBuilder builder;
 		return build(builder);
