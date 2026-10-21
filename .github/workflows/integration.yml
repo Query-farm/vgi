@@ -64,6 +64,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Check native artifact selection
+        run: python3 -m unittest discover -s test/scripts -p 'test_*.py'
+
       - name: Install build toolchain
         run: |
           sudo apt-get update
@@ -121,6 +124,25 @@ jobs:
 
       - name: Build the extension (release)
         run: make release
+
+      # SDKs changing the wire contract need the matching development client
+      # before that revision is published to the signed community channel.
+      # Both executables statically link VGI and its core dependencies.
+      - name: Package native SDK CI executables
+        if: github.ref == 'refs/heads/main'
+        run: |
+          python3 scripts/ci_fetch_native_runner.py --pack \
+            --source "$GITHUB_WORKSPACE" --build build/release \
+            --output "$RUNNER_TEMP/vgi-native-runner"
+
+      - name: Upload native SDK CI executables
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vgi-native-runner-linux_amd64
+          path: ${{ runner.temp }}/vgi-native-runner/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Run Filter v2 producer tests
         run: make test_filter_v2

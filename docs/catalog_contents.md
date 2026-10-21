@@ -457,6 +457,15 @@ those package releases are pending. Package publication remains a separate step;
 normal Git pushes do not publish them. S3 adapters were checked against
 conditional HTTP storage fixtures, without live bucket credentials.
 
+SDK development CI also pins a matching native VGI revision. The native
+integration workflow packages its statically linked test runner and CLI;
+`scripts/ci_fetch_native_runner.py` selects the exact revision's artifact and
+verifies its manifest and executable checksums. Missing artifacts fail the job.
+This lets a new wire contract run through CI before its public extension release.
+The development runner links VGI, HTTPFS, JSON, and Parquet; Spatial remains an
+explicitly reported unsupported dependency in that mode. The integration scripts
+retain their signed-community mode for release qualification and local runs.
+
 To rerun the shared suite from a built native checkout, select a worker and use
 an unused temporary directory. The leading wildcard is necessary when the
 runner registers absolute test paths:
