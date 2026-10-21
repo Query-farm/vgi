@@ -429,6 +429,14 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} vgi_nanoarrow)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} vgi_nanoarrow)
 
+# POSIX shared memory lives in librt on the older glibc used by our Linux
+# distribution images. Arrow previously supplied this transitive dependency;
+# nanoarrow does not, so declare it for VGI's own shm_open/shm_unlink calls.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(${EXTENSION_NAME} rt)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} rt)
+endif()
+
 if(VGI_ENABLE_IROH)
   add_dependencies(${EXTENSION_NAME} vgi_iroh_rust)
   add_dependencies(${LOADABLE_EXTENSION_NAME} vgi_iroh_rust)
