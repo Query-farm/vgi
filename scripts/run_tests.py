@@ -139,7 +139,9 @@ def run_one(
     t0 = time.monotonic()
     try:
         proc = subprocess.Popen(
-            [str(unittest), *extra_args, str(test_path)],
+            # CMake can register extension tests with absolute names. Match the
+            # same file whether the runner registered a relative or full path.
+            [str(unittest), *extra_args, "*" + str(test_path)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -162,6 +164,9 @@ def run_one(
         finally:
             _LIVE.discard(proc.pid)
         exit_code = proc.returncode
+        if exit_code == 0 and ("No test cases matched" in stdout or "No tests ran" in stdout):
+            exit_code = 1
+            error = "the runner matched no test cases for this file"
     except (OSError, subprocess.SubprocessError) as exc:
         # Treat infrastructural failures (binary missing, exec failure, etc.)
         # as test failures so we surface them in the summary rather than
