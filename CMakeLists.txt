@@ -416,6 +416,12 @@ if(EMSCRIPTEN)
     src/vgi_sab_stream.cpp)
 endif()
 
+# DuckDB's WASM side-module post-link invokes emcc separately from the static
+# archive target, so target_link_libraries alone does not carry nanoarrow into it.
+if(EMSCRIPTEN)
+  set(DUCKDB_EXTENSION_VGI_LINKED_LIBS "$<TARGET_FILE:vgi_nanoarrow>")
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 

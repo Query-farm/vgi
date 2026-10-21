@@ -198,14 +198,42 @@ void ReadValue(const VgiColumn &col, int64_t i, std::string &out, const Ctx &ctx
 	out.assign(view.data(), view.size());
 }
 
+bool IsNullValue(const VgiColumn &col, int64_t i, const Ctx &ctx) {
+	if (col.IsNull(i)) {
+		return true;
+	}
+	if (!col.is_dictionary()) {
+		return false;
+	}
+	auto values = col.dictionary();
+	const auto index = col.GetInt(i);
+	if (index < 0 || index >= values.length()) {
+		ThrowType(ctx, col, "dictionary index in range");
+	}
+	return IsNullValue(values, index, ctx);
+}
+
 void ReadValue(const VgiColumn &col, int64_t i, std::vector<uint8_t> &out, const Ctx &ctx) {
 	if (col.IsNull(i)) {
 		ThrowNull(ctx);
 	}
-	if (col.is_dictionary() || !IsBinaryType(col.type().type)) {
+	if (col.is_dictionary()) {
+		auto values = col.dictionary();
+		const auto index = col.GetInt(i);
+		if (index < 0 || index >= values.length()) {
+			ThrowType(ctx, col, "dictionary index in range");
+		}
+		ReadValue(values, index, out, ctx);
+		return;
+	}
+	if (!IsBinaryType(col.type().type)) {
 		ThrowType(ctx, col, "binary");
 	}
 	auto view = col.GetView(i);
+	if (view.empty()) {
+		out.clear();
+		return;
+	}
 	out.assign(reinterpret_cast<const uint8_t *>(view.data()),
 	           reinterpret_cast<const uint8_t *>(view.data()) + view.size());
 }
@@ -356,7 +384,23 @@ void WriteValue(ArrowArray *array, const std::string &value) {
 }
 
 void WriteValue(ArrowArray *array, const std::vector<uint8_t> &value) {
-	append::Bytes(array, value.data(), static_cast<int64_t>(value.size()));
+	if (!array->dictionary) {
+		append::Bytes(array, value.data(), static_cast<int64_t>(value.size()));
+		return;
+	}
+	// Preserve byte identity (including empty values) in first-seen order.
+	auto *dictionary = array->dictionary;
+	const auto *offsets = reinterpret_cast<const int32_t *>(ArrowArrayBuffer(dictionary, 1)->data);
+	const auto *data = ArrowArrayBuffer(dictionary, 2)->data;
+	for (int64_t index = 0; index < dictionary->length; index++) {
+		const auto size = static_cast<size_t>(offsets[index + 1] - offsets[index]);
+		if (size == value.size() && (size == 0 || std::memcmp(data + offsets[index], value.data(), size) == 0)) {
+			append::Int(array, index);
+			return;
+		}
+	}
+	append::Bytes(dictionary, value.data(), static_cast<int64_t>(value.size()));
+	append::Int(array, dictionary->length - 1);
 }
 
 void WriteValue(ArrowArray *array, const VgiBufferPtr &value) {

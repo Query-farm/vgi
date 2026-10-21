@@ -24,7 +24,7 @@
 #include "vgi_rpc_client.hpp"
 #include "vgi_transport.hpp"
 
-#include "mbedtls_wrapper.hpp"
+#include "vgi_sha256.hpp"
 #include "nanoarrow/nanoarrow.h"
 
 namespace duckdb {
@@ -996,6 +996,12 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, const s
 
 	// Decompress if the server indicates a codec we know.
 	auto get_enc = ResolveResponseEncoding(*response);
+#if defined(__EMSCRIPTEN__)
+	// Browser HTTP already decodes standard Content-Encoding.
+	if (!response->HasHeader("X-VGI-Content-Encoding")) {
+		get_enc = HttpEncoding::NONE;
+	}
+#endif
 	if (get_enc != HttpEncoding::NONE && !body.empty()) {
 		return Decompress(get_enc, body.data(), body.size());
 	}
@@ -1035,14 +1041,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 		int64_t sha_idx = pointer_metadata->FindKey(RPC_LOCATION_SHA256_KEY);
 		if (sha_idx >= 0) {
 			auto expected_hex = pointer_metadata->value(sha_idx);
-			// Compute SHA-256 of the fetched body bytes
-			auto raw_hash = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(body);
-			// Convert raw hash to hex string
-			char hex_buf[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT + 1];
-			duckdb_mbedtls::MbedTlsWrapper::ToBase16(const_cast<char *>(raw_hash.data()), hex_buf,
-			                                          duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_BYTES);
-			hex_buf[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT] = '\0';
-			std::string actual_hex(hex_buf, duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT);
+			auto actual_hex = VgiSha256Hex(body);
 
 			if (actual_hex != expected_hex) {
 				throw IOException(location_error(http_error::kChecksumMismatch),

@@ -161,7 +161,6 @@ TEST_CASE("Records round-trip through ToBatch/FromBatch", "[protocol-records]") 
 		SchemaInfo info;
 		info.comment = "a schema";
 		info.tags = {{"owner", "ops"}, {"tier", "gold"}};
-		info.attach_opaque_data = {0, 1, 2, 255};
 		info.path = {"catalog", "main"};
 		info.estimated_object_count = std::map<std::string, int64_t> {{"TABLE", 3}, {"VIEW", 0}};
 		CHECK(RoundTrip(info) == info);
@@ -237,6 +236,46 @@ TEST_CASE("Enums accept only their canonical member names", "[protocol-records]"
 	CHECK(!VgiInitPhaseFromWire("input").has_value());
 }
 
+TEST_CASE("Function metadata binary dictionaries preserve the byte API", "[protocol-records]") {
+	FunctionInfo info;
+	info.arguments = {0xff, 0, 0x80};
+	info.output_schema = {};
+	CHECK(RoundTrip(info) == info);
+	auto batch = ToBatch(info);
+	for (const auto &name : {"arguments", "output_schema", "parameter_default_values"}) {
+		auto column = batch->GetColumnByName(name);
+		REQUIRE(column.is_dictionary());
+		CHECK(column.storage_type() == NANOARROW_TYPE_INT32);
+		CHECK(column.dictionary().storage_type() == NANOARROW_TYPE_BINARY);
+	}
+	CHECK(batch->GetColumnByName("parameter_default_values").IsNull(0));
+	info.parameter_default_values = Bytes {};
+	CHECK(RoundTrip(info).parameter_default_values == info.parameter_default_values);
+	CHECK(!ToBatch(info)->GetColumnByName("parameter_default_values").IsNull(0));
+	info.parameter_default_values = Bytes {0xfe, 0, 0xff};
+	CHECK(RoundTrip(info) == info);
+}
+
+TEST_CASE("Binary dictionary null references respect field nullability", "[protocol-records]") {
+	FunctionInfo info;
+	auto batch = ToBatch(info);
+	for (const auto &name : {"arguments", "output_schema", "parameter_default_values"}) {
+		INFO(name);
+		auto idx = batch->schema()->GetFieldIndex(name);
+		auto changed = SetColumn(batch, idx, batch->schema()->field(idx), [](ArrowArray *a) {
+			append::Null(a->dictionary);
+			append::Int(a, 0);
+		});
+		REQUIRE_NOTHROW(ValidateBatch(*changed, VgiValidation::FULL));
+		if (std::string(name) == "parameter_default_values") {
+			CHECK(!Decode<FunctionInfo>(changed, 0, "w").parameter_default_values.has_value());
+		} else {
+			CHECK(ErrorOf([&] { Decode<FunctionInfo>(changed, 0, "w"); }).find("unexpected null value") !=
+			      std::string::npos);
+		}
+	}
+}
+
 TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 	SchemaInfo info;
 	info.path = {"main"};
@@ -251,16 +290,16 @@ TEST_CASE("Decoding keeps the compatibility contract", "[protocol-records]") {
 	}
 
 	SECTION("a missing required column names the column, record and worker") {
-		auto idx = full->schema()->GetFieldIndex("attach_opaque_data");
+		auto idx = full->schema()->GetFieldIndex("path");
 		auto batch = RemoveColumn(full, idx);
 		auto msg = ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "the-worker"); });
-		CHECK(msg.find("Required column 'attach_opaque_data' not found in SchemaInfo response") != std::string::npos);
+		CHECK(msg.find("Required column 'path' not found in SchemaInfo response") != std::string::npos);
 		CHECK(msg.find("the-worker") != std::string::npos);
 	}
 
 	SECTION("a null in a required column is an error") {
-		auto idx = full->schema()->GetFieldIndex("attach_opaque_data");
-		auto field = FieldOf(type::Binary().Named("attach_opaque_data", /*is_nullable=*/true));
+		auto idx = full->schema()->GetFieldIndex("path");
+		auto field = FieldOf(type::List(type::Utf8()).Named("path", /*is_nullable=*/true));
 		auto batch = SetColumn(full, idx, field->field(0), [](ArrowArray *a) { append::Null(a); });
 		auto msg = ErrorOf([&] { Decode<SchemaInfo>(batch, 0, "w"); });
 		CHECK(msg.find("unexpected null value") != std::string::npos);

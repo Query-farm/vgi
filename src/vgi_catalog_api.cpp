@@ -27,12 +27,16 @@
 #include "vgi_profiling.hpp"
 #include "vgi_protocol_constants.hpp"
 
+#include <cstdlib>
+#include <memory>
 #include <set>
 #include <typeinfo>
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 #include "generated/vgi_request_builders.hpp"
 #include "vgi_schema_registry.hpp"
+#include "vgi_wire_codec.hpp"
+#include "vgi_batch_validation.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
 #include "yyjson.hpp"
@@ -513,24 +517,6 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, Cl
 
 namespace {
 
-// The child of struct column `parent` called `name`; an empty VgiColumn when there is none.
-VgiColumn StructChild(const VgiColumn &parent, const char *name) {
-	const auto n = parent.num_children();
-	for (int64_t k = 0; k < n; k++) {
-		auto child = parent.child(k);
-		if (child.name() == name) {
-			return child;
-		}
-	}
-	return VgiColumn();
-}
-
-// The SchemaContents struct rows of a catalog_contents response (the values of
-// its `schemas` list column); `contents.row` indexes them.
-VgiColumn ContentsRows(const VgiSchemaContents &contents) {
-	return contents.rows().child(0);
-}
-
 // A (non-dictionary) column of exactly nanoarrow type `type`.
 bool HasType(const VgiColumn &column, int type) {
 	return column && column.type().type == type;
@@ -554,54 +540,85 @@ VgiBufferPtr BinaryCell(const VgiBatchPtr &owner, const VgiColumn &values, int64
 	                                         static_cast<int64_t>(view.size()));
 }
 
-// One list<binary> field of a SchemaContents struct row: its items, decoded
-// zero-copy from the response buffers and validated against the item schema of
-// the per-schema RPC that returns the same items (`items_method`).
-std::vector<VgiBatchPtr> ContentsItems(const VgiSchemaContents &contents, const char *column,
-                                       const char *items_method) {
-	auto &worker_path = contents.worker_path;
-	auto list_array = StructChild(ContentsRows(contents), column);
-	if (!HasType(list_array, NANOARROW_TYPE_LIST) || !HasType(list_array.child(0), NANOARROW_TYPE_BINARY)) {
-		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, column),
-		                  "catalog_contents: SchemaContents field '%s' is missing or not list<binary> [worker: %s]",
-		                  column, worker_path);
+struct ContentsCategory {
+	const char *column;
+	const char *items_method;
+};
+
+const ContentsCategory kContentsCategories[] = {
+    {"schemas", "catalog_schemas"},
+    {"tables", "catalog_schema_contents_tables"},
+    {"views", "catalog_schema_contents_views"},
+    {"functions", "catalog_schema_contents_functions"},
+    {"macros", "catalog_schema_contents_macros"},
+    {"indexes", "catalog_schema_contents_indexes"},
+};
+
+// Open each nested stream once and retain the response backing buffers.
+std::vector<VgiBatchPtr> ReadContentsStream(const VgiBatchPtr &owner, const VgiColumn &values,
+                                           const ContentsCategory &category, const std::string &worker_path) {
+	std::vector<VgiBatchPtr> batches;
+	if (values.IsNull(0)) {
+		return batches;
 	}
-	std::vector<VgiBatchPtr> items;
-	if (list_array.IsNull(contents.row)) {
-		return items;
+	auto violation = CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, category.column);
+	auto input = std::make_shared<VgiBufferReader>(BinaryCell(owner, values, 0));
+	auto reader = VgiIpcReader::Open(input);
+	const auto *contract = LookupResponseSchema(category.items_method);
+	if (!contract || !contract->item_schema) {
+		throw InternalException("Missing catalog metadata schema for %s", category.column);
 	}
-	auto values = list_array.child(0);
-	int64_t begin = 0;
-	int64_t end = 0;
-	list_array.ListRange(contents.row, begin, end);
-	items.reserve(static_cast<size_t>(end - begin));
-	for (int64_t i = begin; i < end; i++) {
-		if (values.IsNull(i)) {
-			continue;
+	if (!reader->schema()->Equals(*contract->item_schema, /*check_metadata=*/false)) {
+		throw IOException(violation, "catalog_contents: '%s' stream has an incompatible metadata schema", category.column);
+	}
+	while (auto batch = reader->ReadNext()) {
+		ValidateWorkerBatch(batch.get(), WorkerBatchValidation::FULL, worker_path);
+		for (int column = 0; column < batch->num_columns(); column++) {
+			if (batch->schema()->field_nullable(column)) {
+				continue;
+			}
+			auto values = batch->column(column);
+			for (int64_t row = 0; row < batch->num_rows(); row++) {
+				wire::Ctx ctx {"catalog_contents", &worker_path, batch->column_name(column), row};
+				if (wire::IsNullValue(values, row, ctx)) {
+					throw IOException(violation, "catalog_contents: required '%s.%s' contains nulls", category.column,
+					                  batch->column_name(column));
+				}
+			}
 		}
-		auto item = DeserializeFromIpcBytesZeroCopy(BinaryCell(contents.rows_batch, values, i));
-		if (!item || item->num_rows() == 0) {
-			continue;
-		}
-		ValidateItemSchema(item, items_method, worker_path, static_cast<size_t>(i - begin));
-		items.push_back(std::move(item));
+		batches.push_back(std::move(batch));
 	}
-	return items;
+	if (input->remaining() != 0) {
+		throw IOException(violation, "catalog_contents: trailing bytes after '%s' IPC stream", category.column);
+	}
+	return batches;
 }
 
-std::vector<std::string> StringListAt(const VgiColumn &list, int64_t row) {
-	std::vector<std::string> out;
-	if (list.IsNull(row)) {
-		return out;
-	}
-	auto values = list.child(0);
-	int64_t begin = 0;
-	int64_t end = 0;
-	list.ListRange(row, begin, end);
+std::vector<std::string> ContentsPath(const VgiBatchPtr &batch, int64_t row,
+                                    const char *field, const std::string &worker_path) {
+	auto values = batch->GetColumnByName(field);
+	auto parts = values.child(0);
+	std::vector<std::string> path;
+	int64_t begin = 0, end = 0;
+	values.ListRange(row, begin, end);
 	for (int64_t i = begin; i < end; i++) {
-		out.push_back(values.GetString(i));
+		if (parts.IsNull(i) || parts.GetView(i).empty()) {
+			throw IOException(CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, field),
+			                  "catalog_contents: schema path contains a null or empty component");
+		}
+		path.push_back(parts.GetString(i));
 	}
-	return out;
+	if (path.empty()) {
+		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, field),
+		                  "catalog_contents: schema path must not be empty");
+	}
+	return path;
+}
+
+const std::vector<VgiCatalogItemRef> &ContentsItems(const VgiSchemaContents &contents, const std::string &kind) {
+	static const std::vector<VgiCatalogItemRef> empty;
+	auto found = contents.items.find(kind);
+	return found == contents.items.end() ? empty : found->second;
 }
 
 } // namespace
@@ -619,10 +636,24 @@ VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientCon
 	auto &worker_path = ctx.params->worker_path();
 	auto params = generated::BuildCatalogContentsParams(ctx.attach_opaque_data, if_none_match);
 	auto response = InvokeRpcMethod(ctx, "catalog_contents", params, context);
-	// The registry validates the whole typed response, nested struct included.
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_contents", worker_path);
-	if (!result_batch || result_batch->num_rows() == 0) {
-		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path), "Empty response from catalog_contents [worker: %s]", worker_path);
+	return ParseCatalogContents(result_batch, worker_path, if_none_match);
+}
+
+VgiCatalogContents ParseCatalogContents(const VgiBatchPtr &result_batch,
+                                         const std::string &worker_path,
+                                         const std::optional<std::string> &if_none_match) {
+	ValidateResponseSchema(result_batch, "catalog_contents", worker_path);
+	if (!result_batch || result_batch->num_rows() != 1) {
+		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
+		                  "catalog_contents must contain exactly one response row [worker: %s]", worker_path);
+	}
+	ValidateWorkerBatch(result_batch.get(), WorkerBatchValidation::FULL, worker_path);
+	for (int column = 0; column < result_batch->num_columns(); column++) {
+		if (!result_batch->schema()->field_nullable(column) && result_batch->column(column).IsNull(0)) {
+			throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
+			                  "catalog_contents required field '%s' is null", result_batch->column_name(column));
+		}
 	}
 
 	VgiCatalogContents result;
@@ -641,104 +672,117 @@ VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientCon
 			                  "catalog_contents answered not_modified without a matching if_none_match [worker: %s]",
 			                  worker_path);
 		}
+		for (auto &category : kContentsCategories) {
+			if (!result_batch->GetColumnByName(category.column).IsNull(0)) {
+				throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
+				                  "catalog_contents not_modified response contains '%s' metadata", category.column);
+			}
+		}
 		return result;
 	}
 
-	// `schemas` is list<struct<SchemaContents>>: one struct row per schema. Keep
-	// the response batch and index the struct rows in place; read only `path` now.
-	const int schemas_index = result_batch->schema()->GetFieldIndex("schemas");
-	auto schemas_col = result_batch->column(schemas_index);
-	if (schemas_col.IsNull(0)) {
-		return result;
-	}
-	auto rows = schemas_col.child(0);
-	auto path_col = StructChild(rows, "path");
-	int64_t begin = 0;
-	int64_t end = 0;
-	schemas_col.ListRange(0, begin, end);
-	result.schemas.reserve(static_cast<size_t>(end - begin));
-	for (int64_t i = begin; i < end; i++) {
-		VgiSchemaContents contents;
-		contents.path = StringListAt(path_col, i);
-		contents.name = SchemaNameFromPath(contents.path, "SchemaContents.path");
-		contents.rows_batch = result_batch;
-		contents.rows_column = schemas_index;
-		contents.row = i;
-		contents.worker_path = worker_path;
-		result.schemas.push_back(std::move(contents));
+	std::map<std::vector<std::string>, size_t> schema_index;
+	for (auto &category : kContentsCategories) {
+		auto values = result_batch->GetColumnByName(category.column);
+		for (auto &batch : ReadContentsStream(result_batch, values, category, worker_path)) {
+			const bool is_schema = std::string(category.column) == "schemas";
+			for (int64_t row_idx = 0; row_idx < batch->num_rows(); row_idx++) {
+				auto path = ContentsPath(batch, row_idx, is_schema ? "path" : "schema_path", worker_path);
+				auto path_key = path;
+				for (auto &part : path_key) {
+					part = StringUtil::Lower(part);
+				}
+				if (is_schema) {
+					if (!schema_index.emplace(path_key, result.schemas.size()).second) {
+						throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
+						                  "catalog_contents contains a duplicate schema path");
+					}
+					if (path_key.size() > 1 &&
+					    schema_index.find(std::vector<std::string>(path_key.begin(), path_key.end() - 1)) == schema_index.end()) {
+						throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
+						                  "catalog_contents schema appears before its parent");
+					}
+					VgiSchemaContents contents;
+					contents.name = SchemaNameFromPath(path, "SchemaInfo.path");
+					contents.path = std::move(path);
+					contents.schema = {batch, row_idx};
+					contents.worker_path = worker_path;
+					result.schemas.push_back(std::move(contents));
+					continue;
+				}
+				auto schema = schema_index.find(path_key);
+				if (schema == schema_index.end()) {
+					throw IOException(CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, category.column),
+					                  "catalog_contents '%s' metadata refers to an absent schema", category.column);
+				}
+				std::string kind = category.column;
+				wire::RowReader row(batch, row_idx, category.column, worker_path);
+				if (kind == "functions") {
+					std::string type_string;
+					row.Required("function_type", type_string);
+					auto type = generated::FunctionTypeFromWire(type_string);
+					if (!type) {
+						throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
+						                  "catalog_contents has unknown function_type '%s'", type_string);
+					}
+					kind = *type == generated::FunctionType::Scalar ? "SCALAR_FUNCTION"
+					       : *type == generated::FunctionType::Aggregate ? "AGGREGATE_FUNCTION" : "TABLE_FUNCTION";
+				} else if (kind == "macros") {
+					std::string type;
+					row.Required("macro_type", type);
+					type = StringUtil::Upper(type);
+					if (type != "SCALAR" && type != "TABLE") {
+						throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
+						                  "catalog_contents has unknown macro_type '%s'", type);
+					}
+					kind = type + "_MACRO";
+				}
+				result.schemas[schema->second].items[kind].push_back({batch, row_idx});
+			}
+		}
 	}
 	return result;
 }
 
 VgiSchemaInfo DecodeContentsSchemaInfo(const VgiSchemaContents &contents) {
-	auto &worker_path = contents.worker_path;
-	auto schema_col = StructChild(ContentsRows(contents), "schema");
-	if (!IsBinaryOrUtf8(schema_col) || schema_col.IsNull(contents.row)) {
-		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path)
-		                      .Set(error_key::kField, "schema")
-		                      .Set(error_key::kEntityKind, "schema")
-		                      .Set(error_key::kEntity, contents.name),
-		                  "catalog_contents: schema '%s' has no SchemaInfo [worker: %s]", contents.name, worker_path);
-	}
-	auto batch = DeserializeFromIpcBytesZeroCopy(BinaryCell(contents.rows_batch, schema_col, contents.row));
-	ValidateItemSchema(batch, "catalog_schemas", worker_path, static_cast<size_t>(contents.row));
-	auto info = ParseSchemaInfo(batch, worker_path);
-	if (info.path != contents.path) {
-		auto contents_path =
-		    StringUtil::Join(duckdb::vector<std::string>(contents.path.begin(), contents.path.end()), ".");
-		auto info_path = StringUtil::Join(duckdb::vector<std::string>(info.path.begin(), info.path.end()), ".");
-		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path)
-		                      .Set(error_key::kField, "path")
-		                      .ExpectedActual(contents_path, info_path),
-		                  "catalog_contents: SchemaContents.path [%s] differs from its SchemaInfo.path [%s] "
-		                  "[worker: %s]",
-		                  contents_path, info_path, worker_path);
-	}
-	return info;
+	return ParseSchemaInfo(contents.schema.batch->Slice(contents.schema.row, 1), contents.worker_path);
 }
 
 std::vector<VgiTableInfo> DecodeContentsTables(const VgiSchemaContents &contents, ClientContext &context) {
 	std::vector<VgiTableInfo> out;
-	for (auto &b : ContentsItems(contents, "tables", "catalog_schema_contents_tables")) {
-		out.push_back(ParseTableInfo(context, b, contents.worker_path));
+	for (auto &item : ContentsItems(contents, "tables")) {
+		out.push_back(ParseTableInfo(context, item.batch, item.row, contents.worker_path));
 	}
 	return out;
 }
 
 std::vector<VgiViewInfo> DecodeContentsViews(const VgiSchemaContents &contents) {
 	std::vector<VgiViewInfo> out;
-	for (auto &b : ContentsItems(contents, "views", "catalog_schema_contents_views")) {
-		out.push_back(ParseViewInfo(b, contents.worker_path));
+	for (auto &item : ContentsItems(contents, "views")) {
+		out.push_back(ParseViewInfo(item.batch->Slice(item.row, 1), contents.worker_path));
 	}
 	return out;
 }
 
 std::vector<VgiFunctionInfo> DecodeContentsFunctions(const VgiSchemaContents &contents,
                                                      const std::string &function_type) {
-	const char *column = function_type == "SCALAR_FUNCTION"      ? "scalar_functions"
-	                     : function_type == "AGGREGATE_FUNCTION" ? "aggregate_functions"
-	                     : function_type == "TABLE_FUNCTION"     ? "table_functions"
-	                                                             : nullptr;
-	if (!column) {
+	if (function_type != "SCALAR_FUNCTION" && function_type != "AGGREGATE_FUNCTION" && function_type != "TABLE_FUNCTION") {
 		throw InternalException("catalog_contents: unknown function type %s", function_type);
 	}
 	std::vector<VgiFunctionInfo> out;
-	for (auto &b : ContentsItems(contents, column, "catalog_schema_contents_functions")) {
-		out.push_back(ParseFunctionInfo(b, 0, contents.worker_path));
+	for (auto &item : ContentsItems(contents, function_type)) {
+		out.push_back(ParseFunctionInfo(item.batch, item.row, contents.worker_path));
 	}
 	return out;
 }
 
 std::vector<VgiMacroInfo> DecodeContentsMacros(const VgiSchemaContents &contents, const std::string &macro_type) {
-	const char *column = macro_type == "SCALAR_MACRO" ? "scalar_macros"
-	                     : macro_type == "TABLE_MACRO" ? "table_macros"
-	                                                   : nullptr;
-	if (!column) {
+	if (macro_type != "SCALAR_MACRO" && macro_type != "TABLE_MACRO") {
 		throw InternalException("catalog_contents: unknown macro type %s", macro_type);
 	}
 	std::vector<VgiMacroInfo> out;
-	for (auto &b : ContentsItems(contents, column, "catalog_schema_contents_macros")) {
-		out.push_back(ParseMacroInfo(b, contents.worker_path));
+	for (auto &item : ContentsItems(contents, macro_type)) {
+		out.push_back(ParseMacroInfo(item.batch->Slice(item.row, 1), contents.worker_path));
 	}
 	return out;
 }
@@ -2899,9 +2943,35 @@ VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
 		info.order_preservation = FromWire(*wire.order_preservation);
 	}
 
-	// Documentation: the SQL of each example, plus categories.
+	// DuckDB exposes example SQL directly; retain the structured descriptions
+	// in its discovery tag so workers need not transmit a duplicate copy.
+	const bool synthesize_examples = !wire.examples.empty() && info.tags.find("vgi.example_queries") == info.tags.end();
+	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> examples_doc(
+	    synthesize_examples ? yyjson_mut_doc_new(nullptr) : nullptr, &yyjson_mut_doc_free);
+	if (synthesize_examples && !examples_doc) {
+		throw OutOfMemoryException("Could not allocate example metadata for function '%s'", info.name);
+	}
+	auto *queries = examples_doc ? yyjson_mut_arr(examples_doc.get()) : nullptr;
 	for (auto &example : wire.examples) {
+		if (examples_doc) {
+			auto *entry = yyjson_mut_obj(examples_doc.get());
+			yyjson_mut_obj_add_strncpy(examples_doc.get(), entry, "sql", example.sql.data(), example.sql.size());
+			const auto &description = example.description;
+			yyjson_mut_obj_add_strncpy(examples_doc.get(), entry, "description", description.data(), description.size());
+			if (example.expected_output) {
+				yyjson_mut_obj_add_strncpy(examples_doc.get(), entry, "expected_output", example.expected_output->data(),
+				                           example.expected_output->size());
+			}
+			yyjson_mut_arr_append(queries, entry);
+		}
 		info.examples.push_back(std::move(example.sql));
+	}
+	if (examples_doc) {
+		std::unique_ptr<char, decltype(&std::free)> json(yyjson_mut_val_write(queries, 0, nullptr), &std::free);
+		if (!json) {
+			throw OutOfMemoryException("Could not serialize example metadata for function '%s'", info.name);
+		}
+		info.tags.emplace("vgi.example_queries", json.get());
 	}
 	info.categories = std::move(wire.categories);
 

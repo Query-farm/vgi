@@ -26,6 +26,9 @@ set_target_properties(vgi_nanoarrow PROPERTIES
   POSITION_INDEPENDENT_CODE ON
   INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/include
   INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(EMSCRIPTEN AND USE_WASM_THREADS)
+  target_compile_options(vgi_nanoarrow PRIVATE -pthread)
+endif()
 if(NOT EMSCRIPTEN)
   target_compile_definitions(vgi_nanoarrow PRIVATE NANOARROW_IPC_WITH_ZSTD NANOARROW_IPC_WITH_LZ4)
   target_link_libraries(vgi_nanoarrow PRIVATE ${VGI_ZSTD_LIB} lz4::lz4)

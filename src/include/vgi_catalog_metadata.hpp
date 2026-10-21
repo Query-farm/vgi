@@ -760,23 +760,21 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const VgiB
 // no columns, or an out-of-range row.
 vector<Value> BatchRowToValues(ClientContext &context, const VgiBatchPtr &batch, int64_t row = 0);
 
-// One schema and everything in it, from catalog_contents: row `row` of the
-// response's `schemas` struct column, held in place (every schema of a
-// snapshot shares `rows`, and so the response buffers; nothing is copied).
-// Only `path` is read up front, to name the schema entry. The SchemaInfo and
-// each kind's item list are decoded on first use (DecodeContents* in
-// vgi_catalog_rpc.hpp), so a query touching two schemas does not pay to decode
-// the whole catalog. Each kind is complete: an empty list means none.
-struct VgiSchemaContents {
-	std::string name;              // SchemaNameFromPath(path)
-	std::vector<std::string> path; // SchemaContents.path; must equal SchemaInfo.path
-	//! The catalog_contents response batch; column `rows_column` is the `schemas` struct column.
-	VgiBatchPtr rows_batch;
-	int rows_column = 0;
+// A row in a catalog-wide metadata stream. Batches retain their IPC buffers;
+// indexing rows does not copy or materialize the metadata objects.
+struct VgiCatalogItemRef {
+	VgiBatchPtr batch;
 	int64_t row = 0;
-	VgiColumn rows() const {
-		return rows_batch->column(rows_column);
-	}
+};
+
+// One schema's rows from the six catalog-wide streams. Streams are opened
+// once and indexed by raw schema path and subtype when the snapshot arrives.
+// Full metadata objects are still materialized lazily by DecodeContents*.
+struct VgiSchemaContents {
+	std::string name; // SchemaNameFromPath(path)
+	std::vector<std::string> path;
+	VgiCatalogItemRef schema;
+	std::map<std::string, std::vector<VgiCatalogItemRef>> items;
 	std::string worker_path;
 };
 

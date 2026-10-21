@@ -52,8 +52,8 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 	// it (setting, reload and version rules, a snapshot already fetched by
 	// revalidation); null means the per-schema path. See docs/catalog_contents.md.
 	if (auto snapshot = vgi_catalog.TakeCatalogContents(context, rpc_ctx)) {
-		// Name each entry from SchemaContents.path; its SchemaInfo is decoded
-		// on first use. Every entry shares the snapshot's response buffers.
+		// Paths and row references were indexed from the catalog-wide streams.
+		// Decode full SchemaInfo on first use and share the response buffers.
 		for (auto &contents : snapshot->schemas) {
 			CreateSchemaInfo info;
 			info.schema = contents.name;

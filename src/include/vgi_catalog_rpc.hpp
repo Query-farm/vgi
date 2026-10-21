@@ -129,12 +129,17 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, Cl
 VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context,
                                          const std::optional<std::string> &if_none_match = std::nullopt);
 
+// Validate and index every row/batch of the six embedded metadata streams.
+VgiCatalogContents ParseCatalogContents(const VgiBatchPtr &batch,
+                                       const std::string &worker_path,
+                                       const std::optional<std::string> &if_none_match = std::nullopt);
+
 // The `vgi_catalog_contents` setting (default true). False means the client
 // never calls catalog_contents: neither to load nor to revalidate.
 bool UseCatalogContents(ClientContext &context);
 
 // Decode a catalog_contents schema's SchemaInfo (lazily, on first use).
-// Throws if its path differs from SchemaContents.path.
+// Its row was associated with this raw path when the snapshot was indexed.
 VgiSchemaInfo DecodeContentsSchemaInfo(const VgiSchemaContents &contents);
 
 // Decode one kind of a catalog_contents schema entry (done lazily, on a set's

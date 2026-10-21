@@ -7,9 +7,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "vgi_exception.hpp"
 
-#include <openssl/rand.h>
-
 #if VGI_ENABLE_IROH
+#include <openssl/rand.h>
 #include <vgi_iroh.h>
 #endif
 

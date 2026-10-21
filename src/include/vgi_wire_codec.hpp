@@ -48,6 +48,9 @@ struct Ctx {
 // Decoding
 // ============================================================================
 
+//! Logical null, including a valid dictionary index referring to a null value.
+bool IsNullValue(const VgiColumn &col, int64_t i, const Ctx &ctx);
+
 template <class T>
 struct IsOptional : std::false_type {};
 template <class T>
@@ -67,7 +70,7 @@ void ReadValue(const VgiColumn &col, int64_t i, float &out, const Ctx &ctx);
 void ReadValue(const VgiColumn &col, int64_t i, double &out, const Ctx &ctx);
 //! utf8, large_utf8, utf8_view, or a dictionary of any of them.
 void ReadValue(const VgiColumn &col, int64_t i, std::string &out, const Ctx &ctx);
-//! binary, large_binary or binary_view (copied).
+//! binary, large_binary, binary_view, or a dictionary of those (copied).
 void ReadValue(const VgiColumn &col, int64_t i, std::vector<uint8_t> &out, const Ctx &ctx);
 
 //! A binary / large_binary value as a zero-copy slice that keeps CurrentBatch() alive.
@@ -87,7 +90,7 @@ void MapBounds(const VgiColumn &col, int64_t i, const Ctx &ctx, int64_t &begin, 
 
 template <class T>
 void ReadValue(const VgiColumn &col, int64_t i, std::optional<T> &out, const Ctx &ctx) {
-	if (col.IsNull(i)) {
+	if (IsNullValue(col, i, ctx)) {
 		out.reset();
 		return;
 	}
