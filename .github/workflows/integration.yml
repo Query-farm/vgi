@@ -35,6 +35,10 @@ jobs:
     name: Integration suite (launcher transport)
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    defaults:
+      run:
+        # Explicit bash enables pipefail: tee must not hide a failed test.
+        shell: bash
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
@@ -171,9 +175,9 @@ jobs:
           VGI_PYTHON_DIR: /tmp/vgi-python
           QUERY_FARM_TELEMETRY_OPT_OUT: "1"
         run: |
-          make test_http_bearer 2>&1 | tee /tmp/vgi-bearer.log
+          ./test/run_http_bearer_integration.sh 'test/sql/integration/bearer_auth/*' --min-executed 2 2>&1 | tee /tmp/vgi-bearer.log
           make test_catalog_discovery_auth 2>&1 | tee /tmp/vgi-discovery-auth.log
-          ./build/release/test/unittest "test/sql/oauth/catalog_discovery_options.test" 2>&1 | tee /tmp/vgi-discovery-options.log
+          python3 scripts/run_tests.py --min-executed 1 'test/sql/oauth/catalog_discovery_options.test' 2>&1 | tee /tmp/vgi-discovery-options.log
 
       - name: Build pinned Iroh qualification bridge
         run: |
