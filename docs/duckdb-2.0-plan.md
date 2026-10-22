@@ -1053,8 +1053,8 @@ The concrete remaining work is smaller:
 | Engine uses ScanTriggers for both discovery and execution | Initially expose ENGINE-owned definitions through that hook. A backend-owned trigger must not also be executed by the client. Supporting native discovery of backend-only definitions may need a small engine filtering hook. | Keep one execution-owner field/contract; do not add a scheduler. |
 | Statement-trigger expansion forces base DML RETURNING even without transition aliases | Require the existing rows result mode for that supported path. Count-only providers remain unsupported. | Existing mode negotiation. |
 | Native writes request only count/rows; UPDATE OLD capture and duplicate row-id policy are new engine inputs | Bridge existing paired OLD/NEW changes results to the engine's NEW-then-OLD output, and honor duplicate-target handling. Do not zip reordered returned rows with input OLD values without proven correspondence. | Existing changes carrier is sufficient; no new OLD/NEW record demonstrated. |
-| FinalizeWriteConnection treats every nonempty final output batch as a count | Make final result handling match the selected count/rows/changes mode; prove zero-row and multiple-batch behavior. | Use existing init/finalize and output schemas. |
-| Pre-FINALIZE raw INPUT drain discards batch metadata and tolerates some non-Iroh read failures | Reproduce a provider returning a response then raising, missing responses and premature EOS. If errors are lost, surface them through the existing error/rollback path. | Source-identified candidate in `src/vgi_function_connection.cpp:1007`, not yet reproduced; no new error protocol. |
+| FinalizeWriteConnection treats every nonempty final output batch as a count | Before enabling deferred RETURNING, collect final rows using the selected output schema. Current writable fixtures do not opt into FINALIZE; their results arrive during INPUT. | Optional adapter support gap, not a reproduced fixture regression. Native changes adaptation remains in the DuckDB2 lane. |
+| Pre-FINALIZE raw INPUT drain discards batch metadata and tolerates some non-Iroh read failures | The 2026-10-22 follow-up rules out ordinary Python `out.emit(...); raise` as a successful response followed by an error: RPC buffers until process succeeds. Require a concrete reachable failure before promoting drain robustness to a fix. | Unproven for current writes; no new error protocol. |
 | Multiple-DML CTE support is an explicit engine opt-in, absent in VGI | Keep disabled until two writes and failure/RETURNING behavior share the current provider transaction correctly. | Adapter capability/qualification, not a coordinator. |
 | Commit/rollback already carry the transaction identifier and have an idempotency contract | Preserve existing retry semantics; test that repeats cannot apply effects twice and retain normal provider results/errors. BEGIN returns a new identifier, so review its allocation/cleanup behavior separately before changing retry policy. | Corrects the earlier blanket single-attempt recommendation; no new fields or recovery endpoints. |
 | Commit/rollback exceptions can skip erasing the native transaction entry | Make local cleanup exception-safe and verify provider behavior after a definite refusal; preserve unknown outcome after ambiguous commit. | Local bookkeeping/error handling, not recovery machinery. |
@@ -1073,8 +1073,9 @@ Focused qualification, using the existing wire contract:
 
 1. Autocommit and explicit-transaction writes fail at init, a later batch, or
    finalize; no partial effects can commit. Include prior successful writes in
-   an explicit transaction, zero-row finalization, response-then-error, missing
-   per-batch responses and premature EOS.
+   an explicit transaction and zero-row finalization where opted in. Python
+   process errors, missing per-batch responses and premature EOS are separate
+   cases; do not assume `out.emit(...); raise` sends the response first.
 2. CTAS insert/finalize failure removes the new table and data; expanded ALTER
    failure in UPDATE/default/constraint follow-up rolls back the whole change.
 3. Multiple-DML and BEFORE/base/AFTER failures roll back all admitted writes;
@@ -1096,6 +1097,43 @@ its writable conformance file is a skip stub. General function-finalization
 tests and core-engine trigger tests do not prove external VGI write/trigger
 behavior. No release gate or existing method count changes in this research
 checkpoint. The protocol manifest records the exact source findings.
+
+**Finalization follow-up (2026-10-22; source audit only)**
+
+The current generic and simple Python writable handlers do not override
+`finalize`/`finish` or set `has_finalize`. Their native physical operator still
+has an end-of-input cleanup step, but it closes and drains the existing stream
+without invoking the optional provider FINALIZE callback. Generic writes wait
+for their transactor response and return one result batch per input batch.
+
+The locked and installed `vgi-rpc` 0.50.0 buffers `OutputCollector.emit` in memory.
+Both its subprocess and HTTP exchange paths call `process`, validate, then flush.
+A process exception discards the buffered success response and sends an error.
+The earlier response-then-error example was therefore incorrect for ordinary
+Python providers. Native normal reads process those errors; the raw pre-FINALIZE
+drain remains a source-level robustness observation without a demonstrated
+current-provider failure. INPUT EOS has no additional Python user callback;
+errors from an opted-in finalizer occur during FINALIZE init/read. HTTP uses a
+separate finalize transition and processes
+the exchange response's error metadata before returning its result.
+
+The generic table-in-out API allows optional final output batches, and a custom
+writer can opt in. Native writable finalization only supports count output:
+deferred RETURNING rows are not collected and normally fail count-schema
+validation. This is an optional adapter limitation, not evidence that current
+per-batch RETURNING is broken; no explicit write-specific deferred-RETURNING
+guarantee was found. Keep any final-row implementation tied to a
+provider/reproducer that needs it; no protocol extension is required.
+
+Existing active test cases cover simple-writable per-batch RETURNING/schema
+rejection and generic table-in/out finalize exceptions/multiple batches. They
+do not establish writable FINALIZE semantics. Qualify opted-in count-only
+finalization and zero-input behavior before expanding to deferred RETURNING.
+
+EC2 SSH timed out again, so no runtime reproduction was performed. The exact
+source anchors are in the manifest's `write_finalization_source_audit_2026_10_22`.
+Transaction exception cleanup remains the first concrete implementation target;
+the signed HTTP transaction-token candidate still needs separate reproduction.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
