@@ -5,8 +5,8 @@
 on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
 
 **Build/test workflow:** edit the isolated worktrees locally, then synchronize
-source changes to `ec2-user@18.234.138.19` and build/test there (resumed October 22;
-previous addresses `32.192.49.19` and `52.90.218.118`). This task owns
+source changes to `ec2-user@98.81.121.120` and build/test there (resumed October 23;
+previous addresses `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
 Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
@@ -15,9 +15,10 @@ local edit made during a remote build cannot leave stale objects undetected.
 The implementation goal is active. Preparing this remote workspace does not
 qualify any protocol/native migration gate.
 
-**Overall completion: incomplete.** No P0–P3 or M0–M4 exit gate is marked
-complete. The tested groundwork below is partial implementation, not completion
-of the broader protocol or the native DuckDB 2.0 port.
+**Overall completion: incomplete. P0 scope/inventory review is complete.** The
+October 23 combined review and remote checks cover every scope and field mapping.
+P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
+not a frozen protocol or a native DuckDB 2.0 port.
 
 **Scope correction (2026-10-15):** retain the existing transaction and streamed
 write fundamentals. No savepoints, durable mutation replay/status service or
@@ -46,6 +47,79 @@ before release. Schema/table options, nested field alteration, complete view
 metadata, constraints, indexes, macros, triggers, and query execution belong in
 the same contract review. A feature's later engine implementation date is not
 by itself a reason to postpone its wire design to another version.
+
+### Combined protocol review — October 23, 2026
+
+This review supersedes earlier **next-step and candidate-scope** recommendations,
+including the recommendation to implement triggers next. Historical test results
+below retain their original limits. The companion manifest maps all 151 original
+audit rows and 20 areas; the original field audit and its digest remain unchanged.
+Review uses native `a4921dcb2929`, Python `65c6851fb879`, Haybarn 1.5
+`105edd31b57f`, and the audited 2.0 source pin `e1784fa42310`. The separate Haybarn
+worktree has moved; this review does not silently substitute its current HEAD.
+
+The combined package retains schema/table options and layout, raw column paths,
+view metadata/security, canonical constraints and typed indexes, dependencies,
+macro families, typed prepared read queries, TUPLE/canonical Arrow Variant, and
+the existing transaction/write lifecycle. Much of the old pending inventory was
+stale: those records and bounded reference implementations already exist. Their
+shipping adapter and transport coverage remains a separate gate.
+
+The remaining included work before freeze is:
+
+| Work | Selected direction | Remaining proof or implementation |
+| --- | --- | --- |
+| Column expressions and metadata | Change `catalog_table_column_default_set.expression` from string to required binary `SqlExpression` IPC; change `catalog_table_column_type_change.expression` to nullable binary using the same record. Preserve explicit DROP DEFAULT, existing base64 IPC field annotations, and the existing `comment`/`tags` metadata conventions. | Persistent CREATE/ADD/SET DEFAULT, virtual generation and USING need operation-specific capability checks, durable readback/rollback and matching native/SDK support. Validate tags as a string map without duplicate keys. Stored generated columns and engine compression enums are excluded. |
+| Default schema absence | Make the existing `CatalogAttachResult.default_schema` nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Preserve absence through worker, native adapter and all SDKs; reject on an adapter that cannot implement it. Never invent `main`, split dots, or introduce nested default search paths. |
+| Macro cleanup | Use one overload-family representation in the successor API; migrate legacy single-definition macros into one-element families before removing duplicate wire forms. | Port the native family consumer, preserve typed literal versus expression defaults and required evaluation context, then regenerate and test every SDK. Native 1.5 currently rejects family payloads. Function argument defaults are a different contract and remain intact. |
+| Optimizer preparation | Keep projection expressions/result mapping and repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | Filter v2 is a predicate contract, not a general scalar projection language. Prove typed scalar results, support decisions before optimizer replacement, slot/filter remapping, local residuals and query-scoped repeatability. The existing `table_function_plan` call occurs too late for remote decline. No proposed projection record is frozen yet. |
+
+Capability requirements attach to the actual operation and object semantics.
+Do not add a generic `ObjectRequirements`, metadata mutation RPC, or transaction
+framework simply to close an inventory row. Dependency lifetime ownership does
+not implement SQL authorization ownership; owner transfer is explicitly deferred.
+Views retain their existing SELECT text with owner-relative late binding; fixed
+output-schema guarantees are not implied by aliases or comments.
+
+The following are reviewed deferrals, based on missing execution semantics or
+an unestablished product requirement, rather than their implementation date:
+
+| Candidate | Current coverage and reason to defer | Cost of adding it later |
+| --- | --- | --- |
+| Persistent triggers | Existing identity, SQL/context, dependencies, transactions and OLD/NEW carriers remain. No portable trigger CRUD or execution profiles; exclusive engine/backend ownership and whole-statement behavior need a real provider proof. | About five CRUD methods plus definitions/capabilities and all-SDK redistribution. Existing carriers reduce the size of that change. |
+| Sequences | No remote allocation contract. Pinned `nextval` is coupled to DuckDB transaction state and nonvirtual sequence methods; metadata alone cannot supply allocation authority. | Lifecycle/allocation RPCs, concurrent allocation and rollback/gap policy, another coordinated SDK update. |
+| Named aliases and ENUMs | Supported resolved Arrow values remain. That does not preserve named type identity or a complete ordered ENUM domain. | Catalog methods plus negotiated identity/domain annotations and adapter work; another SDK update. Reinterpreting existing unannotated values would be breaking. |
+| Custom collations / CRS catalogs | Existing evaluation context and field metadata remain. Collation names do not prove equality/order semantics; CRS metadata does not establish catalog resolution or transformations. | New catalog APIs/identity kinds and qualification; an already representable certified collation may need only a named profile implementation. |
+| Standalone windows | Existing aggregate-window lifecycle remains. General peer/navigation/streaming windows need a distinct executable proof. | A new function profile/lifecycle may require SDK changes; a bounded equivalent aggregate-window adapter may avoid them. |
+| Arbitrary statements / CONNECT | Explicit prepared read queries remain. They grant no DML, DDL, transaction-control or session-routing authority. | Statement result kinds and lifecycle/session rules, normally additive methods but coordinated redistribution. Existing typed parameters and transaction handles can be reused. |
+| Multiple relational inputs | Retain the engine feasibility spike and existing bounded tagged-input workaround. The pinned binder rejects a second TABLE subquery; an input ID does not solve scheduling, buffering or completion. | Separate input schemas/lifecycle after a working two-input engine proof, with another coordinated SDK update. |
+| Typed metrics | Existing diagnostics remain; no concrete consumer requires a portable typed metric schema yet. | A later typed result envelope needs units, lifetime/aggregation semantics and an SDK update. |
+
+These choices intentionally accept a possible later protocol release. With
+exact major/minor matching, even additive methods require coordinated SDK and
+worker deployment. No reserved fields or placeholder records count as coverage.
+If one of these features becomes a release requirement, reopen it before freeze
+and meet the proof criteria recorded in the manifest.
+
+Keep one **major** successor transition; the raw-path and canonical record
+changes already rule out the old additive `2.2.0` candidate. The final major
+number/routing name is selected with the complete generated diff. Deploy old
+and new versions at separate versioned endpoints/processes, drain old sessions
+and transactions, and reattach/reprepare after switching. Do not move tokens,
+transactions or incompatible catalog definitions between versions. Rollback
+requires old-compatible catalog state or a tested restore/migration; switching
+a binary alone is insufficient. No version-aware router is required.
+
+**Next checkpoint:** implement the three concrete column/default-schema/macro
+changes above on 1.5, and prove the optimizer contracts before P1 closes. Then
+complete all-SDK regeneration/conformance, capability matrices and the deployment
+exercise for P2/P3. Native 2.0 compilation and execution remain M0–M4 work.
+This review adds no wire fields, version bump, engine-pin update or runtime
+qualification. Validation on the replacement EC2 `98.81.121.120` passed:
+`--require-decisions` covers **151 audit rows / 20 areas / zero unresolved
+scope mappings**, and all **11 manifest tests** pass. Logs are in
+`logs/protocol-review-20261023-SBCl67`. These are inventory checks, not proof of
+the unfinished P1 contracts or native2 behavior.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference
@@ -173,8 +247,9 @@ The combined manifest is in the isolated Python worktree at
 `scripts/check_duckdb2_manifest.py`, compares all 151 field-audit rows and all
 19 target/candidate areas directly with this plan and the audit, plus a shared
 identity area. Removing a candidate that has no catalog-field row still fails
-the inventory check. Coverage is not readiness: `--require-decisions` rejects
-the 137 outstanding scope, capability, and field reviews.
+the inventory check. At this historical checkpoint, `--require-decisions`
+rejected 137 scope, capability, and field reviews. The October 23 combined review
+supersedes that backlog; inventory coverage still does not establish readiness.
 
 The normal SDK modules now define `OptionChanges`, `OptionState`, raw
 `ColumnPath`, and `RequiredFilterPaths`. Typed options distinguish SET NULL,
@@ -1356,7 +1431,7 @@ strings remain unpublished placeholders until the complete contract is frozen.
 
 | Gate | Current status | Work still required |
 | --- | --- | --- |
-| P0 | In progress; inventory coverage checked | Resolve scope, capability, and field mappings across the full package. |
+| P0 | Complete: combined source review and remote inventory/tests passed October 23 | Reopen mappings if scope changes; remaining contract/proof work belongs to P1. |
 | P1 | In progress; catalog groundwork and typed read-query preparation/execution have bounded reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
 | P2 | Shared records and schema/table/column surfaces generated across SDKs; snapshot remains open | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
 | P3 | Not qualified or released | Full capability conformance, transport tests, coordinated deployment/rollback proof, and matched publication. |
@@ -1489,9 +1564,10 @@ fields and capability flags do not bypass it.
 
 ### Target contract package
 
-The following areas are **target scope for the same release**. Exact record and
-method names will be settled in the protocol specification. “Design required”
-means work before the shared freeze, rather than an automatic later release.
+The following table retains every original target for traceability. The October
+23 review selects the included work and explicitly defers triggers. “Design
+required” still means P1 work before the shared freeze, not a frozen record or
+an automatic later release.
 
 | Area | Contract work to bundle | Required semantics before freeze |
 | --- | --- | --- |
@@ -1504,10 +1580,10 @@ means work before the shared freeze, rather than an automatic later release.
 | Macros — concrete contract and reference implemented; adapters pending | Overload collections, declared parameter types, expression/default representation, documentation, and owner-relative definitions | Reconcile the existing single-definition request and typed-value defaults with engine overloads and expression defaults. Define resolution and stable round trips; do not introduce a function overload handle just to mirror DuckDB internals. |
 | Dependencies and catalog consistency | Shared qualified object references; explicit ownership/drop/alter dependency semantics; mutation visibility and metadata-version rules | Settle worker versus engine authority, RESTRICT/CASCADE, rename effects, transaction-local reads, committed versions/etags, and retained entries. Include dependency records where enforcement across clients requires them; no DuckDB pointers or OIDs on the wire. |
 | Transactions and write execution | Reuse existing transaction handles, begin/commit/rollback, write init/exchange/finalize and OLD/NEW results; audit concrete DuckDB2 gaps before adding wire fields | Keep supported DDL, DML and trigger effects in the existing provider transaction; failed writes cannot partially commit. No savepoints, durable replay/status service or general statement ticket/receipt framework in this package. No automatic retry of non-idempotent mutations after ambiguous dispatch; commit/rollback retain existing transaction-ID-based idempotency. |
-| Triggers — contract specified; reference pending | Table-owned identity, list/get/create/drop and metadata mutation, event/timing/granularity, UPDATE OF, transition aliases, action definition, dependencies, and execution mode | Prefer worker authority for persistent definitions. Distinguish engine-executed from backend-executed triggers so they cannot fire twice. Define SQL dialect, ordering, supported row/statement forms, OLD/NEW requirements, rollback, detach/reconnect, and cross-client discovery. |
+| Triggers — reviewed deferral | Retain existing table-owned identity, SQL/context, dependency and OLD/NEW carriers; defer new persistent CRUD and execution profiles | Reopen for a concrete provider need with exclusive execution ownership, exact statement/row semantics, complete discovery and rollback proof. Later CRUD/capabilities require another coordinated SDK update. |
 | Catalog query execution — explicit 1.5 adapter implemented; automatic pending | Negotiated query preparation, typed parameters/context, prepared-result schema and lifetime, and execution through the existing TABLE stream | Reuse the existing read-query proposal. Separate explicit provider-dialect queries from automatic semantic-equivalence pushdown; define decline-before-execution, transaction/identity binding, ordered results, cancellation, token cleanup, and reconnect behavior. |
 | Logical type preservation — concrete contract and codecs implemented; adapters pending | Recursive VGI TUPLE annotation and canonical Arrow Parquet Variant capability with unshredded metadata/value storage | Qualify canonical Variant semantics, missing versus NULL and SDK byte/metadata preservation at each engine pin. Original DuckDB integer width/signedness and its full type domain are not promised; unsupported mappings reject. Reject opaque aggregate-state layouts without a portable contract. |
-| Optimizer and observability additions — design required | Projection expressions and result mapping, repeatability, typed metrics, and any necessary partition-selection/parallelism additions | Reuse Filter v2 and existing split/partition/ordering metadata first. Define decline and local residual behavior, type/NULL semantics, query-scoped repeatability, metric units/lifetime, and selected-partition identity. Existing monotonicity and runtime-filter fields are not new additions. |
+| Optimizer and observability additions — P1 design required | Include scalar projection/result mapping and bind-specific repeatability; reuse diagnostics, split selection and parallelism; defer new typed metrics | Prove support decisions before optimizer replacement, exact result types/slots, local residuals and query-scoped repeatability. Filter v2 currently describes Boolean predicates. Existing monotonicity/runtime filters are retained; no speculative metrics or partition-ID fields. |
 
 For options, prefer a shared typed-value representation, such as the existing
 one-row Arrow record pattern, over independently stringifying values for each
@@ -1528,8 +1604,10 @@ normative.
 
 ### Additional candidates to resolve before freeze
 
-These also receive a decision during this release design, so they cannot become
-unexamined reasons for an immediate follow-up protocol version.
+All candidates below were reviewed on October 23. Cleanup is included; the other
+new feature families are explicitly deferred with reasons, retained coverage,
+reopening proof and later-release cost in the review and manifest. The original
+candidate questions remain here as the scope inventory.
 
 | Candidate | Work needed for an inclusion decision |
 | --- | --- |
@@ -1566,15 +1644,15 @@ protocol and the implementations shipping with it; native 2.0 qualification
 and M4's 2.0 artifacts remain later gates. A successful 1.5 protocol release
 does not establish 2.0 engine support.
 
-### Senior review findings to resolve before freeze
+### Senior review findings and current disposition
 
 | Finding | Implementation/acceptance work |
 | --- | --- |
-| Capability offers stopped at the worker boundary | Forward the existing offer through Python client/catalog hooks first. Then specify successor capability selection, attachment-bound agreements, discovery/execution access, reconnects, and metadata cache scope. Test clients with different offers against one worker. |
-| Trigger-bearing tables need compatible writers | Require backend execution or worker-enforced rejection when a client cannot honor current trigger requirements. Include 1.5 clients, other SDKs, and a trigger created after another client has prepared a write. Effects execute once or the write rejects before mutation. Discovery-time capability checks alone are insufficient. |
-| Exact-version routing needs an operational transition | Decide during P1 between versioned deployments/endpoints with draining, an explicit coordinated outage, or an implemented version-aware routing layer. The current server cannot register two `vgi.v2` minors under one name. Prove active-transaction, reconnect, and rollback behavior, including catalog objects older clients cannot interpret. |
-| Remote-query typed parameters need a concrete carrier/lifecycle | Reuse an Arrow parameter batch: values in a row, types in its schema, and field metadata for additional logical distinctions. Specify placeholder mapping, metadata preservation/validation across SDKs, preparation versus execution binding, token reuse, typed NULLs, and rebinding. Extend the referenced proposal, whose executor currently accepts only a prepared token. |
-| Shared column paths omit existing required-filter metadata | Include `TableInfo.required_filters` in P0's raw-component path inventory. Preserve its AND-of-OR groups and prefix semantics while distinguishing column `"a.b"` from field `b` inside struct `a`. Decide the migration of existing dotted strings; Filter v2 already has distinct column/field references. |
+| Capability offers stopped at the worker boundary | Implemented offer forwarding, sealed selection, current-profile checks and bounded provider references. Remaining work is explicit column execution roles and shipping provider/SDK qualification. |
+| Trigger-bearing tables need compatible writers | Trigger implementation is deferred. Retain the requirement for any future engine/backend trigger profile; do not add a generic writer-requirements framework now. |
+| Exact-version routing needs an operational transition | Selected separate versioned endpoints/processes with draining and reattachment/repreparation. P3 must exercise active transactions, reconnect, unsupported catalog objects and rollback. No token migration or automatic downgrade. |
+| Remote-query typed parameters need a concrete carrier/lifecycle | Implemented parameter batches with schema mapping metadata, preparation/execution validation and token lifecycle. Bounded native 1.5 explicit execution is qualified; automatic native2 semantics and remaining transports/providers are still open. |
+| Shared column paths omit existing required-filter metadata | Implemented raw AND-of-OR paths and explicit schema-checked legacy migration. Native 1.5 enforcement is tested; native2 nested-path/cache integration remains. |
 
 The broad release remains the intended unit. Resolve these findings within its
 design, with executable evidence for the difficult contracts before P2, rather
@@ -1623,9 +1701,10 @@ secure-view security flags, new nested column paths, and expanded ADD COLUMN
 operations as 2.0 correctness gates. Five focused existing cases passed with
 187 assertions; that does not establish a working VGI 2.0 runtime.
 
-The following matrix summarizes the implementation scope. It includes
-existing 1.5 gaps that need an explicit support decision, as well as new 2.0
-features; these must not all be reported as 2.0 regressions.
+The following matrix retains the original source-audit baseline, before the
+protocol increments above. Its missing-wire observations are historical; the
+October 23 review and manifest define current coverage and remaining work.
+Existing 1.5 limitations must not all be reported as 2.0 regressions.
 
 | SQL/catalog area | Engine interface and current VGI evidence | Required implementation or support decision |
 | --- | --- | --- |
@@ -1636,9 +1715,9 @@ features; these must not all be reported as 2.0 regressions.
 | Schema/table/view comments, tags, and definitions | VGI can read metadata and handle some comment changes, but `InvokeCatalogSchemaCreate` currently sends absent comment/tags even though the wire accepts them. Views send a rendered SQL definition. | Distinguish readable metadata from writable DDL. Carry supported metadata and view definition details through create/alter, preserving name resolution and dependencies; reject unsupported details. |
 | View aliases and secure views | Explicit aliases are omitted from the SELECT-only create payload. New `CreateViewInfo.security_type` establishes an optimization barrier; current create/read contracts cannot preserve it. | Fix alias round trips. Preserve the security flag through storage/discovery/rebinding or reject secure view creation before mutation. Sending full CREATE VIEW SQL is not compatible with the existing SELECT-only read contract. |
 | Expanded ADD COLUMN | The 2.0 transformer can generate ADD, UPDATE, SET DEFAULT, SET NOT NULL, and ADD CONSTRAINT operations. VGI currently rejects ADD CONSTRAINT. | Check support for the complete operation and qualify rollback across the sequence. Reject unsupported shapes before remote mutation; carrying parser flags in one RPC alone would miss the execution path. |
-| `CREATE/DROP TRIGGER` and triggered writes | Haybarn's `TableCatalogEntry` exposes create/get/scan/drop trigger hooks and event selection. VGI does not implement trigger catalog storage. | Include definition/lifecycle/execution-mode contracts in the combined release design. Implement native execution after its write prerequisites; qualify OLD/NEW, RETURNING, atomicity, and single execution before advertising support. |
+| `CREATE/DROP TRIGGER` and triggered writes | Haybarn's `TableCatalogEntry` exposes create/get/scan/drop trigger hooks and event selection. VGI does not implement trigger catalog storage. | Reviewed and deferred October 23. Reopen for a concrete provider need with exclusive execution ownership, OLD/NEW, RETURNING, atomicity and single-execution proof; new CRUD requires a later coordinated SDK update. |
 | Multiple DML CTEs, CTAS, MERGE/UPDATE/DELETE and RETURNING | `SupportsMultipleDMLCTEs()` is an explicit catalog opt-in. Physical planning hooks and bound table metadata must match the new execution plans. | Qualify each statement shape with shared worker transaction state. Enable the capability only for workers that can meet the semantics, and test multi-write failures and rollback. Existing write support alone is insufficient evidence. |
-| `CONNECT` and remote query/statement dispatch | `Supports(RemoteCapability)`, `RemoteExecute(...)`, and `SupportsPushdown(...)`. VGI has no 2.0 implementations; a read-query preparation design already exists. | Bundle read-query contract work in the combined release. Resolve raw SQL/statement capability scope before freeze; keep their semantics separate from reads. Ordinary function/catalog workers need not implement a SQL engine. |
+| `CONNECT` and remote query/statement dispatch | `Supports(RemoteCapability)`, `RemoteExecute(...)`, and `SupportsPushdown(...)`. Native2 opt-ins remain unimplemented; read-query preparation and bounded native1.5 explicit execution now exist. | Keep read-query contracts; defer arbitrary mutating statements and raw CONNECT. Ordinary function/catalog workers need not implement a SQL engine. |
 | Other catalog object kinds | VGI rejects native index/macro creation although their RPCs already exist; index lookup/scan is not wired into the schema entry. Sequences, types, collations, and several function kinds are also rejected. These are existing limitations. | Integrate existing requests where sufficient; qualify index option types and macro overload/default contracts. Replace misleading blanket "read-only" errors with accurate capability errors. New kinds may require protocol/SDK work. |
 
 Evidence: upstream [catalog hooks](https://github.com/duckdb/duckdb/blob/c65ca930b9fe39b2e8d8ed8821018dca650965f4/src/include/duckdb/catalog/catalog.hpp),
@@ -1823,20 +1902,19 @@ can precede WASM only if its documented support scope explicitly says so.
 
 ## Feature enablement after native parity
 
-The timing below concerns engine/worker feature enablement. Wire additions for
-these features are reviewed and, where specified and proven, frozen in the
-combined protocol release above. A later runtime implementation should consume
-that contract rather than trigger another planned schema migration. An internal
-2.0 build can run basic smoke tests before all optional profiles are enabled.
+The timing below concerns engine/worker feature enablement. Included wire
+additions must be specified and proven before the combined freeze. Explicitly
+deferred families may need a later release. An internal 2.0 build can run basic
+smoke tests before all optional profiles are enabled.
 
 | Priority | Feature | Work and acceptance gate |
 | --- | --- | --- |
 | First | Scalar monotonicity and optimizer metadata | Connect existing `argument_monotonicity` metadata to 2.0 argument properties. Prove both plan benefit and result equivalence, including decreasing functions and NULL behavior. |
 | First | Async split scans and table-in/out | Split scans currently disable async prefetch. Give each split correct task/connection ownership and backpressure. Audit/extend the engine's table-in/out blocking/resume contract for both Execute and FinalExecute; test cancellation and bounded memory. Source-side `AsyncResult` alone does not establish this capability. |
-| Next | DML in CTEs and custom-table triggers | Consume the frozen transaction/trigger contracts; cache worker-authoritative persistent definitions locally. Qualify the selected execution mode, OLD/NEW, RETURNING, rollback, and single execution. Reject unsupported atomicity; do not assume arbitrary workers provide distributed transactions. |
+| Next | DML in CTEs | Qualify admitted multi-write forms through existing transactions and write phases, including OLD/NEW, RETURNING and whole-transaction rollback. Custom-table triggers are separately deferred; no frozen trigger contract is assumed. |
 | Next | Canonical VARIANT and TUPLE | Qualify canonical Parquet Variant mappings and the VGI tuple annotation at engine import/export boundaries. Test missing versus NULL, nested values and SDK metadata/byte preservation. Reject unsupported DuckDB values; original width/signedness is not a full-domain preservation guarantee. |
-| Separate engine project | Multiple relational inputs | Follow [the existing proposal](multi_input_table_functions.md). Resolve inclusion of its wire model during P0/P1; binder/operator scheduling may follow later. Inputs must share the caller's transaction semantics. |
-| Optional capability | Whole-query remote execution | Implement the consolidated read-query contract, including explicit queries on 1.5 and qualified automatic pushdown on 2.0. Enable raw SQL/statement execution only under its separately specified capability if included. |
+| Separate engine project | Multiple relational inputs | Wire deferred after review. Follow [the existing proposal](multi_input_table_functions.md) and prove two-input scheduling, completion and bounded buffering in the caller's transaction before reopening the contract. |
+| Optional capability | Whole-query remote execution | Retain explicit queries on 1.5 and qualify automatic read pushdown on 2.0. Arbitrary mutating statements and raw CONNECT are deferred. |
 
 General engine optimizations, storage format changes, and parser improvements
 need compatibility tests where they touch VGI. They do not automatically require
