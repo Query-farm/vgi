@@ -379,10 +379,16 @@ The rules above, as a worker framework sees them. The Python SDK
 - **The framework must see "more".** The next input must be a tick exactly when
   the last reply said more, so route "more" through the SDK's emit API, where the
   framework records it, not through raw reply metadata it cannot see.
-- **State.** The resume position must survive the HTTP state token, so it lives
-  in the exchange state the SDK already serializes there, along with a "more
-  pending" flag. Refuse at registration a function that can continue but has no
-  state of its own to resume from.
+- **One reply per turn.** A turn (an input or a tick) is answered by exactly one
+  batch; a reply that says more is that batch. Refuse a turn that emits none or
+  several.
+- **State.** The resume position must survive between HTTP turns. Where the SDK
+  serializes exchange state into the HTTP state token (Python, Go, Rust,
+  TypeScript, Java), it lives there along with a "more pending" flag; where the
+  SDK's HTTP server keeps the live stream between requests (C#, C++, C), it
+  already survives. Refuse a function that can continue but has no state of its
+  own to resume from, at registration or worker startup, or at compile time where
+  the language can (an empty state type).
 - **Validators belong to one input.** `vgi.cache.if_none_match` /
   `if_modified_since` arrive with a real input and apply to that input's first
   reply only; the client never sends them on a tick. Reset them on every real
@@ -390,8 +396,8 @@ The rules above, as a worker framework sees them. The Python SDK
 - **What the framework refuses.** A tick with no output pending, a tick with rows,
   real input while output is pending, cache control on a tick's reply, "more"
   outside a table-in-out exchange, and (at registration) continuation on a function
-  whose catalog `max_workers` is 1. An SDK with no `max_workers` setting cannot hit
-  that last case.
+  whose catalog `max_workers` is 1 (at registration or worker startup). An SDK
+  that never advertises `max_workers` cannot hit that last case.
 - **What only the client enforces.** `not_modified` on a reply that says more, or
   on a tick's reply: a framework need not block it (the `not_modified_more` fixture
   sends one on purpose), and the extension fails the query.
@@ -401,7 +407,9 @@ The rules above, as a worker framework sees them. The Python SDK
   integer, row-transform functions only); the extension refuses it at bind too.
 - **Generated protocol code.** Regenerate one SDK's checkout with vgi-python's
   `scripts/regen_generated.py --only <repo> --root <repo>=<path>`; without
-  `--only` it writes every sibling checkout it finds.
+  `--only` it writes every sibling checkout it finds. vgi-c++ (`scripts/regenerate_protocol.sh`)
+  and vgi-c (`scripts/generate_protocol.py`) generate their schema code with their
+  own scripts, from a vgi-python checkout.
 
 ## Input Rows Per Call
 
