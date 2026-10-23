@@ -137,6 +137,10 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// (PhysicalTableInOutFunction, which advances on NEED_MORE_INPUT).
 	bool input_from_args = false;
 	bool single_row_scan = false;
+	// Blended only: the most input rows one worker call receives; the batched-LATERAL
+	// operator splits each input chunk into calls of at most this many rows. 0 = a
+	// whole chunk per call.
+	idx_t input_rows_per_call = 0;
 	// Declared DuckDB types of the per-row input columns (blended). One entry per
 	// input column. Execute casts the incoming input DataChunk to these before
 	// shipping it, so the worker always receives its declared arg types (the
@@ -268,10 +272,17 @@ struct VgiTableInOutLocalState : public ArrowScanLocalState {
 	bool finalize_sent = false;
 
 	// Phase B (blended literal scan-mode): whether the single synthesized input row
-	// has been written + the input writer closed. Single-thread-safe:
+	// has been written, and whether the input writer is closed (only once the worker
+	// has no more output for it). Single-thread-safe:
 	// PhysicalTableScan::ParallelSource() is false for in-out functions, so the
 	// literal scan runs on one local state.
 	bool input_submitted = false;
+	bool input_closed = false;
+
+	// Continued output: the last reply said HAVE_MORE_OUTPUT, so the next exchange on
+	// this input is a continuation tick, not new input. Never set on the shared
+	// (max_workers = 1) connection, which refuses continued output.
+	bool more_pending = false;
 
 	// Exchange-mode result cache (M1): this substream's latched worker cache-control
 	// advertisement (read from the first exchange output batch). Once latched,
@@ -314,6 +325,9 @@ struct VgiTableInOutBindParams {
 	// childless (literal / pure-varargs) call so Execute uses the write-once
 	// scan-mode + casts the synthesized input row to the declared types.
 	bool input_from_args = false;
+	// Blended only: the most input rows per worker call (see FunctionInfo). Unset =
+	// a whole chunk per call.
+	std::optional<int64_t> input_rows_per_call;
 	std::vector<std::string> positional_input_names;
 	std::vector<LogicalType> positional_input_types;
 	LogicalType varargs_input_type;

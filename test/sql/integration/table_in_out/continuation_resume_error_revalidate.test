@@ -1,0 +1,255 @@
+# name: test/sql/integration/table_in_out/continuation_resume_error_revalidate.test
+# description: Continued output meeting a worker error and cache revalidation, on the
+#   batched-LATERAL path (blended_paged) and the stock in-out path (paged_explode).
+#   - An error raised while output is pending fails the query, and the next query on
+#     the same worker pool gets correct results (no connection is reused mid-exchange).
+#   - A stored, revalidatable entry whose conditional request is answered with changed,
+#     continued output: the client returns the new pages, not the stale entry, and
+#     stores nothing (continued output is never cached).
+#   - A conditional request answered with not_modified on a reply that also says more:
+#     a protocol violation (a 304 stands for an input's whole stored output), so the
+#     query fails rather than serve the stored entry, and the worker pool stays usable.
+#
+# Fixture contract: blended_paged (lateral_continuation.test) and paged_explode
+#   (continuation_classic.test) also take, as named bind-time arguments:
+#   - fail_on_page := 0 BIGINT: when > 0, the worker fails instead of sending reply
+#     number fail_on_page (1-based) for an input batch (one process() call and the
+#     ticks that follow it), with "failing on page <k> as asked". Replies are counted
+#     per input batch, not per input row.
+#   - revalidate := false BOOLEAN: when true, the output depends on the request alone,
+#     and cache_ttl is ignored. Without vgi.cache.if_none_match on the input, the
+#     whole output is one reply carrying vgi.cache ttl = 0, etag "v1", revalidatable.
+#     With it (the client is revalidating), the data has changed: every i is 1000
+#     larger, the output is cut into page_size replies as usual, and the first reply
+#     carries ttl = 0, etag "v2", revalidatable (not not_modified).
+#   - not_modified_more := false BOOLEAN: only with revalidate, and only on a
+#     conditional request: the first reply is instead empty, carries
+#     vgi.cache.not_modified (ttl = 0, etag "v1", revalidatable) and says more; the
+#     replies after it are the changed pages as above.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded. Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# One thread, so the follow-up queries reuse the pooled worker the failed one used.
+statement ok
+SET threads = 1;
+
+# ---------------------------------------------------------------------------
+# An error from resume() while output is pending, then the same worker again. (The
+# runner does not substitute loop variables in expected errors, hence "as asked".)
+# 4 + 5 + 6 = 15 rows; i sums to 6 + 10 + 15 = 31.
+# ---------------------------------------------------------------------------
+
+foreach page 2 3
+
+statement error
+SELECT count(*) FROM range(3) t(x), LATERAL ex.blended_paged(t.x + 4, page_size := 2, fail_on_page := ${page});
+----
+as asked
+
+query II
+SELECT count(*), sum(i) FROM range(3) t(x), LATERAL ex.blended_paged(t.x + 4, page_size := 2);
+----
+15	31
+
+query II
+SELECT count(*), sum(i) FROM range(3) t(x), LATERAL ex.blended_paged(t.x + 4, page_size := 2);
+----
+15	31
+
+statement error
+SELECT count(*) FROM ex.blended_paged(5, page_size := 2, fail_on_page := ${page});
+----
+as asked
+
+query II
+SELECT count(*), sum(i) FROM ex.blended_paged(5, page_size := 2);
+----
+5	10
+
+statement error
+SELECT count(*) FROM ex.paged_explode((SELECT 5 AS n), page_size := 2, fail_on_page := ${page});
+----
+as asked
+
+query II
+SELECT count(*), sum(i) FROM ex.paged_explode((SELECT 5 AS n), page_size := 2);
+----
+5	10
+
+query II
+SELECT count(*), sum(i) FROM ex.paged_explode((SELECT 5 AS n), page_size := 2);
+----
+5	10
+
+endloop
+
+# ---------------------------------------------------------------------------
+# Revalidation answered with continued output. The first query stores the
+# one-reply output (i = 0..n-1). Each repeat revalidates the stale entry; the
+# worker says the data changed and pages the new output (i + 1000) one row per
+# reply: 5 replies, 4 ticks, nothing stored, and the rows are the new ones.
+# ---------------------------------------------------------------------------
+
+# Revalidate even tiny entries (the default minimum is 256 KB).
+statement ok
+SET vgi_result_cache_revalidate_min_bytes = 0;
+
+statement ok
+CREATE TABLE rv AS SELECT * FROM (VALUES (2), (3)) v(x);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# --- batched LATERAL ---
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, i FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1, revalidate := true) ORDER BY x, i;
+----
+2	0
+2	1
+3	0
+3	1
+3	2
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%blended_paged%';
+----
+true
+
+foreach run 1 2
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, i FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1, revalidate := true) ORDER BY x, i;
+----
+2	1000
+2	1001
+3	1000
+3	1001
+3	1002
+
+query II
+SELECT
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue'),
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store')
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%blended_paged%';
+----
+4	0
+
+endloop
+
+# --- stock in-out ---
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT i FROM ex.paged_explode((SELECT x FROM rv), page_size := 1, revalidate := true) ORDER BY i;
+----
+0
+0
+1
+1
+2
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%paged_explode%';
+----
+true
+
+foreach run 1 2
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT i FROM ex.paged_explode((SELECT x FROM rv), page_size := 1, revalidate := true) ORDER BY i;
+----
+1000
+1000
+1001
+1001
+1002
+
+query II
+SELECT
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue'),
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store')
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%paged_explode%';
+----
+4	0
+
+endloop
+
+# ---------------------------------------------------------------------------
+# not_modified on a continued reply. The first query stores the one-reply output;
+# the repeat revalidates, and the worker answers with an empty not_modified reply
+# that also says more. The client must refuse it, not serve the stored entry, and
+# the next query on the worker pool must still work.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1, revalidate := true, not_modified_more := true);
+----
+5
+
+statement error
+SELECT count(*) FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1, revalidate := true, not_modified_more := true);
+----
+not_modified on a continued reply
+
+query II
+SELECT count(*), sum(i) FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1);
+----
+5	4
+
+query I
+SELECT count(*) FROM ex.paged_explode((SELECT x FROM rv), page_size := 1, revalidate := true, not_modified_more := true);
+----
+5
+
+statement error
+SELECT count(*) FROM ex.paged_explode((SELECT x FROM rv), page_size := 1, revalidate := true, not_modified_more := true);
+----
+not_modified on a continued reply
+
+query II
+SELECT count(*), sum(i) FROM ex.paged_explode((SELECT x FROM rv), page_size := 1);
+----
+5	4
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET vgi_result_cache_revalidate_min_bytes;
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH ex;

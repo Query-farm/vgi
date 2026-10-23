@@ -1,0 +1,270 @@
+# name: test/sql/integration/table_in_out/continuation_cache.test
+# description: The result cache never holds partial or continued output. A LIMIT that
+#   stops a query partway through must not leave an entry that a later query would
+#   serve as the whole answer (stock in-out and batched LATERAL), and a chunk whose
+#   calls (input_rows_per_call) are partly continued, or partly served from per-value
+#   entries, stores per-value entries only for the calls answered in one reply.
+#
+#   Fixtures: paged_explode (continuation_classic.test), blended_paged
+#   (lateral_continuation.test) and blended_sliced (input_rows_per_call.test). Each
+#   section uses its own cache_ttl, so its cache key is its own.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded. Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads = 1;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# Stock in-out, a LIMIT met by a reply that says more: nothing is stored, so the
+# full query asks the worker and gets every row (0..1999 sum to 1999000).
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (SELECT i FROM ex.paged_explode((SELECT 2000 AS n), page_size := 10, cache_ttl := 302) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%paged_explode%';
+----
+0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM ex.paged_explode((SELECT 2000 AS n), page_size := 10, cache_ttl := 302);
+----
+2000	1999000
+
+query II
+SELECT
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'),
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store')
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%paged_explode%';
+----
+0	0
+
+# A LIMIT met by an input's only reply: that reply is the input's whole output, so
+# it is stored whole (not the 5 rows the LIMIT kept) and serves the full query
+# without the worker.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (SELECT i FROM ex.paged_explode((SELECT 2000 AS n), page_size := 1000000, cache_ttl := 303) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%paged_explode%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM ex.paged_explode((SELECT 2000 AS n), page_size := 1000000, cache_ttl := 303);
+----
+2000	1999000
+
+query II
+SELECT
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'),
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input')
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%paged_explode%';
+----
+1	0
+
+# ---------------------------------------------------------------------------
+# Batched LATERAL, a LIMIT over two input chunks. 3000 rows of n = x % 7: 8994
+# rows whose i sum to 14984.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE lim_in AS SELECT x % 7 AS n FROM range(3000) t(x);
+
+# Continued (page_size 3): neither the LIMIT query nor the full one stores anything.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (SELECT i FROM lim_in, LATERAL ex.blended_paged(lim_in.n, page_size := 3, cache_ttl := 304) LIMIT 10);
+----
+10
+
+query II
+SELECT count(*), sum(i) FROM lim_in, LATERAL ex.blended_paged(lim_in.n, page_size := 3, cache_ttl := 304);
+----
+8994	14984
+
+query II
+SELECT
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'),
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store')
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%blended_paged%';
+----
+0	0
+
+# One reply per chunk: the LIMIT query stores only chunks it finished, so the full
+# query is still complete, and a third run is served entirely from the cache.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (SELECT i FROM lim_in, LATERAL ex.blended_paged(lim_in.n, page_size := 100000, cache_ttl := 305) LIMIT 10);
+----
+10
+
+query II
+SELECT count(*), sum(i) FROM lim_in, LATERAL ex.blended_paged(lim_in.n, page_size := 100000, cache_ttl := 305);
+----
+8994	14984
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM lim_in, LATERAL ex.blended_paged(lim_in.n, page_size := 100000, cache_ttl := 305);
+----
+8994	14984
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_paged%';
+----
+0
+
+# ---------------------------------------------------------------------------
+# input_rows_per_call with calls that do and don't continue. blended_sliced takes 3
+# rows per call; with n = x over range(9) and page_size 5 the calls are [0,1,2]
+# (3 rows: one reply), [3,4,5] (12 rows) and [6,7,8] (21 rows), which continue.
+# Only the first call's values get per-value entries; the chunk gets no whole-chunk
+# entry. 36 rows; i sums to 84.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE explode_ref AS SELECT x, i FROM range(9) t(x), LATERAL ex.blended_explode(8 - t.x);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM range(9) t(x), LATERAL ex.blended_sliced(t.x, page_size := 5, cache_ttl := 306);
+----
+36	84
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_sliced%';
+----
+3
+
+# The same values reversed miss the whole-chunk cache. Values 0, 1 and 2 are served
+# from their per-value entries; the six others are shipped as two calls, both
+# continued, and merged with the served rows: the result matches blended_explode.
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TABLE sliced_mixed AS SELECT x, i FROM range(9) t(x), LATERAL ex.blended_sliced(8 - t.x, page_size := 5, cache_ttl := 306);
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_sliced%';
+----
+2
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM sliced_mixed EXCEPT ALL SELECT * FROM explode_ref)
+  UNION ALL
+  (SELECT * FROM explode_ref EXCEPT ALL SELECT * FROM sliced_mixed)
+);
+----
+0
+
+# The first query repeated: no whole-chunk entry was stored for it, so the two
+# continued calls run again.
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM range(9) t(x), LATERAL ex.blended_sliced(t.x, page_size := 5, cache_ttl := 306);
+----
+36	84
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_sliced%';
+----
+2
+
+# Only the one-reply call's values: served entirely from per-value entries, with
+# each row's own outer column. n = 2, 1, 0 give i = 0, 1 / 0 / none.
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, i FROM range(3) t(x), LATERAL ex.blended_sliced(2 - t.x, page_size := 5, cache_ttl := 306) ORDER BY x, i;
+----
+0	0
+0	1
+1	0
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_sliced%';
+----
+0
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH ex;

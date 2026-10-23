@@ -692,6 +692,9 @@ struct VgiFunctionInfo {
 	// flag even without a TABLE-typed arg, and bind builds the input schema from
 	// the declared arg names + drives the literal single-row scan-mode.
 	bool input_from_args = false;
+	// Blended only: the most input rows one worker call receives. Each input chunk
+	// is split into calls of at most this many rows. Unset = a whole chunk per call.
+	std::optional<int64_t> input_rows_per_call;
 
 	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;

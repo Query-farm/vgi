@@ -494,6 +494,9 @@ private:
 	// read by the result-cache capture layer on the first batch (same lockstep
 	// timing as ``last_batch_index_``).
 	VgiCacheControl last_cache_control_;
+
+	// Whether the most recent data batch said ``vgi.status: HAVE_MORE_OUTPUT``.
+	bool last_more_output_ = false;
 public:
 	idx_t GetLastBatchIndex() const override {
 		return last_batch_index_;
@@ -504,6 +507,10 @@ public:
 	const std::string &GetLastParentRowBytes() const override {
 		return last_parent_row_bytes_;
 	}
+	bool GetLastMoreOutput() const override {
+		return last_more_output_;
+	}
+	void WriteContinuationTick() override;
 	VgiCacheControl GetLastCacheControl() const override {
 		return last_cache_control_;
 	}

@@ -307,3 +307,82 @@ plus the `parent_row` parse in `vgi_function_connection.cpp` /
 `vgi_http_function_connection.cpp` and the reused exchange helpers
 (`AcquireBlendedInputConnection` threads projection) in `vgi_table_in_out_impl.cpp`.
 
+## Continued Output (several replies for one input)
+
+A table-in-out exchange answers each input batch with one reply, but a worker may
+need several: one upstream API page per reply, or more output than it wants to
+build at once. It says so on the reply's metadata, `vgi.status: HAVE_MORE_OUTPUT`,
+and the client asks for the next reply with a **continuation tick**: a zero-row
+batch of the input schema carrying `vgi.status: CONTINUE`. Each tick is an
+ordinary exchange turn (one input, one reply), so vgi-rpc is unchanged and HTTP
+needs nothing new: the worker's resume position rides the stream state token like
+any other exchange state. Every reply's `parent_row` indexes the same, last real
+input. While output is pending a tick is the only valid input, and a tick is valid
+only then; a worker refuses anything else. There is no capability negotiation.
+
+Two more rules every worker must follow:
+
+- **Answer every tick with a reply.** An empty HTTP body, or end-of-stream, in
+  answer to a tick is a protocol violation. A reply may be empty and still say
+  more; the client returns it to DuckDB as an empty `HAVE_MORE_OUTPUT` and ticks on
+  the next call, so a long run of empty pages can be cancelled.
+- **Never answer `not_modified` on a continued reply.** A 304 stands for an
+  input's whole stored output, so it must be the input's only reply: one that says
+  more, or answers a tick, fails the query.
+- **Send nothing when the input closes while output is pending.** A LIMIT stops
+  ticking and closes the input; the worker drops the pending output and ends its
+  stream. The client relies on this to drain and pool the connection.
+
+A literal call (`f(5)`) closes its input only once the worker has no more output,
+and a worker that sends output after that close fails the query ("sent output
+after its input was closed").
+
+The extension handles it on every exchange path. `IFunctionConnection` parses the
+status in `ReadDataBatch` (`GetLastMoreOutput()`) and writes ticks
+(`WriteContinuationTick()`) on the subprocess, HTTP and webworker transports.
+
+- **Batched LATERAL** (`PhysicalVgiLateralBatch`): keeps the chunk's exchange state
+  (`ChunkExchange`: the shipped rows, dedup groups, per-value mapping, the current
+  call) across `Execute` returns, and returns `HAVE_MORE_OUTPUT` while the loaded
+  reply has rows or the worker said more; the next call sends the tick.
+- **Stock in-out, per-substream connection**: continues one reply per call
+  (`local_state.more_pending`).
+- **Stock in-out, one shared connection** (`max_workers = 1`): not supported.
+  Several pipelines take turns on that connection under `exchange_mutex`, so it
+  cannot leave output pending; a continued reply there is a protocol violation, and
+  workers refuse `resume()` with `max_workers = 1` at registration.
+- **Literal call** (`single_row_scan`): the input writer now closes only once the
+  worker has no more output; before, it closed right after the single input row.
+
+A LIMIT simply stops asking: no more ticks go out, and closing the input at
+teardown ends the worker's stream with the output still pending. On the stock path
+and the literal call a LIMIT met by the first reply sends no tick. Batched LATERAL
+sits under a delim join, which DuckDB drains a whole input chunk at a time, so
+there a LIMIT stops only between chunks: every page of the current chunk's calls is
+still fetched. `input_rows_per_call` bounds how much that is.
+
+**Caching.** Continued output is never cached. A chunk any of whose replies
+continued is not stored in the whole-chunk (M2) cache, and a call whose output
+continued stores no per-value entries; an M1 (stock path) input whose output
+continued is not stored. Output that fits in one reply is cached as before.
+
+## Input Rows Per Call
+
+A blended function may declare `Meta.input_rows_per_call = N` (catalog
+`FunctionInfo.input_rows_per_call`, nullable `int64`; unset = a whole chunk per
+call). The batched-LATERAL operator then sends each chunk's worker input — after
+dedup and per-value hits — as calls of at most N rows, in order, and maps each
+call's replies back through the call's offset (and the dedup groups) to the
+chunk's rows. A call's output may itself continue. Conditional revalidation is
+armed only for a chunk that goes out as one call; per-value entries are stored per
+call. The literal call and the row-by-row path already send one row per call.
+`N < 1`, or `N` on a function that is not blended, fails at bind.
+
+Tests: `test/sql/integration/table_in_out/lateral_continuation.test` (blended:
+every call shape, page sizes, dedup, threads, LIMIT, cache, and reply counts via
+the `table_in_out.continue` log event), `input_rows_per_call.test` (the split,
+its interaction with dedup, continuation and per-value caching),
+`continuation_classic.test` (the stock path), `continuation_resume_error_revalidate.test`
+(a worker error while output is pending, then pool reuse; revalidation answered with
+continued output). Fixture contracts — which every SDK's fixture worker must implement —
+are in each file's header.

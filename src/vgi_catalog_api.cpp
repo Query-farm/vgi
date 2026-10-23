@@ -3168,6 +3168,7 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	info.requires_input_batch_index = wire.requires_input_batch_index;
 	// A blended ("UNNEST-style") table-in-out whose positional args ARE its input.
 	info.input_from_args = wire.input_from_args;
+	info.input_rows_per_call = wire.input_rows_per_call;
 
 	info.required_settings = std::move(wire.required_settings);
 	for (auto &secret : wire.required_secrets) {

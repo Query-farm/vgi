@@ -264,6 +264,11 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 		}
 		cond_sent_ = true;
 	}
+	if (pending_tick_) {
+		meta_keys.push_back(VGI_STATUS_KEY);
+		meta_values.push_back(VGI_STATUS_CONTINUE);
+		pending_tick_ = false;
+	}
 	std::shared_ptr<arrow::KeyValueMetadata> metadata;
 	if (!meta_keys.empty()) {
 		metadata = arrow::KeyValueMetadata::Make(meta_keys, meta_values);
@@ -761,6 +766,19 @@ void HttpFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::Record
 	pending_input_ = reconciled;
 }
 
+void HttpFunctionConnection::WriteContinuationTick() {
+	if (!input_writer_opened_ || input_writer_closed_) {
+		throw IOException("HttpFunctionConnection::WriteContinuationTick called without an open input writer [url: %s]",
+		                  base_url_);
+	}
+	auto tick = arrow::RecordBatch::MakeEmpty(input_schema_);
+	if (!tick.ok()) {
+		throw IOException("Failed to build continuation tick: %s [url: %s]", tick.status().ToString(), base_url_);
+	}
+	pending_input_ = tick.ValueUnsafe();
+	pending_tick_ = true;
+}
+
 void HttpFunctionConnection::CloseInputWriter() {
 	input_writer_closed_ = true;
 }
@@ -1016,26 +1034,37 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto buffer = arrow::Buffer::FromString(std::move(response_body));
 	auto input_stream = std::make_shared<arrow::io::BufferReader>(buffer);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input_stream);
+	const auto violation =
+	    HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_);
+	// Reset batch_index + partition_values BEFORE the loop (and before the
+	// empty-response return, so no flag outlives the reply it came from). The
+	// HTTP response may contain a data batch followed by a 0-row continuation
+	// batch carrying only STATE_KEY; resetting inside the loop would let
+	// the continuation batch's pass clear values parsed from the data
+	// batch.
+	const bool was_more_pending = last_more_output_;
+	last_batch_index_ = DConstants::INVALID_INDEX;
+	last_partition_values_bytes_.clear();
+	last_parent_row_bytes_.clear();
+	last_cache_control_ = VgiCacheControl{};
+	last_more_output_ = false;
 	if (!reader_result.ok()) {
+		// While output is pending this exchange was a continuation tick, which the
+		// worker must answer with a reply; an empty body would otherwise end the
+		// output silently (or, with a stale "more", tick forever).
+		if (was_more_pending) {
+			throw IOException(violation, "VGI HTTP worker function '%s' sent an empty response to a continuation tick",
+			                  function_name_);
+		}
 		// Empty response in exchange mode means no output for this input
 		return arrow::RecordBatch::Make(
 		    cached_output_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
 	}
 	auto reader = reader_result.ValueUnsafe();
 
-	const auto violation =
-	    HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_);
 	const auto log_error_context = HttpFunctionInfo(nullptr, base_url_, function_name_, function_type_);
 	std::shared_ptr<arrow::RecordBatch> output_batch;
 	std::string new_state_token;
-	// Reset batch_index + partition_values BEFORE the loop. The HTTP
-	// response may contain a data batch followed by a 0-row continuation
-	// batch carrying only STATE_KEY; resetting inside the loop would let
-	// the continuation batch's pass clear values parsed from the data
-	// batch.
-	last_batch_index_ = DConstants::INVALID_INDEX;
-	last_partition_values_bytes_.clear();
-	last_cache_control_ = VgiCacheControl{};
 
 	while (true) {
 		auto read_result = reader->ReadNext();
@@ -1095,6 +1124,9 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			auto cc = ParseVgiCacheControl(bwm.custom_metadata);
 			if (cc.present) {
 				last_cache_control_ = cc;
+			}
+			if (HasMoreOutputStatus(bwm.custom_metadata)) {
+				last_more_output_ = true;
 			}
 		}
 		if (!output_batch) {
