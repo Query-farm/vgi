@@ -654,7 +654,8 @@ if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
     test/cpp/test_constraint_contract.cpp
     test/cpp/test_index_contract.cpp
     test/cpp/test_query_interrupt.cpp
-    test/cpp/test_query_rpc.cpp)
+    test/cpp/test_query_rpc.cpp
+    test/cpp/test_transaction_cleanup.cpp)
   target_include_directories(vgi_catalog_tests PRIVATE
     src/include
     duckdb/src/include

@@ -68,6 +68,10 @@ public:
 	void Checkpoint(ClientContext &context, bool force = false) override;
 
 private:
+	//! Transfer ownership before completion so provider errors cannot retain a
+	//! transaction that DuckDB has already removed from the session.
+	unique_ptr<VgiTransaction> TakeTransaction(Transaction &transaction);
+
 	VgiCatalog &vgi_catalog_;
 	std::mutex transaction_lock_;
 	reference_map_t<Transaction, unique_ptr<VgiTransaction>> transactions_;

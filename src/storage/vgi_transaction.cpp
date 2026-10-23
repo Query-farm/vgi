@@ -44,6 +44,13 @@ void VgiTransaction::Start(ClientContext &context) {
 }
 
 void VgiTransaction::Commit(ClientContext &context) {
+	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
+
+	// Retain entries referenced by bound statements even if the provider
+	// throws. DuckDB ends this local transaction on either completion outcome.
+	// Do not publish its metadata as the catalog's committed cache.
+	ClearSchemaCache();
+
 	// Call the worker's catalog_transaction_commit RPC
 	if (!transaction_opaque_data_.empty()) {
 		auto &params = vgi_catalog_.attach_parameters();
@@ -51,11 +58,6 @@ void VgiTransaction::Commit(ClientContext &context) {
 		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, transaction_opaque_data_};
 		vgi::InvokeCatalogTransactionCommit(rpc_ctx, context);
 	}
-	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
-
-	// Retain entries referenced by bound statements, but do not publish this
-	// transaction's metadata cache as the catalog's committed cache.
-	ClearSchemaCache();
 	// The next Start still checks committed catalog/result-cache versions.
 }
 
@@ -115,19 +117,28 @@ Transaction &VgiTransactionManager::StartTransaction(ClientContext &context) {
 	return result;
 }
 
-ErrorData VgiTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
-	auto &vgi_transaction = transaction.Cast<VgiTransaction>();
-	vgi_transaction.Commit(context);
+unique_ptr<VgiTransaction> VgiTransactionManager::TakeTransaction(Transaction &transaction) {
 	std::lock_guard<std::mutex> l(transaction_lock_);
-	transactions_.erase(transaction);
+	auto entry = transactions_.find(transaction);
+	if (entry == transactions_.end()) {
+		throw InternalException("VGI transaction is not owned by this manager");
+	}
+	auto owned_transaction = std::move(entry->second);
+	transactions_.erase(entry);
+	return owned_transaction;
+}
+
+ErrorData VgiTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
+	// Release local ownership on both success and exception, without holding
+	// the manager mutex across cache retirement or provider RPCs.
+	auto owned_transaction = TakeTransaction(transaction);
+	owned_transaction->Commit(context);
 	return ErrorData();
 }
 
 void VgiTransactionManager::RollbackTransaction(Transaction &transaction) {
-	auto &vgi_transaction = transaction.Cast<VgiTransaction>();
-	vgi_transaction.Rollback();
-	std::lock_guard<std::mutex> l(transaction_lock_);
-	transactions_.erase(transaction);
+	auto owned_transaction = TakeTransaction(transaction);
+	owned_transaction->Rollback();
 }
 
 void VgiTransactionManager::Checkpoint(ClientContext &context, bool force) {

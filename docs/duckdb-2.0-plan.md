@@ -1057,11 +1057,11 @@ The concrete remaining work is smaller:
 | Pre-FINALIZE raw INPUT drain discards batch metadata and tolerates some non-Iroh read failures | The 2026-10-22 follow-up rules out ordinary Python `out.emit(...); raise` as a successful response followed by an error: RPC buffers until process succeeds. Require a concrete reachable failure before promoting drain robustness to a fix. | Unproven for current writes; no new error protocol. |
 | Multiple-DML CTE support is an explicit engine opt-in, absent in VGI | Keep disabled until two writes and failure/RETURNING behavior share the current provider transaction correctly. | Adapter capability/qualification, not a coordinator. |
 | Commit/rollback already carry the transaction identifier and have an idempotency contract | Preserve existing retry semantics; test that repeats cannot apply effects twice and retain normal provider results/errors. BEGIN returns a new identifier, so review its allocation/cleanup behavior separately before changing retry policy. | Corrects the earlier blanket single-attempt recommendation; no new fields or recovery endpoints. |
-| Commit/rollback exceptions can skip erasing the native transaction entry | Make local cleanup exception-safe and verify provider behavior after a definite refusal; preserve unknown outcome after ambiguous commit. | Local bookkeeping/error handling, not recovery machinery. |
+| Commit/rollback exceptions could skip erasing the native transaction entry | Fixed and verified on native 1.5 in the transaction cleanup checkpoint below. Local ownership ends on success or exception; preserve unknown outcome after ambiguous commit. | Local bookkeeping/error handling, not recovery machinery. |
 | Signed HTTP writable fixture reads the sealed transaction token directly into the transactor | Reproduce begin/write/commit through signed HTTP; verify authenticated unwrapping at the provider boundary without replacing sealed wire/storage state. | Existing token plumbing; source-identified candidate, not yet reproduced. |
 
-The first implementation checkpoint should address current 1.5-compatible
-transaction cleanup, duplicate-completion and focused finalization/failure tests. Native2 trigger hooks
+The native 1.5 checkpoints below cover transaction exception cleanup and focused
+finalization/failure tests. Duplicate-completion qualification remains separate. Native2 trigger hooks
 and OLD/NEW bridging follow in their engine lane. The generic transactor's SQL
 per input batch does not itself implement whole-statement backend triggers;
 start with engine-owned execution and reject unqualified backend-owned forms.
@@ -1132,8 +1132,9 @@ finalization and zero-input behavior before expanding to deferred RETURNING.
 
 EC2 SSH timed out again, so no runtime reproduction was performed. The exact
 source anchors are in the manifest's `write_finalization_source_audit_2026_10_22`.
-Transaction exception cleanup remains the first concrete implementation target;
-the signed HTTP transaction-token candidate still needs separate reproduction.
+Transaction exception cleanup was the next implementation target, completed in
+the later checkpoint below. The signed HTTP transaction-token candidate still
+needs separate reproduction.
 
 **Finalization runtime checkpoint (2026-10-22; native 1.5 subprocess)**
 
@@ -1156,6 +1157,35 @@ Logs and per-case traces are under
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/logs/write-finalize-20261022-F5qbim/verified`.
 Exact versions, executable digests and limits are recorded in
 `write_finalization_runtime_checkpoint_2026_10_22` in the Python manifest.
+
+**Transaction cleanup checkpoint (2026-10-22; native 1.5 subprocess)**
+
+Commit and rollback now transfer the transaction out of the manager map into
+scoped ownership before completion. Provider exceptions release that local
+object, matching DuckDB's terminal transaction lifecycle. Commit retires its
+schema cache before the provider call, preserving bound catalog entries through
+the existing bounded retention mechanism. Errors and completion retry semantics
+are unchanged; this adds no remote recovery or compensating rollback.
+
+The new `test/run_transaction_cleanup_probe.py` runner drives the native
+`[transaction-cleanup]` test against a diagnostic Python provider. The unmodified
+implementation failed 24 lifetime assertions. The fix passes all 960 assertions:
+commit/rollback success, rejection before completion, and a provider error after
+completion, each repeated three times. Destruction sentinels prove transaction
+release and schema-root retention through catalog teardown. Prepared statements
+execute in new transactions, and a second connection keeps its original token.
+All six provider traces show exactly one requested completion attempt per token,
+with no compensating operation. The existing `ddl_transactions` semantic ALTER
+case also passes pending visibility, rollback, commit and reconnect readback.
+
+Builds and tests ran only on EC2 `18.234.138.19`, with the existing 1.5 engine pin.
+Logs are under
+`/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/logs/transaction-cleanup-20261022-5qEOLH`;
+exact evidence is in `transaction_cleanup_checkpoint_2026_10_22` in the manifest.
+The probe has no row mutations; the after-completion case is an application
+error, not transport response loss. Remote rejected transactions remain the
+provider's responsibility. Duplicate-completion behavior, BEGIN allocation
+cleanup, signed HTTP, and broader write atomicity still need their own checks.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
