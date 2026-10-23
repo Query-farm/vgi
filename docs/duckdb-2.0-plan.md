@@ -5,8 +5,8 @@
 on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
 
 **Build/test workflow:** edit the isolated worktrees locally, then synchronize
-source changes to `ec2-user@32.192.49.19` and build/test there (resumed October 14;
-previous address `52.90.218.118`). This task owns
+source changes to `ec2-user@18.234.138.19` and build/test there (resumed October 22;
+previous addresses `32.192.49.19` and `52.90.218.118`). This task owns
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
 Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
@@ -1134,6 +1134,28 @@ EC2 SSH timed out again, so no runtime reproduction was performed. The exact
 source anchors are in the manifest's `write_finalization_source_audit_2026_10_22`.
 Transaction exception cleanup remains the first concrete implementation target;
 the signed HTTP transaction-token candidate still needs separate reproduction.
+
+**Finalization runtime checkpoint (2026-10-22; native 1.5 subprocess)**
+
+The replacement EC2 address retains the isolated workspace and matching cached
+build. No production source changed since its last verified build. The opt-in
+`test/run_write_finalize_probe.py` runner and Python
+`tests/catalog/write_finalize_probe.py` diagnostic provider establish seven
+expected outcomes: ordinary INPUT RETURNING, buffered emit followed by a process
+error, count-only finalization, 5,000 rows across three input batches, zero-input
+finalization, a finalizer error, and rejection of deferred RETURNING with the
+existing count-schema error. INPUT/FINALIZE execution identities match and the
+opted-in callback runs once. The fixture lint check also passes.
+
+This confirms the source-audit correction: ordinary process errors are surfaced;
+deferred RETURNING remains an optional unsupported form. The diagnostic sink
+does not implement stored rows or transactions, so these checks do not prove
+rollback, commit/rollback cleanup, signed HTTP behavior, or production-provider
+atomicity. No runtime fix, wire change or release-gate completion is claimed.
+Logs and per-case traces are under
+`/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/logs/write-finalize-20261022-F5qbim/verified`.
+Exact versions, executable digests and limits are recorded in
+`write_finalization_runtime_checkpoint_2026_10_22` in the Python manifest.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
