@@ -133,7 +133,10 @@ struct VgiAttachParameters {
 	// a proper fix is to make the upstream secret read lock-free, or to move
 	// CheckAndInvalidateCache off the Transaction::Start hot path so HTTP I/O
 	// never happens under the MetaTransaction lock in the first place.
-	std::shared_ptr<HTTPParams> GetOrInitHttpParams(ClientContext &context, const std::string &url) const;
+	// Both ordinary and single-attempt provider parameter sets are initialized
+	// together during ATTACH; BEGIN must not initialize either under the mutex.
+	std::shared_ptr<HTTPParams> GetOrInitHttpParams(ClientContext &context, const std::string &url,
+	                                             bool single_attempt = false) const;
 
 	const std::string &worker_path() const {
 		return worker_path_;
@@ -286,6 +289,7 @@ private:
 	// See GetOrInitHttpParams above for the rationale behind caching these.
 	mutable std::mutex http_params_mutex_;
 	mutable std::shared_ptr<HTTPParams> cached_http_params_;
+	mutable std::shared_ptr<HTTPParams> cached_single_attempt_http_params_;
 
 	// Capability cache for catalog_table_scan_branches_get. See accessors above.
 	mutable std::atomic<int> branches_capability_{0};

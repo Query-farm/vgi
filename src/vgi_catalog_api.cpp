@@ -163,25 +163,35 @@ private:
 // (and its MetaTransaction mutex) from under VgiTransaction::Start on HTTP
 // transport.
 std::shared_ptr<HTTPParams> VgiAttachParameters::GetOrInitHttpParams(
-    ClientContext &context, const std::string &url) const {
+    ClientContext &context, const std::string &url, bool single_attempt) const {
 	std::lock_guard<std::mutex> lock(http_params_mutex_);
 	if (!cached_http_params_) {
 		auto &db = *context.db;
 		auto &http_util = HTTPUtil::Get(db);
 		auto owned = http_util.InitializeParameters(context, url);
-		cached_http_params_ = std::shared_ptr<HTTPParams>(owned.release());
+		// Initialize both concrete provider types before publishing either cache.
+		// HTTPParams has no virtual clone; copying its base would lose HTTPFS TLS
+		// and credential fields. Doing this later inside BEGIN would deadlock on
+		// the MetaTransaction mutex already held by VgiTransaction::Start.
+		auto single_owned = http_util.InitializeParameters(context, url);
+		single_owned->retries = 0;
 		// Mirror the per-call ApplyHttpTimeout that HttpPostArrowIpcInternal
 		// used to do. Captured once at cache-init time — vgi_http_timeout_seconds
 		// changes won't be picked up without re-ATTACH. See the TODO on the
 		// method declaration.
 		Value timeout_val;
 		if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
-			cached_http_params_->timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
+			owned->timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
 		} else {
-			cached_http_params_->timeout = defaults::HTTP_TIMEOUT_SECONDS;
+			owned->timeout = defaults::HTTP_TIMEOUT_SECONDS;
 		}
+		single_owned->timeout = owned->timeout;
+		auto regular_params = std::shared_ptr<HTTPParams>(owned.release());
+		auto single_params = std::shared_ptr<HTTPParams>(single_owned.release());
+		cached_http_params_ = std::move(regular_params);
+		cached_single_attempt_http_params_ = std::move(single_params);
 	}
-	return cached_http_params_;
+	return single_attempt ? cached_single_attempt_http_params_ : cached_http_params_;
 }
 
 std::shared_ptr<VgiHttpClientPool> VgiAttachParameters::GetOrInitHttpClientPool() const {
@@ -280,12 +290,8 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		                      "rpc_catalog",
 		                      ctx.params->auth(),
 		                      ctx.params->cookie_jar()};
-		// Preparation, CREATE and constraint mutation can take effect before a lost response.
-		// The subprocess pool retries ambiguous IO failures; use one fresh attempt
-		// until these operations have an explicit durable replay contract.
-		if (RequiresSingleAttemptUnary(method_name)) {
-			opts.use_pool = false;
-		}
+		// The dispatcher enforces single-attempt mutation policy while retaining
+		// healthy subprocess pool reuse; pool selection does not control replay.
 		opts.tcp_proxy = ctx.params->tcp_proxy();
 		opts.iroh = ctx.params->iroh();
 		// Cache-hit on the HTTP path: avoids re-entering the secret manager (and
@@ -294,7 +300,8 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		// VgiAttachParameters::GetOrInitHttpParams.
 		if (IsHttpTransport(ctx.params->worker_path()) || IsHttpiTransport(ctx.params->worker_path())) {
 			if (IsHttpTransport(ctx.params->worker_path())) {
-			opts.cached_http_params = ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
+				opts.cached_http_params = ctx.params->GetOrInitHttpParams(
+				    context, ctx.params->worker_path(), RequiresSingleAttemptUnary(method_name));
 			}
 			// Keep-alive client pool: consecutive catalog RPCs reuse TCP/TLS
 			// connections instead of handshaking per call.

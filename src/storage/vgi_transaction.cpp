@@ -72,8 +72,9 @@ void VgiTransaction::Rollback() {
 	// has gone away (cross-session rollback during shutdown reconciliation,
 	// extension teardown, etc.), we have no context to dispatch on — skip
 	// the worker RPC and the cache-version probe. The cache will be
-	// rechecked on the next Start anyway, and the worker's transaction will
-	// be reaped by its idle timeout / pool eviction.
+	// rechecked on the next Start anyway. Remote transaction cleanup remains
+	// the provider's responsibility; disconnect or pool eviction does not
+	// necessarily reclaim a transaction in a shared transactor.
 	auto ctx = context.lock();
 	if (!ctx) {
 		return;

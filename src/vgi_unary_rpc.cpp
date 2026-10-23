@@ -17,6 +17,7 @@
 #include "vgi_github.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
+#include "vgi_unary_retry.hpp"
 #if defined(__EMSCRIPTEN__)
 #include "vgi_webworker_function_connection.hpp" // WebWorkerInvokeUnary (worker: unary branch)
 #endif
@@ -242,15 +243,18 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
 		auto backoff = std::chrono::milliseconds(150);
 		for (;;) {
+			bool request_dispatched = false;
 			try {
 				auto ep = EnsureSharedContainer(shared_spec, shared_mode);
 				if (ep.mode == ContainerConnMode::HTTP) {
+					request_dispatched = true;
 					return HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth, opts.cookie_jar,
 					                       /*cached_http_params=*/nullptr, "", "", "", "",
 					                        opts.protocol);
 				}
 				// tcp (and, later, unix): native vgi-rpc over the connected fd.
 				auto worker = ConnectSharedContainer(ep);
+				request_dispatched = true;
 				if (params) {
 					WriteRpcRequest(worker->GetStdinFd(), method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 				} else {
@@ -259,6 +263,11 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 				auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 				return ReadUnaryResponse(worker->GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
 			} catch (const IOException &) {
+				if (request_dispatched && RequiresSingleAttemptUnary(method_name)) {
+					// Readiness failures before dispatch may reconnect; a lost
+					// response after mutation dispatch must not repeat the call.
+					throw;
+				}
 				if (std::chrono::steady_clock::now() >= deadline) {
 					throw;
 				}
@@ -397,8 +406,10 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 	try {
 		return AttemptUnaryRpc(opts, method_name, params, /*force_fresh=*/false);
 	} catch (const IOException &) {
-		if (!opts.use_pool) {
-			throw; // nothing to retry — not pooled
+		if (!opts.use_pool || RequiresSingleAttemptUnary(method_name)) {
+			// Reusing a healthy worker does not make a lost mutation reply safe
+			// to repeat. Keep pool acquisition independent of retry policy.
+			throw;
 		}
 		// Single retry with a fresh worker. If that also fails, propagate.
 		NoteWorkerConnectionReestablished(opts.worker_path);

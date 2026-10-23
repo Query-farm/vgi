@@ -108,8 +108,9 @@ struct UnaryRpcOptions {
 //   - Sends the request, reads the response.
 //   - Returns the worker to the pool with stderr fd preserved so the pool's
 //     cleanup thread can close it when the worker is eventually evicted.
-//   - On IOException from a *pooled* worker, retries once with a fresh spawn
-//     (matches AcquireAndBindConnection's stale-pool semantics).
+//   - With pooling enabled, IOException retries once with a fresh spawn only
+//     when the method permits replay. Single-attempt methods still reuse healthy
+//     pooled workers, but propagate failures without repeating the RPC.
 //
 // HTTP transport: dispatches to HttpInvokeUnary (no pool involvement).
 //

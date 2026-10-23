@@ -28,6 +28,10 @@ supersedes the corresponding October 14 design proposals below, not completed
 runtime work. Failed writes use whole-transaction rollback/invalidation.
 Non-idempotent mutations are not automatically retried after ambiguous dispatch;
 commit/rollback retain their existing transaction-ID-based idempotency contract.
+The October 22 checkpoint below verifies bounded completion/disconnect cleanup,
+signed HTTP token plumbing, and real stored-data rollback through native 1.5.
+BEGIN now uses one dispatch attempt; a lost allocation reply still requires
+provider-owned orphan cleanup.
 
 Prepare **one broad, coordinated protocol release** for the catalog and
 execution capabilities we intend to support in DuckDB 2.0, while continuing to
@@ -1056,12 +1060,13 @@ The concrete remaining work is smaller:
 | FinalizeWriteConnection treats every nonempty final output batch as a count | Before enabling deferred RETURNING, collect final rows using the selected output schema. Current writable fixtures do not opt into FINALIZE; their results arrive during INPUT. | Optional adapter support gap, not a reproduced fixture regression. Native changes adaptation remains in the DuckDB2 lane. |
 | Pre-FINALIZE raw INPUT drain discards batch metadata and tolerates some non-Iroh read failures | The 2026-10-22 follow-up rules out ordinary Python `out.emit(...); raise` as a successful response followed by an error: RPC buffers until process succeeds. Require a concrete reachable failure before promoting drain robustness to a fix. | Unproven for current writes; no new error protocol. |
 | Multiple-DML CTE support is an explicit engine opt-in, absent in VGI | Keep disabled until two writes and failure/RETURNING behavior share the current provider transaction correctly. | Adapter capability/qualification, not a coordinator. |
-| Commit/rollback already carry the transaction identifier and have an idempotency contract | Preserve existing retry semantics; test that repeats cannot apply effects twice and retain normal provider results/errors. BEGIN returns a new identifier, so review its allocation/cleanup behavior separately before changing retry policy. | Corrects the earlier blanket single-attempt recommendation; no new fields or recovery endpoints. |
+| Commit/rollback already carry the transaction identifier and have an idempotency contract | Existing retry semantics remain. The October 22 real-DuckDB completion tests verify that duplicate/opposite completion cannot repeat effects; completed tokens return an inactive-transaction error. BEGIN now permits one dispatch attempt because its reply allocates a new identifier. | No new fields or recovery endpoints; a lost BEGIN reply leaves provider-owned cleanup. |
 | Commit/rollback exceptions could skip erasing the native transaction entry | Fixed and verified on native 1.5 in the transaction cleanup checkpoint below. Local ownership ends on success or exception; preserve unknown outcome after ambiguous commit. | Local bookkeeping/error handling, not recovery machinery. |
-| Signed HTTP writable fixture reads the sealed transaction token directly into the transactor | Reproduce begin/write/commit through signed HTTP; verify authenticated unwrapping at the provider boundary without replacing sealed wire/storage state. | Existing token plumbing; source-identified candidate, not yet reproduced. |
+| Signed HTTP writable fixture read the sealed transaction token directly into the transactor | Reproduced and fixed: bind/init/process/finalize callbacks receive authenticated plaintext through `params.transaction_opaque_data`; original wire and continuation records retain sealed tokens. Signed HTTP commit/rollback and attachment-isolation checks pass. | Existing token plumbing; no wire fields or transaction framework added. |
 
-The native 1.5 checkpoints below cover transaction exception cleanup and focused
-finalization/failure tests. Duplicate-completion qualification remains separate. Native2 trigger hooks
+The native 1.5 checkpoints below cover transaction exception cleanup, bounded
+completion/BEGIN behavior, signed HTTP and persisted INSERT/CTAS rollback.
+Native2 trigger hooks
 and OLD/NEW bridging follow in their engine lane. The generic transactor's SQL
 per input batch does not itself implement whole-statement backend triggers;
 start with engine-owned execution and reject unqualified backend-owned forms.
@@ -1069,7 +1074,10 @@ Finalization has per-write-operator identity today, not a demonstrated global
 statement identity across operators. That is adequate for engine scheduling;
 only a concrete backend execution requirement should justify an extension.
 
-Focused qualification, using the existing wire contract:
+Qualification targets, using the existing wire contract: the October 22
+checkpoint verifies the bounded INSERT/CTAS and signed HTTP subsets of items
+1, 2, 6 and 7. Expanded ALTER, trigger/multiple-DML behavior and broader
+providers remain separate work.
 
 1. Autocommit and explicit-transaction writes fail at init, a later batch, or
    finalize; no partial effects can commit. Include prior successful writes in
@@ -1086,15 +1094,18 @@ Focused qualification, using the existing wire contract:
    transaction-visible definitions. Confirm no double firing for execution owners.
 6. Definite commit/rollback errors leave no native bookkeeping entry; retries
    reuse the same transaction identifier without repeating effects. A duplicate
-   error does not prove whether an earlier commit succeeded. BEGIN allocation
-   and abandoned-transaction cleanup need separate retry review.
+   error does not prove whether an earlier commit succeeded. BEGIN now has one
+   dispatch attempt; disconnect does not reclaim an allocated remote transaction.
+   Provider cleanup remains necessary after a lost allocation reply.
 7. Signed HTTP begin/write/commit/rollback uses the authenticated provider
    transaction correctly; wrong-attachment tokens reject.
 
 The old writable SQL tests under `test_deferred/writable/` are useful cases,
-not current runtime evidence. Python's transactor suite is module-skipped and
-its writable conformance file is a skip stub. General function-finalization
-tests and core-engine trigger tests do not prove external VGI write/trigger
+not current runtime evidence. Python's broad transactor suite remains
+module-skipped and its writable conformance file is a skip stub. The later
+bounded completion tests and SQLite-backed native write matrix supply the
+specific runtime evidence recorded below; they do not qualify the full bundled
+transactor. Core-engine trigger tests do not prove external VGI trigger
 behavior. No release gate or existing method count changes in this research
 checkpoint. The protocol manifest records the exact source findings.
 
@@ -1132,9 +1143,9 @@ finalization and zero-input behavior before expanding to deferred RETURNING.
 
 EC2 SSH timed out again, so no runtime reproduction was performed. The exact
 source anchors are in the manifest's `write_finalization_source_audit_2026_10_22`.
-Transaction exception cleanup was the next implementation target, completed in
-the later checkpoint below. The signed HTTP transaction-token candidate still
-needs separate reproduction.
+Transaction exception cleanup and signed HTTP token handling were still
+implementation/reproduction targets at this source-audit point. The later
+checkpoints below record their fixes and runtime evidence.
 
 **Finalization runtime checkpoint (2026-10-22; native 1.5 subprocess)**
 
@@ -1184,8 +1195,79 @@ Logs are under
 exact evidence is in `transaction_cleanup_checkpoint_2026_10_22` in the manifest.
 The probe has no row mutations; the after-completion case is an application
 error, not transport response loss. Remote rejected transactions remain the
-provider's responsibility. Duplicate-completion behavior, BEGIN allocation
-cleanup, signed HTTP, and broader write atomicity still need their own checks.
+provider's responsibility. Duplicate completion, BEGIN allocation and signed
+HTTP were separate follow-ups at this checkpoint; their bounded qualification
+and persisted write evidence are recorded next.
+
+**Completion, signed HTTP and persisted write checkpoint (2026-10-22; pinned 1.5)**
+
+Native BEGIN now uses a single dispatch attempt, including HTTP and pooled
+subprocess connections, while retaining healthy pooled connections for reuse.
+A lost reply cannot trigger another remote allocation. COMMIT/ROLLBACK retry
+semantics are unchanged. The native transaction remains absent locally when
+BEGIN fails; if the provider allocated before the reply was lost, that remote
+transaction remains the provider's cleanup responsibility. There is no TTL
+reaper or new recovery service.
+
+The real-DuckDB completion/disconnect/shutdown qualification covers six
+scenarios; the combined focused run passed nine pytest items. Repeated and
+opposite completion requests cannot repeat effects, undo a commit or revive a
+rollback, and do not disturb another active transaction. The existing inactive
+transaction error is retained. Disconnect leaves an abandoned transaction open;
+explicit transactor shutdown rolls back its pending DML/DDL and releases the
+database connections. Stock Python DuckDB 1.5.5 lacks the private `subcursor()`
+and `enable_suspended_queries` support required by the bundled transactor.
+These tests directly seed real DuckDB transactions into its registries, then
+exercise the actual completion/RPC/shutdown paths. They do not qualify the
+bundled transactor's BEGIN or streaming-write implementation.
+
+Signed HTTP reproduced the writable fixture's sealed-token leak. The framework
+now supplies authenticated provider plaintext as `params.transaction_opaque_data`
+on bind, init, process and finalize callbacks, including resumed HTTP turns.
+Generic writable handlers use that accessor; request and continuation state
+keep the original sealed tokens. Public signed HTTP checks cover count/rows
+writes, commit, rollback, later turns and wrong-attachment rejection. Their
+SQLite transaction service substitutes only for the unavailable private
+DuckDB backend, so this is token-plumbing qualification rather than a claim
+about that backend.
+
+The new [native runner](../test/run_transactional_write_probe.py) and
+[Python SQLite reference](../../vgi-python-duckdb2/tests/catalog/transactional_write_reference.py)
+pass **17 native signed HTTP cases**: five successes (5,000-row count mode,
+per-batch RETURNING, explicit rollback, zero-input finalization and CTAS), plus
+12 failures spanning autocommit/explicit transactions, INSERT/CTAS and
+init/input/finalize. Input failures occur after real SQLite inserts, including
+the failing batch; finalization failures occur after all 5,000 rows arrive.
+The provider never rolls back merely because a callback raises. Native rollback
+removes partial data and newly created CTAS tables, and also undoes an earlier
+successful write in an explicit transaction even when the next SQL statement
+is COMMIT. A subsequent write succeeds. Each case reads committed tables using
+an independent SQLite connection before server termination and verifies that
+every begun transaction has exactly one completion event.
+
+This qualifies the existing native write path against one serialized,
+single-process transactional provider. It does not qualify the full DuckDB
+transactor, concurrent/multi-process execution, trigger or multiple-DML
+semantics, deferred RETURNING, arbitrary providers or lost-completion recovery.
+The original simple-writable fixture still does not prove transaction atomicity.
+Logs and independent stored-state snapshots are under
+`/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/logs/transactional-writes-20261022-2ke59i/verified`.
+The Python manifest records the companion completion, BEGIN and signed HTTP
+checks. All builds/tests ran on EC2; the engine remains pinned to
+`105edd31b57fe7e6d32ee648efad562e45a9f908`. This checkpoint adds no wire fields,
+transaction framework or savepoints, changes no COMMIT/ROLLBACK retry policy,
+and closes no P0–P3 or M0–M4 release gate.
+
+The final full launcher integration run is not green: 242 actual passes,
+66 failures and 59 skips (the runner includes skips in its 301 reported passes).
+Of those failures, 63 are CHECK-expression negotiation and one is the
+constraint read/enforcement gate; unchanged baseline sources and representative
+baseline probes reproduce both groups. A pagination EOF and filter-pushdown
+count mismatch appeared only in the full run; both pass focused baseline and
+current-source reruns, leaving their cause unresolved. Whole-repo Python lint
+and mypy pass; formatting reports one unchanged baseline file. These broader
+limits do not replace the focused transaction evidence above. Logs are in
+`logs/transactional-writes-20261022-2ke59i/integration.log` and `quality/`.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major
@@ -1598,8 +1680,9 @@ is an integration checkpoint, not the supported release feature set.
 **Exit:** existing behavior passes differential tests against the 1.5 lane and
 local DuckDB evaluation. Pushdown enabled/disabled yields the same results;
 timeouts and failures release workers and resources without hangs or duplicate
-writes. Check rollback using a genuinely transactional fixture: the simple
-SQLite fixture intentionally does not establish transaction correctness.
+writes. Extend the October 22 transactional SQLite reference coverage to the
+2.0 execution paths. The separate simple-writable fixture still does not
+establish transaction correctness.
 
 ### M3 Complete nested schema support
 

@@ -410,28 +410,33 @@ static std::string HttpPostArrowIpcInternal(
 #endif
 	} else {
 		auto &http_util = HTTPUtil::Get(*context.db);
-		// Mutation/prepare calls get private provider parameters. Reinitializing
-		// preserves HTTPFS-specific fields and credentials; slicing HTTPParams or
-		// changing the shared ATTACH parameters would be incorrect. Read calls
-		// retain their existing cache and retry policy.
-		std::shared_ptr<HTTPParams> params = single_attempt ? nullptr : cached_http_params;
+		// ATTACH primes a separate provider parameter set with retries disabled.
+		// Reuse it for BEGIN: initializing HTTPFS secrets here would re-enter the
+		// MetaTransaction mutex. Never mutate the ordinary shared retry policy or
+		// slice provider-specific fields from HTTPParams.
+		std::shared_ptr<HTTPParams> params = cached_http_params;
+		if (single_attempt && params && params->retries != 0) {
+			params.reset();
+		}
 		if (!params) {
 			auto owned = http_util.InitializeParameters(context, url);
+			owned->timeout = timeout_seconds;
+			if (single_attempt) owned->retries = 0;
 			params = std::shared_ptr<HTTPParams>(owned.release());
+		} else if (!single_attempt) {
+			params->timeout = timeout_seconds;
 		}
-		if (single_attempt) params->retries = 0;
-		params->timeout = timeout_seconds;
 		PostRequestInfo post(url, headers, *params, reinterpret_cast<const_data_ptr_t>(req_body_data),
-	                     static_cast<idx_t>(req_body_size));
-	post.try_request = true;
+		                     static_cast<idx_t>(req_body_size));
+		post.try_request = true;
 		// Per request, never on the cached params: those are shared by every
 		// query against this ATTACH.
 		post.cancellation = cancellation;
-	if (client_holder) {
+		if (client_holder) {
 			out_response->native = http_util.Request(post, *client_holder);
-	} else {
+		} else {
 			out_response->native = http_util.Request(post);
-	}
+		}
 		// Checked before anything reads the response: an aborted transfer carries
 		// no capability headers either, so it would otherwise surface as a
 		// misleading "does not advertise" or transport error.
@@ -439,9 +444,9 @@ static std::string HttpPostArrowIpcInternal(
 			throw InterruptException();
 		}
 		if (!out_response->native) {
-		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
-		                  "VGI HTTP POST returned no response (transport failure) [url: %s]", url);
-	}
+			throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
+			                  "VGI HTTP POST returned no response (transport failure) [url: %s]", url);
+		}
 		if (!post.buffer_out.empty()) {
 			response_body.assign(post.buffer_out.data(), post.buffer_out.data() + post.buffer_out.size());
 		}
