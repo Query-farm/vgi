@@ -70,7 +70,7 @@ The remaining included work before freeze is:
 | Work | Selected direction | Remaining proof or implementation |
 | --- | --- | --- |
 | Column expressions and metadata | Implemented: `catalog_table_column_default_set.expression` is required binary `SqlExpression` IPC; `catalog_table_column_type_change.expression` is nullable binary using the same record. CREATE/ADD default annotations use the same canonical codec. These are mandatory successor representations, with no new capability checks. | Bounded durable reference, native 1.5 and SDK support are covered by the checkpoint below. Virtual generation and complete column-metadata semantics remain open. Validate tags as a string map without duplicate keys. Stored generated columns and engine compression enums are excluded. |
-| Default schema absence | Make the existing `CatalogAttachResult.default_schema` nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Preserve absence through worker, native adapter and all SDKs; reject on an adapter that cannot implement it. Never invent `main`, split dots, or introduce nested default search paths. |
+| Default schema absence | Implemented: `CatalogAttachResult.default_schema` is nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Python and SDKs preserve absence; native 1.5 rejects it before publishing the attachment. Native 2.0 optional-default execution remains part of the later adapter port. Never invent `main`, split dots, or introduce nested default search paths. |
 | Macro cleanup | Use one overload-family representation in the successor API; migrate legacy single-definition macros into one-element families before removing duplicate wire forms. | Port the native family consumer, preserve typed literal versus expression defaults and required evaluation context, then regenerate and test every SDK. Native 1.5 currently rejects family payloads. Function argument defaults are a different contract and remain intact. |
 | Optimizer preparation | Keep projection expressions/result mapping and repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | Filter v2 is a predicate contract, not a general scalar projection language. Prove typed scalar results, support decisions before optimizer replacement, slot/filter remapping, local residuals and query-scoped repeatability. The existing `table_function_plan` call occurs too late for remote decline. No proposed projection record is frozen yet. |
 
@@ -114,7 +114,7 @@ transactions or incompatible catalog definitions between versions. Rollback
 requires old-compatible catalog state or a tested restore/migration; switching
 a binary alone is insufficient. No version-aware router is required.
 
-**Next checkpoint:** finish default-schema absence, macro-family consolidation
+**Next checkpoint:** finish macro-family consolidation
 and the remaining column semantics, and prove the optimizer contracts before P1 closes. Then
 complete all-SDK regeneration/conformance, capability matrices and the deployment
 exercise for P2/P3. Native 2.0 compilation and execution remain M0–M4 work.
@@ -175,6 +175,36 @@ Build/test evidence is recorded in the companion manifest's
 This closes the DEFAULT/USING wire
 migration only. Nullable default schema, macro cleanup, optimizer contracts,
 broader column semantics, release qualification and native 2.0 remain open.
+
+### Nullable default schema implementation — October 23, 2026
+
+The existing attach-result field now accepts NULL to mean no implicit default.
+Python's declarative catalog and all SDK codecs preserve that absence. Existing
+providers that omit a constructor default continue choosing `main`; an explicit
+NULL is never replaced with it. Present names are nonempty raw root identifiers
+without NUL, including literal dots. Unscoped function registration requires an
+explicit schema when a provider has no default.
+
+The native 1.5 adapter rejects absent defaults before attachment publication,
+settings registration or catalog installation. It also rejects empty/NUL names
+instead of silently using `main`. This prepares the wire for the 2.0 optional
+catalog API while preserving the supported 1.5 behavior. No new capability,
+RPC, engine-pin change or public version release is introduced.
+
+Evidence is recorded in `nullable_default_schema_checkpoint_2026_10_23` in the
+companion manifest and remote `logs/nullable-default-schema-20261023-3AVBK6`.
+Python validation passes **1,454 checks / 8 skips**, Ruff and mypy (223 source
+files). Strict all-SDK generation and all 11 manifest tests pass. Native
+production and test builds pass, with **2 unit cases / 41 assertions**, **1 SQL
+case / 16 assertions**, and **12 existing attachment/global-function cases /
+394 assertions**; five optional HTTP versioning cases are skipped. SDK checks
+pass: Go 65 codec cases, Rust 2 tests plus client test compilation, TypeScript
+4 tests plus typecheck, Java 40 tests, C# 29 tests plus solution build, and
+C++ normal SDK build with 331 assertions. The browser client is rebuilt.
+
+Native 2.0 execution and the previously recorded nested NOT NULL regression
+remain open. The remaining combined work is macro-family consolidation,
+projection/repeatability, remaining column semantics and release qualification.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference

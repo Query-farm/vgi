@@ -2594,10 +2594,16 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	result.catalog_version_frozen = row["catalog_version_frozen"].value_not_null<bool>();
 	result.catalog_version = row["catalog_version"].value_not_null<int64_t>();
 	result.attach_opaque_data_required = row["attach_opaque_data_required"].value_not_null<bool>();
-	result.default_schema = row["default_schema"].value_not_null<std::string>();
-	if (result.default_schema.empty()) {
-		result.default_schema = "main";
+	std::optional<std::string> default_schema = row["default_schema"];
+	if (!default_schema) {
+		throw NotImplementedException("VGI native DuckDB 1.5 requires an explicit default_schema; catalogs with no "
+		                              "implicit default are unsupported");
 	}
+	if (default_schema->empty() || default_schema->find('\0') != std::string::npos) {
+		throw IOException(CatalogProtocolViolation("catalog_attach", worker_path),
+		                  "CatalogAttachResult.default_schema must be a nonempty raw identifier without NUL");
+	}
+	result.default_schema = *default_schema;
 
 	// Parse settings list - each element is a serialized Setting
 	auto settings_bytes = row["settings"].value_or(std::vector<std::vector<uint8_t>> {});
