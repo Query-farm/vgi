@@ -28,6 +28,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_macro_contract.hpp"
 #include "vgi_function_docs.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_protocol_constants.hpp"
@@ -38,6 +39,7 @@ namespace vgi {
 namespace {
 
 struct ArgRow {
+	std::optional<int64_t> overload_index;
 	std::string catalog_name;
 	std::string schema_name;
 	std::string function_name;
@@ -60,7 +62,7 @@ struct ArgRow {
 	// columns from a correlated LATERAL driver.
 	bool input_from_args;
 	// Per-argument constraint metadata (agent discovery); empty -> NULL.
-	std::string arg_default; // presence-only vgi_default (JSON scalar text)
+	std::string arg_default; // functions: vgi_default JSON; macros: imported literal rendered as SQL
 	bool arg_default_present;
 	std::string arg_choices; // presence-only vgi_choices (JSON array text)
 	bool arg_choices_present;
@@ -183,17 +185,35 @@ static void EmitFunctionArgs(ClientContext &context, const std::string &catalog_
 	                   func.arguments_schema, func.input_from_args, out);
 }
 
-// Expand one macro's arguments_schema into per-argument rows. macro_type is the
-// wire value "scalar"/"table"; surface it as "scalar_macro"/"table_macro" so the
-// function_type column distinguishes macros from same-named functions.
+// Canonical macro documentation is separate from declared type identity.
 static void EmitMacroArgs(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
                           const VgiMacroInfo &macro, std::vector<ArgRow> &out) {
-	// macro_type arrives as the MacroType enum name ("SCALAR"/"TABLE"); accept the
-	// lowercase value form too for resilience.
-	const bool is_table = macro.macro_type == "TABLE" || macro.macro_type == "table";
-	const std::string function_type = is_table ? "table_macro" : "scalar_macro";
-	EmitArgsFromSchema(context, catalog_name, schema_name, macro.name, function_type, macro.arguments_schema, false,
-	                   out);
+	for (size_t overload = 0; overload < macro.overloads.size(); ++overload) {
+		const auto &parameters = macro.overloads[overload].parameters;
+		for (size_t index = 0; index < parameters.size(); ++index) {
+			const auto &parameter = parameters[index];
+			ArgRow row {};
+			row.overload_index = overload;
+			row.catalog_name = catalog_name;
+			row.schema_name = schema_name;
+			row.function_name = macro.name;
+			row.function_type = macro.macro_type == "table" ? "table_macro" : "scalar_macro";
+			row.arg_position = index;
+			row.arg_position_present = true;
+			row.field_index = index;
+			row.arg_name = parameter.name;
+			row.is_any_type = !parameter.declared_type;
+			row.arg_type = row.is_any_type ? "ANY" : NativeMacroParameterType(context, parameter).ToString();
+			row.arg_description_present = parameter.documentation.has_value();
+			row.arg_description = parameter.documentation.value_or("");
+			row.is_positional = true;
+			row.is_named = true; // Pinned MacroFunction accepts named required and defaulted parameters.
+			row.arg_default_present = bool(parameter.default_value);
+			if (parameter.default_value)
+				row.arg_default = NativeMacroDefaultValue(context, parameter).ToSQLString();
+			out.push_back(std::move(row));
+		}
+	}
 }
 
 static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context, TableFunctionBindInput &input,
@@ -214,16 +234,17 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 	    LogicalType::BOOLEAN, // is_varargs
 	    LogicalType::BOOLEAN, // is_table_input
 	    LogicalType::BOOLEAN, // is_any_type
-	    LogicalType::VARCHAR, // arg_default (NULL when unconstrained; JSON scalar)
+	    LogicalType::VARCHAR, // arg_default (functions: JSON scalar; macros: SQL literal)
 	    LogicalType::VARCHAR, // arg_choices (NULL when unconstrained; JSON array)
 	    LogicalType::VARCHAR, // arg_range (NULL when unbounded; interval notation)
 	    LogicalType::VARCHAR, // arg_pattern (NULL when no pattern; regex)
 	    LogicalType::BOOLEAN, // input_from_args (function-level capability)
+	    LogicalType::BIGINT,  // overload_index (zero-based; NULL for functions)
 	};
 	names = {"catalog_name",  "schema_name", "function_name", "function_type",   "arg_position",
 	         "field_index",   "arg_name",    "arg_type",      "arg_description", "is_named",
 	         "is_positional", "is_const",    "is_varargs",    "is_table_input",  "is_any_type",
-	         "arg_default",   "arg_choices", "arg_range",     "arg_pattern",     "input_from_args"};
+	         "arg_default",   "arg_choices", "arg_range",     "arg_pattern",     "input_from_args", "overload_index"};
 
 	auto data = make_uniq<VgiFunctionArgumentsData>();
 
@@ -269,24 +290,15 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 			}
 
 			// Macros: enumerate scalar + table macros and surface their per-
-			// parameter docs (arguments_schema vgi_doc field metadata).
+			// parameter documentation from each ordered overload.
 			static const char *kMacroTypeRequests[] = {"SCALAR_MACRO", "TABLE_MACRO"};
 			for (const char *macro_type : kMacroTypeRequests) {
-				try {
-					CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data, transaction_opaque};
-					rpc_ctx.entity_kind = "schema";
-					rpc_ctx.entity_qualifier = schema_name;
-					auto macro_list = InvokeCatalogSchemaContentsMacros(rpc_ctx, schema_name, macro_type, context);
-					for (auto &macro : macro_list) {
-						EmitMacroArgs(context, catalog_name, schema_name, macro, data->rows);
-					}
-				} catch (const std::exception &e) {
-					VGI_LOG(context, "vgi.function_arguments.skip_failed",
-					        {{"catalog", catalog_name},
-					         {"schema", schema_name},
-					         {"function_type", macro_type},
-					         {"error", e.what()}});
-				}
+				CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data, transaction_opaque};
+				rpc_ctx.entity_kind = "schema";
+				rpc_ctx.entity_qualifier = schema_name;
+				auto macro_list = InvokeCatalogSchemaContentsMacros(rpc_ctx, schema_name, macro_type, context);
+				for (auto &macro : macro_list)
+					EmitMacroArgs(context, catalog_name, schema_name, macro, data->rows);
 			}
 		});
 	}
@@ -319,6 +331,7 @@ static void VgiFunctionArgumentsScan(ClientContext &context, TableFunctionInput 
 		output.SetValue(17, count, row.arg_range_present ? Value(row.arg_range) : Value());
 		output.SetValue(18, count, row.arg_pattern_present ? Value(row.arg_pattern) : Value());
 		output.SetValue(19, count, Value::BOOLEAN(row.input_from_args));
+		output.SetValue(20, count, row.overload_index ? Value::BIGINT(*row.overload_index) : Value());
 		count++;
 	}
 	output.SetCardinality(count);
@@ -337,7 +350,8 @@ void RegisterVgiFunctionArgumentsFunction(ExtensionLoader &loader) {
 	    "per-argument description (vgi_doc), and discovery-facing "
 	    "constraints (arg_default, arg_choices, arg_range, arg_pattern) so an agent can read valid inputs "
 	    "before calling. Filter with WHERE catalog_name = '...'. Reports each catalog's current data "
-	    "version; does not honor time travel.",
+	    "version; does not honor time travel. Macro rows include overload_index and preserve explicitly empty "
+	    "documentation; their arg_default is a SQL literal display of the resolved typed value.",
 	    {}, {},
 	    {"SELECT * FROM vgi_function_arguments();",
 	     "SELECT arg_name, arg_type, is_const, arg_description FROM vgi_function_arguments() "

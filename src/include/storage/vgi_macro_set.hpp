@@ -13,6 +13,7 @@ class VgiSchemaEntry;
 class VgiMacroSet : public VgiCatalogSet {
 public:
 	VgiMacroSet(Catalog &catalog, VgiSchemaEntry &schema, CatalogType macro_type);
+	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const std::string &name);
 
 protected:
 	void LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &_load_lock) override;
@@ -23,7 +24,7 @@ protected:
 
 private:
 	VgiSchemaEntry &schema_;
-	CatalogType macro_catalog_type_;  // MACRO_ENTRY or TABLE_MACRO_ENTRY
+	CatalogType macro_catalog_type_; // MACRO_ENTRY or TABLE_MACRO_ENTRY
 };
 
 } // namespace duckdb

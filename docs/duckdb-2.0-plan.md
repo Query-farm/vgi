@@ -71,7 +71,7 @@ The remaining included work before freeze is:
 | --- | --- | --- |
 | Column expressions and metadata | Implemented: `catalog_table_column_default_set.expression` is required binary `SqlExpression` IPC; `catalog_table_column_type_change.expression` is nullable binary using the same record. CREATE/ADD default annotations use the same canonical codec. These are mandatory successor representations, with no new capability checks. | Bounded durable reference, native 1.5 and SDK support are covered by the checkpoint below. Virtual generation and complete column-metadata semantics remain open. Validate tags as a string map without duplicate keys. Stored generated columns and engine compression enums are excluded. |
 | Default schema absence | Implemented: `CatalogAttachResult.default_schema` is nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Python and SDKs preserve absence; native 1.5 rejects it before publishing the attachment. Native 2.0 optional-default execution remains part of the later adapter port. Never invent `main`, split dots, or introduce nested default search paths. |
-| Macro cleanup | Use one overload-family representation in the successor API; migrate legacy single-definition macros into one-element families before removing duplicate wire forms. | Port the native family consumer, preserve typed literal versus expression defaults and required evaluation context, then regenerate and test every SDK. Native 1.5 currently rejects family payloads. Function argument defaults are a different contract and remain intact. |
+| Macro cleanup | Implemented: required nonempty overload families replace the duplicate parent definition fields. Simple macros use one-element families through local authoring helpers. No family-only capability check. | Native 1.5 loads complete scalar/table families; typed defaults, declarations, docs and owner context remain distinct. Native SQL CREATE MACRO, general dependency extraction and broader body/context support remain separate qualification work. Function argument defaults are unchanged. |
 | Optimizer preparation | Keep projection expressions/result mapping and repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | Filter v2 is a predicate contract, not a general scalar projection language. Prove typed scalar results, support decisions before optimizer replacement, slot/filter remapping, local residuals and query-scoped repeatability. The existing `table_function_plan` call occurs too late for remote decline. No proposed projection record is frozen yet. |
 
 The user withdrew the proposed DEFAULT/USING capability flags: this is an
@@ -114,8 +114,8 @@ transactions or incompatible catalog definitions between versions. Rollback
 requires old-compatible catalog state or a tested restore/migration; switching
 a binary alone is insufficient. No version-aware router is required.
 
-**Next checkpoint:** finish macro-family consolidation
-and the remaining column semantics, and prove the optimizer contracts before P1 closes. Then
+**Next checkpoint:** finish the remaining column semantics
+and prove the optimizer contracts before P1 closes. Then
 complete all-SDK regeneration/conformance, capability matrices and the deployment
 exercise for P2/P3. Native 2.0 compilation and execution remain M0–M4 work.
 This review adds no wire fields, version bump, engine-pin update or runtime
@@ -203,8 +203,51 @@ pass: Go 65 codec cases, Rust 2 tests plus client test compilation, TypeScript
 C++ normal SDK build with 331 assertions. The browser client is rebuilt.
 
 Native 2.0 execution and the previously recorded nested NOT NULL regression
-remain open. The remaining combined work is macro-family consolidation,
-projection/repeatability, remaining column semantics and release qualification.
+remain open. Macro-family consolidation follows in the next checkpoint;
+projection/repeatability, remaining column semantics and release qualification
+remain combined-package work.
+
+### Canonical macro families — October 23, 2026
+
+`MacroInfo` and `MacroCreateRequest` now require one nonempty ordered overload
+family. Their duplicate parent parameter, definition, default-batch and
+arguments-schema fields are removed. The existing catalog create/get/list/drop
+methods continue to operate on the whole named family. Local authoring helpers
+convert simple definitions into a one-member family; function argument defaults
+are a separate contract and remain unchanged. No new capability flags or
+per-overload RPCs are introduced.
+
+Parameters retain their declared Arrow type, documentation and resolved literal
+default independently. CREATE may submit an expression default for the owner
+to resolve once; discovery rejects unresolved defaults. Typed NULL remains
+different from no default. Python's client, provider and worker use this same
+representation, with a durable reference for replacement failure, reconnect,
+commit and rollback through existing transaction paths.
+
+The native 1.5 adapter validates and installs complete scalar/table families,
+uses the existing Arrow scanner for typed defaults, and delegates overload
+selection to the pinned engine. Context is checked on cached lookups as well
+as initial discovery. Unsupported owner paths, contexts, query forms and logical
+type metadata reject explicitly. This adapter has a bounded owner-relative SQL
+implementation; general body/type resolution and dependency extraction remain
+open. Atomic installation covers wire, parse, type and context validation;
+body binding still happens at invocation, so unresolved references can fail
+when called. The owner remains responsible for CREATE-time body validation.
+Native SQL CREATE MACRO remains unsupported, as before this checkpoint.
+
+Validation and exact source revisions are recorded in
+`macro_family_checkpoint_2026_10_23` in the companion manifest and remote
+`logs/macro-families-20261023-Rulov6`. Python's broad run passes **1,697 tests /
+8 skips**, with all **9 generation parity reruns** and **9 final durable cases**
+passing. Native builds pass, with **4 macro cases / 101 assertions**, **3 metadata
+cases / 131 assertions**, and existing macro, introspection, catalog, global
+function and attachment regressions passing; five optional HTTP attachment
+cases remain skipped. All six SDK suites, both TypeScript Arrow backends,
+browser rebuild, strict generation and all **11 manifest tests** pass.
+
+The engine pin remains DuckDB 1.5.x;
+this is successor-protocol preparation, not native 2.0 qualification or a public
+protocol release.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference
@@ -1662,7 +1705,7 @@ an automatic later release.
 | Columns and nested fields | Raw component `ColumnPath`; add/drop/rename/type/default/nullability operations; defaults, generated expressions, comments, tags, and supported compression policy | Consistent create/alter/read representation, USING expression semantics, generated dependencies, quoted dotted names, and complete validation before mutation. Keep existing Arrow metadata keys where sufficient. |
 | Views | Ordered aliases, security mode, create/read metadata, column comments and their mutation | Preserve the SELECT-definition contract or explicitly version its replacement. Security barriers must survive create/discovery/refresh/rebind; define name resolution, replacement, dependencies, and unsupported-reader behavior. |
 | Constraints and indexes | Constraint addition and supported mutation/discovery; full native integration of existing index RPCs; typed index options if string values are insufficient | Worker enforcement versus metadata-only declaration, existing-data validation, logical column identity, FK target paths, dependent objects, and atomic changes. Do not promise SQL constraint forms the selected engine itself rejects. |
-| Macros — concrete contract and reference implemented; adapters pending | Overload collections, declared parameter types, expression/default representation, documentation, and owner-relative definitions | Reconcile the existing single-definition request and typed-value defaults with engine overloads and expression defaults. Define resolution and stable round trips; do not introduce a function overload handle just to mirror DuckDB internals. |
+| Macros — canonical families and bounded native 1.5 support | Overload collections, declared parameter types, expression/default representation, documentation, and owner-relative definitions | Reconcile the existing single-definition request and typed-value defaults with engine overloads and expression defaults. Define resolution and stable round trips; do not introduce a function overload handle just to mirror DuckDB internals. |
 | Dependencies and catalog consistency | Shared qualified object references; explicit ownership/drop/alter dependency semantics; mutation visibility and metadata-version rules | Settle worker versus engine authority, RESTRICT/CASCADE, rename effects, transaction-local reads, committed versions/etags, and retained entries. Include dependency records where enforcement across clients requires them; no DuckDB pointers or OIDs on the wire. |
 | Transactions and write execution | Reuse existing transaction handles, begin/commit/rollback, write init/exchange/finalize and OLD/NEW results; audit concrete DuckDB2 gaps before adding wire fields | Keep supported DDL, DML and trigger effects in the existing provider transaction; failed writes cannot partially commit. No savepoints, durable replay/status service or general statement ticket/receipt framework in this package. No automatic retry of non-idempotent mutations after ambiguous dispatch; commit/rollback retain existing transaction-ID-based idempotency. |
 | Triggers — reviewed deferral | Retain existing table-owned identity, SQL/context, dependency and OLD/NEW carriers; defer new persistent CRUD and execution profiles | Reopen for a concrete provider need with exclusive execution ownership, exact statement/row semantics, complete discovery and rollback proof. Later CRUD/capabilities require another coordinated SDK update. |

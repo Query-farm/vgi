@@ -2,6 +2,7 @@
 #include "vgi_settings_defaults.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_column_expression.hpp"
+#include "vgi_macro_contract.hpp"
 #include "vgi_query_rpc.hpp"
 #include "vgi_constraint_contract.hpp"
 #include "vgi_index_contract.hpp"
@@ -684,6 +685,13 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> ContentsItems(const VgiSchemaCo
 	const int64_t end = list_array->value_offset(contents.row + 1);
 	items.reserve(static_cast<size_t>(end - begin));
 	for (int64_t i = begin; i < end; i++) {
+		if (std::string(items_method) == "catalog_schema_contents_macros") {
+			if (values->IsNull(i))
+				throw InvalidInputException("VGI macro contents contains a NULL family");
+			auto bytes = values->GetView(i);
+			items.push_back(DecodeMacroInfoRecord(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size()));
+			continue;
+		}
 		if (values->IsNull(i)) {
 			continue;
 		}
@@ -2992,58 +3000,6 @@ VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const std::shared_ptr<arrow::Recor
 	auto options_data = row["options"].value_not_null<std::vector<uint8_t>>();
 	if (!options_data.empty()) {
 		info.options_schema = DeserializeSchema(options_data);
-	}
-
-	return info;
-}
-
-VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
-	VgiMacroInfo info;
-
-	if (!batch || batch->num_rows() == 0) {
-		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path), "Empty response from macro_get");
-	}
-	// The legacy loader installs exactly one untyped definition. Reject the new
-	// family representation before it can ignore overloads or skip parse errors.
-	if (auto overloads = batch->GetColumnByName("overloads")) {
-		if (!overloads->IsNull(0)) {
-			throw NotImplementedException(
-			    "VGI macro overload families require a qualified native adapter [worker: %s]", worker_path);
-		}
-	}
-
-	RecordBatchSingleRow row(batch, 0, "MacroInfo", worker_path);
-	info.name = row["name"].value_not_null<std::string>();
-	info.schema_name =
-	    SchemaNameFromPath(row["schema_path"].value_not_null<std::vector<std::string>>(), "MacroInfo.schema_path");
-	info.macro_type = row["macro_type"].value_not_null<std::string>();
-	info.definition = row["definition"].value_not_null<std::string>();
-	info.comment = row["comment"].value_or("");
-	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
-	info.parameters = row["parameters"].value_not_null<std::vector<std::string>>();
-
-	// parameter_default_values is nullable binary (IPC bytes)
-	auto default_bytes = row["parameter_default_values"].as<std::vector<uint8_t>>();
-	if (default_bytes && !default_bytes->empty()) {
-		// The legacy macro loader reads defaults manually instead of using the
-		// Arrow scanner. Apply the same logical-type gate here, outside that
-		// loader's catch-and-skip path, so annotated storage cannot be coerced.
-		auto defaults = DeserializeFromIpcBytes(*default_bytes);
-		if (defaults) {
-			ArrowSchemaWrapper defaults_schema;
-			ExportSchema(defaults->schema(), defaults_schema);
-		}
-		info.parameter_default_values_bytes = std::move(*default_bytes);
-	}
-
-	// arguments_schema is an additive binary (IPC schema bytes) carrying per-
-	// parameter docs via vgi_doc field metadata. Absent on older workers — guard
-	// on the column existing so we stay compatible with pre-feature listings.
-	if (batch->schema()->GetFieldByName("arguments_schema")) {
-		auto args_bytes = row["arguments_schema"].as<std::vector<uint8_t>>();
-		if (args_bytes && !args_bytes->empty()) {
-			info.arguments_schema = DeserializeSchema(*args_bytes);
-		}
 	}
 
 	return info;

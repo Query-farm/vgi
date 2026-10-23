@@ -1,0 +1,223 @@
+// © Copyright 2026 Query Farm LLC - https://query.farm
+#include "catch.hpp"
+#include "duckdb.hpp"
+#include "core_functions_extension.hpp"
+#include "vgi_extension.hpp"
+#include "vgi_macro_contract.hpp"
+#include "vgi_catalog_rpc.hpp"
+#include "vgi_arrow_utils.hpp"
+#include "vgi_rpc_types.hpp"
+#include "../../src/generated/vgi_protocol_schemas.hpp"
+#include <cstdlib>
+
+using namespace duckdb;
+namespace {
+using Array = std::shared_ptr<arrow::Array>;
+Array Null(arrow::Type::type type = arrow::Type::BINARY) {
+	return arrow::MakeArrayOfNull(type == arrow::Type::BINARY ? arrow::binary() : arrow::utf8(), 1).ValueOrDie();
+}
+Array Struct(const std::shared_ptr<arrow::Schema> &schema, std::vector<Array> columns) {
+	return arrow::StructArray::Make(columns, schema->fields()).ValueOrDie();
+}
+Array List(Array values) {
+	return arrow::MakeArrayFromScalar(arrow::ListScalar(values), 1).ValueOrDie();
+}
+Array Parameter(Array literal = Null(), Array declared = Null(), Array expression = Null(), std::string name = "x") {
+	return Struct(vgi::generated::MacroParameterSchema(),
+	              {vgi::BuildStringScalar(name), declared, literal, expression, vgi::BuildStringScalar("")});
+}
+Array Overload(Array parameters, std::string profile = "duckdb.macro.v1", std::string owner = "main",
+               std::string zone = "UTC") {
+	auto context =
+	    Struct(vgi::generated::QueryEvaluationContextSchema(),
+	           {vgi::BuildStringScalar(zone), vgi::BuildStringScalar("binary"), vgi::BuildStringScalar("asc"),
+	            vgi::BuildStringScalar("nulls_last"), vgi::BuildBoolScalar(true)});
+	return Struct(vgi::generated::MacroOverloadSchema(),
+	              {List(parameters), vgi::BuildStringScalar("x"), vgi::BuildStringScalar(profile),
+	               vgi::BuildStringListScalar({owner}), vgi::BuildStringScalar("scalar"), context});
+}
+std::shared_ptr<arrow::RecordBatch> Family(Array overloads) {
+	auto schema = vgi::generated::MacroInfoSchema();
+	return arrow::RecordBatch::Make(schema, 1,
+	                                {Null(arrow::Type::STRING), vgi::BuildStringMapScalar({}),
+	                                 vgi::BuildStringScalar("m"), vgi::BuildStringListScalar({"main"}),
+	                                 vgi::BuildEnumArray("SCALAR", {"SCALAR", "TABLE"}), List(overloads)});
+}
+unique_ptr<MaterializedQueryResult> Query(Connection &con, const std::string &sql) {
+	auto result = con.Query(sql);
+	INFO(sql);
+	INFO((result->HasError() ? result->GetError() : "ok"));
+	REQUIRE_FALSE(result->HasError());
+	return result;
+}
+} // namespace
+
+TEST_CASE("Canonical macro records reject malformed owners profiles and literal metadata", "[macro-contract]") {
+	auto valid = Family(Overload(Parameter()));
+	auto parsed = vgi::ParseMacroInfo(valid, "test");
+	REQUIRE(parsed.overloads.size() == 1);
+	CHECK(parsed.overloads[0].parameters[0].documentation == std::optional<std::string>(""));
+	for (auto invalid : {Overload(Parameter(), "unknown"), Overload(Parameter(), "duckdb.macro.v1", "main.nested"),
+	                     Overload(Parameter(), "duckdb.macro.v1", "main", "Europe/Paris"),
+	                     Overload(Parameter(Null(), Null(), vgi::BuildBinaryScalarRequired({1})))}) {
+		CHECK_THROWS(vgi::ParseMacroInfo(Family(invalid), "test"));
+	}
+	auto repeated = arrow::Concatenate({Parameter(), Parameter(Null(), Null(), Null(), "X")}).ValueOrDie();
+	CHECK_THROWS(vgi::ParseMacroInfo(Family(Overload(repeated)), "test"));
+	auto empty =
+	    arrow::MakeArrayOfNull(arrow::struct_(vgi::generated::MacroOverloadSchema()->fields()), 0).ValueOrDie();
+	CHECK_THROWS(vgi::ParseMacroInfo(Family(empty), "test"));
+	for (bool annotated : {false, true}) {
+		auto field = arrow::field("x", arrow::binary());
+		if (annotated)
+			field = field->WithMetadata(arrow::key_value_metadata({"vgi.logical_type.v1"}, {"variant"}));
+		auto batch = arrow::RecordBatch::Make(arrow::schema({field}), 1, {vgi::BuildBinaryScalarRequired({0, 255})});
+		auto family = Family(Overload(Parameter(vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(batch)))));
+		if (annotated)
+			CHECK_THROWS(vgi::ParseMacroInfo(family, "test"));
+		else
+			CHECK_NOTHROW(vgi::ParseMacroInfo(family, "test"));
+	}
+}
+
+TEST_CASE("Macro list and bulk envelopes reject trailing data and absent family records", "[macro-contract]") {
+	auto family = Family(Overload(Parameter()));
+	auto valid = vgi::SerializeToIpcBytes(family);
+	auto trailing = valid;
+	trailing.push_back(0);
+	auto zero_rows = vgi::SerializeToIpcBytes(family->Slice(0, 0));
+	auto check = [&](Array binary, bool accepted) {
+		auto list = List(binary);
+		auto wrapper = arrow::RecordBatch::Make(arrow::schema({arrow::field("items", list->type())}), 1, {list});
+		vgi::VgiSchemaContents contents;
+		contents.worker_path = "test";
+		contents.rows = std::static_pointer_cast<arrow::StructArray>(
+		    Struct(arrow::schema({arrow::field("scalar_macros", list->type())}), {list}));
+		if (accepted) {
+			CHECK(vgi::UnwrapAndValidateItems(wrapper, "catalog_schema_contents_macros", "test").size() == 1);
+			CHECK(vgi::DecodeContentsMacros(contents, "SCALAR_MACRO").size() == 1);
+		} else {
+			CHECK_THROWS(vgi::UnwrapAndValidateItems(wrapper, "catalog_schema_contents_macros", "test"));
+			CHECK_THROWS(vgi::DecodeContentsMacros(contents, "SCALAR_MACRO"));
+		}
+	};
+	check(vgi::BuildBinaryScalarRequired(valid), true);
+	check(vgi::BuildBinaryScalarRequired(trailing), false);
+	check(vgi::BuildBinaryScalarRequired(zero_rows), false);
+	check(Null(), false);
+	// The size limit is checked before attempting to copy/decode the buffer.
+	CHECK_THROWS(vgi::DecodeMacroInfoRecord(nullptr, 8 * 1024 * 1024 + 1));
+	auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+	auto writer = arrow::ipc::MakeStreamWriter(sink, family->schema()).ValueOrDie();
+	vgi::ThrowOnArrowError(writer->WriteRecordBatch(*family));
+	vgi::ThrowOnArrowError(writer->WriteRecordBatch(*family));
+	vgi::ThrowOnArrowError(writer->Close());
+	auto twice = sink->Finish().ValueOrDie();
+	check(vgi::BuildBinaryScalarRequired(std::vector<uint8_t>(twice->data(), twice->data() + twice->size())), false);
+}
+
+TEST_CASE("Native macro literal import preserves typed NULL and complex values", "[macro-contract]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	for (auto type : {arrow::int32(), arrow::date32(), arrow::decimal128(10, 2), arrow::binary(),
+	                  arrow::struct_({arrow::field("key", arrow::int64())})}) {
+		auto schema = arrow::schema({arrow::field("x", type)});
+		auto batch = arrow::RecordBatch::Make(schema, 1, {arrow::MakeArrayOfNull(type, 1).ValueOrDie()});
+		auto family =
+		    Family(Overload(Parameter(vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(batch)),
+		                              vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(schema)))));
+		auto parameter = vgi::ParseMacroInfo(family, "test").overloads[0].parameters[0];
+		auto value = vgi::NativeMacroDefaultValue(*con.context, parameter);
+		CHECK(value.IsNull());
+		CHECK(value.type() == vgi::NativeMacroParameterType(*con.context, parameter));
+	}
+	auto schema = arrow::schema({arrow::field("x", arrow::binary())});
+	auto batch = arrow::RecordBatch::Make(schema, 1, {vgi::BuildBinaryScalarRequired({0, 255, 65})});
+	auto parameter =
+	    vgi::ParseMacroInfo(
+	        Family(Overload(Parameter(vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(batch))))), "test")
+	        .overloads[0]
+	        .parameters[0];
+	CHECK(vgi::NativeMacroParameterType(*con.context, parameter) == LogicalType::UNKNOWN);
+	CHECK(vgi::NativeMacroDefaultValue(*con.context, parameter) == Value::BLOB_RAW(std::string("\0\xff"
+	                                                                                           "A",
+	                                                                                           3)));
+}
+
+TEST_CASE("Native macro families execute with stable owner context and atomic loading", "[macro-family-native]") {
+	auto worker = std::getenv("VGI_MACRO_FAMILY_WORKER");
+	REQUIRE(worker);
+	auto bad_worker = std::getenv("VGI_MACRO_BAD_FAMILY_WORKER");
+	REQUIRE(bad_worker);
+	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<VgiExtension>();
+	Connection con(db);
+	Query(con, "ATTACH 'options' AS m (TYPE vgi, LOCATION '" + StringUtil::Replace(worker, "'", "''") + "')");
+	CHECK(Query(con, "SELECT m.main.family(7), m.main.family('seven')")->GetValue(0, 0) == Value(8));
+	CHECK(Query(con, "SELECT m.main.family('seven')")->GetValue(0, 0) == Value("SEVEN"));
+	CHECK(Query(con, "SELECT m.main.family(x := 7)")->GetValue(0, 0) == Value(8));
+	CHECK(Query(con, "SELECT m.main.defaults(), typeof(m.main.typed_null()), m.main.typed_null() IS NULL")
+	          ->GetValue(0, 0) == Value::BIGINT(43));
+	CHECK(Query(con, "SELECT m.main.defaults(x := 7)")->GetValue(0, 0) == Value(8));
+	CHECK(Query(con, "SELECT typeof(m.main.typed_null())")->GetValue(0, 0) == Value("INTEGER"));
+	CHECK(Query(con, "SELECT value FROM m.main.table_family(7)")->GetValue(0, 0) == Value(7));
+	CHECK(Query(con, "SELECT value FROM m.main.table_family('seven')")->GetValue(0, 0) == Value("seven"));
+	Query(con, "CREATE TEMP MACRO upper(x) AS 'shadow'");
+	CHECK(Query(con, "SELECT m.main.family('seven')")->GetValue(0, 0) == Value("SEVEN"));
+	auto docs = Query(con, "SELECT overload_index,arg_type,arg_description FROM vgi_function_arguments() WHERE "
+	                       "catalog_name='m' AND function_name='family' ORDER BY overload_index");
+	REQUIRE(docs->RowCount() == 2);
+	CHECK(docs->GetValue(0, 0) == Value::BIGINT(0));
+	CHECK(docs->GetValue(1, 0) == Value("INTEGER"));
+	CHECK(docs->GetValue(2, 0) == Value(""));
+	CHECK(docs->GetValue(2, 1).IsNull());
+	Query(con, "BEGIN");
+	CHECK(Query(con, "SELECT m.main.family(7)")->GetValue(0, 0) == Value(8));
+	Query(con, "SET default_order='desc'");
+	auto changed = con.Query("SELECT m.main.family(7)");
+	REQUIRE(changed->HasError());
+	CHECK((changed->GetError().find("context") != std::string::npos ||
+	       changed->GetError().find("settings") != std::string::npos));
+	Query(con, "ROLLBACK");
+	Query(con, "SET default_order='asc'");
+	CHECK(Query(con, "SELECT m.main.family(7)")->GetValue(0, 0) == Value(8));
+	Query(con, "ATTACH 'options' AS bad (TYPE vgi, LOCATION '" + StringUtil::Replace(bad_worker, "'", "''") + "')");
+	for (int attempt = 0; attempt < 2; ++attempt) {
+		auto failed = con.Query("SELECT bad.main.family(7)");
+		REQUIRE(failed->HasError());
+		// A valid first overload must never become callable after the invalid later member failed.
+		CHECK((failed->GetError().find("syntax") != std::string::npos ||
+		       failed->GetError().find("Parser") != std::string::npos));
+	}
+	for (const auto &mode : {std::string("WINDOW"), std::string("FOREIGN")}) {
+		auto command = std::getenv(("VGI_MACRO_" + mode + "_FAMILY_WORKER").c_str());
+		REQUIRE(command);
+		auto alias = "bad_" + mode;
+		Query(con, "ATTACH 'options' AS " + alias + " (TYPE vgi, LOCATION '" + StringUtil::Replace(command, "'", "''") +
+		               "')");
+		for (int attempt = 0; attempt < 2; ++attempt) {
+			auto failed = con.Query("SELECT " + alias + ".main.family(7)");
+			REQUIRE(failed->HasError());
+			CHECK(failed->GetError().find(mode == "WINDOW" ? "window expressions" : "client catalog") !=
+			      std::string::npos);
+		}
+	}
+	// Missing-function suggestions enumerate attached catalogs. Keep the
+	// deliberately unparsable providers out of this separate binding probe.
+	Query(con, "DETACH bad");
+	Query(con, "DETACH bad_WINDOW");
+	Query(con, "DETACH bad_FOREIGN");
+	auto unknown = std::getenv("VGI_MACRO_UNKNOWN_FAMILY_WORKER");
+	REQUIRE(unknown);
+	Query(con, "ATTACH 'options' AS late_bind (TYPE vgi, LOCATION '" + StringUtil::Replace(unknown, "'", "''") + "')");
+	// Syntax/type/context validation installs the whole family. Function body
+	// binding remains invocation-time; a bad selected overload is never skipped.
+	CHECK(Query(con, "SELECT late_bind.main.family(7)")->GetValue(0, 0) == Value(8));
+	auto missing_function = con.Query("SELECT late_bind.main.family('text')");
+	REQUIRE(missing_function->HasError());
+	INFO(missing_function->GetError());
+	CHECK(missing_function->GetError().find("missing_function") != std::string::npos);
+	CHECK(Query(con, "SELECT late_bind.main.family(7)")->GetValue(0, 0) == Value(8));
+	CHECK(Query(con, "SELECT 11")->GetValue(0, 0) == Value(11));
+}

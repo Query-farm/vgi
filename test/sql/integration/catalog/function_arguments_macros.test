@@ -1,7 +1,7 @@
 # name: test/sql/integration/catalog/function_arguments_macros.test
 # description: vgi_function_arguments() now also enumerates MACROS and surfaces
-#   their per-parameter descriptions (the macro arguments_schema vgi_doc field
-#   metadata). function_type is scalar_macro / table_macro. Anchored on the
+#   their explicit per-parameter documentation from each ordered overload.
+#   function_type is scalar_macro / table_macro. Anchored on the
 #   fixture worker's documented macros vgi_multiply / vgi_clamp / vgi_range_table.
 # group: [vgi_integration]
 
@@ -52,3 +52,12 @@ WHERE catalog_name = 'example'
   AND arg_description IS NULL;
 ----
 0
+
+# Required and defaulted macro parameters accept positional and named notation.
+query I
+SELECT count(*) FROM vgi_function_arguments()
+WHERE catalog_name = 'example'
+  AND function_type IN ('scalar_macro', 'table_macro')
+  AND is_positional AND is_named AND overload_index = 0;
+----
+6

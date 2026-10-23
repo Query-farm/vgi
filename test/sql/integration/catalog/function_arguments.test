@@ -40,10 +40,12 @@ ORDER BY arg_position;
 ----
 value	ANY	true
 
-# A positional argument is never also named (mutually exclusive classification).
+# Function arguments keep their mutually exclusive classification; macro
+# parameters support either call notation.
 query I
 SELECT count(*) FROM vgi_function_arguments()
-WHERE catalog_name = 'example' AND is_positional AND is_named;
+WHERE catalog_name = 'example' AND is_positional AND is_named
+  AND function_type IN ('scalar', 'table', 'table_buffering', 'aggregate');
 ----
 0
 

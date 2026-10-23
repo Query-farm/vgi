@@ -2,6 +2,7 @@
 #include "vgi_rpc_types.hpp"
 #include "vgi_constraint_contract.hpp"
 #include "vgi_query_rpc.hpp"
+#include "vgi_macro_contract.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_ipc.hpp"
@@ -1073,6 +1074,23 @@ std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const std::shared_pt
 std::vector<std::shared_ptr<arrow::RecordBatch>>
 UnwrapAndValidateItems(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &method_name,
                        const std::string &worker_path) {
+	if (method_name == "catalog_schema_contents_macros") {
+		if (!batch || batch->num_rows() != 1)
+			throw InvalidInputException("VGI macro listing requires exactly one row");
+		auto list = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("items"));
+		if (!list || list->IsNull(0) || list->value_type()->id() != arrow::Type::BINARY) {
+			throw InvalidInputException("VGI macro listing requires non-NULL binary items");
+		}
+		auto values = std::static_pointer_cast<arrow::BinaryArray>(list->values());
+		std::vector<std::shared_ptr<arrow::RecordBatch>> items;
+		for (int64_t i = list->value_offset(0); i < list->value_offset(0) + list->value_length(0); ++i) {
+			if (values->IsNull(i))
+				throw InvalidInputException("VGI macro listing contains a NULL family");
+			auto bytes = values->GetView(i);
+			items.push_back(DecodeMacroInfoRecord(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size()));
+		}
+		return items;
+	}
 	auto bytes_list = UnwrapBinaryResponseItems(batch);
 	std::vector<std::shared_ptr<arrow::RecordBatch>> items;
 	items.reserve(bytes_list.size());
