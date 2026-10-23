@@ -9,7 +9,7 @@
 #   blended_sliced(n BIGINT, page_size := 1000000 BIGINT, cache_ttl := 0 BIGINT)
 #     -> (i BIGINT, call_rows BIGINT)
 #   - A RowTransformFunction declaring input_rows_per_call = 3. It fails a call given
-#     more than 3 rows.
+#     more than 3 rows (any error; the message is not checked).
 #   - Output is blended_paged's for the call (rows i = 0 .. n-1 per input row, NULL or
 #     negative n counting as 0, page_size rows per reply, continued with
 #     vgi.status: HAVE_MORE_OUTPUT), plus call_rows = the call's input row count.

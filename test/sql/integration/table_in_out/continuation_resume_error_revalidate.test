@@ -15,7 +15,8 @@
 #   - fail_on_page := 0 BIGINT: when > 0, the worker fails instead of sending reply
 #     number fail_on_page (1-based) for an input batch (one process() call and the
 #     ticks that follow it), with "failing on page <k> as asked". Replies are counted
-#     per input batch, not per input row.
+#     per input batch, not per input row, from 1, and every reply counts, including
+#     not_modified_more's empty first reply.
 #   - revalidate := false BOOLEAN: when true, the output depends on the request alone,
 #     and cache_ttl is ignored. Without vgi.cache.if_none_match on the input, the
 #     whole output is one reply carrying vgi.cache ttl = 0, etag "v1", revalidatable.

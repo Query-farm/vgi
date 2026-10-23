@@ -320,7 +320,7 @@ any other exchange state. Every reply's `parent_row` indexes the same, last real
 input. While output is pending a tick is the only valid input, and a tick is valid
 only then; a worker refuses anything else. There is no capability negotiation.
 
-Two more rules every worker must follow:
+More rules every worker must follow:
 
 - **Answer every tick with a reply.** An empty HTTP body, or end-of-stream, in
   answer to a tick is a protocol violation. A reply may be empty and still say
@@ -347,7 +347,7 @@ status in `ReadDataBatch` (`GetLastMoreOutput()`) and writes ticks
   reply has rows or the worker said more; the next call sends the tick.
 - **Stock in-out, per-substream connection**: continues one reply per call
   (`local_state.more_pending`).
-- **Stock in-out, one shared connection** (`max_workers = 1`): not supported.
+- **Stock in-out, one shared connection** (the catalog's `FunctionInfo.max_workers = 1`): not supported.
   Several pipelines take turns on that connection under `exchange_mutex`, so it
   cannot leave output pending; a continued reply there is a protocol violation, and
   workers refuse `resume()` with `max_workers = 1` at registration.
@@ -365,6 +365,43 @@ still fetched. `input_rows_per_call` bounds how much that is.
 continued is not stored in the whole-chunk (M2) cache, and a call whose output
 continued stores no per-value entries; an M1 (stock path) input whose output
 continued is not stored. Output that fits in one reply is cached as before.
+
+### Implementing it in an SDK
+
+The rules above, as a worker framework sees them. The Python SDK
+(`vgi/protocol.py`, `TableInOutExchangeState.exchange`) is the reference.
+
+- **Where the status rides.** `vgi.status` is the custom metadata of the batch
+  itself: the input batch for `CONTINUE`, the reply batch for `HAVE_MORE_OUTPUT`.
+  Some RPC libraries surface an input batch's metadata separately (a call-context
+  field) on one transport and on the batch on another; read it wherever the batch's
+  metadata arrives.
+- **The framework must see "more".** The next input must be a tick exactly when
+  the last reply said more, so route "more" through the SDK's emit API, where the
+  framework records it, not through raw reply metadata it cannot see.
+- **State.** The resume position must survive the HTTP state token, so it lives
+  in the exchange state the SDK already serializes there, along with a "more
+  pending" flag. Refuse at registration a function that can continue but has no
+  state of its own to resume from.
+- **Validators belong to one input.** `vgi.cache.if_none_match` /
+  `if_modified_since` arrive with a real input and apply to that input's first
+  reply only; the client never sends them on a tick. Reset them on every real
+  input, and do not offer them to the reply of a tick.
+- **What the framework refuses.** A tick with no output pending, a tick with rows,
+  real input while output is pending, cache control on a tick's reply, "more"
+  outside a table-in-out exchange, and (at registration) continuation on a function
+  whose catalog `max_workers` is 1. An SDK with no `max_workers` setting cannot hit
+  that last case.
+- **What only the client enforces.** `not_modified` on a reply that says more, or
+  on a tick's reply: a framework need not block it (the `not_modified_more` fixture
+  sends one on purpose), and the extension fails the query.
+- **Errors.** An error while output is pending ends the stream; the client discards
+  the connection, so nothing needs to clear the pending flag.
+- **`input_rows_per_call`.** Validate it at registration as well (a positive
+  integer, row-transform functions only); the extension refuses it at bind too.
+- **Generated protocol code.** Regenerate one SDK's checkout with vgi-python's
+  `scripts/regen_generated.py --only <repo> --root <repo>=<path>`; without
+  `--only` it writes every sibling checkout it finds.
 
 ## Input Rows Per Call
 
