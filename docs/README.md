@@ -22,6 +22,11 @@ The reference worker SDK is **vgi-python** — `pip install vgi-python`.
 
 Created by [Query.Farm](https://query.farm).
 
+## Documentation
+
+Installation, usage, and the DuckDB extension reference are available on the
+[Query Farm VGI extension page](https://query.farm/products/extensions/vgi/).
+
 ## Worker SDKs
 
 A VGI worker can be written in any language that implements the protocol. Query.Farm
