@@ -1,0 +1,157 @@
+# VGI repository notes
+
+For installation and the full user documentation, see the
+[Query Farm VGI documentation](https://query.farm/products/extensions/vgi/).
+
+## Worker SDKs
+
+A VGI worker can be written in any language that implements the protocol. Query.Farm
+maintains reference SDKs in five languages. **vgi-python** is the most complete reference
+implementation and is published to PyPI; the others are developed in the open.
+
+| Language   | Repository                                                                 | Build | Package |
+|------------|---------------------------------------------------------------------------|-------|---------|
+| Python     | [Query-farm/vgi-python](https://github.com/Query-farm/vgi-python)          | [![CI](https://github.com/Query-farm/vgi-python/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-python/actions/workflows/ci.yml) | [![PyPI](https://img.shields.io/pypi/v/vgi-python)](https://pypi.org/project/vgi-python/) `pip install vgi-python` |
+| TypeScript | [Query-farm/vgi-typescript](https://github.com/Query-farm/vgi-typescript) | _private repo_ | — |
+| Go         | [Query-farm/vgi-go](https://github.com/Query-farm/vgi-go)                  | [![CI](https://github.com/Query-farm/vgi-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-go/actions/workflows/ci.yml) | — |
+| Rust       | [Query-farm/vgi-rust](https://github.com/Query-farm/vgi-rust)              | [![CI](https://github.com/Query-farm/vgi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-rust/actions/workflows/ci.yml) | — |
+| Java       | [Query-farm/vgi-java](https://github.com/Query-farm/vgi-java)              | [![CI](https://github.com/Query-farm/vgi-java/actions/workflows/integration.yml/badge.svg)](https://github.com/Query-farm/vgi-java/actions/workflows/integration.yml) | — |
+
+## Why VGI?
+
+| Traditional DuckDB extensions | VGI workers |
+|-------------------------------|-------------|
+| C/C++ compilation required | Any language — write a script or ship a binary |
+| Tied to a specific DuckDB version | Version independent |
+| Complex build / release cycle | Ship a script or executable |
+| Runs in-process | Process isolation |
+| Shares DuckDB's process and runtime | Pool of independent worker processes — true parallelism even under a GIL |
+
+**Use cases:** call REST APIs from SQL, run ML inference (PyTorch, scikit-learn),
+process data with Python/pandas/numpy, build custom ETL transforms, or expose external
+data sources as queryable tables and views.
+
+## Features
+
+- **Function shapes** — scalar, table, table-in-out (streaming), buffered table
+  (see-every-row-before-output), aggregate, and windowed aggregate functions, all defined
+  in the worker and surfaced as native DuckDB functions.
+- **Full catalog integration** — workers expose schemas, tables, views, and functions;
+  DuckDB lazily loads catalog metadata, column statistics, and supports multi-branch
+  (UNION-ALL) tables.
+- **Multiple transports** — `LOCATION` accepts a bare command (subprocess, pooled per
+  DuckDB process), `http(s)://` (HTTP), `tcp://host:port` (raw TCP, including DNS
+  and bracketed IPv6), `unix:///path/to.sock` (AF_UNIX), or `launch:<argv>`
+  (launcher-managed shared worker), plus cached workers from GitHub releases,
+  OCI images, or a [`database://` package table](database-worker-transport.md).
+- **Pushdown** — projection, filter, `ORDER BY` + `LIMIT`, and join-key pushdown to
+  workers that opt in.
+- **Worker pooling** — subprocess workers are pooled and reused across queries, with
+  diagnostics (`vgi_worker_pool()`, `vgi_worker_pool_stats()`).
+- **Performance** — optional POSIX shared-memory transport for zero-copy batch transfer.
+- **Auth** — per-catalog OAuth / bearer tokens; OIDC identity introspection via
+  `vgi_oauth_identity()`.
+- **Remote secret provider** — a catalog can advertise a secret-service URL at `ATTACH`;
+  DuckDB then fetches S3/HTTP/etc. credentials *lazily* from that remote service under the
+  **same** identity (no `CREATE SECRET`), cached with a TTL bounded by the credential's
+  own expiry. See [Remote secret provider](#remote-secret-provider) below.
+
+See the [`docs/`](.) directory for deep dives on
+[multi-branch tables](multi_branch.md),
+[database-backed worker packages](database-worker-transport.md),
+[the launcher protocol](launcher-protocol.md),
+[catalog profiling](catalog_profiling.md), and more.
+
+## Building
+
+This extension uses VCPKG for dependency management and is built with multiple modules,
+so set `USE_MERGED_VCPKG_MANIFEST=1`. The Makefile auto-detects the VCPKG toolchain from
+`vcpkg/` in the project tree.
+
+```sh
+git clone --recurse-submodules https://github.com/Query-farm/vgi.git
+cd vgi
+
+# Debug build
+USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make debug
+
+# Release build
+USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make release
+```
+
+Installing [ccache](https://ccache.dev/) and [ninja](https://ninja-build.org/) is
+strongly recommended for fast incremental rebuilds.
+
+The build produces:
+
+```sh
+./build/release/duckdb                                    # DuckDB shell with the extension preloaded
+./build/release/test/unittest                             # test runner
+./build/release/extension/vgi/vgi.duckdb_extension        # the loadable extension
+```
+
+## Testing
+
+The extension supports two transports; subprocess is the faster default. Tests prefer the
+release build:
+
+```sh
+# Subprocess transport (default, faster)
+make test_launcher
+
+# HTTP transport
+make test_http
+
+# Both
+make test_all
+```
+
+The `VGI_TEST_WORKER` environment variable controls which worker is used and defaults to
+the `vgi-python` fixture worker. See the project root `CLAUDE.md` for the full matrix of
+test targets, debug builds, and environment variables.
+
+## Remote secret provider
+
+A VGI catalog can broker downstream credentials. When its `ATTACH` response advertises a
+secret-service URL (via the catalog `tags["vgi_secret_service_url"]`), the extension
+registers a custom DuckDB `SecretStorage` that resolves secrets **lazily** from that
+service — so a consumer like httpfs resolving an `s3://` path "just works" with **no
+`CREATE SECRET`**:
+
+```sql
+ATTACH 'orchard' AS orch (TYPE vgi, LOCATION 'https://orchard.example/');
+SELECT count(*) FROM 's3://bucket/data.parquet';   -- credentials fetched on demand
+```
+
+- **One identity** — the secret service is called under the *same* OAuth / bearer auth the
+  catalog established, so you authenticate once for both worker RPCs and credential fetches.
+- **Lazy + cached** — credentials are fetched on first use and cached with a TTL bounded by
+  the credential's own expiry (short-lived STS tokens are never served stale).
+- **Any value type** — string, int64, bool, struct, list, and nested values round-trip
+  through the Arrow→DuckDB bridge; the server marks sensitive keys `redact_keys` so they
+  are hidden in `duckdb_secrets()`.
+- **HTTPS required** — a remote secret broker must be reached over `https://` (only
+  `http://localhost` is allowed, for testing).
+- **Opt out per catalog** — add `secrets false` to the `ATTACH` options.
+
+Diagnostics: `vgi_secret_providers()` lists registered providers; `vgi_secret_provider_flush([catalog])`
+clears the TTL cache. The `vgi_secret_default_ttl_seconds` setting (default 300) bounds the
+cache when the server suggests no TTL. The remote service speaks a separate, independently
+versioned protocol (`VgiSecretProtocol`); the reference server is `vgi-secret-serve` in
+vgi-python. See [the design notes](remote_secret_provider_plan.md) for the full architecture.
+
+## Performance benchmarks
+
+For repeatable CPU/memory measurements, wide/long table workloads, allocation
+profiles and remote EC2 runs, see [the benchmark guide](../benchmarks/README.md).
+
+## License
+
+This project is licensed under the **Query Farm Source-Available License, Version 1.0**
+(Licensor: Query Farm LLC). Non-production use is freely permitted, as is production use —
+except for offering a Competing Offering or operating a Commercial Marketplace built on
+the Licensed Work, which require a separate commercial license. Each version converts to
+**Apache 2.0** on its Change Date (the tenth anniversary of that version's first public
+release). See [`LICENSE`](../LICENSE) for the full terms.
+
+For commercial or custom licensing, contact hello@query.farm.
