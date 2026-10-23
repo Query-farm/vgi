@@ -277,6 +277,10 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	// A3 serial opt-out: a worker that declares Meta.max_workers=1 keeps its
 	// streaming table-in-out on a single shared worker (MaxThreads()=1).
 	params.max_workers = vgi_info.function_info().max_workers.value_or(0);
+#ifdef VGI_DUCKDB2_INVOCATION_PROFILE
+	// The advertised capacity is an upper bound; this profile uses one substream.
+	params.max_workers = 1;
+#endif
 	// Blended (Phase B): the DECLARED positional arg names are the worker's input
 	// column names (it reads batch.column("<name>")). Re-parse the arguments schema
 	// to recover them (+ varargs flag) so bind can build the input schema by name.
@@ -330,7 +334,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 
 	for (const auto &func_info : overloads) {
 #ifdef VGI_DUCKDB2_INVOCATION_PROFILE
-		if (func_info.function_type == vgi::VgiFunctionType::TableBuffering || func_info.has_finalize || func_info.source_order_dependent || func_info.sink_order_dependent || func_info.requires_input_batch_index || func_info.max_workers.value_or(1) > 1 || func_info.supports_positions || func_info.supports_splits || func_info.supports_batch_index || func_info.partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
+		if (func_info.function_type == vgi::VgiFunctionType::TableBuffering || func_info.has_finalize || func_info.source_order_dependent || func_info.sink_order_dependent || func_info.requires_input_batch_index || func_info.supports_positions || func_info.supports_splits || func_info.supports_batch_index || func_info.partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
 			throw NotImplementedException("VGI DuckDB 2 invocation profile requires a synchronous producer or independent input_from_args row map: %s", func_info.name);
 		}
 #endif

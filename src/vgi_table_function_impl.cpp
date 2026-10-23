@@ -2734,7 +2734,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// -DVGI_ASYNC_INIT_ENABLED=1 restores the async path.
 	auto applied = perform_init_with_retry(std::move(connection), acquired.from_pool);
 #ifdef VGI_DUCKDB2_INVOCATION_PROFILE
-	if (applied.first.max_workers != 1) throw NotImplementedException("VGI DuckDB 2 invocation profile requires exactly one producer worker");
+	// max_workers is an upper bound, not a required degree of parallelism.
+	// The isolated profile always consumes the producer with one worker.
+	if (applied.first.max_workers < 1) throw InvalidInputException("VGI producer max_workers must be positive");
+	applied.first.max_workers = 1;
 #endif
 	global_state->global_execution_id = std::move(applied.first.execution_id);
 	global_state->max_processes = static_cast<idx_t>(applied.first.max_workers);
