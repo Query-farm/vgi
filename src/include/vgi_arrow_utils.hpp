@@ -121,7 +121,8 @@ void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow
 // Convert DuckDB ColumnList to Arrow Schema
 // This is the inverse of ArrowSchemaToColumnList: takes DuckDB column definitions
 // and produces an Arrow schema using DuckDB's ArrowConverter via the C ABI bridge.
-std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns);
+std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns,
+                                                          const std::string &owner_schema = "");
 
 // ============================================================================
 // DuckDB DataChunk / Type to Arrow Conversion

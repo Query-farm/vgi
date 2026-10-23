@@ -24,4 +24,4 @@ query II
 SELECT protocol_version, protocol_hash
 FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE protocol_name = 'vgi.v2';
 ----
-2.1.0	8003abf6447266f5bc59cca76bef09df661f35fbbf0b360f400d92fdd4b12aee
+2.1.0	457a2fc7c24a637480d2c34237ea0ccf826b10f4ea5e316d4623895f4a535585

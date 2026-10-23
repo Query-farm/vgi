@@ -142,5 +142,86 @@ does not exist
 statement ok
 DROP TABLE w.main.column_paths;
 
+# The canonical payload distinguishes an explicit NULL default/USING from
+# DROP DEFAULT and the absent ordinary-cast expression.
+statement ok
+CREATE TABLE w.main.expression_values (id INTEGER, temperature INTEGER DEFAULT 250);
+
+statement ok
+INSERT INTO w.main.expression_values (id) VALUES (1);
+
+statement ok
+ALTER TABLE w.main.expression_values ALTER COLUMN temperature TYPE DOUBLE USING temperature / 10.0;
+
+query IR
+SELECT id, temperature FROM w.main.expression_values;
+----
+1	25.0
+
+statement ok
+ALTER TABLE w.main.expression_values ALTER COLUMN temperature SET DEFAULT NULL;
+
+statement ok
+INSERT INTO w.main.expression_values (id) VALUES (2);
+
+query IR
+SELECT id, temperature FROM w.main.expression_values ORDER BY id;
+----
+1	25.0
+2	NULL
+
+statement ok
+ALTER TABLE w.main.expression_values ALTER COLUMN temperature TYPE INTEGER USING NULL;
+
+query II
+SELECT id, temperature FROM w.main.expression_values ORDER BY id;
+----
+1	NULL
+2	NULL
+
+statement ok
+ALTER TABLE w.main.expression_values ALTER COLUMN temperature TYPE BIGINT;
+
+statement ok
+ALTER TABLE w.main.expression_values ALTER COLUMN temperature SET DEFAULT abs(-7);
+
+statement ok
+INSERT INTO w.main.expression_values (id) VALUES (3);
+
+query II
+SELECT id, temperature FROM w.main.expression_values ORDER BY id;
+----
+1	NULL
+2	NULL
+3	7
+
+# Unsupported context and effects must not replace the durable prior default.
+statement ok
+SET default_order='desc';
+
+statement error
+ALTER TABLE w.main.expression_values ALTER COLUMN temperature SET DEFAULT 99;
+----
+default explicit evaluation context
+
+statement ok
+SET default_order='asc';
+
+statement error
+ALTER TABLE w.main.expression_values ALTER COLUMN temperature SET DEFAULT random();
+----
+unsupported scalar function
+
+statement ok
+INSERT INTO w.main.expression_values (id) VALUES (4);
+
+query II
+SELECT id, temperature FROM w.main.expression_values WHERE id = 4;
+----
+4	7
+
+statement ok
+DROP TABLE w.main.expression_values;
+
 statement ok
 DETACH w;

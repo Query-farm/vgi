@@ -340,6 +340,7 @@ src/vgi_table_buffering_impl.cpp
 src/vgi_catalog_api.cpp
 src/vgi_query_rpc.cpp
 src/vgi_constraint_contract.cpp
+src/vgi_column_expression.cpp
 src/vgi_index_contract.cpp
 src/vgi_query_function.cpp
 src/vgi_function_connection.cpp
@@ -652,6 +653,7 @@ if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
     test/cpp/test_schema_metadata.cpp
     test/cpp/test_query_bind.cpp
     test/cpp/test_constraint_contract.cpp
+    test/cpp/test_column_expression.cpp
     test/cpp/test_index_contract.cpp
     test/cpp/test_query_interrupt.cpp
     test/cpp/test_query_rpc.cpp

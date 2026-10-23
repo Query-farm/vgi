@@ -69,12 +69,16 @@ The remaining included work before freeze is:
 
 | Work | Selected direction | Remaining proof or implementation |
 | --- | --- | --- |
-| Column expressions and metadata | Change `catalog_table_column_default_set.expression` from string to required binary `SqlExpression` IPC; change `catalog_table_column_type_change.expression` to nullable binary using the same record. Preserve explicit DROP DEFAULT, existing base64 IPC field annotations, and the existing `comment`/`tags` metadata conventions. | Persistent CREATE/ADD/SET DEFAULT, virtual generation and USING need operation-specific capability checks, durable readback/rollback and matching native/SDK support. Validate tags as a string map without duplicate keys. Stored generated columns and engine compression enums are excluded. |
+| Column expressions and metadata | Implemented: `catalog_table_column_default_set.expression` is required binary `SqlExpression` IPC; `catalog_table_column_type_change.expression` is nullable binary using the same record. CREATE/ADD default annotations use the same canonical codec. These are mandatory successor representations, with no new capability checks. | Bounded durable reference, native 1.5 and SDK support are covered by the checkpoint below. Virtual generation and complete column-metadata semantics remain open. Validate tags as a string map without duplicate keys. Stored generated columns and engine compression enums are excluded. |
 | Default schema absence | Make the existing `CatalogAttachResult.default_schema` nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Preserve absence through worker, native adapter and all SDKs; reject on an adapter that cannot implement it. Never invent `main`, split dots, or introduce nested default search paths. |
 | Macro cleanup | Use one overload-family representation in the successor API; migrate legacy single-definition macros into one-element families before removing duplicate wire forms. | Port the native family consumer, preserve typed literal versus expression defaults and required evaluation context, then regenerate and test every SDK. Native 1.5 currently rejects family payloads. Function argument defaults are a different contract and remain intact. |
 | Optimizer preparation | Keep projection expressions/result mapping and repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | Filter v2 is a predicate contract, not a general scalar projection language. Prove typed scalar results, support decisions before optimizer replacement, slot/filter remapping, local residuals and query-scoped repeatability. The existing `table_function_plan` call occurs too late for remote decline. No proposed projection record is frozen yet. |
 
-Capability requirements attach to the actual operation and object semantics.
+The user withdrew the proposed DEFAULT/USING capability flags: this is an
+unpublished wire change, so it needs no additional opt-in. `SqlExpression.profile`
+still identifies SQL interpretation; it is not a permission flag. Existing
+nested-operation, transaction and constraint requirements remain applicable.
+Other capability requirements attach to the actual operation and object semantics.
 Do not add a generic `ObjectRequirements`, metadata mutation RPC, or transaction
 framework simply to close an inventory row. Dependency lifetime ownership does
 not implement SQL authorization ownership; owner transfer is explicitly deferred.
@@ -110,8 +114,8 @@ transactions or incompatible catalog definitions between versions. Rollback
 requires old-compatible catalog state or a tested restore/migration; switching
 a binary alone is insufficient. No version-aware router is required.
 
-**Next checkpoint:** implement the three concrete column/default-schema/macro
-changes above on 1.5, and prove the optimizer contracts before P1 closes. Then
+**Next checkpoint:** finish default-schema absence, macro-family consolidation
+and the remaining column semantics, and prove the optimizer contracts before P1 closes. Then
 complete all-SDK regeneration/conformance, capability matrices and the deployment
 exercise for P2/P3. Native 2.0 compilation and execution remain M0–M4 work.
 This review adds no wire fields, version bump, engine-pin update or runtime
@@ -120,6 +124,57 @@ qualification. Validation on the replacement EC2 `98.81.121.120` passed:
 scope mappings**, and all **11 manifest tests** pass. Logs are in
 `logs/protocol-review-20261023-SBCl67`. These are inventory checks, not proof of
 the unfinished P1 contracts or native2 behavior.
+
+### Column expression implementation — October 23, 2026
+
+The successor now carries canonical `SqlExpression` records for SET DEFAULT and
+USING, and the same base64 IPC record in CREATE/ADD default field metadata. Python
+public APIs accept the typed record; native and all six worker SDKs use the new
+binary request fields. The bundled browser client is regenerated. No new RPC,
+capability flag, protocol publication or engine-pin update is introduced.
+
+An absent USING payload requests an ordinary cast. A present expression with
+SQL `NULL` remains explicit; DROP DEFAULT keeps its existing operation. Owner,
+context, record shape and supported grammar are validated before mutation.
+TYPE-only definitions reject expression metadata recursively. The durable
+reference preserves definitions through readback, rollback, commit and reconnect;
+failed casts preserve both schema and rows. Signed HTTP and the CLI exercise the
+same public path, including attachments without a capability offer.
+
+Native 1.5 supports a bounded deterministic primitive scalar grammar and the
+explicit default evaluation context. Supported defaults are materialized as
+typed literals for native binding, while authoritative table metadata retains
+the original SQL/context. USING also supports numeric division. Generated,
+volatile and general SQL expressions remain unsupported. Static `Table.defaults`
+discovery retains its existing legacy adapter. The custom DuckDB transactor
+fixture cannot retain canonical context and explicitly rejects these expression
+operations; the durable column reference supplies the qualified mutation path.
+
+Build/test evidence is recorded in the companion manifest's
+`column_expression_checkpoint_2026_10_23` and remote
+`logs/column-expressions-20261023-JgPvmj`:
+
+- Python regression: **1,439 passed / 8 skipped**; final focused checks after
+  fixture and recursive metadata fixes: **85 passed**. Ruff, mypy (223 source
+  files), strict all-SDK generation and the 151-row manifest check pass.
+- Native production build and expression unit tests pass (**4 cases / 50
+  assertions**). Column/default/USING SQL and companion raw-path/view tests pass
+  (**3 cases / 251 assertions**).
+- Go: 62 corpus cases; Rust: 3 column tests; TypeScript: 3 tests and 97
+  assertions with each Arrow implementation plus its type build; Java: 16
+  tests; C#: 23 tests and solution build; C++: normal SDK/RPC build and 322
+  corpus assertions. The browser client is rebuilt and its digest recorded.
+- The broad native launcher run reported **384 passed / 3 failed**, with 37
+  skip markers. Updated protocol-hash and hostile row-ID constraint fixtures
+  subsequently pass **2 cases / 8 assertions**. One existing failure remains:
+  `schema_reconcile.test:40` publishes nested NOT NULL metadata that the 1.5
+  native constraint decoder rejects. Both source paths predate this change;
+  the fidelity assertions are retained. This is an open native qualification
+  issue, not a passing full regression run.
+
+This closes the DEFAULT/USING wire
+migration only. Nullable default schema, macro cleanup, optimizer contracts,
+broader column semantics, release qualification and native 2.0 remain open.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference

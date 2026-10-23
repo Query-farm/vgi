@@ -16,33 +16,28 @@ require vgi
 statement ok
 ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_ROWID_CONSTRAINT_WORKER}');
 
-query T
+statement error
 SELECT table_name FROM duckdb_tables() WHERE database_name = 'w' ORDER BY 1;
 ----
-items
-items_broken_returning
-items_insert_only
-items_no_returning
+constraint paths cannot address storage identities
 
-# row_id is skipped in a key, and a key left empty is dropped.
-query TTT
-SELECT table_name, constraint_type, constraint_column_names
-FROM duckdb_constraints()
-WHERE database_name = 'w' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')
-ORDER BY ALL;
+# Rejection is an ordinary input error and must not invalidate the database.
+query I
+SELECT 42;
 ----
-items_no_returning	PRIMARY KEY	[id]
-items_no_returning	UNIQUE	[name]
+42
 
-# The surviving key still satisfies DuckDB's ON CONFLICT binder...
-statement ok
-EXPLAIN INSERT INTO w.main.items_no_returning VALUES (1, 'a', 1) ON CONFLICT (id) DO NOTHING;
-
-# ...and the dropped one is simply absent.
+# Canonical constraints preserve their exact raw paths. Neither an all-rowid
+# key nor a mixed user-column/rowid key may become a partial SQL key.
 statement error
-INSERT INTO w.main.items VALUES (1, 'a', 1) ON CONFLICT DO NOTHING;
+SELECT * FROM w.main.items;
 ----
-There are no UNIQUE/PRIMARY KEY constraints that refer to this table
+constraint paths cannot address storage identities
+
+statement error
+SELECT * FROM w.main.items_no_returning;
+----
+constraint paths cannot address storage identities
 
 # The database is still usable.
 query I

@@ -338,19 +338,15 @@ void InvokeCatalogTableColumnCommentSet(
     ClientContext &context);
 
 // Invoke catalog_table_column_type_change: change a column's type in a table.
-void InvokeCatalogTableColumnTypeChange(
-    const CatalogRpcContext &ctx,
-    const std::string &schema_name, const std::string &table_name,
-    const std::shared_ptr<arrow::Schema> &column_definition,
-    const std::string &expression,
-    ClientContext &context);
+void InvokeCatalogTableColumnTypeChange(const CatalogRpcContext &ctx, const std::string &schema_name,
+                                        const std::string &table_name,
+                                        const std::shared_ptr<arrow::Schema> &column_definition,
+                                        const std::optional<std::vector<uint8_t>> &expression, ClientContext &context);
 
 // Invoke catalog_table_column_default_set: set a column's default expression.
-void InvokeCatalogTableColumnDefaultSet(
-    const CatalogRpcContext &ctx,
-    const std::string &schema_name, const std::string &table_name,
-    const std::string &column_name, const std::string &expression,
-    ClientContext &context);
+void InvokeCatalogTableColumnDefaultSet(const CatalogRpcContext &ctx, const std::string &schema_name,
+                                        const std::string &table_name, const std::string &column_name,
+                                        const std::vector<uint8_t> &expression, ClientContext &context);
 
 // Invoke catalog_table_column_default_drop: drop a column's default expression.
 void InvokeCatalogTableColumnDefaultDrop(

@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_column_expression.hpp"
 #include "vgi_query_rpc.hpp"
 #include "vgi_constraint_contract.hpp"
 #include "vgi_index_contract.hpp"
@@ -1376,25 +1377,21 @@ void InvokeCatalogTableColumnCommentSet(
 	InvokeVoidRpc(ctx, "catalog_table_column_comment_set", params, context);
 }
 
-void InvokeCatalogTableColumnTypeChange(
-    const CatalogRpcContext &ctx,
-    const std::string &schema_name, const std::string &table_name,
-    const std::shared_ptr<arrow::Schema> &column_definition,
-    const std::string &expression,
-    ClientContext &context) {
+void InvokeCatalogTableColumnTypeChange(const CatalogRpcContext &ctx, const std::string &schema_name,
+                                        const std::string &table_name,
+                                        const std::shared_ptr<arrow::Schema> &column_definition,
+                                        const std::optional<std::vector<uint8_t>> &expression, ClientContext &context) {
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
 	auto params = generated::BuildCatalogTableColumnTypeChangeParams(
 	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-	    std::vector<std::string> {column_definition->field(0)->name()}, column_bytes, OptStrIfNonEmpty(expression),
+	    std::vector<std::string> {column_definition->field(0)->name()}, column_bytes, expression,
 	    /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_type_change", params, context);
 }
 
-void InvokeCatalogTableColumnDefaultSet(
-    const CatalogRpcContext &ctx,
-    const std::string &schema_name, const std::string &table_name,
-    const std::string &column_name, const std::string &expression,
-    ClientContext &context) {
+void InvokeCatalogTableColumnDefaultSet(const CatalogRpcContext &ctx, const std::string &schema_name,
+                                        const std::string &table_name, const std::string &column_name,
+                                        const std::vector<uint8_t> &expression, ClientContext &context) {
 	auto params = generated::BuildCatalogTableColumnDefaultSetParams(
 	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, std::vector<std::string> {column_name}, expression,
 	    /*ignore_not_found=*/false, OptTxn(ctx));
@@ -3373,9 +3370,13 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	}
 
 	if (table_info.arrow_schema) {
+		auto type_schema = NativeColumnTypeSchema(table_info.arrow_schema, schema_name);
 		if (table_info.row_id_column >= 0) {
 			// Convert the row_id field type to DuckDB LogicalType
 			auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
+			if (ReadNativeColumnDefault(rowid_field, schema_name)) {
+				throw InvalidInputException("VGI column expression: a row ID cannot declare a default");
+			}
 			auto rowid_schema = arrow::schema({rowid_field});
 			ArrowSchemaWrapper c_schema;
 			ArrowTableSchema arrow_table;
@@ -3388,13 +3389,13 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			std::vector<std::shared_ptr<arrow::Field>> filtered_fields;
 			for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
 				if (i != table_info.row_id_column) {
-					filtered_fields.push_back(table_info.arrow_schema->field(i));
+					filtered_fields.push_back(type_schema->field(i));
 				}
 			}
 			auto filtered_schema = arrow::schema(filtered_fields);
 			ArrowSchemaToColumnList(context, filtered_schema, create_info.columns);
 		} else {
-			ArrowSchemaToColumnList(context, table_info.arrow_schema, create_info.columns);
+			ArrowSchemaToColumnList(context, type_schema, create_info.columns);
 		}
 	}
 
@@ -3494,6 +3495,12 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			}
 			auto &col = create_info.columns.GetColumnMutable(LogicalIndex(adjusted));
 
+			// Canonical defaults were validated before type conversion. Preserve
+			// their meaning and never fall back to legacy SQL when a record is present.
+			auto canonical_default = BindNativeColumnDefault(context, arrow_field, schema_name, col.Type());
+			if (canonical_default) {
+				col.SetDefaultValue(std::move(canonical_default));
+			}
 			// Generated expression (mutually exclusive with default)
 			auto gen_idx = arrow_field->metadata()->FindKey(VGI_GENERATED_EXPRESSION_METADATA_KEY);
 			if (gen_idx >= 0) {
@@ -3502,7 +3509,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 				if (!gen_expressions.empty()) {
 					col.SetGeneratedExpression(std::move(gen_expressions[0]));
 				}
-			} else {
+			} else if (arrow_field->metadata()->FindKey(VGI_COLUMN_DEFAULT) < 0) {
 				// Default value (only for non-generated columns)
 				auto default_idx = arrow_field->metadata()->FindKey("default");
 				if (default_idx >= 0) {

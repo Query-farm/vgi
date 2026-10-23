@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_constraint_contract.hpp"
+#include "vgi_column_expression.hpp"
 #include "vgi_index_contract.hpp"
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/main/settings.hpp"
@@ -18,6 +19,9 @@
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 
 #include "storage/vgi_catalog.hpp"
@@ -278,7 +282,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	auto &context = transaction.GetContext();
 
 	// The shared encoder preserves defaults for both CREATE and ADD COLUMN.
-	auto columns_schema = vgi::DuckDBColumnsToArrowSchema(context, create_info.columns);
+	auto columns_schema = vgi::DuckDBColumnsToArrowSchema(context, create_info.columns, name);
 
 	// The binder accepts case-insensitive SQL spellings. Resolve referenced FK
 	// coordinates to actual catalog names before the raw-path wire boundary.
@@ -554,7 +558,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		// Convert single column to Arrow schema
 		ColumnList single_col;
 		single_col.AddColumn(add_col.new_column.Copy());
-		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col);
+		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col, schema_name);
 		vgi::InvokeCatalogTableColumnAdd(rpc_ctx, schema_name, table_name, col_schema,
 		                                  add_col.if_column_not_exists, context);
 		break;
@@ -583,17 +587,45 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		ColumnList single_col;
 		single_col.AddColumn(ColumnDefinition(change_type.column_name, change_type.target_type));
 		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col);
-		auto expression_str = change_type.expression ? change_type.expression->ToString() : "";
-		vgi::InvokeCatalogTableColumnTypeChange(rpc_ctx, schema_name, table_name, col_schema,
-		                                         expression_str, context);
+		std::optional<std::vector<uint8_t>> expression;
+		// DuckDB 1.5 synthesizes CAST(column AS target) for an omitted USING.
+		// Normalize that exact ordinary cast to absence. Explicit USING NULL
+		// remains a present SqlExpression, never a request to skip evaluation.
+		bool ordinary_cast = false;
+		if (change_type.expression && change_type.expression->GetExpressionClass() == ExpressionClass::CAST) {
+			auto &cast = change_type.expression->Cast<CastExpression>();
+			auto cast_type = cast.cast_type;
+			if (cast_type.id() == LogicalTypeId::UNBOUND) {
+				auto &type = UnboundType::GetTypeExpression(cast_type);
+				if (type->GetExpressionClass() == ExpressionClass::TYPE) {
+					auto &name = type->Cast<TypeExpression>();
+					if (name.GetCatalog().empty() && name.GetSchema().empty()) {
+						cast_type = UnboundType::TryDefaultBind(cast_type);
+					}
+				}
+			}
+			if (!cast.try_cast && cast_type == change_type.target_type &&
+			    cast.child->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				auto &column = cast.child->Cast<ColumnRefExpression>();
+				ordinary_cast = column.column_names.size() == 1 &&
+				                StringUtil::CIEquals(column.column_names[0], change_type.column_name);
+			}
+		}
+		if (change_type.expression && !ordinary_cast) {
+			expression = vgi::BuildNativeColumnExpression(change_type.expression->ToString(), schema_name,
+			                                              vgi::NativeColumnEvaluationContext(context), true);
+		}
+		vgi::InvokeCatalogTableColumnTypeChange(rpc_ctx, schema_name, table_name, col_schema, expression, context);
 		break;
 	}
 	case AlterTableType::SET_DEFAULT: {
 		auto &set_def = alter_table.Cast<SetDefaultInfo>();
 		if (set_def.expression) {
 			// SET DEFAULT
-			vgi::InvokeCatalogTableColumnDefaultSet(rpc_ctx, schema_name, table_name, set_def.column_name,
-			                                         set_def.expression->ToString(), context);
+			auto expression = vgi::BuildNativeColumnExpression(set_def.expression->ToString(), schema_name,
+			                                                   vgi::NativeColumnEvaluationContext(context), false);
+			vgi::InvokeCatalogTableColumnDefaultSet(rpc_ctx, schema_name, table_name, set_def.column_name, expression,
+			                                        context);
 		} else {
 			// DROP DEFAULT (null expression)
 			vgi::InvokeCatalogTableColumnDefaultDrop(rpc_ctx, schema_name, table_name, set_def.column_name,

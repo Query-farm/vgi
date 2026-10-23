@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_arrow_utils.hpp"
+#include "vgi_column_expression.hpp"
 #include "vgi_protocol_constants.hpp"
 #include "vgi_rpc_types.hpp"
 
@@ -193,7 +194,8 @@ void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow
 	}
 }
 
-std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns) {
+std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns,
+                                                          const std::string &owner_schema) {
 	vector<LogicalType> types;
 	vector<string> names;
 
@@ -220,7 +222,9 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 		auto field = schema->field(static_cast<int>(index++));
 		if (col.HasDefaultValue()) {
 			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
-			metadata->Append("default", col.DefaultValue().ToString());
+			auto expression = BuildNativeColumnExpression(col.DefaultValue().ToString(), owner_schema,
+			                                              NativeColumnEvaluationContext(context), false);
+			metadata->Append(VGI_COLUMN_DEFAULT, EncodeNativeColumnDefaultMetadata(expression));
 			field = field->WithMetadata(metadata);
 		}
 		fields.push_back(field);

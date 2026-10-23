@@ -11,6 +11,7 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_column_expression.hpp"
 #include "vgi_constraint_contract.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_function_connection.hpp"
@@ -485,7 +486,9 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 
 	// Build input schema (table columns minus row_id)
 	auto &table_info = table->GetTableInfo();
-	auto input_schema = table_info.arrow_schema;
+	// Catalog defaults have already been validated and bound by the table
+	// adapter. Value streams carry their physical types, not SQL definitions.
+	auto input_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 	if (table_info.row_id_column >= 0) {
 		auto fields = input_schema->fields();
 		fields.erase(fields.begin() + table_info.row_id_column);
@@ -526,7 +529,7 @@ unique_ptr<LocalSinkState> VgiPhysicalInsert::GetLocalSinkState(ExecutionContext
 	// return_chunk is always false so the response schema is only used for count output.
 	if (insert_table) {
 		auto &table_info = insert_table->GetTableInfo();
-		auto response_schema = table_info.arrow_schema;
+		auto response_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 		if (table_info.row_id_column >= 0) {
 			auto fields = response_schema->fields();
 			fields.erase(fields.begin() + table_info.row_id_column);
@@ -645,7 +648,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	    });
 
 	auto &table_info = table.GetTableInfo();
-	auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
+	auto value_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
+	auto rowid_field = value_schema->field(table_info.row_id_column);
 	auto input_schema = arrow::schema({rowid_field});
 
 	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
@@ -655,7 +659,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	if (return_chunk) {
 		// DELETE RETURNING surfaces the deleted rows in the table's user-column
 		// schema (sans rowid). Same shape used by GetLocalSinkState below.
-		auto response_schema = table_info.arrow_schema;
+		auto response_schema = value_schema;
 		if (table_info.row_id_column >= 0) {
 			auto fields = response_schema->fields();
 			fields.erase(fields.begin() + table_info.row_id_column);
@@ -678,7 +682,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 
 unique_ptr<LocalSinkState> VgiPhysicalDelete::GetLocalSinkState(ExecutionContext &context) const {
 	auto &table_info = table.GetTableInfo();
-	auto response_schema = table_info.arrow_schema;
+	auto response_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 	if (table_info.row_id_column >= 0) {
 		auto fields = response_schema->fields();
 		fields.erase(fields.begin() + table_info.row_id_column);
@@ -786,6 +790,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 
 	auto &table_info = table.GetTableInfo();
 	auto &table_columns = table.GetColumns();
+	auto value_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 
 	// For each updated column, look the field up by name in the worker's
 	// declared table schema rather than re-deriving via DuckDB's Arrow
@@ -796,15 +801,15 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	std::vector<std::shared_ptr<arrow::Field>> send_fields;
 	for (auto &col_idx : columns) {
 		auto &col = table_columns.GetColumn(col_idx);
-		auto declared_idx = table_info.arrow_schema->GetFieldIndex(col.Name());
+		auto declared_idx = value_schema->GetFieldIndex(col.Name());
 		if (declared_idx >= 0) {
-			send_fields.push_back(table_info.arrow_schema->field(declared_idx));
+			send_fields.push_back(value_schema->field(declared_idx));
 		} else {
 			auto arrow_type = BuildArrowSchemaFromDuckDB(context, {col.Type()}, {col.Name()});
 			send_fields.push_back(arrow_type->field(0));
 		}
 	}
-	auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
+	auto rowid_field = value_schema->field(table_info.row_id_column);
 	send_fields.push_back(rowid_field);
 
 	auto input_schema = arrow::schema(send_fields);
@@ -816,7 +821,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	if (return_chunk) {
 		// UPDATE RETURNING surfaces the updated rows in the table's user-column
 		// schema (sans rowid). Same shape used by GetLocalSinkState below.
-		auto response_schema = table_info.arrow_schema;
+		auto response_schema = value_schema;
 		if (table_info.row_id_column >= 0) {
 			auto fields = response_schema->fields();
 			fields.erase(fields.begin() + table_info.row_id_column);
@@ -839,7 +844,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 
 unique_ptr<LocalSinkState> VgiPhysicalUpdate::GetLocalSinkState(ExecutionContext &context) const {
 	auto &table_info = table.GetTableInfo();
-	auto response_schema = table_info.arrow_schema;
+	auto response_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 	if (table_info.row_id_column >= 0) {
 		auto fields = response_schema->fields();
 		fields.erase(fields.begin() + table_info.row_id_column);
