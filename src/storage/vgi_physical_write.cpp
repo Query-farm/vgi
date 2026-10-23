@@ -11,6 +11,7 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_constraint_contract.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_logging.hpp"
@@ -29,6 +30,9 @@ template <typename FetchFn>
 static vgi::VgiScanFunctionResult ResolveWriteFunction(
     ClientContext &context, VgiTableEntry &table, const char *operation,
     const std::optional<vgi::VgiScanFunctionResult> &inlined, FetchFn &&fetch) {
+	// Covers CTAS as well as INSERT/UPDATE/DELETE, before either inlined use or
+	// fallback discovery. Reading trusted facts grants no write authority.
+	vgi::RequireNativeConstraintWrite(*table.GetCatalog().Cast<VgiCatalog>().attach_result(), table.GetTableInfo());
 	if (inlined.has_value()) {
 		VGI_LOG(context, "vgi.write_function.inlined",
 		        {{"schema", table.GetTableInfo().schema_name},

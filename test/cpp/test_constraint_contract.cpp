@@ -4,8 +4,10 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/parser/constraints/check_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "vgi_constraint_contract.hpp"
+#include "vgi_catalog_rpc.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "../../src/generated/vgi_protocol_schemas.hpp"
@@ -49,6 +51,33 @@ std::vector<uint8_t> GetDefinition(const vgi::VgiTableInfo &table) {
 	auto batch = vgi::DeserializeFromIpcBytes(table.constraints[0]);
 	vgi::RecordBatchSingleRow row(batch, 0, "ConstraintInfo", "test");
 	return row["definition"].value_not_null<std::vector<uint8_t>>();
+}
+std::vector<uint8_t> CheckExpression(const std::string &sql = "budget >= 0") {
+	auto context = arrow::StructArray::Make(
+	    {vgi::BuildStringScalar("UTC"), vgi::BuildStringScalar("binary"), vgi::BuildStringScalar("asc"),
+	     vgi::BuildStringScalar("nulls_last"), vgi::BuildBoolScalar(true)},
+	    vgi::generated::QueryEvaluationContextSchema()->fields()).ValueOrDie();
+	return vgi::SerializeToIpcBytes(arrow::RecordBatch::Make(
+	    vgi::generated::SqlExpressionSchema(), 1,
+	    {vgi::BuildStringScalar(sql), vgi::BuildStringScalar(vgi::VGI_CONSTRAINT_SCALAR_READ),
+	     vgi::BuildStringListScalar({"main"}), context}));
+}
+vgi::VgiTableInfo CheckTable(const std::vector<uint8_t> &expression = CheckExpression()) {
+	auto strings = std::make_shared<arrow::StringBuilder>();
+	auto inner = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), strings);
+	arrow::ListBuilder paths(arrow::default_memory_pool(), inner);
+	REQUIRE(paths.Append().ok());
+	auto definition = vgi::SerializeToIpcBytes(arrow::RecordBatch::Make(
+	    vgi::generated::ConstraintDefinitionSchema(), 1,
+	    {vgi::BuildEnumArray("CHECK", {"NOT_NULL", "UNIQUE", "PRIMARY_KEY", "CHECK", "FOREIGN_KEY"}),
+	     paths.Finish().ValueOrDie(), arrow::MakeArrayOfNull(arrow::utf8(), 1).ValueOrDie(),
+	     vgi::BuildBinaryScalarRequired(expression), vgi::BuildOptionalBinaryScalar(std::nullopt)}));
+	vgi::VgiTableInfo table;
+	table.schema_name = "main";
+	table.name = "t";
+	table.arrow_schema = arrow::schema({arrow::field("budget", arrow::float64())});
+	table.constraints = {ConstraintRecord(definition)};
+	return table;
 }
 } // namespace
 
@@ -130,6 +159,99 @@ TEST_CASE("Native constraint capability selection rejects unoffered profiles", "
 	CHECK_THROWS(vgi::ParseNativeConstraintCapabilities(result, vgi::SerializeToIpcBytes(batch)));
 	vgi::CatalogAttachResult empty;
 	CHECK_THROWS(vgi::RequireNativeConstraintCapabilities(empty, "read"));
+}
+
+TEST_CASE("Canonical read facts do not grant constrained write or mutation authority", "[constraint-contract]") {
+	auto table = NativeTable();
+	vgi::DecodeNativeConstraints(table);
+	vgi::CatalogAttachResult attached;
+	attached.constraint_profiles = {vgi::VGI_CONSTRAINT_READ};
+	CHECK_NOTHROW(vgi::RequireNativeConstraintRead(attached, table));
+	// The count-mode fallback and an inlined function must not confer authority.
+	table.write_result_modes["insert"] = "count";
+	for (const auto *operation : {vgi::VGI_CONSTRAINT_CREATE, vgi::VGI_CONSTRAINT_MUTATE}) {
+		attached.constraint_profiles.insert(operation);
+		CHECK_THROWS(vgi::RequireNativeConstraintCapabilities(attached, operation));
+	}
+	CHECK_THROWS(vgi::RequireNativeConstraintWrite(attached, table));
+	attached.constraint_profiles.insert(vgi::VGI_CONSTRAINT_ENFORCE);
+	CHECK_NOTHROW(vgi::RequireNativeConstraintWrite(attached, table));
+	CHECK_NOTHROW(vgi::RequireNativeConstraintCapabilities(attached, vgi::VGI_CONSTRAINT_MUTATE));
+	table.constraints.clear();
+	CHECK_NOTHROW(vgi::RequireNativeConstraintWrite({}, table));
+}
+
+TEST_CASE("Canonical numeric CHECK read requires the selected profile and binds Boolean", "[constraint-contract]") {
+	DuckDB db(nullptr);
+	Connection connection(db);
+	REQUIRE_FALSE(connection.Query("BEGIN")->HasError());
+	for (const auto &sql : {"budget >= 0", "BUDGET < 1.5", "budget = budget", "budget <> 0", "0 <= budget"}) {
+		auto table = CheckTable(CheckExpression(sql));
+		vgi::DecodeNativeConstraints(table);
+		REQUIRE(table.check_constraints == std::vector<std::string> {sql});
+		vgi::CatalogAttachResult attached;
+		attached.constraint_profiles = {vgi::VGI_CONSTRAINT_READ};
+		CHECK_THROWS(vgi::RequireNativeConstraintRead(attached, table));
+		attached.constraint_profiles.insert(vgi::VGI_CONSTRAINT_SCALAR_READ);
+		CHECK_NOTHROW(vgi::RequireNativeConstraintRead(attached, table));
+		auto create = vgi::CreateTableInfoFromVgiTable(*connection.context, table, "main");
+		REQUIRE(create.constraints.size() == 1);
+		CHECK(create.constraints[0]->type == ConstraintType::CHECK);
+		CHECK_THROWS(vgi::EncodeNativeConstraints(create, table.arrow_schema));
+	}
+	auto table = CheckTable();
+	vgi::DecodeNativeConstraints(table);
+	table.arrow_schema = arrow::schema({arrow::field("budget", arrow::float64())->WithMetadata(
+	    arrow::key_value_metadata({"generated_expression"}, {"1.0"}))});
+	CHECK_THROWS(vgi::CreateTableInfoFromVgiTable(*connection.context, table, "main"));
+	REQUIRE_FALSE(connection.Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE("Canonical CHECK rejects unqualified SQL semantics and malformed envelopes", "[constraint-contract]") {
+	for (const auto &sql : {"budget", "42", "true", "budget + 1 > 0", "abs(budget) > 0",
+	                        "budget >= CAST(0 AS DOUBLE)", "budget > '0'", "budget > ?", "t.budget > 0",
+	                        "missing > 0", "(SELECT 1) > 0", "budget > 0 AS ok", "budget > 0, 1 = 1",
+	                        "budget > 0; SELECT 1", "budget > 0 FROM other", "budget > 0 WHERE true",
+	                        "budget > 0 ORDER BY 1", "budget > 0 AND budget < 10"}) {
+		INFO(sql);
+		auto table = CheckTable(CheckExpression(sql));
+		CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	}
+	for (const auto &type : {arrow::utf8(), arrow::boolean(), arrow::timestamp(arrow::TimeUnit::SECOND)}) {
+		auto table = CheckTable();
+		table.arrow_schema = arrow::schema({arrow::field("budget", type)});
+		CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	}
+	auto table = CheckTable();
+	table.row_id_column = 0;
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	table = CheckTable();
+	table.arrow_schema = arrow::schema({arrow::field("budget", arrow::float64()), arrow::field("BUDGET", arrow::float64())});
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	auto expression = vgi::DeserializeFromIpcBytes(CheckExpression());
+	for (int index : {1, 2}) {
+		auto columns = expression->columns();
+		columns[index] = index == 1 ? vgi::BuildStringScalar("vgi.expression.unsupported.v1")
+		                           : vgi::BuildStringListScalar({"other"});
+		table = CheckTable(vgi::SerializeToIpcBytes(arrow::RecordBatch::Make(expression->schema(), 1, columns)));
+		CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	}
+	auto context = std::static_pointer_cast<arrow::StructArray>(expression->column(3));
+	for (int index = 0; index < 5; ++index) {
+		auto settings = context->fields();
+		settings[index] = index == 4 ? vgi::BuildBoolScalar(false) : vgi::BuildStringScalar("unsupported");
+		auto columns = expression->columns();
+		columns[3] = arrow::StructArray::Make(settings, vgi::generated::QueryEvaluationContextSchema()->fields()).ValueOrDie();
+		table = CheckTable(vgi::SerializeToIpcBytes(arrow::RecordBatch::Make(expression->schema(), 1, columns)));
+		CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	}
+	auto bytes = CheckExpression();
+	bytes.push_back(0);
+	table = CheckTable(bytes);
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	table = CheckTable();
+	table.constraints = {ConstraintRecord(GetDefinition(table), "key", "METADATA_ONLY", "UNVALIDATED")};
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
 }
 
 TEST_CASE("Canonical constraint paths cannot discard NULL components", "[constraint-contract]") {

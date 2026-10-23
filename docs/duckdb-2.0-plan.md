@@ -905,10 +905,11 @@ mutable SDK providers reject constrained creation or mutation before effects.
 
 The 1.5 adapter translates top-level NOT_NULL, UNIQUE, PRIMARY_KEY and same-schema
 MATCH SIMPLE NO_ACTION/RESTRICT foreign keys. SET/DROP NOT NULL uses the canonical
-apply RPC with stable provider identity and revision checks. CHECK and nested
-constraints reject at this native boundary; public reference CHECK coverage does
-not qualify native SQL translation. Default/generated metadata translation also
-remains pending. The reference exposes catalog operations and DDL transactions;
+apply RPC with stable provider identity and revision checks. At this checkpoint,
+CHECK and nested constraints rejected at the native boundary; the October 23
+checkpoint below subsequently qualifies a bounded numeric CHECK read subset.
+CHECK creation and nested constraints remain unsupported. Default/generated
+metadata translation also remains pending. The reference exposes catalog operations and DDL transactions;
 row enforcement is proven through its provider authority, with no public DML
 adapter advertised.
 
@@ -1258,7 +1259,7 @@ checks. All builds/tests ran on EC2; the engine remains pinned to
 transaction framework or savepoints, changes no COMMIT/ROLLBACK retry policy,
 and closes no P0–P3 or M0–M4 release gate.
 
-The final full launcher integration run is not green: 242 actual passes,
+The October 22 full launcher integration run was not green: 242 actual passes,
 66 failures and 59 skips (the runner includes skips in its 301 reported passes).
 Of those failures, 63 are CHECK-expression negotiation and one is the
 constraint read/enforcement gate; unchanged baseline sources and representative
@@ -1268,6 +1269,84 @@ current-source reruns, leaving their cause unresolved. Whole-repo Python lint
 and mypy pass; formatting reports one unchanged baseline file. These broader
 limits do not replace the focused transaction evidence above. Logs are in
 `logs/transactional-writes-20261022-2ke59i/integration.log` and `quality/`.
+
+**Constraint read negotiation checkpoint (2026-10-23; verified on pinned 1.5)**
+
+Native discovery now requires the canonical constraint read profile without
+requiring write-enforcement authority. Immutable provider facts still require
+ENFORCED/ALL_ROWS, valid stable identities and matching Arrow nullability.
+The Python fixture already validates its immutable rows against those facts;
+its read-only capability selection is unchanged. Normal enumeration, individual
+table lookup and time-travel lookup all apply the native read gate.
+
+The native client now offers `vgi.expression.duckdb.scalar.v1` in the read
+category for a deliberately bounded CHECK subset: one Boolean comparison
+(`=`, `<>`, `<`, `>`, `<=` or `>=`) whose operands are primitive signed numeric
+columns (including FLOAT/DOUBLE) or numeric constants. Exact SQL/context
+records, the owning flat schema and the declared evaluation context
+(UTC, binary, asc, nulls_last, preserve_insertion_order=true) are validated.
+Each expression is then bound against the actual table
+columns without implicitly casting its result to Boolean. The accepted numeric
+subset does not depend on session collation or time zone.
+
+Functions, casts, qualified or ambiguous references, generated/extension-typed
+operands, non-Boolean expressions, additional SQL clauses/statements and other
+contexts reject explicitly. The selected scalar read profile is checked on
+every table materialization path; offering it does not qualify general scalar
+expressions, CHECK creation or expression-bearing DDL. No constraints are
+silently removed or downgraded.
+
+Constrained INSERT/UPDATE/DELETE/MERGE now have an explicit enforcement gate at
+planning, with a physical write guard before either inlined function use or
+fallback discovery (including CTAS). Read access therefore cannot authorize a
+write. Constraint creation/mutation and unique-index DDL retain their enforcement
+requirements; unique-index discovery requires read authority only.
+
+EC2 validation passed **16 C++ constraint/index cases, 415 assertions**, and
+**four focused SQL integration probes, 308 assertions with no skips**. These
+cover canonical CHECK discovery, time travel, read-only constrained INSERT
+rejection without changing stored rows, and the unsupported-expression and
+capability boundaries. Logs are under
+`/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/logs/regressions-20261023-6SzJ8G`.
+The subsequent full launcher rerun passes **308 executed cases and 11,538
+assertions, with zero failures and 59 environment-dependent skips**. This
+supersedes the earlier run's failure status for this tested configuration;
+the skipped transports/fixtures remain unqualified. The engine pin remains
+`105edd31b57fe7e6d32ee648efad562e45a9f908`. No wire fields, protocol version,
+transaction framework or release-gate status changed.
+
+**Scan truncation checkpoint (2026-10-23; launcher and subprocess)**
+
+A deterministic worker-exit probe reproduced a silent data-loss bug: a producer
+terminated after its first valid batch, yet the native client reported successful
+counts of zero (filtered-empty batch) or 100 (nonempty batch) from an incomplete
+10,000-row scan. Arrow permits physical EOF at a message boundary, but VGI's
+wire contract requires explicit Arrow EOS. Function connections now require
+complete reads from their raw FD input, turning a disconnect before EOS into an
+I/O error. Other FD-reader callers retain their previous behavior; this is not
+a wire-format or retry-policy change.
+
+The [scan probe](../test/run_scan_truncation_probe.py) passes all **12 cases**
+across launcher and subprocess transports: drops after empty, nonempty and split
+batches fail without a successful aggregate result; healthy pagination, a
+zero-row result and a scan traversing 99 empty batches complete normally.
+The copied pre-fix binary reproduces the two silent partial results. Its split
+drop fails later while closing the next split's input, whereas the fixed reader
+reports missing EOS at the interrupted split. Artifacts are under
+`logs/scan-investigation-20261023-t8GYBQ`.
+
+The exact trigger of the earlier spontaneous pagination disconnect remains
+unproven. Nine predecessor cases and 30 same-session stress cycles did not
+reproduce it; the final full suite passes both pagination and filter pushdown.
+A separate launcher idle-shutdown race was reproduced in installed RPC 0.50.0,
+but the original suite lasted 174 seconds, shorter than its 300-second idle
+timeout, so it is not attributed to that failure. Its evidence remains at
+`logs/idle-race-audit-eREs07` for a separate dependency fix; no RPC dependency
+changes were made here.
+
+Whole-repo Python lint and mypy pass; formatting still reports one unchanged
+baseline file. The manifest's `regression_checkpoint_2026_10_23` records exact
+source/binary hashes, logs, full-suite counts and these qualification limits.
 
 Changing existing parameter types and adding required column targets makes the
 current combined wire diff **breaking**. If retained, it requires a major

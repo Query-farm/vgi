@@ -225,8 +225,8 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
 #if VGI_SUBPROCESS_TRANSPORT
 
 // FdInputStream implementation
-FdInputStream::FdInputStream(int fd, ClientContext *context)
-    : fd_(fd), position_(0), is_open_(true), context_(context)
+FdInputStream::FdInputStream(int fd, ClientContext *context, bool require_complete_reads)
+    : fd_(fd), position_(0), is_open_(true), context_(context), require_complete_reads_(require_complete_reads)
 #if defined(_WIN32)
       ,
       read_event_(::CreateEvent(nullptr, TRUE, FALSE, nullptr))
@@ -361,6 +361,10 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 	}
 
 	position_ += total_bytes_read;
+	if (require_complete_reads_ && total_bytes_read != nbytes) {
+		return arrow::Status::IOError("Unexpected transport EOF before Arrow EOS marker: read ", total_bytes_read,
+		                              " of ", nbytes, " bytes");
+	}
 	return total_bytes_read;
 }
 

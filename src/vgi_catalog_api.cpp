@@ -3463,14 +3463,6 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		}
 	}
 
-	// Apply CHECK constraints
-	for (auto &expr_str : table_info.check_constraints) {
-		auto expressions = Parser::ParseExpressionList(expr_str);
-		if (!expressions.empty()) {
-			create_info.constraints.push_back(make_uniq<CheckConstraint>(expressions[0]->Copy()));
-		}
-	}
-
 	// Apply FOREIGN KEY constraints
 	for (auto &fk : table_info.foreign_key_constraints) {
 		ForeignKeyInfo fk_info;
@@ -3530,6 +3522,9 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		}
 	}
 
+	// Bind after column metadata is applied so generated columns cannot be
+	// mistaken for the physical numeric operands qualified by this read profile.
+	AppendNativeCheckConstraints(context, table_info, create_info);
 	return create_info;
 }
 

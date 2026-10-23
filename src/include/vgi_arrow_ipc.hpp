@@ -82,7 +82,7 @@ std::shared_ptr<arrow::Buffer> TranscodeIpcWithCodec(const std::shared_ptr<arrow
 // NON-OWNING: Does not close the fd on destruction. The caller retains ownership.
 class FdInputStream : public arrow::io::InputStream {
 public:
-	explicit FdInputStream(int fd, ClientContext *context = nullptr);
+	explicit FdInputStream(int fd, ClientContext *context = nullptr, bool require_complete_reads = false);
 	~FdInputStream() override;
 
 	arrow::Status Close() override;
@@ -96,6 +96,9 @@ private:
 	int64_t position_;
 	bool is_open_;
 	ClientContext *context_;
+	// VGI data streams terminate with an explicit Arrow EOS marker. Reject a
+	// physical EOF before Arrow reads that marker, including at batch boundaries.
+	bool require_complete_reads_;
 #if defined(_WIN32)
 	void *read_event_; // manual-reset event for overlapped reads (HANDLE)
 #endif

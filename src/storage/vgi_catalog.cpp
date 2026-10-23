@@ -24,6 +24,7 @@
 #include "storage/vgi_table_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_constraint_contract.hpp"
 #include "vgi_companion_catalogs.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
@@ -45,6 +46,7 @@ static int WriteResultModeRank(const string &mode) {
 }
 
 static void RequireWriteResultMode(const VgiTableEntry &table, const string &operation, bool return_chunk) {
+	vgi::RequireNativeConstraintWrite(*table.GetCatalog().Cast<VgiCatalog>().attach_result(), table.GetTableInfo());
 	const auto requested = return_chunk ? "rows" : "count";
 	const auto &modes = table.GetTableInfo().write_result_modes;
 	auto entry = modes.find(operation);

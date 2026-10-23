@@ -103,7 +103,8 @@ void RequireNativeIndexCapabilities(const CatalogAttachResult &result, const cha
                                     bool unique, bool transaction) {
 	Require(result.constraint_profiles.count(VGI_INDEX_READ) && result.constraint_profiles.count(operation),
 	        "index profile was not negotiated");
-	if (unique) RequireNativeConstraintCapabilities(result, "read");
+	if (unique) RequireNativeConstraintCapabilities(result,
+	    std::string(operation) == VGI_INDEX_READ ? "read" : VGI_CONSTRAINT_ENFORCE);
 	if (transaction) Require(result.constraint_profiles.count("vgi.transaction.ddl.v1"),
 	                         "index DDL in a transaction requires vgi.transaction.ddl.v1");
 }

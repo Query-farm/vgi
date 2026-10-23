@@ -200,6 +200,22 @@ PRIMARY KEY	4
 UNIQUE	2
 
 # ============================================================================
+# Reading immutable constraint facts does not authorize constrained writes.
+# This must fail at native planning, before fallback write-function discovery.
+# Count mode has no RETURNING requirement to accidentally mask the missing gate.
+# ============================================================================
+
+statement error
+INSERT INTO example.data.departments (id, name, budget) VALUES (99, 'unauthorized', 100);
+----
+constraint enforcement profile was not negotiated
+
+query I
+SELECT count(*) FROM example.data.departments;
+----
+3
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

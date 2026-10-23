@@ -78,6 +78,8 @@ TEST_CASE("Native index CREATE uses typed parent and explicit profiles", "[index
 	CHECK_THROWS(vgi::RequireNativeIndexCapabilities(attached, vgi::VGI_INDEX_CREATE, true));
 	CHECK_THROWS(vgi::RequireNativeIndexCapabilities(attached, vgi::VGI_INDEX_CREATE, false, true));
 	attached.constraint_profiles.insert(vgi::VGI_CONSTRAINT_READ);
+	CHECK_NOTHROW(vgi::RequireNativeIndexCapabilities(attached, vgi::VGI_INDEX_READ, true));
+	CHECK_THROWS(vgi::RequireNativeIndexCapabilities(attached, vgi::VGI_INDEX_CREATE, true));
 	attached.constraint_profiles.insert(vgi::VGI_CONSTRAINT_ENFORCE);
 	attached.constraint_profiles.insert("vgi.transaction.ddl.v1");
 	CHECK_NOTHROW(vgi::RequireNativeIndexCapabilities(attached, vgi::VGI_INDEX_CREATE, true, true));

@@ -9,6 +9,15 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
+#include "duckdb/parser/constraints/check_constraint.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression_binder/check_binder.hpp"
 #include <arrow/util/byte_size.h>
 #include <set>
 #include <algorithm>
@@ -141,11 +150,105 @@ void Records(const std::vector<std::vector<uint8_t>> &records) {
 		Require(size <= MAX_BYTES, "constraint collection exceeds size limit");
 	}
 }
+
+// The read profile is deliberately bounded to numeric comparisons. No function,
+// cast, collation, subquery, parameter or external name resolution is qualified.
+// These expressions are independent of the reader's session evaluation settings.
+void NumericOperand(const ParsedExpression &expression, const VgiTableInfo &info) {
+	Require(!expression.HasAlias(), "CHECK expressions cannot have aliases");
+	if (expression.GetExpressionClass() == ExpressionClass::CONSTANT) {
+		const auto &value = expression.Cast<ConstantExpression>().value;
+		Require(!value.IsNull() && value.type().IsNumeric(), "CHECK requires numeric operands");
+		return;
+	}
+	Require(expression.GetExpressionClass() == ExpressionClass::COLUMN_REF,
+	        "native CHECK read supports only numeric column/constant comparisons");
+	const auto &names = expression.Cast<ColumnRefExpression>().column_names;
+	Require(names.size() == 1, "CHECK requires unqualified column references");
+	int index = -1;
+	for (int i = 0; i < info.arrow_schema->num_fields(); ++i) {
+		if (StringUtil::CIEquals(info.arrow_schema->field(i)->name(), names[0])) {
+			Require(index < 0, "ambiguous CHECK column reference");
+			index = i;
+		}
+	}
+	Require(index >= 0 && index != info.row_id_column, "CHECK references a missing or synthetic column");
+	const auto &field = info.arrow_schema->field(index);
+	Require(!field->metadata() || !field->metadata()->Contains("ARROW:extension:name"),
+	        "CHECK extension-typed operands are unsupported");
+	switch (field->type()->id()) {
+	case arrow::Type::INT8:
+	case arrow::Type::INT16:
+	case arrow::Type::INT32:
+	case arrow::Type::INT64:
+	case arrow::Type::FLOAT:
+	case arrow::Type::DOUBLE:
+		return;
+	default:
+		throw InvalidInputException("VGI constraint protocol: CHECK requires primitive signed numeric columns");
+	}
+}
+unique_ptr<ParsedExpression> ParseNumericCheck(const std::string &sql, const VgiTableInfo &info) {
+	Require(!sql.empty() && sql.size() <= 1024 * 1024 && sql.find('\0') == std::string::npos,
+	        "invalid CHECK SQL size or text");
+	Parser parser;
+	parser.ParseQuery("SELECT " + sql);
+	Require(parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT,
+	        "CHECK requires exactly one scalar expression");
+	auto &node = parser.statements[0]->Cast<SelectStatement>().node;
+	Require(node->type == QueryNodeType::SELECT_NODE, "CHECK requires exactly one scalar expression");
+	auto &select = node->Cast<SelectNode>();
+	Require(select.select_list.size() == 1 && select.from_table &&
+	            select.from_table->type == TableReferenceType::EMPTY_FROM && select.modifiers.empty() &&
+	            select.cte_map.map.empty() && !select.where_clause && select.groups.group_expressions.empty() &&
+	            select.groups.grouping_sets.empty() && !select.having && !select.qualify && !select.sample,
+	        "CHECK requires exactly one scalar expression without query clauses");
+	auto expression = std::move(select.select_list[0]);
+	Require(!expression->HasAlias() && expression->GetExpressionClass() == ExpressionClass::COMPARISON,
+	        "native CHECK read supports only Boolean numeric comparisons");
+	switch (expression->GetExpressionType()) {
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_NOTEQUAL:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		break;
+	default:
+		throw InvalidInputException("VGI constraint protocol: unsupported CHECK comparison");
+	}
+	auto &comparison = expression->Cast<ComparisonExpression>();
+	NumericOperand(*comparison.left, info);
+	NumericOperand(*comparison.right, info);
+	return expression;
+}
+std::string ReadCheck(const std::vector<uint8_t> &bytes, const VgiTableInfo &info) {
+	auto expression = Decode(bytes, generated::SqlExpressionSchema());
+	RecordBatchSingleRow row(expression, 0, "SqlExpression", "constraint");
+	Require(row["profile"].value_not_null<std::string>() == VGI_CONSTRAINT_SCALAR_READ,
+	        "unsupported CHECK expression profile");
+	Require(row["schema_path"].value_not_null<std::vector<std::string>>() ==
+	            std::vector<std::string> {info.schema_name}, "CHECK expression belongs to another schema");
+	auto context = std::static_pointer_cast<arrow::StructArray>(expression->GetColumnByName("evaluation_context"));
+	Require(!context->IsNull(0), "CHECK requires an evaluation context");
+	auto batch = arrow::RecordBatch::Make(generated::QueryEvaluationContextSchema(), 1, context->fields());
+	Strict(batch, generated::QueryEvaluationContextSchema());
+	RecordBatchSingleRow settings(batch, 0, "QueryEvaluationContext", "constraint");
+	Require(settings["timezone"].value_not_null<std::string>() == "UTC" &&
+	            settings["collation"].value_not_null<std::string>() == "binary" &&
+	            settings["default_order"].value_not_null<std::string>() == "asc" &&
+	            settings["default_null_order"].value_not_null<std::string>() == "nulls_last" &&
+	            settings["preserve_insertion_order"].value_not_null<bool>(),
+	        "unsupported CHECK evaluation context");
+	auto sql = row["sql"].value_not_null<std::string>();
+	ParseNumericCheck(sql, info);
+	return sql;
+}
 } // namespace
 
 std::vector<uint8_t> BuildNativeConstraintCapabilities() {
 	return Encode(generated::CatalogCapabilitiesSchema(),
-	              {BuildStringListScalar({VGI_CONSTRAINT_READ, VGI_INDEX_READ}),
+	              {BuildStringListScalar({VGI_CONSTRAINT_READ, VGI_CONSTRAINT_SCALAR_READ, VGI_INDEX_READ}),
 	               BuildStringListScalar({VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE, VGI_INDEX_CREATE, VGI_INDEX_DROP}),
 	               BuildStringListScalar({VGI_CONSTRAINT_ENFORCE}), BuildStringListScalar({"vgi.transaction.ddl.v1"})});
 }
@@ -154,7 +257,7 @@ void ParseNativeConstraintCapabilities(CatalogAttachResult &result, const std::v
 		return;
 	auto batch = Decode(bytes, generated::CatalogCapabilitiesSchema());
 	RecordBatchSingleRow row(batch, 0, "CatalogCapabilities", "constraint");
-	std::map<std::string, std::set<std::string>> offered {{"read", {VGI_CONSTRAINT_READ, VGI_INDEX_READ}},
+	std::map<std::string, std::set<std::string>> offered {{"read", {VGI_CONSTRAINT_READ, VGI_CONSTRAINT_SCALAR_READ, VGI_INDEX_READ}},
 	                                                      {"ddl", {VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE, VGI_INDEX_CREATE, VGI_INDEX_DROP}},
 	                                                      {"write", {VGI_CONSTRAINT_ENFORCE}},
 	                                                      {"transaction", {"vgi.transaction.ddl.v1"}}};
@@ -178,12 +281,23 @@ void ParseNativeConstraintCapabilities(CatalogAttachResult &result, const std::v
 	}
 }
 void RequireNativeConstraintCapabilities(const CatalogAttachResult &result, const char *operation) {
-	Require(result.constraint_profiles.count(VGI_CONSTRAINT_READ) &&
-	            result.constraint_profiles.count(VGI_CONSTRAINT_ENFORCE),
-	        "constraint read/enforcement profiles were not negotiated");
+	Require(result.constraint_profiles.count(VGI_CONSTRAINT_READ), "constraint read profile was not negotiated");
 	if (std::string(operation) != "read") {
+		Require(result.constraint_profiles.count(VGI_CONSTRAINT_ENFORCE),
+		        "constraint enforcement profile was not negotiated");
 		Require(result.constraint_profiles.count(operation), "constraint operation profile was not negotiated");
 	}
+}
+void RequireNativeConstraintRead(const CatalogAttachResult &result, const VgiTableInfo &info) {
+	if (!info.constraints.empty())
+		RequireNativeConstraintCapabilities(result, "read");
+	if (!info.check_constraints.empty())
+		Require(result.constraint_profiles.count(VGI_CONSTRAINT_SCALAR_READ),
+		        "CHECK scalar read profile was not negotiated");
+}
+void RequireNativeConstraintWrite(const CatalogAttachResult &result, const VgiTableInfo &info) {
+	if (!info.constraints.empty())
+		RequireNativeConstraintCapabilities(result, VGI_CONSTRAINT_ENFORCE);
 }
 
 void ValidateNativeConstraintList(const std::shared_ptr<arrow::Array> &array, int64_t row) {
@@ -229,14 +343,18 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 		}
 		auto foreign = def["foreign_key"].value_or(std::vector<uint8_t>());
 		auto target_bytes = row["referenced_constraint"].value_or(std::vector<uint8_t>());
-		Require(definition->GetColumnByName("check_expression")->IsNull(0) && kind != "CHECK",
-		        "native 1.5 canonical CHECK expression profiles are not yet supported");
-		Require(!names.empty(), "constraint requires column paths");
-		Require(kind == "NOT_NULL" || kind == "UNIQUE" || kind == "PRIMARY_KEY" || kind == "FOREIGN_KEY",
+		Require((kind == "CHECK") == !definition->GetColumnByName("check_expression")->IsNull(0),
+		        "inconsistent CHECK payload");
+		Require(kind == "CHECK" ? names.empty() : !names.empty(), "invalid constraint column paths");
+		Require(kind == "NOT_NULL" || kind == "UNIQUE" || kind == "PRIMARY_KEY" || kind == "FOREIGN_KEY" || kind == "CHECK",
 		        "unknown constraint kind");
 		Require((kind == "FOREIGN_KEY") == !definition->GetColumnByName("foreign_key")->IsNull(0) &&
 		            (kind == "FOREIGN_KEY") == !batch->GetColumnByName("referenced_constraint")->IsNull(0),
 		        "inconsistent FK payload");
+		if (kind == "CHECK") {
+			info.check_constraints.push_back(ReadCheck(def["check_expression"].value_not_null<std::vector<uint8_t>>(), info));
+			continue;
+		}
 		std::vector<int> indices;
 		for (const auto &name : names) {
 			auto index = info.arrow_schema->GetFieldIndex(name);
@@ -280,6 +398,31 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 			Require(info.arrow_schema->field(i)->nullable() == !required.count(i),
 			        "Arrow nullability disagrees with canonical NOT_NULL/PRIMARY_KEY");
 		}
+	}
+}
+
+void AppendNativeCheckConstraints(ClientContext &context, const VgiTableInfo &info, CreateTableInfo &create) {
+	for (const auto &sql : info.check_constraints) {
+		auto expression = ParseNumericCheck(sql, info);
+		// Bind only against this table's physical primitive columns. No generated
+		// expression expansion or session/catalog function lookup is qualified.
+		auto &comparison = expression->Cast<ComparisonExpression>();
+		for (const auto *operand : {comparison.left.get(), comparison.right.get()}) {
+			if (operand->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				const auto &name = operand->Cast<ColumnRefExpression>().column_names[0];
+				const auto &column = create.columns.GetColumn(name);
+				Require(!column.Generated() && column.Type().IsNumeric(), "unsupported bound CHECK column type");
+			}
+		}
+		auto binder = Binder::CreateBinder(context);
+		physical_index_set_t columns;
+		CheckBinder check_binder(*binder, context, create.table, create.columns, columns);
+		// DuckDB's CHECK binder normally casts to INTEGER; require an actual Boolean.
+		check_binder.target_type = LogicalType::INVALID;
+		auto copy = expression->Copy();
+		auto bound = check_binder.Bind(copy);
+		Require(bound->return_type == LogicalType::BOOLEAN, "CHECK must bind to BOOLEAN");
+		create.constraints.push_back(make_uniq<CheckConstraint>(std::move(expression)));
 	}
 }
 

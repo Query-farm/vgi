@@ -569,7 +569,10 @@ std::shared_ptr<arrow::io::InputStream> FunctionConnection::TransportInput() {
 	if (!proc_) {
 		throw InternalException("VGI byte transport is not connected");
 	}
-	return std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_);
+	// Arrow accepts physical EOF at a message boundary as normal stream end.
+	// VGI requires explicit EOS: a disconnected socket or wrapper process must
+	// not make an interrupted producer look like a complete (possibly empty) result.
+	return std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_, /*require_complete_reads=*/true);
 }
 
 std::shared_ptr<arrow::io::OutputStream> FunctionConnection::TransportOutput() {
