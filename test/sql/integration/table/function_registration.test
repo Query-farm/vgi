@@ -111,7 +111,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   path only, NOT a data Table; backs the C++ concurrency bench + the S8/S5 guards;
 #   see cache/disk_streaming.test + cache/entry_cap.test)
 # 2 parallel/order cache fixtures (cache_parallel — multi-worker cacheable, one
-#   substream per worker, backs cache/parallel_capture.test + cache/parallel_2gb.test_slow;
+#   substream per worker, backs cache/parallel_capture.test + cache/parallel_spill_stream.test_slow;
 #   cache_ordered — FIXED_ORDER/supports_batch_index cacheable, backs cache/ordered_serve.test;
 #   cache_ordered is ALSO a data Table but that surfaces as a table, not a table function)
 # 3 spill-coverage cache fixtures (cache_types — nested/wide/NULL columns through the

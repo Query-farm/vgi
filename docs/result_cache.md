@@ -106,7 +106,7 @@ budget mid-spill → `reason=disk_entry_too_large`. Files: `VgiCaptureDiskWriter
 `BeginStreamingCapture`/`CommitStreamingCapture`/`AbortStreamingCapture` in `vgi_result_cache.cpp`; the
 spill wiring (`VgiResultCaptureCtx.disk_writer`/`spilling`, `InstallBatch`, gstate dtor) in
 `vgi_table_function_impl.cpp`. Tests: `cache/spill.test` (fast, parallel + single-producer) +
-`cache/parallel_2gb.test_slow` (2 GB end to end).
+`cache/parallel_spill_stream.test_slow` (640 MB end to end, served under a 256 MB memory limit).
 
 **Streaming disk serve for results larger than RAM (S8).** On an in-memory miss, `Lookup` first
 `PeekDiskRefBytes` (a cheap ref read): entries **≤ `max_entry_bytes`** take `LoadFromDisk` (materialize

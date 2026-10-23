@@ -1,5 +1,5 @@
 # name: test/sql/integration/cache/spill.test
-# description: VGI result cache (spill-to-disk) — a capture that exceeds max_entry_bytes with the disk tier on SPILLS to a streaming disk blob instead of aborting, keeping RAM flat at ~max_entry_bytes. Covers single-producer (cache_big) and parallel (cache_parallel, one substream per worker) spill at a small, fast scale; the >2 GB flat-RAM proof is parallel_2gb.test_slow.
+# description: VGI result cache (spill-to-disk) — a capture that exceeds max_entry_bytes with the disk tier on SPILLS to a streaming disk blob instead of aborting, keeping RAM flat at ~max_entry_bytes. Covers single-producer (cache_big) and parallel (cache_parallel, one substream per worker) spill at a small, fast scale; the at-scale flat-RAM proof is parallel_spill_stream.test_slow.
 # group: [vgi_integration_cache]
 
 require-env VGI_TEST_WORKER
