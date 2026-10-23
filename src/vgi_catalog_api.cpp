@@ -2,6 +2,7 @@
 #include "vgi_settings_defaults.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_column_expression.hpp"
+#include "vgi_column_metadata.hpp"
 #include "vgi_macro_contract.hpp"
 #include "vgi_query_rpc.hpp"
 #include "vgi_constraint_contract.hpp"
@@ -1282,6 +1283,7 @@ void InvokeCatalogTableCreate(
     const std::string &on_conflict,
     const std::vector<std::vector<uint8_t>> &constraint_definitions,
     ClientContext &context) {
+	ValidateNativeColumnMetadata(columns_schema);
 	auto request_batch =
 	    BuildTableCreateRequest(ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, columns_schema,
 	                            on_conflict, constraint_definitions, ctx.transaction_opaque_data);
@@ -1330,6 +1332,7 @@ void InvokeCatalogTableColumnAdd(
     const std::shared_ptr<arrow::Schema> &column_definition,
     bool if_column_not_exists,
     ClientContext &context) {
+	ValidateNativeColumnMetadata(column_definition);
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
 	auto params = generated::BuildCatalogTableColumnAddParams(
 	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
@@ -2710,6 +2713,7 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 	// Parse the columns field which contains a serialized Arrow schema
 	auto columns_data = row["columns"].value_not_null<std::vector<uint8_t>>();
 	info.arrow_schema = DeserializeSchema(columns_data);
+	ValidateNativeColumnMetadata(info.arrow_schema);
 
 	// Detect is_row_id field metadata
 	for (int i = 0; i < info.arrow_schema->num_fields(); i++) {
@@ -3483,11 +3487,8 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 				}
 			}
 
-			// Column comment (applies to both generated and non-generated)
-			auto comment_idx = arrow_field->metadata()->FindKey("comment");
-			if (comment_idx >= 0) {
-				col.SetComment(Value(arrow_field->metadata()->value(comment_idx)));
-			}
+			// ArrowSchemaToColumnList imported validated comments before any
+			// table entry is published, preserving missing versus empty text.
 		}
 	}
 

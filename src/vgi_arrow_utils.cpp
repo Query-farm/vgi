@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_arrow_utils.hpp"
 #include "vgi_column_expression.hpp"
+#include "vgi_column_metadata.hpp"
 #include "vgi_protocol_constants.hpp"
 #include "vgi_rpc_types.hpp"
 
@@ -180,6 +181,7 @@ void ArrowSchemaToDuckDBTypes(ClientContext &context, const std::shared_ptr<arro
 
 void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow::Schema> &schema,
                              ColumnList &columns) {
+	ValidateNativeColumnMetadata(schema);
 	// Use temporary structures for the conversion
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
@@ -190,7 +192,13 @@ void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow
 
 	// Populate the ColumnList
 	for (idx_t i = 0; i < types.size(); i++) {
-		columns.AddColumn(ColumnDefinition(names[i], types[i]));
+		ColumnDefinition column(names[i], types[i]);
+		auto metadata = ReadNativeColumnMetadata(schema->field(static_cast<int>(i)));
+		if (metadata.comment)
+			column.SetComment(Value(*metadata.comment));
+		// Pinned 1.5 exposes no public column-tags API. The authoritative Arrow
+		// schema retains tags; reconstructing only a ColumnList cannot carry them.
+		columns.AddColumn(std::move(column));
 	}
 }
 
@@ -211,15 +219,21 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 		// A profile for creating generated/compressed columns has not been negotiated.
 		// Refuse the operation before RPC rather than reconstructing an ordinary column.
 		if (col.Generated()) {
-			throw NotImplementedException("VGI generated-column creation requires a supported column definition profile");
+			throw NotImplementedException(
+			    "VGI generated-column creation requires a supported column definition profile");
 		}
 		if (col.CompressionType() != CompressionType::COMPRESSION_AUTO) {
 			throw NotImplementedException("VGI does not support non-default column compression");
 		}
-		if (!col.Comment().IsNull()) {
-			throw NotImplementedException("VGI inline column comments require a supported column definition profile");
-		}
 		auto field = schema->field(static_cast<int>(index++));
+		if (!col.Comment().IsNull()) {
+			if (col.Comment().type() != LogicalType::VARCHAR) {
+				throw InvalidInputException("VGI column metadata: native column comment must be a string");
+			}
+			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
+			metadata->Append("comment", col.Comment().GetValue<std::string>());
+			field = field->WithMetadata(metadata);
+		}
 		if (col.HasDefaultValue()) {
 			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
 			auto expression = BuildNativeColumnExpression(col.DefaultValue().ToString(), owner_schema,
@@ -229,7 +243,9 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 		}
 		fields.push_back(field);
 	}
-	return arrow::schema(fields, schema->metadata());
+	auto result = arrow::schema(fields, schema->metadata());
+	ValidateNativeColumnMetadata(result);
+	return result;
 }
 
 // ============================================================================

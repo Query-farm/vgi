@@ -69,7 +69,7 @@ The remaining included work before freeze is:
 
 | Work | Selected direction | Remaining proof or implementation |
 | --- | --- | --- |
-| Column expressions and metadata | Implemented: `catalog_table_column_default_set.expression` is required binary `SqlExpression` IPC; `catalog_table_column_type_change.expression` is nullable binary using the same record. CREATE/ADD default annotations use the same canonical codec. These are mandatory successor representations, with no new capability checks. | Bounded durable reference, native 1.5 and SDK support are covered by the checkpoint below. Virtual generation and complete column-metadata semantics remain open. Validate tags as a string map without duplicate keys. Stored generated columns and engine compression enums are excluded. |
+| Column expressions and metadata | Implemented: canonical DEFAULT/USING payloads and CREATE/ADD default annotations; strict `comment`/`tags` Arrow metadata on CREATE, ADD and discovery. These are mandatory successor representations, with no new capability checks. | Virtual generation and its dependency/type semantics remain open. Native 1.5 carries comments; tags remain in authoritative Arrow metadata because its column API lacks public tag access. Stored generated columns and engine compression enums are excluded. |
 | Default schema absence | Implemented: `CatalogAttachResult.default_schema` is nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Python and SDKs preserve absence; native 1.5 rejects it before publishing the attachment. Native 2.0 optional-default execution remains part of the later adapter port. Never invent `main`, split dots, or introduce nested default search paths. |
 | Macro cleanup | Implemented: required nonempty overload families replace the duplicate parent definition fields. Simple macros use one-element families through local authoring helpers. No family-only capability check. | Native 1.5 loads complete scalar/table families; typed defaults, declarations, docs and owner context remain distinct. Native SQL CREATE MACRO, general dependency extraction and broader body/context support remain separate qualification work. Function argument defaults are unchanged. |
 | Optimizer preparation | Keep projection expressions/result mapping and repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | Filter v2 is a predicate contract, not a general scalar projection language. Prove typed scalar results, support decisions before optimizer replacement, slot/filter remapping, local residuals and query-scoped repeatability. The existing `table_function_plan` call occurs too late for remote decline. No proposed projection record is frozen yet. |
@@ -114,7 +114,7 @@ transactions or incompatible catalog definitions between versions. Rollback
 requires old-compatible catalog state or a tested restore/migration; switching
 a binary alone is insufficient. No version-aware router is required.
 
-**Next checkpoint:** finish the remaining column semantics
+**Next checkpoint:** finish virtual generated-column semantics
 and prove the optimizer contracts before P1 closes. Then
 complete all-SDK regeneration/conformance, capability matrices and the deployment
 exercise for P2/P3. Native 2.0 compilation and execution remain M0–M4 work.
@@ -248,6 +248,42 @@ browser rebuild, strict generation and all **11 manifest tests** pass.
 The engine pin remains DuckDB 1.5.x;
 this is successor-protocol preparation, not native 2.0 qualification or a public
 protocol release.
+
+### Column comments and tags — October 23, 2026
+
+CREATE, ADD COLUMN and discovery now share strict validation for the existing
+Arrow field keys `comment` and `tags`. Comments are literal UTF-8; tags are a
+JSON object of string keys and values. Missing annotations remain different
+from an empty comment or explicit `{}`. Duplicate decoded JSON keys, malformed
+encoding/JSON, unpaired surrogates and non-string values reject before provider
+effects or table publication. The existing unique Arrow metadata-key rule
+remains. Validation traverses nested fields without rewriting accepted values
+or unrelated valid metadata.
+
+The Python API provides small authoring/validation helpers, and the existing
+durable column reference retains metadata through transaction snapshots and
+reconnect. Native 1.5 sends comments through CREATE/ADD and preserves them on
+discovery and COPY; tagged Arrow definitions retain their authoritative schema
+through both catalog discovery paths. Its `ColumnDefinition` stores tags
+privately without public accessors, so native SQL tag authoring/introspection
+and preservation through native-column-only reconstruction remain engine-port
+work. Nested annotations likewise remain in Arrow metadata where no native
+column API can express them.
+
+This checkpoint introduces no RPC, record layout, protocol version, engine-pin
+change or capability flag. The proposed `vgi.column.metadata.create.v1` opt-in
+is withdrawn. Virtual generated columns and their dependency/type rules remain
+separate work. Exact proof and repository revisions are recorded in
+`column_metadata_checkpoint_2026_10_23` in the companion manifest and remote
+`logs/column-metadata-20261023-6KZ8Vg`.
+
+Validation passed on EC2: the shared 4-valid/27-invalid schema corpus across
+all six SDKs; 183 new native assertions plus existing column/catalog regressions;
+and Python's focused tests and broader regression run. Go's Arrow reader needed
+a repair to preserve MAP child metadata, with endianness and registered-extension
+round trips checked. Unsupported MAP entries-field metadata rejects explicitly.
+Generated record layouts and the protocol fingerprint remain unchanged. The
+manifest records exact counts, skips and corrected test-only failures.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference
