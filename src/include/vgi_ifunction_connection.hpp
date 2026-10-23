@@ -12,6 +12,7 @@
 
 #include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
 
 #include "vgi_arrow_utils.hpp"
@@ -23,6 +24,27 @@ namespace duckdb {
 class ClientContext;
 
 namespace vgi {
+
+// Continued table-in-out output: a reply's ``vgi.status`` says more output follows
+// for the same input, and a zero-row input carrying ``vgi.status: CONTINUE`` asks
+// for it. See IFunctionConnection::GetLastMoreOutput / WriteContinuationTick.
+inline constexpr const char *VGI_STATUS_KEY = "vgi.status";
+inline constexpr const char *VGI_STATUS_HAVE_MORE_OUTPUT = "HAVE_MORE_OUTPUT";
+inline constexpr const char *VGI_STATUS_CONTINUE = "CONTINUE";
+
+// Whether a data batch's metadata says ``vgi.status: HAVE_MORE_OUTPUT``.
+inline bool HasMoreOutputStatus(const std::shared_ptr<const arrow::KeyValueMetadata> &metadata) {
+	if (!metadata) {
+		return false;
+	}
+	const int idx = metadata->FindKey(VGI_STATUS_KEY);
+	return idx >= 0 && metadata->value(idx) == VGI_STATUS_HAVE_MORE_OUTPUT;
+}
+
+// The metadata a continuation tick carries.
+inline std::shared_ptr<arrow::KeyValueMetadata> ContinuationTickMetadata() {
+	return arrow::KeyValueMetadata::Make({VGI_STATUS_KEY}, {VGI_STATUS_CONTINUE});
+}
 
 class PooledWorker;
 struct VgiAttachParameters;
@@ -313,6 +335,23 @@ public:
 	virtual const std::string &GetLastParentRowBytes() const {
 		static const std::string kEmpty;
 		return kEmpty;
+	}
+
+	// Continued output (table-in-out exchange). True when the most recent data
+	// batch carried ``vgi.status: HAVE_MORE_OUTPUT``: the worker has more output for
+	// the same input batch, and the only valid next input is a continuation tick
+	// (WriteContinuationTick). Every such reply's parent_row indexes that same input.
+	// Set inside ``ReadDataBatch``. Default false: connections that never reach a
+	// worker (cached replay) never continue.
+	virtual bool GetLastMoreOutput() const {
+		return false;
+	}
+
+	// Ask for the next batch of the last input's output: write a zero-row input
+	// batch carrying ``vgi.status: CONTINUE``, then ReadDataBatch reads the reply.
+	// Valid only right after a reply for which GetLastMoreOutput() was true.
+	virtual void WriteContinuationTick() {
+		throw NotImplementedException("This VGI connection type cannot continue an exchange's output");
 	}
 
 	// Parsed `vgi.cache.*` cache-control advertisement observed on the most

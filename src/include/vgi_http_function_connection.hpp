@@ -134,6 +134,10 @@ public:
 	const std::string &GetLastParentRowBytes() const override {
 		return last_parent_row_bytes_;
 	}
+	bool GetLastMoreOutput() const override {
+		return last_more_output_;
+	}
+	void WriteContinuationTick() override;
 	VgiCacheControl GetLastCacheControl() const override {
 		return last_cache_control_;
 	}
@@ -294,6 +298,10 @@ private:
 
 	// Exchange mode pending input
 	std::shared_ptr<arrow::RecordBatch> pending_input_;
+	// pending_input_ is a continuation tick: its request carries vgi.status: CONTINUE.
+	bool pending_tick_ = false;
+	// Whether the most recent exchange reply said vgi.status: HAVE_MORE_OUTPUT.
+	bool last_more_output_ = false;
 	bool input_writer_opened_ = false;
 	bool input_writer_closed_ = false;
 

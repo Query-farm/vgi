@@ -994,6 +994,7 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	last_batch_index_ = DConstants::INVALID_INDEX;
 	last_partition_values_bytes_.clear();
 	last_cache_control_ = {};
+	last_more_output_ = false;
 
 	// NOT cleared, deliberately: the SAB slot and its rings (the transport),
 	// tick_filter_state_ (a shared gstate object PerformInit never touches, so
@@ -1227,6 +1228,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// Parse vgi.cache.* cache-control off the wire metadata (first-batch only
 		// in practice; read via GetLastCacheControl on the first batch).
 		last_cache_control_ = ParseVgiCacheControl(result.custom_metadata);
+		last_more_output_ = HasMoreOutputStatus(result.custom_metadata);
 
 		// Committed to returning this batch — send the next tick now so the worker
 		// produces the next batch while DuckDB consumes this one.
@@ -1304,6 +1306,25 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 		fields.emplace_back("function_name", function_name_);
 		fields.emplace_back("input_schema_fields", std::to_string(input_schema_->num_fields()));
 		VGI_LOG(context_, "function_connection.input_writer_opened", fields);
+	}
+}
+
+void WebWorkerFunctionConnection::WriteContinuationTick() {
+	if (!input_writer_opened_ || input_writer_closed_) {
+		ThrowVgiIOException("WebWorkerFunctionConnection::WriteContinuationTick called without an open input writer",
+		                    location_, -1, GetExecutionIdHex());
+	}
+	auto tick = arrow::RecordBatch::MakeEmpty(input_schema_);
+	if (!tick.ok()) {
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr),
+		                          "Failed to build continuation tick: %s", location_, -1, GetExecutionIdHex(),
+		                          tick.status().ToString());
+	}
+	auto write_status = input_writer_->WriteRecordBatch(*tick.ValueUnsafe(), ContinuationTickMetadata());
+	if (!write_status.ok()) {
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr),
+		                          "Failed to write continuation tick: %s", location_, -1, GetExecutionIdHex(),
+		                          write_status.ToString());
 	}
 }
 

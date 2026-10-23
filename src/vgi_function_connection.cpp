@@ -1110,6 +1110,7 @@ void FunctionConnection::ResetForNextSplit() {
 	last_partition_values_bytes_.clear();
 	last_parent_row_bytes_.clear();
 	last_cache_control_ = {};
+	last_more_output_ = false;
 	cond_if_none_match_.clear();
 	cond_if_modified_since_.clear();
 
@@ -1463,6 +1464,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// lockstep timing as last_batch_index_). Cheap: a few FindKeys, only on
 		// the data-batch path; present=false when no vgi.cache.* key is set.
 		last_cache_control_ = ParseVgiCacheControl(result.custom_metadata);
+		last_more_output_ = HasMoreOutputStatus(result.custom_metadata);
 
 		// We're committed to returning this data batch. NOW send the next tick —
 		// after FreeAllocation + shm resolve above — so the worker's allocator
@@ -1550,6 +1552,25 @@ void FunctionConnection::OpenInputWriter() {
 		fields.emplace_back("function_name", function_name_);
 		fields.emplace_back("input_schema_fields", std::to_string(input_schema_->num_fields()));
 		VGI_LOG(context_, "function_connection.input_writer_opened", fields);
+	}
+}
+
+void FunctionConnection::WriteContinuationTick() {
+	if (!input_writer_opened_ || input_writer_closed_) {
+		ThrowVgiIOException("FunctionConnection::WriteContinuationTick called without an open input writer", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
+	}
+	auto tick = arrow::RecordBatch::MakeEmpty(input_schema_);
+	if (!tick.ok()) {
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr),
+		                         "Failed to build continuation tick: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                         GetExecutionIdHex(), tick.status().ToString());
+	}
+	auto write_status = input_writer_->WriteRecordBatch(*tick.ValueUnsafe(), ContinuationTickMetadata());
+	if (!write_status.ok()) {
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr),
+		                         "Failed to write continuation tick: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                         GetExecutionIdHex(), write_status.ToString());
 	}
 }
 

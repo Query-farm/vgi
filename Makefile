@@ -234,7 +234,7 @@ test_launcher:
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	python3 scripts/run_tests.py --build release "test/*" \
+	python3 scripts/run_tests.py --build release --isolate-launcher "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test"
 
@@ -253,7 +253,7 @@ test_launcher_debug:
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	python3 scripts/run_tests.py --build debug "test/*" \
+	python3 scripts/run_tests.py --build debug --isolate-launcher "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test"
 

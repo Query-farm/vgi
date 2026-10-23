@@ -1,0 +1,94 @@
+# name: test/sql/integration/cache/parallel_spill_stream.test_slow
+# description: VGI result cache (spill-to-disk) at scale — a 640 MB result (80M int64 rows, 800 batches of 100k rows across 8 producers; over HTTP each batch is a request, so not more) captured under a NORMAL 64 MB per-entry cap (10x smaller) SPILLS to a streaming disk blob (RAM stays flat at ~max_entry_bytes, not the whole result the old buffer-then-persist path cost), then serves back via the disk-STREAMING path under a 256 MB memory limit (2.5x smaller than the result). Proves capture never buffers the whole result: a >max_entry_bytes result caches to disk instead of aborting, at flat memory. Sized to keep both ratios, not for a byte boundary: the result never crosses 2^31 bytes. (Cross-process RSS proof — 2 GB stored at ~133 MB peak, served at ~35 MB — is in the streaming-capture notes; a single-process .test can't measure peak RSS.) spill.test covers the same spill at a small, fast scale.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET threads = 8;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc_spill_stream';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 6442450944;
+
+# NORMAL 64 MB per-entry cap: capture buffers up to this in RAM, then SPILLS the
+# rest straight to the disk blob — the 640 MB result is cached without ever holding
+# it (or a serialized copy of it) in memory.
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Store: MISS + spill-to-disk capture of 640 MB. sum(0..N-1) = N*(N-1)/2 confirms
+# every row survived the fan-out across producers + the RAM→disk spill boundary.
+query II
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(80000000, batch_size := 100000);
+----
+80000000	3199999960000000
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+# It was CACHED (spilled to disk), not aborted as too-large: exactly one 640 MB blob.
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.abort%';
+----
+0
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_rc_spill_stream/*/objects/*.vrc');
+----
+1
+
+# The spilled entry is disk-only (never entered the memory index — that is the point
+# of the spill), so there is no in-memory row for it.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_parallel';
+----
+0
+
+statement ok
+SET memory_limit = '256MB';
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Serve the 640 MB entry via disk streaming — complete, correct, and under the
+# memory limit (one batch resident at a time).
+query II
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(80000000, batch_size := 100000);
+----
+80000000	3199999960000000
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=disk_streaming%';
+----
+true
+
+statement ok
+RESET memory_limit;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
