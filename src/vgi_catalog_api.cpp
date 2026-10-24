@@ -23,6 +23,7 @@
 #include "duckdb/parser/constraints/check_constraint.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_exception.hpp"
@@ -3340,8 +3341,10 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		if (table_info.row_id_column >= 0) {
 			// Convert the row_id field type to DuckDB LogicalType
 			auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
-			if (ReadNativeColumnDefault(rowid_field, schema_name)) {
-				throw InvalidInputException("VGI column expression: a row ID cannot declare a default");
+			if (ReadNativeColumnDefault(rowid_field, schema_name) ||
+			    ReadNativeColumnGenerated(rowid_field, schema_name)) {
+				throw InvalidInputException(
+				    "VGI column expression: a row ID cannot declare a default or generated expression");
 			}
 			auto rowid_schema = arrow::schema({rowid_field});
 			ArrowSchemaWrapper c_schema;
@@ -3444,52 +3447,51 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		    make_uniq<ForeignKeyConstraint>(std::move(pk_cols), std::move(fk_cols), std::move(fk_info)));
 	}
 
-	// Apply column metadata (defaults, comments) from Arrow field metadata
+	// Construct generated columns with their category before AddColumn assigns
+	// physical storage indexes. Bind the raw canonical SQL before adding the
+	// engine's output cast, so a hostile result-type mismatch cannot be hidden.
 	if (table_info.arrow_schema) {
-		for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
-			if (table_info.row_id_column >= 0 && i == table_info.row_id_column) {
+		ColumnList rebuilt;
+		idx_t logical = 0;
+		for (int i = 0; i < table_info.arrow_schema->num_fields(); ++i) {
+			if (i == table_info.row_id_column)
+				continue;
+			const auto &field = table_info.arrow_schema->field(i);
+			auto column = create_info.columns.GetColumn(LogicalIndex(logical++)).Copy();
+			auto generated = ReadNativeColumnGenerated(field, schema_name);
+			if (generated) {
+				ColumnDefinition definition(column.Name(), column.Type(), std::move(generated),
+				                            TableColumnType::GENERATED);
+				definition.SetComment(column.Comment());
+				rebuilt.AddColumn(std::move(definition));
 				continue;
 			}
-			auto &arrow_field = table_info.arrow_schema->field(i);
-			if (!arrow_field->HasMetadata()) {
-				continue;
-			}
-
-			int adjusted = i;
-			if (table_info.row_id_column >= 0 && i > table_info.row_id_column) {
-				adjusted--;
-			}
-			auto &col = create_info.columns.GetColumnMutable(LogicalIndex(adjusted));
-
-			// Canonical defaults were validated before type conversion. Preserve
-			// their meaning and never fall back to legacy SQL when a record is present.
-			auto canonical_default = BindNativeColumnDefault(context, arrow_field, schema_name, col.Type());
-			if (canonical_default) {
-				col.SetDefaultValue(std::move(canonical_default));
-			}
-			// Generated expression (mutually exclusive with default)
-			auto gen_idx = arrow_field->metadata()->FindKey(VGI_GENERATED_EXPRESSION_METADATA_KEY);
-			if (gen_idx >= 0) {
-				auto gen_expr_str = arrow_field->metadata()->value(gen_idx);
-				auto gen_expressions = Parser::ParseExpressionList(gen_expr_str);
-				if (!gen_expressions.empty()) {
-					col.SetGeneratedExpression(std::move(gen_expressions[0]));
-				}
-			} else if (arrow_field->metadata()->FindKey(VGI_COLUMN_DEFAULT) < 0) {
-				// Default value (only for non-generated columns)
-				auto default_idx = arrow_field->metadata()->FindKey("default");
-				if (default_idx >= 0) {
-					auto default_expr = arrow_field->metadata()->value(default_idx);
-					auto expressions = Parser::ParseExpressionList(default_expr);
-					if (!expressions.empty()) {
-						col.SetDefaultValue(std::move(expressions[0]));
-					}
+			auto canonical_default = BindNativeColumnDefault(context, field, schema_name, column.Type());
+			if (canonical_default)
+				column.SetDefaultValue(std::move(canonical_default));
+			else if (field->metadata() && field->metadata()->FindKey(VGI_COLUMN_DEFAULT) < 0) {
+				auto index = field->metadata()->FindKey("default");
+				if (index >= 0) {
+					auto expressions = Parser::ParseExpressionList(field->metadata()->value(index));
+					if (!expressions.empty())
+						column.SetDefaultValue(std::move(expressions[0]));
 				}
 			}
-
-			// ArrowSchemaToColumnList imported validated comments before any
-			// table entry is published, preserving missing versus empty text.
+			rebuilt.AddColumn(std::move(column));
 		}
+		ValidateNativeGeneratedColumns(context, rebuilt);
+		for (idx_t index = 0; index < rebuilt.LogicalColumnCount(); ++index) {
+			auto &column = rebuilt.GetColumnMutable(LogicalIndex(index));
+			if (!column.Generated())
+				continue;
+			auto expression = column.GeneratedExpression().Copy();
+			// Avoid duplicating a canonical CREATE's explicit engine cast.
+			if (expression->GetExpressionClass() != ExpressionClass::CAST ||
+			    expression->Cast<CastExpression>().cast_type != column.Type()) {
+				column.SetGeneratedExpression(std::move(expression));
+			}
+		}
+		create_info.columns = std::move(rebuilt);
 	}
 
 	// Bind after column metadata is applied so generated columns cannot be

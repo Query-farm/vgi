@@ -656,6 +656,7 @@ if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
     test/cpp/test_query_bind.cpp
     test/cpp/test_constraint_contract.cpp
     test/cpp/test_column_expression.cpp
+    test/cpp/test_generated_columns.cpp
     test/cpp/test_column_metadata.cpp
     test/cpp/test_default_schema.cpp
     test/cpp/test_macro_contract.cpp

@@ -15,6 +15,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_column_expression.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_multi_scan_rewriter.hpp"
@@ -68,7 +69,8 @@ VgiTableEntry::VgiTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Creat
 VgiTableEntry::~VgiTableEntry() = default;
 
 unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
-	if (column_id == COLUMN_IDENTIFIER_ROW_ID || column_id == COLUMN_IDENTIFIER_EMPTY) {
+	if (column_id == COLUMN_IDENTIFIER_ROW_ID || column_id == COLUMN_IDENTIFIER_EMPTY ||
+	    GetColumns().PhysicalColumnCount() != GetColumns().LogicalColumnCount()) {
 		return nullptr;
 	}
 
@@ -372,10 +374,23 @@ vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &conte
 }
 
 TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
-                                                  const string &at_unit, const string &at_value) {
+                                                 const string &at_unit, const string &at_value) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
+	const bool generated_columns = GetColumns().PhysicalColumnCount() != GetColumns().LogicalColumnCount();
+	if (generated_columns)
+		vgi::NativeColumnEvaluationContext(context);
+	// The worker scan contains only physical fields, including any hidden rowid.
+	auto worker_column = [&](int declared_index) {
+		int physical = 0;
+		for (int i = 0; i < declared_index; ++i) {
+			const auto &field = table_info_.arrow_schema->field(i);
+			if (!field->metadata() || field->metadata()->FindKey(vgi::VGI_COLUMN_GENERATED) < 0)
+				physical++;
+		}
+		return physical;
+	};
 
 	// Resolve the scan-function shape. Three paths in priority order:
 	//   1. Inlined ``table_info_.scan_function`` (legacy single-branch
@@ -435,6 +450,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		     branches_result.branches[0].IsCatalogTable() || branches_result.branches[0].IsFormatBranch());
 
 		if (branches_result.branches.size() > 1 || single_branch_needs_rewriter) {
+			if (generated_columns)
+				throw NotImplementedException("VGI generated columns require a single worker function scan");
 			// Multi-branch path. Up-front check of the rollback knob — if
 			// the rewriter is disabled, refuse here with a clear
 			// BinderException rather than returning the marker and reaching
@@ -614,6 +631,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	}
 
 	if (from_system_catalog && func_entry) {
+		if (generated_columns)
+			throw NotImplementedException("VGI generated columns require a worker function scan");
 		vgi::RequireVgiOptimizerExtensions(context, StringUtil::Format("VGI table %s.%s (native delegation to '%s')",
 		                                                          ParentSchema().name, name, scan_result.function_name));
 		// Native delegation: bind the system function eagerly here, then return
@@ -785,6 +804,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// Arrow IPC round-trip (``row_id_column`` above is detected the same way).
 	// Indices are worker-schema positions — the rowid column included — which
 	// is the space ``VgiGetPartitionData`` maps the sink's request into.
+	if (generated_columns && scan_partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
+		throw NotImplementedException("VGI partitioned generated-column scans require a qualified adapter");
+	}
 	if (scan_partition_kind != vgi::VgiPartitionKind::NotPartitioned && table_info_.arrow_schema) {
 		for (int i = 0; i < table_info_.arrow_schema->num_fields(); ++i) {
 			const auto &field = table_info_.arrow_schema->field(i);
@@ -809,7 +831,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 
 	// Pass row_id info to bind data
 	if (table_info_.row_id_column >= 0) {
-		scan_bind_data->rowid_worker_col_index = table_info_.row_id_column;
+		scan_bind_data->rowid_worker_col_index = worker_column(table_info_.row_id_column);
 		scan_bind_data->rowid_type = table_info_.rowid_type;
 	}
 
@@ -845,20 +867,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// So the worker may bind *more* physical columns than the catalog exposes,
 	// but never *fewer* — that's the case that overflows the batch.
 	{
-		// Count the columns the worker is actually responsible for scanning:
-		// every declared column except generated ones (those are computed by
-		// DuckDB from physical columns and never read off the wire). We can't use
-		// ColumnList::PhysicalColumnCount() here — VGI marks generated columns via
-		// SetGeneratedExpression() *after* AddColumn() has already assigned them a
-		// storage oid (CreateTableInfoFromVgiTable), so that count is stale and
-		// still includes them. Test directly with Generated().
-		const auto &decl_columns = GetColumns();
-		idx_t scannable_count = 0;
-		for (auto &col : decl_columns.Logical()) {
-			if (!col.Generated()) {
-				scannable_count++;
-			}
-		}
+		const auto scannable_count = GetColumns().PhysicalColumnCount();
 		if (names.size() < scannable_count) {
 			throw BinderException(
 			    vgi::ErrorInfo(vgi::error_subtype::kSchemaMismatch)
@@ -872,8 +881,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			                       "cover every column the table exposes. A mismatch usually means the worker's table "
 			                       "listing and its scan bind disagree — e.g. a proxy narrowed one but not the other.",
 			                       static_cast<unsigned long long>(names.size()),
-			                       static_cast<unsigned long long>(scannable_count),
-			                       catalog_.GetName(), ParentSchema().name, name, scan_result.function_name));
+			                       static_cast<unsigned long long>(scannable_count), catalog_.GetName(),
+			                       ParentSchema().name, name, scan_result.function_name));
 		}
 	}
 
@@ -905,11 +914,15 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// Wire up the shared table function implementation
 	TableFunction func("vgi_table_scan", {}, vgi::VgiTableFunctionScan, nullptr,
 	                   vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
-	func.projection_pushdown = has_projection_pushdown;
+	// DuckDB must project away generated fields even when the worker cannot.
+	// The shared init callbacks translate logical IDs to compact physical IDs.
+	func.projection_pushdown = generated_columns || has_projection_pushdown;
 	const auto supports_filter_v2 =
 	    std::find(scan_filter_semantic_profiles.begin(), scan_filter_semantic_profiles.end(),
 	              "vgi.duckdb.standard.v1") != scan_filter_semantic_profiles.end();
-	func.filter_pushdown = has_filter_pushdown && supports_filter_v2;
+	// Generated-table optimizer callbacks still use logical coordinates; keep
+	// those filters/order/statistics local until their remapping is qualified.
+	func.filter_pushdown = !generated_columns && has_filter_pushdown && supports_filter_v2;
 	func.sampling_pushdown = has_sampling_pushdown;
 	// Propagate the worker's declared order preservation to the synthetic
 	// TableFunction so DuckDB's planner sees the right SourceOrder() for
@@ -926,8 +939,10 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.to_string = vgi::VgiTableFunctionToString;
 	func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
 	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
-	func.set_scan_order = vgi::VgiSetScanOrder;
-	func.statistics = vgi::VgiTableFunctionStatistics;
+	if (!generated_columns) {
+		func.set_scan_order = vgi::VgiSetScanOrder;
+		func.statistics = vgi::VgiTableFunctionStatistics;
+	}
 	// Make the synthetic scan function survive LogicalOperator::Copy()'s
 	// serialize/deserialize round-trip (WindowSelfJoin et al.). See the
 	// callback definitions below and the catalog registration in
@@ -947,9 +962,12 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// TODO about a deferred-filter-capture refactor that could restore the
 	// eager flag without sacrificing join pushdown.
 
-	// Set virtual column callbacks for row_id support
-	if (table_info_.row_id_column >= 0) {
+	// Generated tables expose an empty virtual for COUNT/constant scans so the
+	// engine never selects an unexpanded generated field merely to count rows.
+	if (generated_columns || table_info_.row_id_column >= 0) {
 		func.get_virtual_columns = vgi::VgiTableScanGetVirtualColumns;
+	}
+	if (table_info_.row_id_column >= 0) {
 		func.get_row_id_columns = vgi::VgiTableScanGetRowIdColumns;
 
 		// Opt into DuckDB's late-materialization optimizer only when the worker
@@ -962,7 +980,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// can be safely set; any path that registers no rowid callbacks must
 		// stay false.
 		func.late_materialization =
-		    has_late_materialization && has_filter_pushdown && has_projection_pushdown;
+		    !generated_columns && has_late_materialization && has_filter_pushdown && has_projection_pushdown;
 	}
 
 	// PartitionColumns: without ``get_partition_info`` the planner skips the
@@ -1079,12 +1097,14 @@ TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 }
 
 virtual_column_map_t VgiTableEntry::GetVirtualColumns() const {
-	if (rowid_type_ != LogicalType::INVALID) {
-		virtual_column_map_t result;
-		result.insert({COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", rowid_type_)});
-		return result;
+	virtual_column_map_t result;
+	if (GetColumns().PhysicalColumnCount() != GetColumns().LogicalColumnCount()) {
+		result.insert({COLUMN_IDENTIFIER_EMPTY, TableColumn("", GetColumns().GetColumn(PhysicalIndex(0)).Type())});
 	}
-	return {};
+	if (rowid_type_ != LogicalType::INVALID) {
+		result.insert({COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", rowid_type_)});
+	}
+	return result;
 }
 
 vector<column_t> VgiTableEntry::GetRowIdColumns() const {

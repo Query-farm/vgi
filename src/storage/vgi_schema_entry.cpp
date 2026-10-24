@@ -555,12 +555,14 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	switch (alter_table.alter_table_type) {
 	case AlterTableType::ADD_COLUMN: {
 		auto &add_col = alter_table.Cast<AddColumnInfo>();
+		if (add_col.new_column.Generated())
+			throw NotImplementedException("VGI native ALTER ADD generated columns is not supported");
 		// Convert single column to Arrow schema
 		ColumnList single_col;
 		single_col.AddColumn(add_col.new_column.Copy());
 		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col, schema_name);
-		vgi::InvokeCatalogTableColumnAdd(rpc_ctx, schema_name, table_name, col_schema,
-		                                  add_col.if_column_not_exists, context);
+		vgi::InvokeCatalogTableColumnAdd(rpc_ctx, schema_name, table_name, col_schema, add_col.if_column_not_exists,
+		                                 context);
 		break;
 	}
 	case AlterTableType::REMOVE_COLUMN: {

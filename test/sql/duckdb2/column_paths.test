@@ -132,7 +132,7 @@ ALTER TABLE w.main.column_paths DROP COLUMN "renamed.literal";
 statement error
 CREATE TABLE w.main.bad_generated (id INTEGER, doubled INTEGER GENERATED ALWAYS AS (id * 2));
 ----
-generated-column creation requires
+generated expressions and nondefault compression are not supported
 
 statement error
 SELECT * FROM w.main.bad_generated;

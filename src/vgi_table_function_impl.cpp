@@ -2062,7 +2062,45 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 	}
 }
 
-unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+// Catalog LogicalGet IDs include virtual generated fields. Worker schemas contain
+// only physical fields; normalize once before any init projection/cache processing.
+// The existing table_entry survives bind-data copies and plan deserialization.
+static bool HasGeneratedCatalogColumns(const VgiTableFunctionBindData &bind_data) {
+	return bind_data.table_entry && bind_data.table_entry->GetColumns().PhysicalColumnCount() !=
+	                                    bind_data.table_entry->GetColumns().LogicalColumnCount();
+}
+
+static TableFunctionInitInput PhysicalCatalogScanInput(const TableFunctionInitInput &logical_input) {
+	auto input = logical_input;
+	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
+	if (!HasGeneratedCatalogColumns(bind_data)) {
+		return input;
+	}
+	auto &columns = bind_data.table_entry->GetColumns();
+	for (idx_t i = 0; i < input.column_ids.size(); ++i) {
+		auto &column_id = input.column_ids[i];
+		if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		if (column_id == COLUMN_IDENTIFIER_EMPTY) {
+			// Row-count scans still read one physical field; VGI cannot request
+			// a zero-column worker projection yet. Its type matches this virtual.
+			column_id = 0;
+			input.column_indexes[i] = ColumnIndex(0);
+			continue;
+		}
+		if (column_id >= columns.LogicalColumnCount() || columns.GetColumn(LogicalIndex(column_id)).Generated()) {
+			throw InvalidInputException("VGI generated column must be expanded before scanning physical fields");
+		}
+		column_id = columns.GetColumn(LogicalIndex(column_id)).Physical().index;
+		input.column_indexes[i] = ColumnIndex(column_id, input.column_indexes[i].GetChildIndexes());
+	}
+	return input;
+}
+
+unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &context,
+                                                                TableFunctionInitInput &logical_input) {
+	auto input = PhysicalCatalogScanInput(logical_input);
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 
 	// Read TABLESAMPLE pushdown from DuckDB optimizer (SYSTEM_SAMPLE percentage only)
@@ -2744,8 +2782,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 // Init Local Function - Create local state for scanning
 // ============================================================================
 
-unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &context,
+                                                              TableFunctionInitInput &logical_input,
                                                               GlobalTableFunctionState *global_state_p) {
+	auto input = PhysicalCatalogScanInput(logical_input);
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	auto &global_state = global_state_p->Cast<VgiTableFunctionGlobalState>();
 
@@ -2763,9 +2803,9 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		local_state->cancel_enabled = true;
 	}
 
-	// Set column_ids for ArrowToDuckDB projection support if function supports it
-	// This tells ArrowToDuckDB which columns to extract from the Arrow arrays
-	if (bind_data.projection_pushdown) {
+	// Generated catalog scans always project locally, even when the worker sends
+	// its complete physical schema. Worker projection remains an independent flag.
+	if (bind_data.projection_pushdown || HasGeneratedCatalogColumns(bind_data)) {
 		local_state->column_ids = input.column_ids;
 		// When a rowid column exists, remap column_ids to match the worker's full schema indices.
 		// COLUMN_IDENTIFIER_ROW_ID maps to the actual worker column index.
@@ -4056,7 +4096,8 @@ static void ConvertCurrentBatch(const VgiTableFunctionBindData &bind_data,
 	output.SetCardinality(output_size);
 
 	if (output_size > 0) {
-		idx_t rowid_col = (!bind_data.projection_pushdown && bind_data.rowid_worker_col_index >= 0)
+		idx_t rowid_col = (!bind_data.projection_pushdown && !HasGeneratedCatalogColumns(bind_data) &&
+		                    bind_data.rowid_worker_col_index >= 0)
 		                      ? static_cast<idx_t>(bind_data.rowid_worker_col_index)
 		                      : COLUMN_IDENTIFIER_ROW_ID;
 		// Defense in depth: ArrowTableFunction::ArrowToDuckDB dereferences
@@ -4431,11 +4472,14 @@ BindInfo VgiTableScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 
 virtual_column_map_t VgiTableScanGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
-	if (bind_data.rowid_worker_col_index < 0) {
-		return {};
-	}
 	virtual_column_map_t result;
-	result.insert({COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", bind_data.rowid_type)});
+	if (HasGeneratedCatalogColumns(bind_data)) {
+		result.insert({COLUMN_IDENTIFIER_EMPTY,
+		               TableColumn("", bind_data.table_entry->GetColumns().GetColumn(PhysicalIndex(0)).Type())});
+	}
+	if (bind_data.rowid_worker_col_index >= 0) {
+		result.insert({COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", bind_data.rowid_type)});
+	}
 	return result;
 }
 

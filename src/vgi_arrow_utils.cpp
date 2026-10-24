@@ -216,12 +216,6 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 	arrow::FieldVector fields;
 	idx_t index = 0;
 	for (auto &col : columns.Logical()) {
-		// A profile for creating generated/compressed columns has not been negotiated.
-		// Refuse the operation before RPC rather than reconstructing an ordinary column.
-		if (col.Generated()) {
-			throw NotImplementedException(
-			    "VGI generated-column creation requires a supported column definition profile");
-		}
 		if (col.CompressionType() != CompressionType::COMPRESSION_AUTO) {
 			throw NotImplementedException("VGI does not support non-default column compression");
 		}
@@ -232,6 +226,17 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 			}
 			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
 			metadata->Append("comment", col.Comment().GetValue<std::string>());
+			field = field->WithMetadata(metadata);
+		}
+		if (col.Generated()) {
+			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
+			// Pinned ColumnDefinition stores its declared/inferred output cast
+			// in this SQL. Keep it: the canonical record itself must have the
+			// Arrow field's exact result type, before discovery adds any cast.
+			auto expression = BuildNativeGeneratedExpression(col.GeneratedExpression().ToString(), owner_schema,
+			                                                 NativeColumnEvaluationContext(context));
+			metadata->Append(VGI_COLUMN_GENERATED, EncodeNativeColumnDefaultMetadata(expression));
+			metadata->Append(VGI_COLUMN_GENERATION, "virtual");
 			field = field->WithMetadata(metadata);
 		}
 		if (col.HasDefaultValue()) {
@@ -245,6 +250,18 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 	}
 	auto result = arrow::schema(fields, schema->metadata());
 	ValidateNativeColumnMetadata(result);
+	ColumnList validated;
+	idx_t validated_index = 0;
+	for (const auto &column : columns.Logical()) {
+		auto expression = ReadNativeColumnGenerated(result->field(static_cast<int>(validated_index++)), owner_schema);
+		if (expression) {
+			validated.AddColumn(
+			    ColumnDefinition(column.Name(), column.Type(), std::move(expression), TableColumnType::GENERATED));
+		} else {
+			validated.AddColumn(column.Copy());
+		}
+	}
+	ValidateNativeGeneratedColumns(context, validated);
 	return result;
 }
 
@@ -253,7 +270,7 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 // ============================================================================
 
 std::shared_ptr<arrow::RecordBatch> DataChunkToArrow(ClientContext &context, DataChunk &chunk,
-                                                      const std::shared_ptr<arrow::Schema> &schema) {
+                                                     const std::shared_ptr<arrow::Schema> &schema) {
 	if (chunk.size() == 0) {
 		// Create empty batch with schema
 		std::vector<std::shared_ptr<arrow::Array>> empty_arrays;

@@ -22,6 +22,9 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder/constant_binder.hpp"
+#include "duckdb/planner/expression_binder.hpp"
+#include "duckdb/catalog/catalog_entry/column_dependency_manager.hpp"
+#include "duckdb/parser/column_list.hpp"
 #include <set>
 
 namespace duckdb {
@@ -64,12 +67,29 @@ bool Primitive(const LogicalType &type) {
 	}
 }
 
-void Scalar(ParsedExpression &expression, bool using_expression, bool qualify_functions, size_t depth, size_t &nodes) {
+bool GeneratedPrimitive(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::SQLNULL:
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::VARCHAR:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void Scalar(ParsedExpression &expression, bool using_expression, bool qualify_functions, size_t depth, size_t &nodes,
+            bool generated = false) {
 	Require(depth <= 64 && ++nodes <= 4096, "scalar expression is too complex");
 	Require(!expression.HasAlias(), "scalar aliases are unsupported");
 	switch (expression.GetExpressionClass()) {
 	case ExpressionClass::CONSTANT:
-		Require(Primitive(expression.Cast<ConstantExpression>().value.type()), "unsupported scalar literal type");
+		Require((generated ? GeneratedPrimitive : Primitive)(expression.Cast<ConstantExpression>().value.type()),
+		        "unsupported scalar literal type");
 		break;
 	case ExpressionClass::COLUMN_REF: {
 		auto &column = expression.Cast<ColumnRefExpression>();
@@ -89,7 +109,8 @@ void Scalar(ParsedExpression &expression, bool using_expression, bool qualify_fu
 			// built-ins, without consulting the caller's catalog or search path.
 			cast.cast_type = UnboundType::TryDefaultBind(cast.cast_type);
 		}
-		Require(!cast.try_cast && Primitive(cast.cast_type), "unsupported scalar cast");
+		Require(!cast.try_cast && (generated ? GeneratedPrimitive : Primitive)(cast.cast_type),
+		        "unsupported scalar cast");
 		break;
 	}
 	case ExpressionClass::COMPARISON:
@@ -123,7 +144,8 @@ void Scalar(ParsedExpression &expression, bool using_expression, bool qualify_fu
 		Require(function.catalog.empty() && function.schema.empty() && !function.distinct && !function.filter &&
 		            !function.export_state && (!function.order_bys || function.order_bys->orders.empty()) &&
 		            (allowed.count(StringUtil::Lower(function.function_name)) ||
-		             (using_expression && function.function_name == "/")),
+		             (using_expression && !generated && function.function_name == "/") ||
+		             (generated && function.function_name == "||")),
 		        "unsupported scalar function");
 		if (qualify_functions) {
 			// These names identify built-ins in the bounded profile, never a macro
@@ -138,11 +160,12 @@ void Scalar(ParsedExpression &expression, bool using_expression, bool qualify_fu
 		    "VGI column expression: expression is outside the supported deterministic scalar grammar");
 	}
 	ParsedExpressionIterator::EnumerateChildren(expression, [&](ParsedExpression &child) {
-		Scalar(child, using_expression, qualify_functions, depth + 1, nodes);
+		Scalar(child, using_expression, qualify_functions, depth + 1, nodes, generated);
 	});
 }
 
-unique_ptr<ParsedExpression> Parse(const std::string &sql, bool using_expression, bool qualify_functions) {
+unique_ptr<ParsedExpression> Parse(const std::string &sql, bool using_expression, bool qualify_functions,
+                                   bool generated = false) {
 	Text(sql, MAX_SQL, "SQL");
 	Parser parser;
 	parser.ParseQuery("SELECT (" + sql + ")");
@@ -158,7 +181,7 @@ unique_ptr<ParsedExpression> Parse(const std::string &sql, bool using_expression
 	        "query clauses are unsupported");
 	auto expression = std::move(select.select_list[0]);
 	size_t nodes = 0;
-	Scalar(*expression, using_expression, qualify_functions, 0, nodes);
+	Scalar(*expression, using_expression, qualify_functions, 0, nodes, generated);
 	return expression;
 }
 
@@ -217,11 +240,10 @@ VgiQueryEvaluationContext NativeColumnEvaluationContext(ClientContext &context) 
 	return result;
 }
 
-std::vector<uint8_t> BuildNativeColumnExpression(const std::string &sql, const std::string &schema_name,
-                                                 const VgiQueryEvaluationContext &context, bool using_expression) {
+static std::vector<uint8_t> EncodeColumnExpression(const std::string &sql, const std::string &schema_name,
+                                                   const VgiQueryEvaluationContext &context) {
 	Text(schema_name, 4096, "owner schema");
 	Context(context);
-	Parse(sql, using_expression, false);
 	auto settings = arrow::StructArray::Make({BuildStringScalar(context.timezone), BuildStringScalar(context.collation),
 	                                          BuildStringScalar(context.default_order),
 	                                          BuildStringScalar(context.default_null_order),
@@ -232,6 +254,99 @@ std::vector<uint8_t> BuildNativeColumnExpression(const std::string &sql, const s
 	    arrow::RecordBatch::Make(generated::SqlExpressionSchema(), 1,
 	                             {BuildStringScalar(sql), BuildStringScalar(VGI_CONSTRAINT_SCALAR_READ),
 	                              BuildStringListScalar({schema_name}), settings.ValueOrDie()}));
+}
+
+std::vector<uint8_t> BuildNativeColumnExpression(const std::string &sql, const std::string &schema_name,
+                                                 const VgiQueryEvaluationContext &context, bool using_expression) {
+	Parse(sql, using_expression, false);
+	return EncodeColumnExpression(sql, schema_name, context);
+}
+
+std::vector<uint8_t> BuildNativeGeneratedExpression(const std::string &sql, const std::string &schema_name,
+                                                    const VgiQueryEvaluationContext &context) {
+	Parse(sql, true, false, true);
+	return EncodeColumnExpression(sql, schema_name, context);
+}
+
+unique_ptr<ParsedExpression> ReadNativeColumnGenerated(const std::shared_ptr<arrow::Field> &field,
+                                                       const std::string &schema_name) {
+	if (!field->metadata())
+		return nullptr;
+	auto metadata = field->metadata();
+	std::set<std::string> keys;
+	for (int64_t i = 0; i < metadata->size(); ++i) {
+		const auto &key = metadata->key(i);
+		Require(keys.insert(key).second, "duplicate column metadata key");
+		Require((key.compare(0, 21, "vgi.column.generated.") != 0 || key == VGI_COLUMN_GENERATED) &&
+		            (key.compare(0, 22, "vgi.column.generation.") != 0 || key == VGI_COLUMN_GENERATION),
+		        "unknown generated metadata version");
+	}
+	Require(!keys.count("generated_expression"),
+	        "legacy generated_expression requires canonical SqlExpression metadata");
+	auto generated = metadata->FindKey(VGI_COLUMN_GENERATED);
+	auto category = metadata->FindKey(VGI_COLUMN_GENERATION);
+	Require((generated >= 0) == (category >= 0), "generated expression and category must occur together");
+	if (generated < 0)
+		return nullptr;
+	Require(metadata->value(category) == "virtual", "native adapter supports only VIRTUAL generated columns");
+	Require(!keys.count(VGI_COLUMN_DEFAULT) && !keys.count("default"),
+	        "generated column conflicts with default metadata");
+	Require(field->nullable(), "native generated columns must be nullable");
+	switch (field->type()->id()) {
+	case arrow::Type::BOOL:
+	case arrow::Type::INT8:
+	case arrow::Type::INT16:
+	case arrow::Type::INT32:
+	case arrow::Type::INT64:
+	case arrow::Type::STRING:
+		break;
+	default:
+		throw NotImplementedException("VGI generated columns require signed integer, Boolean or string types");
+	}
+	const auto &encoded = metadata->value(generated);
+	Require(!encoded.empty() && encoded.size() <= ((MAX_RECORD + 2) / 3) * 4, "invalid generated metadata size");
+	auto decoded = Blob::FromBase64(string_t(encoded));
+	Require(Blob::ToBase64(string_t(decoded)) == encoded, "generated metadata requires canonical base64");
+	auto sql = ReadExpression(std::vector<uint8_t>(decoded.begin(), decoded.end()), schema_name);
+	return Parse(sql, true, true, true);
+}
+
+void ValidateNativeGeneratedColumns(ClientContext &context, const ColumnList &columns) {
+	bool generated = false;
+	for (const auto &column : columns.Logical())
+		generated = generated || column.Generated();
+	if (!generated)
+		return;
+	NativeColumnEvaluationContext(context);
+	Require(columns.PhysicalColumnCount() > 0, "generated table requires a physical column");
+	ColumnDependencyManager dependencies;
+	vector<string> names;
+	vector<LogicalType> types;
+	for (const auto &column : columns.Logical()) {
+		names.push_back(column.Name());
+		types.push_back(column.Type());
+		if (!column.Generated())
+			continue;
+		Require(GeneratedPrimitive(column.Type()) && column.Type() != LogicalType::SQLNULL,
+		        "unsupported generated column type");
+		dependencies.AddGeneratedColumn(column, columns);
+		vector<string> referenced;
+		column.GetListOfDependencies(referenced);
+		for (const auto &name : referenced)
+			Require(GeneratedPrimitive(columns.GetColumn(name).Type()), "unsupported generated operand type");
+	}
+	auto binder = Binder::CreateBinder(context);
+	binder->bind_context.AddGenericBinding(binder->GenerateTableIndex(), "__vgi_generated", names, types);
+	ExpressionBinder expressions(*binder, context);
+	for (const auto &column : columns.Logical()) {
+		if (!column.Generated())
+			continue;
+		auto expression = column.GeneratedExpression().Copy();
+		auto bound = expressions.Bind(expression);
+		Require(bound->return_type == column.Type(), "generated result type differs from its column");
+		if (bound->IsFoldable())
+			ExpressionExecutor::EvaluateScalar(context, *bound);
+	}
 }
 
 std::string EncodeNativeColumnDefaultMetadata(const std::vector<uint8_t> &expression) {
@@ -297,12 +412,18 @@ std::shared_ptr<arrow::Schema> NativeColumnTypeSchema(const std::shared_ptr<arro
                                                       const std::string &schema_name) {
 	arrow::FieldVector fields;
 	for (const auto &field : schema->fields()) {
-		if (!ReadNativeColumnDefault(field, schema_name)) {
+		auto generated = ReadNativeColumnGenerated(field, schema_name);
+		if (!ReadNativeColumnDefault(field, schema_name) && !generated) {
 			fields.push_back(field);
 			continue;
 		}
 		auto metadata = field->metadata()->Copy();
-		ThrowOnArrowError(metadata->Delete(VGI_COLUMN_DEFAULT));
+		if (generated) {
+			ThrowOnArrowError(metadata->Delete(VGI_COLUMN_GENERATED));
+			ThrowOnArrowError(metadata->Delete(VGI_COLUMN_GENERATION));
+		} else {
+			ThrowOnArrowError(metadata->Delete(VGI_COLUMN_DEFAULT));
+		}
 		fields.push_back(field->WithMetadata(metadata));
 	}
 	return arrow::schema(fields, schema->metadata());

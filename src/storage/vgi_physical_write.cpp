@@ -28,9 +28,14 @@ namespace duckdb {
 // catalog_table_*_function_get RPC). The trampoline parameter dispatches to
 // InvokeCatalogTableInsert/Update/DeleteFunctionGet on cache miss.
 template <typename FetchFn>
-static vgi::VgiScanFunctionResult ResolveWriteFunction(
-    ClientContext &context, VgiTableEntry &table, const char *operation,
-    const std::optional<vgi::VgiScanFunctionResult> &inlined, FetchFn &&fetch) {
+static vgi::VgiScanFunctionResult
+ResolveWriteFunction(ClientContext &context, VgiTableEntry &table, const char *operation,
+                     const std::optional<vgi::VgiScanFunctionResult> &inlined, FetchFn &&fetch) {
+	for (const auto &column : table.GetColumns().Logical()) {
+		if (column.Generated()) {
+			throw NotImplementedException("VGI native writes to generated-column tables are not supported");
+		}
+	}
 	// Covers CTAS as well as INSERT/UPDATE/DELETE, before either inlined use or
 	// fallback discovery. Reading trusted facts grants no write authority.
 	vgi::RequireNativeConstraintWrite(*table.GetCatalog().Cast<VgiCatalog>().attach_result(), table.GetTableInfo());

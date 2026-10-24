@@ -69,7 +69,7 @@ The remaining included work before freeze is:
 
 | Work | Selected direction | Remaining proof or implementation |
 | --- | --- | --- |
-| Column expressions and metadata | Implemented: canonical DEFAULT/USING payloads and CREATE/ADD default annotations; strict `comment`/`tags` Arrow metadata on CREATE, ADD and discovery. These are mandatory successor representations, with no new capability checks. | Virtual generation and its dependency/type semantics remain open. Native 1.5 carries comments; tags remain in authoritative Arrow metadata because its column API lacks public tag access. Stored generated columns and engine compression enums are excluded. |
+| Column expressions and metadata | Implemented: canonical DEFAULT/USING, strict `comment`/`tags` metadata, and bounded virtual generated CREATE/discovery/read. Generated definitions reuse `SqlExpression`, field types and existing dependency records. These are mandatory successor representations, with no new capability checks. | Broader generated grammar/types, generated-table writes and provider acceptance remain qualification work. Native 1.5 rejects generated ALTER ADD; stored generation and engine compression enums are excluded. Tags remain in authoritative Arrow metadata because its column API lacks public tag access. |
 | Default schema absence | Implemented: `CatalogAttachResult.default_schema` is nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Python and SDKs preserve absence; native 1.5 rejects it before publishing the attachment. Native 2.0 optional-default execution remains part of the later adapter port. Never invent `main`, split dots, or introduce nested default search paths. |
 | Macro cleanup | Implemented: required nonempty overload families replace the duplicate parent definition fields. Simple macros use one-element families through local authoring helpers. No family-only capability check. | Native 1.5 loads complete scalar/table families; typed defaults, declarations, docs and owner context remain distinct. Native SQL CREATE MACRO, general dependency extraction and broader body/context support remain separate qualification work. Function argument defaults are unchanged. |
 | Optimizer preparation | Keep projection expressions/result mapping and repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | Filter v2 is a predicate contract, not a general scalar projection language. Prove typed scalar results, support decisions before optimizer replacement, slot/filter remapping, local residuals and query-scoped repeatability. The existing `table_function_plan` call occurs too late for remote decline. No proposed projection record is frozen yet. |
@@ -114,8 +114,8 @@ transactions or incompatible catalog definitions between versions. Rollback
 requires old-compatible catalog state or a tested restore/migration; switching
 a binary alone is insufficient. No version-aware router is required.
 
-**Next checkpoint:** finish virtual generated-column semantics
-and prove the optimizer contracts before P1 closes. Then
+**Next checkpoint:** prove the optimizer contracts and finish the remaining
+provider/adapter acceptance before P1 closes. Then
 complete all-SDK regeneration/conformance, capability matrices and the deployment
 exercise for P2/P3. Native 2.0 compilation and execution remain M0–M4 work.
 This review adds no wire fields, version bump, engine-pin update or runtime
@@ -284,6 +284,51 @@ a repair to preserve MAP child metadata, with endianness and registered-extensio
 round trips checked. Unsupported MAP entries-field metadata rejects explicitly.
 Generated record layouts and the protocol fingerprint remain unchanged. The
 manifest records exact counts, skips and corrected test-only failures.
+
+### Canonical virtual generated columns — October 23, 2026
+
+The existing generated-column read support now uses the same owned expression
+representation as CREATE. Authoring helpers translate SQL strings into
+`vgi.column.generated.v1` (`SqlExpression` IPC in canonical base64), paired with
+`vgi.column.generation.v1 = virtual`; the Arrow field supplies the resolved type.
+Legacy-only generated metadata, incomplete pairs, wrong owners/profiles,
+malformed IPC and DEFAULT conflicts reject before provider effects or publication.
+The proposed `vgi.column.generated.virtual.v1` capability is withdrawn. No new
+RPC, record schema, engine pin or public version is introduced.
+
+Native 1.5 accepts bounded deterministic virtual CREATE/read definitions over
+signed integer, Boolean and string operands under the explicit default context.
+It validates expression types before the engine inserts its output cast, uses
+the existing column dependency manager, qualifies builtin functions and checks
+the context when cached tables are scanned. Generated categories are assigned
+before physical indices, so interleaved generated columns do not shift worker
+fields. Providers scan physical fields only; DuckDB computes virtual results.
+Scan initialization translates logical IDs to physical positions through the
+existing table entry. Engine-side projection works even when a worker sends all
+physical fields; hidden rowid and count/constant scans use the same mapping.
+Generated-table filter/order/statistics/late-materialization pushdown remains
+disabled until its optimizer coordinates are qualified; SQL evaluation stays local.
+
+The durable generated reference reuses the existing dependency authority and
+transaction snapshots for creation, physical scan readback, reconnect and
+rollback. Unsupported semantic column edits reject unchanged. Native ALTER ADD
+is still rejected by the pinned parser; generated-table writes, stored/nested
+generation, delegated/multiple-branch/partitioned generated scans and broader
+SQL contexts are not qualified by this checkpoint and reject explicitly.
+
+Exact test results and repository revisions are recorded in
+`virtual_generated_columns_checkpoint_2026_10_23` in the companion manifest and
+remote `logs/generated-columns-20261023-X8dPoO`. The earlier nested NOT_NULL
+schema-reconciliation regression remains separate. Optimizer contracts and the
+P1-P3/native2 release gates remain open.
+
+Remote validation passed: 24 lifecycle CLI probes, 260 native contract/regression
+assertions, 750 assertions across 11 existing SQL cases, and the earlier metadata
+lifecycle's 183 assertions. Python's broad run passed 1,505 tests with 9 skips;
+focused boundary/corpus reruns cover the final 3-valid/20-invalid schema vectors.
+All six SDKs pass that corpus and their targeted regressions. Five generated-value
+queries pass against each SDK on the final native binary, also over TypeScript
+HTTP. This SDK query subset excludes unrelated catalog constraint enumeration.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference
