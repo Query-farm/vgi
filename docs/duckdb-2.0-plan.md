@@ -57,6 +57,14 @@ of that optimizer feature. The source review found no demonstrated missing
 wire field: retain the existing preparation/release, typed parameter/context,
 object/output manifest and TABLE execution contracts.
 
+**Worker opt-in uses existing attachment capability discovery.** The client
+offers query profiles and its engine build; the worker selects compatible
+support. Once the 2.0 adapter is qualified, selecting the automatic profile
+enables eligible ordinary queries by default. Omitted or explicit-only support
+keeps ordinary scans local without preparation RPCs. Capability discovery is the
+enablement mechanism; there is no user/session pushdown control. Each query still
+passes eligibility and preparation acceptance. This needs no new capability field.
+
 The detailed A0–A5 plan and acceptance boundaries are in the companion
 [query design](../../vgi-python-duckdb2/docs/protocol/vgi-catalog-query-pushdown-design.md#implementation-checkpoint--october-24-2026)
 and `areas.query` / `automatic_query_pushdown_plan_2026_10_24` in the companion
@@ -113,7 +121,8 @@ Full nested schemas, DDL/writes, COPY, advanced operators, automatic parameters,
 all-platform distribution and full M0–M4 parity are outside this pilot estimate.
 The monolithic extension source list still requires mechanical compatibility
 edits or explicit module exclusions for an isolated read target. Excluding a
-module must not advertise its capability. Keep automatic support opt-in and
+module must not advertise its capability. Enable automatic support through
+worker capability discovery and
 claim only the qualified provider/operator matrix. Existing P1–P3, wrapped-IPC
 and wider provider qualification gates remain open.
 
