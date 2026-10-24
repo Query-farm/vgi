@@ -72,7 +72,7 @@ The remaining included work before freeze is:
 | Column expressions and metadata | Implemented: canonical DEFAULT/USING, strict `comment`/`tags` metadata, and bounded virtual generated CREATE/discovery/read. Generated definitions reuse `SqlExpression`, field types and existing dependency records. These are mandatory successor representations, with no new capability checks. | Broader generated grammar/types, generated-table writes and provider acceptance remain qualification work. Native 1.5 rejects generated ALTER ADD; stored generation and engine compression enums are excluded. Tags remain in authoritative Arrow metadata because its column API lacks public tag access. |
 | Default schema absence | Implemented: `CatalogAttachResult.default_schema` is nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Python and SDKs preserve absence; native 1.5 rejects it before publishing the attachment. Native 2.0 optional-default execution remains part of the later adapter port. Never invent `main`, split dots, or introduce nested default search paths. |
 | Macro cleanup | Implemented: required nonempty overload families replace the duplicate parent definition fields. Simple macros use one-element families through local authoring helpers. No family-only capability check. | Native 1.5 loads complete scalar/table families; typed defaults, declarations, docs and owner context remain distinct. Native SQL CREATE MACRO, general dependency extraction and broader body/context support remain separate qualification work. Function argument defaults are unchanged. |
-| Optimizer preparation | Structured scalar projection negotiation is implemented; bind-specific repeatability and Go outer IPC fixes are in source, awaiting remote qualification. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | `table_function_projection` accepts or declines before optimizer replacement. The new `BindResponse.repeatability` defaults to `UNKNOWN`; stable binds preserve their snapshot and obtain fresh prepared-execution state. Run mutable-provider/native/SDK proofs on EC2, then finish broader mappings. Existing `table_function_plan` remains late split enumeration. |
+| Optimizer preparation | Structured scalar projection negotiation, bind-specific repeatability and Go outer IPC fixes have bounded native 1.5 / SDK qualification. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | `table_function_projection` accepts or declines before optimizer replacement. The new `BindResponse.repeatability` defaults to `UNKNOWN`; stable binds preserve their snapshot and obtain fresh prepared-execution state. Mutable-provider/native/SDK proofs pass on EC2; finish broader provider and native 2.0 mappings. Python outer wrapped-IPC qualification remains open. Existing `table_function_plan` remains late split enumeration. |
 
 The user withdrew the proposed DEFAULT/USING capability flags: this is an
 unpublished wire change, so it needs no additional opt-in. `SqlExpression.profile`
@@ -375,7 +375,7 @@ version are unchanged; these fields join the same unpublished major successor.
 
 ### Repeatability and Go wrapped IPC — October 24, 2026
 
-The next source checkpoint appends one required dictionary enum,
+This checkpoint appends one required dictionary enum,
 `BindResponse.repeatability`, with `UNKNOWN` and `STABLE_WITHIN_QUERY` values.
 SDK defaults remain conservative. A stable claim covers equivalent scans of
 the same complete bound state within one statement; separate binds may observe
@@ -396,15 +396,34 @@ into an 8 MiB raw limit before decoding. Physical EOF and explicit EOS remain
 valid. The SDK requires this dependency interface at compile time; publishing
 and pinning the paired dependency is a release prerequisite.
 
-The specification is `vgi-python/docs/protocol/scan-repeatability.md`. Mutable
-SQLite, signed HTTP, continuation, prepared execution, stale inline metadata,
-cache and copy tests are authored. The shared SDK runner adds claim validation
-and an optional Go framing mode. EC2 at `98.81.121.120` is unreachable, so this
-checkpoint has no new build/runtime qualification. No local builds/tests were
-substituted. Browser regeneration, remote source synchronization and runtime
-evidence remain pending. Existing historical test results do not validate this
-new field. The engine pin, published protocol version and P1-P3/M0-M4 release
-gates are unchanged.
+The specification is `vgi-python/docs/protocol/scan-repeatability.md`. Remote
+qualification resumed on the same EC2 instance at `3.82.45.233`. Native builds
+passed, followed by 8 contract/copy cases with 100 assertions, all 5 mutable
+snapshot scenarios, and 12 projection regressions. Stable prepared executions
+see newly committed rows, repeated scans of one bind retain their snapshot,
+and stale inline metadata/result caches cannot supply an old snapshot.
+
+All 18 explicit remote-query scenarios also passed again on this build,
+including typed values, prepared executions, transactions, interruption and
+zero retained query resources. The engine pin remains
+`105edd31b57fe7e6d32ee648efad562e45a9f908`; its measured shell banner is
+`v1.5.6-dev149`, still the 1.5 development line.
+
+Go's public subprocess and HTTP probes each pass all 27 contract/framing cases.
+The SDK checks also corrected request-local EOF handling in Java, C#, Rust and
+TypeScript and stale C++ test hash expectations. Python's generic RPC wrapper
+still discards an extra outer IPC batch before its typed validator runs; its
+19 required semantic cases pass, but complete outer framing/raw-size rejection
+remains a dependency-level release prerequisite. No additional Python protocol
+adapter or generic dependency change was introduced here.
+
+Exact SDK counts, browser artifact hash and native SDK query/copy evidence are
+recorded in the companion manifest's `scan_repeatability_and_go_framing_2026_10_24`
+checkpoint and `logs/repeatability-20261024-w3GOmK` on EC2. All builds/tests ran
+remotely. These bounded proofs leave broader production-provider semantics,
+Python outer framing, paired Go dependency publication/pinning, the combined
+release gates and the actual DuckDB 2.0 port open. The published protocol
+version remains unchanged.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference

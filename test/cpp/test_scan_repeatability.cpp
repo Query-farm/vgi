@@ -55,6 +55,14 @@ TEST_CASE("Bind repeatability validates the required enum independently of dicti
 	                                                     arrow::MakeArrayOfNull(arrow::utf8(), 1).ValueOrDie())
 	                      .ValueOrDie();
 	CHECK_THROWS(vgi::ParseBindResponse(Bind(null_value)));
+	// Arrow permits a NULL dictionary value to retain nonempty payload bytes.
+	// GetString alone would accidentally turn this NULL into a valid claim.
+	auto valid = std::static_pointer_cast<arrow::DictionaryArray>(reversed);
+	auto hidden = valid->dictionary()->data()->Copy();
+	hidden->buffers[0] = arrow::Buffer::FromString(std::string(1, '\0'));
+	hidden->SetNullCount(hidden->length);
+	auto hidden_null = arrow::DictionaryArray::FromArrays(valid->indices(), arrow::MakeArray(hidden)).ValueOrDie();
+	CHECK_THROWS(vgi::ParseBindResponse(Bind(hidden_null)));
 	arrow::Int32Builder wrong_index;
 	vgi::ThrowOnArrowError(wrong_index.Append(0));
 	auto values = std::static_pointer_cast<arrow::DictionaryArray>(reversed)->dictionary();
