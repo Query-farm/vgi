@@ -50,6 +50,13 @@ by itself a reason to postpone its wire design to another version.
 
 ### Automatic whole-query pushdown plan — October 24, 2026
 
+**A0 initial compile inventory recorded:** the isolated audited-2.0 configuration
+passes; 53 of 107 native C++ sources compile and 54 fail, with every source
+attempted. Generated version metadata also compiles. See the
+[diagnostic checkpoint](duckdb-2.0-a0-diagnostics.md) for exact pins, error groups,
+reproduction and the next A1 batch. Engine/loadable linking and runtime remain
+blocked; these counts are not a percentage of the port. The 1.5 build is unchanged.
+
 **Still open.** Ordinary SQL over attached VGI tables does not yet move its joins
 and aggregates to the provider. Explicit `vgi_query(...)`, bounded scalar
 projection and per-bind repeatability are working preparation, not completion
@@ -75,7 +82,7 @@ implementation pin in A0. No 2.0 build or runtime qualification is claimed here.
 
 | Checkpoint | Reviewable result | Rough effort |
 | --- | --- | --- |
-| A0: isolated 2.0 build | Exact engine/toolchain pins and a complete compile/link diagnostic inventory; retain the working 1.5 lane. | 1–3 engineer-days |
+| A0: isolated 2.0 build | Initial compile inventory recorded: all 107 native C++ sources attempted, 53 compiled/54 failed. Configuration passes; linking is blocked by compile failures. Retain the working 1.5 lane. | Initial checkpoint reached; original budget 1–3 engineer-days |
 | A1: basic 2.0 reads | ATTACH, table lookup, ordinary scans and explicit query execution. Port identifier/name APIs, optional default schema, column ownership, bound functions, plan bindings and Arrow cardinality. | 4–10 days |
 | A2: real provider | A bounded SQL provider whose ordinary scans and queries share the existing backend transaction/snapshot; incremental result bounds and active-query cancellation. Can begin on 1.5 alongside A0/A1. | 4–8 days |
 | A3: eligible plan export | Whole read-only SELECT roots from one attachment; bound SQL export before existing scalar projection/multi-scan transforms; exact output mapping and safe local decline. | 3–6 days |
