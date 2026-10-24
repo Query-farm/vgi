@@ -122,22 +122,7 @@ StreamHeaderResult SabReadStreamHeader(int region_offset, int slot, ClientContex
 std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResult &response,
                                                         const std::string &method_name,
                                                         const std::string &worker_path) {
-	if (!response.batch || response.batch->num_rows() == 0) {
-		ThrowVgiIOException("Empty response from " + method_name, worker_path, -1, "");
-	}
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		ThrowVgiIOException("Response missing 'result' column from " + method_name, worker_path, -1, "");
-	}
-	if (result_col->type()->id() != arrow::Type::BINARY) {
-		ThrowVgiIOException("Response 'result' column has wrong type from " + method_name, worker_path, -1, "");
-	}
-	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-	if (bin->IsNull(0)) {
-		return nullptr;
-	}
-	auto v = bin->GetView(0);
-	return vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+	return UnwrapResultEnvelope(response.batch, method_name, ErrorInfo().Worker(worker_path), /*null_result_ok=*/true);
 }
 
 } // namespace
@@ -714,19 +699,8 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 		}
 
 		auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_);
-		if (!response.batch || response.batch->num_rows() == 0) {
-			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Empty bind response from worker", location_, -1, "");
-		}
-		auto result_col = response.batch->GetColumnByName("result");
-		if (!result_col) {
-			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response missing 'result' column", location_, -1, "");
-		}
-		auto bin_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-		if (!bin_array || bin_array->IsNull(0)) {
-			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response 'result' column is null", location_, -1, "");
-		}
-		auto v = bin_array->GetView(0);
-		auto bind_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+		auto bind_batch = UnwrapResultEnvelope(response.batch, "bind",
+		                                       WebWorkerFunctionInfo(function_name_, function_type_, nullptr).Worker(location_));
 		ValidateResponseSchema(bind_batch, "bind", location_);
 		return bind_batch;
 	};
@@ -1025,6 +999,7 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	last_batch_index_ = DConstants::INVALID_INDEX;
 	last_partition_values_bytes_.clear();
 	last_cache_control_ = {};
+	last_more_output_ = false;
 
 	// NOT cleared, deliberately: the SAB slot and its rings (the transport),
 	// tick_filter_state_ (a shared gstate object PerformInit never touches, so
@@ -1258,6 +1233,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// Parse vgi.cache.* cache-control off the wire metadata (first-batch only
 		// in practice; read via GetLastCacheControl on the first batch).
 		last_cache_control_ = ParseVgiCacheControl(result.custom_metadata);
+		last_more_output_ = HasMoreOutputStatus(result.custom_metadata);
 
 		// Committed to returning this batch — send the next tick now so the worker
 		// produces the next batch while DuckDB consumes this one.
@@ -1335,6 +1311,25 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 		fields.emplace_back("function_name", function_name_);
 		fields.emplace_back("input_schema_fields", std::to_string(input_schema_->num_fields()));
 		VGI_LOG(context_, "function_connection.input_writer_opened", fields);
+	}
+}
+
+void WebWorkerFunctionConnection::WriteContinuationTick() {
+	if (!input_writer_opened_ || input_writer_closed_) {
+		ThrowVgiIOException("WebWorkerFunctionConnection::WriteContinuationTick called without an open input writer",
+		                    location_, -1, GetExecutionIdHex());
+	}
+	auto tick = arrow::RecordBatch::MakeEmpty(input_schema_);
+	if (!tick.ok()) {
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr),
+		                          "Failed to build continuation tick: %s", location_, -1, GetExecutionIdHex(),
+		                          tick.status().ToString());
+	}
+	auto write_status = input_writer_->WriteRecordBatch(*tick.ValueUnsafe(), ContinuationTickMetadata());
+	if (!write_status.ok()) {
+		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr),
+		                          "Failed to write continuation tick: %s", location_, -1, GetExecutionIdHex(),
+		                          write_status.ToString());
 	}
 }
 
@@ -1452,10 +1447,7 @@ std::vector<uint8_t> WebWorkerFunctionConnection::RpcTableBufferingProcess(
 	if (!inner || inner->num_rows() == 0) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_process response missing data", location_, -1, "");
 	}
-	auto col = inner->GetColumnByName("state_id");
-	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
-	auto view = bin_array->GetView(0);
-	return std::vector<uint8_t>(view.data(), view.data() + view.size());
+	return vgi::generated::Decode<vgi::generated::TableBufferingProcessResult>(inner, 0, location_).state_id;
 }
 
 std::vector<std::vector<uint8_t>>
@@ -1480,18 +1472,7 @@ WebWorkerFunctionConnection::RpcTableBufferingCombine(const std::string &functio
 	if (!inner || inner->num_rows() == 0) {
 		ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_combine response missing data", location_, -1, "");
 	}
-	auto col = inner->GetColumnByName("finalize_state_ids");
-	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
-	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
-	auto offset = list_array->value_offset(0);
-	auto length = list_array->value_length(0);
-	std::vector<std::vector<uint8_t>> result;
-	result.reserve(length);
-	for (int64_t i = 0; i < length; ++i) {
-		auto v = values->GetView(offset + i);
-		result.emplace_back(v.data(), v.data() + v.size());
-	}
-	return result;
+	return vgi::generated::Decode<vgi::generated::TableBufferingCombineResult>(inner, 0, location_).finalize_state_ids;
 }
 
 void WebWorkerFunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,

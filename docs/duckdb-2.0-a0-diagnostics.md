@@ -1,5 +1,7 @@
 # DuckDB 2.0 initial compile inventory — October 24, 2026
 
+The initial run below is preserved. The [main-integration refresh](#main-integration-refresh--october-24-2026) records the current merged source baseline.
+
 The isolated diagnostic configuration succeeds. All **107 native VGI C++ source
 files** were attempted: **53 compiled and 54 failed**. The engine-generated
 `describe.c` also compiled, giving 108 translation units. Ninja's final archive
@@ -111,3 +113,58 @@ the next implementation batch; a successful read-path build and execution are
 still needed to narrow the remaining integration estimate. Automatic query
 export/replacement, provider snapshot proof, and capability discovery remain
 subsequent A2–A5 work.
+
+## Main integration refresh — October 24, 2026
+
+After merging native main `454fefa50b11f8bfe3065fb11aebf8f5761d7b3d`
+into preparation head `e1dc7520d28dec8cc7414bb65e227e565b6ff560`, a fresh
+isolated compile inventory attempted all **110 native C++ sources**: **54
+compiled, 56 failed, none were left unattempted**. Engine-generated `describe.c`
+also compiled, giving **111 translation units**. Configuration passes and the
+archive remains blocked by compilation failures. This is no link/load/runtime
+qualification and no source was ported to 2.0 in this refresh.
+
+The original A0 lane and JSON remain unchanged. The new owned lane is
+`/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/vgi-native2-main-sync-20261024-bwhd8iln`.
+It reuses the original clean audited engine and installed ARM64 dependency
+prefix read-only, with a separate native snapshot and build directory. Engine
+tracked sources stayed clean and the dependency status hash is unchanged. The
+112-command target graph includes no engine C++ compilation.
+
+The [refreshed machine-readable inventory](duckdb-2.0-a0-main-sync.json) records
+both merge parents, the uncommitted source snapshot tree and archive hash, every
+translation unit, the source manifest and build-log hashes. Source tree
+`870ee358bdd9fc5aa5b8dbf9728252ee4c50fb10` identifies the reviewed snapshot;
+it is not a merge commit. A later generated-header update added explanatory
+comments only; its before/after hashes are recorded separately. The active
+compile source was not changed during the run.
+
+Compared with the first inventory, exactly four source statuses differ:
+
+| Source | Initial A0 | Main integration | Evidence |
+| --- | --- | --- | --- |
+| `src/vgi_wire_codec.cpp` | Not present | Compiled | Main's strict wire codecs compile against the audited engine. |
+| `src/generated/vgi_protocol_records.cpp` | Not present | Compiled | Main's typed generated records compile. |
+| `src/vgi_http_params.cpp` | Not present | Failed | `SecretFreeFileOpener::TryGetCurrentSetting` overrides use the old string-based signatures. |
+| `src/vgi_input_dedup.cpp` | Compiled | Failed | Main's new capacity handling calls removed `DataChunk::SetCapacity`. |
+
+All other existing source statuses are unchanged. The refresh captured 415
+compiler error lines under the same 12-errors-per-unit cap. Shared catalog
+signatures, Identifier/name conversions, function callbacks and expression
+accessors remain the first A1 work; later errors are still masked. Add the
+FileOpener setting signatures and chunk-capacity adaptation to that inventory.
+These counts do not estimate migration completeness or demonstrate a missing
+protocol field.
+
+The merged preparation still builds on the retained 1.5 engine. Its selected
+native validation passed 74 contract cases/1,542 assertions, eight HTTP
+cases/265 assertions, six multibatch-catalog cases/380 assertions, five
+continuation cases/473 assertions, eight discovery/reflection cases/221
+assertions and two plan-copy cases/41 assertions. Five mutable-repeatability,
+12 projection and 18 explicit-query scenarios also passed. Each of six SDKs
+passed five native queries (42 result rows) and the accepted-plan copy check.
+The common SDK fixture claims `UNKNOWN` repeatability; the mutable Python
+fixture proves stable snapshots. These are focused checks, not a new full-suite
+or platform-matrix qualification. Evidence is in
+`logs/main-sync-20261024-kmz7l4hp/native-merge-evidence.json` under the owned EC2
+root.

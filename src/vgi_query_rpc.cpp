@@ -3,6 +3,7 @@
 
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_record_access.hpp"
 #include "vgi_attach_parameters.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_settings_defaults.hpp"

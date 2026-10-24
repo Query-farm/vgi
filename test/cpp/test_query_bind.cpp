@@ -15,9 +15,11 @@ TEST_CASE("Prepared query binding cannot negotiate external secrets", "[query-rp
 	int calls = 0;
 	auto transport = [&](const std::vector<uint8_t> &) {
 		++calls;
-		auto types = vgi::BuildStringListScalar({"s3"});
-		return arrow::RecordBatch::Make(arrow::schema({arrow::field("lookup_secret_types", types->type())}),
-		                                1, {types});
+		vgi::generated::BindResponse response;
+		response.lookup_secret_types = {"s3"};
+		response.lookup_scopes = {""};
+		response.lookup_names = {""};
+		return vgi::generated::ToBatch(response);
 	};
 	CHECK_THROWS_WITH(vgi::PerformBindProtocol(*con.context, vgi::VGI_QUERY_EXECUTOR, "TABLE", nullptr,
 	                                          nullptr, {1}, {}, {}, {}, "test-worker", transport),

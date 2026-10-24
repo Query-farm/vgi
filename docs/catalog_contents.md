@@ -1,7 +1,9 @@
 # `catalog_contents`: load a whole catalog in one RPC
 
-Status: **implemented** in protocol 2.1.0 (branch `catalog-contents` in `vgi`
-and `vgi-python`; every SDK serves it).
+`catalog_contents` was introduced in protocol 2.1.0. Protocol **2.2.0** changes
+its wire representation to six Arrow collections spanning the whole catalog.
+The protocol routing name remains `vgi.v2`; clients and workers must agree on
+the minor wire revision. See [the implementation plan](catalog_contents_batching_plan.md).
 
 ## Problem
 
@@ -16,7 +18,7 @@ catalog_schema_contents_functions   × (schemas × function types present)
 catalog_schema_contents_views/macros/indexes …
 ```
 
-Every call is sequential. Measured against `vgi-cloudflare` over HTTP (24
+In the original 2.1.0 measurements, every call was sequential. Against `vgi-cloudflare` over HTTP (24
 schemas, 224 tables, ~1,150 functions) a full enumeration
 (`duckdb_tables()` + `duckdb_functions()`) is **32 RPCs**. With 100 ms added to
 each request the load took **6.9 s** (0.34 s on loopback); 34 × 100 ms of it is
@@ -28,9 +30,9 @@ Existing mitigations reduce the *count* but not the shape:
 `vgi_eager_load_threshold` makes each schema one bulk RPC instead of one RPC per
 name. Nothing batches across schemas.
 
-## Proposal
+## Contract
 
-One new unary RPC that returns every schema and all of its contents, and one
+One unary RPC returns every schema and all of its contents, and one
 attach-result flag that advertises it.
 
 ### Advertising: `CatalogAttachResult.supports_catalog_contents`
@@ -57,38 +59,47 @@ catalog_contents(attach_opaque_data: binary, if_none_match: utf8 nullable = null
 CatalogContentsResponse            -- ordinary typed unary result: one batch, one row
   catalog_version: int64           -- version the snapshot was taken at
   etag:            utf8, nullable  -- opaque validator; null = worker does not revalidate
-  not_modified:    bool            -- true => `schemas` is empty, the client keeps what it has
-  schemas:         list<struct<SchemaContents>>   -- one struct row per schema, parents before children
-
-SchemaContents (a struct, not a separately serialized record)
-  path:                list<utf8>     -- the schema path; MUST equal SchemaInfo.path inside `schema`
-  schema:              binary         -- a SchemaInfo item, byte-identical to a catalog_schemas `items` entry
-  tables:              list<binary>   -- TableInfo items      (= catalog_schema_contents_tables)
-  views:               list<binary>   -- ViewInfo items       (= …_views)
-  scalar_functions:    list<binary>   -- FunctionInfo items   (= …_functions type=SCALAR_FUNCTION)
-  aggregate_functions: list<binary>   --                        (… type=AGGREGATE_FUNCTION)
-  table_functions:     list<binary>   --                        (… type=TABLE_FUNCTION)
-  scalar_macros:       list<binary>   -- MacroInfo items      (= …_macros type=SCALAR_MACRO)
-  table_macros:        list<binary>   --                        (… type=TABLE_MACRO)
-  indexes:             list<binary>   -- IndexInfo items      (= …_indexes)
+  not_modified:    bool            -- true => all six collections are null
+  schemas:         binary nullable -- SchemaInfo rows, parents before children
+  tables:          binary nullable -- TableInfo rows
+  views:           binary nullable -- ViewInfo rows
+  functions:       binary nullable -- FunctionInfo rows, all subtypes
+  macros:          binary nullable -- MacroInfo rows, both subtypes
+  indexes:         binary nullable -- IndexInfo rows
 ```
 
-`SchemaContents` nests as `list<struct<…>>`, the way other protocol records nest
-dataclasses (`CatalogInfo.releases`, `FunctionInfo.examples`), so the whole
-response is one typed batch: the client reads `path` straight from the struct
-column and never decodes a per-schema IPC record. Every item is byte-for-byte
-what the matching per-schema RPC returns today, so the client decodes them with
-its existing per-kind decoders and fills the same entry caches — there is no
-second definition of any catalog object. Each kind is **complete**: an empty
-list means "this schema has none of that kind" (the worker must not omit a kind
-it has; it may skip *computing* a kind its `estimated_object_count` reports as
-0). Item encoding is deterministic (map columns in sorted key order), so equal
-contents serialize to equal bytes — which content-hash etags rely on.
+Each non-null collection contains one Arrow IPC stream with zero or more
+record batches. Each row uses the existing metadata schema for that object
+type. Schema rows carry `path`; other rows carry the owning `schema_path`.
+Both preserve raw path components. Functions of every
+subtype share one stream; scalar and table macros share another. Readers must
+consume all rows in all batches, including dictionary replacements. Empty
+categories are normally null; a correctly typed zero-row stream is also valid.
+
+`FunctionInfo.arguments`, `output_schema`, and `parameter_default_values` use
+`dictionary<int32, binary>`. The first two fields remain non-nullable; defaults
+remain nullable. Dictionary indices refer to byte-exact values, including empty
+and non-UTF8 bytes; null indices represent missing values. These field types also
+apply to singleton `FunctionInfo` results from per-name and per-schema RPCs.
+The payloads and author-facing types are unchanged. Other binary metadata fields
+remain plain binary, and existing enum dictionaries retain their int16 indices.
+
+Every collection is complete across all schemas. Missing categories mean that
+the catalog has no objects of that type. The worker may skip computing a kind
+whose `estimated_object_count` is zero. Object values must equal those returned
+by the per-schema APIs; serialized bytes can differ because schemas and
+dictionaries are now shared. Per-schema RPCs retain their existing envelopes.
+`SchemaInfo` no longer carries `attach_opaque_data`; request and attach-result
+state are unchanged.
+
+The outer unary RPC envelope remains one non-null `result: binary` row. Its
+value is the serialized response above. A published object must contain this
+complete outer envelope.
 
 `etag` / `if_none_match` semantics:
 
 - `not_modified = true` iff `if_none_match` is non-null and equals the worker's
-  current etag. Then `schemas = []`, `etag` is that same etag, and
+  current etag. Then all six collections are null, `etag` is that same etag, and
   `catalog_version` is the current version.
 - A full response always carries the etag (or null). `etag = null` means the
   worker does not support revalidation; it then ignores `if_none_match`.
@@ -128,30 +139,42 @@ worker publishes the response once (`publish_external`), caches the ref, and
 returns it on later calls — no per-call serialization or upload. Clients already
 resolve these pointers transparently.
 
-Cross-session reuse should come from the *content*, not the version: a client
-may cache resolved external payloads on disk keyed by their
-`vgi_rpc.location.sha256`, so two sessions hit only when the worker handed them
-byte-identical contents. Whether contents vary per user is the worker's call —
-it expresses that simply by what it publishes.
+The digest identifies byte-identical objects; it does not authorize sharing
+between attachments. A catalog must explicitly declare a visibility scope for
+shared publications. Otherwise the framework isolates publications by sealed
+attachment. This change does not add a client disk cache.
 
-Caveat: every `SchemaInfo`/`TableInfo`/… item embeds the attach's sealed
-`attach_opaque_data`, which is unique per attach, so as specified the response
-is **not** byte-identical across sessions. Making refs shareable needs those
-per-attach bytes out of the items (the client already knows its attach id) —
-follow-up work, not needed for the latency win.
+The framework publication policy is opt-in. It identifies an immutable snapshot
+using the catalog namespace, source revision, visibility scope, catalog version,
+wire revision, metadata contract hash, codec revision, and storage profile.
+Authorization runs before every lookup. A durable manifest can recover an
+existing publication before the inventory is built; a new process validates it
+once through HTTP. Warm hits reuse the validated reference without rebuilding,
+serializing, compressing, uploading, or fetching the object again.
+
+Publication validates raw and stored size limits before upload and verifies the
+raw SHA-256, outer RPC envelope, nested collections, and inventory on HTTP
+readback before committing a manifest. Repositories must describe URL expiry
+and object retention explicitly. Memory and S3-compatible repositories support
+conditional commits, invalidation, and URL renewal. Publication failures raise
+by default; ordinary delivery fallback must be explicitly configured.
+
+Published RPC objects share the same wire contract across all SDKs. Durable
+manifest serialization is SDK-specific; importing another SDK's manifest is not
+part of the contract. Repository namespaces and storage profiles should keep
+those manifests separate.
 
 ## Client behaviour (DuckDB extension)
 
 1. `catalog_attach` → record `supports_catalog_contents`.
 2. On a schema-set load (where `catalog_schemas` is called today), if supported
    and the `vgi_catalog_contents` setting is on, call `catalog_contents`
-   instead — subject to the reload and version rules below. Each schema entry
-   is created from `SchemaContents.path` alone and **seeded** with its struct
-   row: the response batch is held once and every schema indexes its row in
-   place (no per-schema copies). The `SchemaInfo` (comment, tags,
-   `estimated_object_count`) is decoded on first use — a schema scan such as
-   `duckdb_schemas()`, or a child set that needs the counts — and its path
-   must equal `SchemaContents.path`.
+   instead — subject to the reload and version rules below. The client opens
+   each collection once, validates its schema, and indexes every row by raw
+   schema path and object kind. Shared record batches retain the Arrow buffers;
+   the index stores batch-and-row references without per-object serialization.
+   Schema comments, tags, and counts are decoded when first needed. Native
+   DuckDB still supports only one-component schema paths.
 3. Each per-kind load (`LoadEntries` / inventory) decodes and consumes its seed
    instead of issuing `catalog_schema_contents_*` — once per schema and kind;
    the per-name single-entry paths see a loaded set and hit the cache.
@@ -221,7 +244,7 @@ may short-circuit *before* building the contents, so a cheap validator — a
 generation counter, a schema version, a git sha — makes revalidation cost about
 what the version poll did. vgi-python can instead derive the etag from the
 contents (`catalog_contents_etag = "content-hash"`, off by default): SHA-256 over
-the deterministic serialized `schemas`, with a matching `if_none_match` turned
+the deterministic serialized six collections, with a matching `if_none_match` turned
 into `not_modified`. That still builds the contents on every call, saving only
 transfer and client decode — for a non-frozen catalog it turns a cheap version
 poll into a full build per transaction, hence opt-in. Frozen catalogs never
@@ -247,9 +270,9 @@ revalidate; vgi-python builds their response once per (catalog, version).
 
 `SELECT * FROM vgi_catalog_contents('<catalog>' [, if_none_match := '<etag>'])`
 issues one `catalog_contents` and returns `catalog_version`, `etag`,
-`not_modified`, `schemas` (names from `SchemaContents.path`) and
-`schema_info_names` (decoded from each `SchemaInfo`, which verifies the paths
-agree) — no rows if the worker does not advertise it. It does not touch the
+`not_modified`, `schemas` (names from the snapshot index) and
+`schema_info_names` (decoded from each `SchemaInfo`) — no rows if the worker does
+not advertise it. It does not touch the
 caches; the conformance test uses it to check revalidation on any worker.
 
 Tests: `test/sql/integration/catalog/catalog_contents*.test`
@@ -271,7 +294,7 @@ lazy above) — requires the counts before the call, e.g. on the attach result.
   any catalog can serve it without new code.
 - `catalog_contents_etag = "content-hash"` (catalog-level, default off): when
   the catalog returned no etag, the framework uses the hex SHA-256 of the
-  deterministic serialized `schemas` and turns a matching `if_none_match` into
+  deterministic serialized six collections and turns a matching `if_none_match` into
   `not_modified`.
 - `ReadOnlyCatalogInterface` (static, version-frozen catalogs such as
   `vgi-cloudflare`) advertises `supports_catalog_contents=True`, and the
@@ -280,11 +303,190 @@ lazy above) — requires the counts before the call, e.g. on the attach result.
 - Every SDK mirrors this API idiomatically, and its example worker should expose
   a revalidating catalog so the conditional path is exercised in every language.
 
-## Expected effect (vgi-cloudflare, 100 ms RTT)
+## Measured collection encoding (2026-10-21)
+
+The implemented Python writer was measured against the same captured metadata
+inventories used for the proposal. Sizes below are the inner
+`CatalogContentsResponse` IPC stream; gzip uses level 6. An external publication
+adds the ordinary unary `result: binary` envelope. Decoded metadata equality was
+checked for every object.
+
+| Catalog | Schemas / objects | Raw bytes, 2.1 → 2.2 | Gzip bytes, 2.1 → 2.2 | Gzip reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Open-Meteo | 1 / 23 | 459,864 → 292,576 | 49,603 → 30,489 | 38.5% |
+| GitHub | 3 / 806 | 12,188,640 → 2,710,136 | 556,565 → 139,408 | 75.0% |
+| Cloudflare | 24 / 1,927 | 25,227,976 → 7,541,368 | 2,081,458 → 894,472 | 57.0% |
+
+Before the binary dictionary addition, cold metadata encoding plus response
+assembly took 3.94 → 1.49 ms for
+Open-Meteo, 168.65 → 47.78 ms for GitHub, and 384.34 → 108.86 ms for
+Cloudflare (five-run medians on the development Mac; inventory collection and
+network time excluded). Reassembling the old response from already memoized
+per-item IPC was faster than rebuilding the new collections: 0.08, 1.76, and
+4.20 ms respectively. Frozen-response caching and published warm hits avoid
+both encoding paths.
+
+A paired nine-run check of the implemented three-field dictionary writer found
+plain-binary → dictionary encoding times of 1.45 → 1.45 ms, 47.53 → 47.50 ms,
+and 109.73 → 106.92 ms respectively. This showed no meaningful encoding slowdown
+in Python; it does not establish writer costs in the other SDKs. The benchmark
+and outputs are in `/tmp/catalog-batching-implementation/binary-dictionary-current.py`
+and `/tmp/catalog-batching-implementation/binary-dictionary-current/`.
+
+GitHub and Cloudflare's legacy re-encoding exactly reproduced the captured
+bytes. Open-Meteo's legacy re-encoding was 4,976 bytes smaller than its capture
+despite equal decoded metadata, due to an earlier IPC encoder difference; the
+table uses the captured baseline.
+
+### Dictionary encoding check
+
+The metadata contract already uses `dictionary<int16, utf8>` for function type,
+stability, null handling, order preservation, partition kind, order dependence,
+distinct dependence, macro type, and index constraint type. The collection
+writers preserve those fields. The following controlled comparison retains the
+same rows and batch boundaries and changes only the indicated Arrow field types.
+All variants round-trip to identical metadata values.
+
+| Encoding | Open-Meteo gzip bytes | GitHub gzip bytes | Cloudflare gzip bytes |
+| --- | ---: | ---: | ---: |
+| Enum dictionaries only (batching baseline) | 30,669 | 178,810 | 927,335 |
+| Existing enum fields as plain strings | 30,674 | 183,908 | 939,622 |
+| Current enums + binary default dictionaries | 30,766 | 167,359 | 921,400 |
+| Current enums + dictionaries for all top-level binary metadata fields | 30,577 | 139,640 | 892,989 |
+| Current enums + dictionaries for schema-path components | 30,694 | 177,655 | 922,444 |
+| Implemented: enum dictionaries + three FunctionInfo binary fields | 30,489 | 139,408 | 894,472 |
+
+Existing enum dictionaries save 2.8% gzip for GitHub and 1.3% for Cloudflare;
+their effect on Open-Meteo is negligible. The implemented three-field binary
+dictionaries save a further 22.0% gzip for GitHub, 3.5% for Cloudflare, and 0.6%
+for Open-Meteo versus the batching baseline. Broad binary and path dictionaries
+remain experiments. The three-field row was reproduced by the actual writer,
+with equal decoded metadata for every object.
+
+#### Retained memory follow-up
+
+A second experiment decoded the batching baseline and dictionary variants with PyArrow
+25.0.1, preserving zero-copy slices of the six streams as the native reader
+does. It counted unique buffer ranges, including dictionary values, and traced
+their parent buffers to count the backing bytes retained. These are catalog
+buffer measurements, not whole-process RSS or writer peak-memory measurements.
+
+| Catalog | Baseline backing bytes | Implemented three-field dictionaries | Bytes saved | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Open-Meteo | 301,472 | 292,576 | 8,896 | 3.0% |
+| GitHub | 4,617,392 | 2,710,136 | 1,907,256 | 41.3% |
+| Cloudflare | 8,259,848 | 7,541,368 | 718,480 | 8.7% |
+
+Expanding the same rows into Python dictionaries, lists, strings and bytes
+produced identical retained object sizes in both variants: 450,748 bytes for
+Open-Meteo, 6,838,102 for GitHub, and 15,065,370 for Cloudflare. This is a
+materialization experiment, not a measurement of the complete framework worker.
+Dictionary encoding shares Arrow values; consumers that create separate
+per-function objects give up that sharing. The native reader currently copies
+default bytes and independently parses argument/output schemas for each
+function. Its object memory does not automatically shrink with the wire buffers.
+Warm published workers retain manifests rather than an extra full encoded body,
+so the publication layer already avoids that persistent payload allocation.
+
+The implemented scope is `FunctionInfo.arguments`, `output_schema`, and
+`parameter_default_values`. Encoding only those three fields gives GitHub
+2,710,136 backing bytes / 139,408 gzip bytes, and Cloudflare 7,541,368 backing
+bytes / 894,472 gzip bytes. Most of the gain therefore comes from those fields;
+dictionary-encoding every binary field adds little. Decoded-schema/default
+sharing and writer allocation/CPU costs need separate measurements before
+claiming a comparable reduction in application memory or peak memory.
+
+The reproducible experiment and full field breakdown are
+`/tmp/catalog-batching-implementation/dictionary-memory.py` and
+`dictionary-memory-results.json`. The three-field change is included in the
+still-unreleased 2.2 contract; it does not allocate another wire revision.
+
+## Development verification and release dependencies
+
+The implementation was built locally and on the isolated EC2 workspace
+`/home/ec2-user/catalog-batching-20261021-H2Bc5i` on 2026-10-21. The shared
+native catalog suite checks ordinary enumeration, capability fallback, DDL,
+version changes, ETags, and equivalence with the per-schema APIs. Its six cases
+contain 380 assertions per SDK worker. The additional multi-batch Python fixture
+uses small batches so dictionary replacement and row indexing cross batch
+boundaries.
+
+All six SDK workers passed that native suite on EC2. Published Python responses
+also passed over subprocess and HTTP transports, and published TypeScript/Go
+responses passed the native HTTP conformance case. Python clients independently
+compared those TypeScript/Go published inventories with per-schema results.
+These checks were repeated after adding the three binary dictionaries. SDK
+checks also cover byte-content deduplication, empty and non-UTF8 values,
+nullable defaults, required fields referencing null dictionary values, and
+dictionary replacement across record batches. Rust passed against published
+RPC 0.32.0; Java and C# passed with their new packaged RPC dependencies.
+
+Publication checks cover the full outer RPC envelope, gzip/zstd, HTTP readback,
+durable recovery, conditional commits and invalidation, URL renewal, attachment
+isolation, concurrent requests, size limits, malformed objects, and explicit
+ordinary fallback. Chromium and WebKit loaded the rebuilt WASM extension and
+enumerated a published catalog with one `catalog_contents` call, zero fallback,
+and zero per-schema calls. These browser runs use a local HTTP object fixture;
+production S3/R2 CORS, signed URLs, and rollout remain deployment checks.
+
+| Framework | RPC dependency used for this feature |
+| --- | --- |
+| Python | Published `vgi-rpc` 0.52.0 verified on current main; install `vgi[external]` for publication fetch dependencies |
+| TypeScript | Requires new `@query-farm/vgi-rpc` 0.29.1; packed artifacts verified in Node and Bun, including browser exports |
+| Go | Published `github.com/Query-farm/vgi-rpc-go` 0.35.0 |
+| Rust | Published `vgi-rpc` 0.32.0 |
+| Java | Requires new RPC 0.33.1; locally published Maven artifacts verified without composite source substitution |
+| C# | Requires new RPC NuGet packages 0.18.1; packed packages verified locally and on EC2 without sibling source projects |
+
+The new TypeScript RPC fixes external gzip resolution; Java adds the multi-row
+and binary dictionary codecs, emits dictionary replacements between batches,
+and makes IPC end-of-stream writing idempotent. C# adds binary dictionary
+schema derivation and value decoding. Publish those RPC
+dependencies before the corresponding framework packages. Development source
+changes and locally packed artifacts have not been published or deployed.
+The original catalog feature also passed against Python RPC 0.50.0 in isolation;
+current main retains its newer 0.52.0 dependency and Identity.v2 support. Existing
+unrelated reporting work remains separate.
+
+Current-main TypeScript packed-artifact checks are recorded in
+`/tmp/vgi-main-packages-20261021/verification.json`; the RPC version is 0.29.1,
+and the SDK lock matches the verified artifact. Java's Maven packages are in
+`/tmp/vgi-catalog-main-maven`, and C#'s NuGet packages are in
+`/tmp/vgi-catalog-main-nuget`. SDK CI pins the required RPC source commits while
+those package releases are pending. Package publication remains a separate step;
+normal Git pushes do not publish them. S3 adapters were checked against
+conditional HTTP storage fixtures, without live bucket credentials.
+
+SDK development CI also pins a matching native VGI revision. The native
+integration workflow packages its statically linked test runner and CLI;
+`scripts/ci_fetch_native_runner.py` selects the exact revision's artifact and
+verifies its manifest and executable checksums. Missing artifacts fail the job.
+This lets a new wire contract run through CI before its public extension release.
+The development runner links VGI, HTTPFS, JSON, and Parquet; Spatial remains an
+explicitly reported unsupported dependency in that mode. The integration scripts
+retain their signed-community mode for release qualification and local runs.
+
+To rerun the shared suite from a built native checkout, select a worker and use
+an unused temporary directory. The leading wildcard is necessary when the
+runner registers absolute test paths:
+
+```sh
+VGI_TEST_WORKER=/absolute/path/to/worker ./build/release/test/unittest \
+  --test-temp-dir /tmp/vgi-catalog-unique-run \
+  --test-config test/configs/no_error_skip.json \
+  '*test/sql/integration/catalog/catalog_contents*'
+```
+
+The no-error-skip configuration ensures HTTP errors cannot silently turn a
+failed interoperability case into a skip. Build `unittest` as well as
+`vgi_loadable_extension` after native changes: the runner statically embeds the
+extension.
+
+## Original round-trip improvement (vgi-cloudflare, 100 ms RTT)
 
 Full enumeration: 32 RPCs → 3 (`catalog_attach`, `catalog_copy_from_formats`,
-`catalog_contents`), i.e. ~3.4 s of latency → ~0.3 s. Measured numbers go here
-once the implementation is benchmarked.
+`catalog_contents`), i.e. ~3.4 s of modeled latency → ~0.3 s. Collection batching
+changes the response encoding without adding RPCs.
 
 
 ### Worker transactions

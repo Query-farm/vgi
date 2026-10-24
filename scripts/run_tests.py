@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Parallel test runner for the VGI DuckDB extension.
 
-Discovers ``.test`` files matching DuckDB-unittest-style glob patterns and
+Discovers ``.test`` / ``.test_slow`` files matching DuckDB-unittest-style glob patterns and
 runs each one in its own ``./build/<build>/test/unittest <file>`` subprocess,
 N at a time. Designed for workloads where unittest is mostly waiting on
 external I/O (Cloudflare DO storage, HTTP transport) so serial execution
@@ -14,7 +14,7 @@ Pattern semantics match the way the Makefile targets pass arguments to
     characters including ``/``.
   - A leading ``~`` excludes any path matching that pattern. Excludes
     are applied after includes.
-  - All matching files must end in ``.test``.
+  - Matching files must end in ``.test`` or ``.test_slow``.
 
 Env vars (``VGI_TEST_WORKER``, ``VGI_WORKER_SHARED_STORAGE``,
 ``VGI_CF_DO_URL``, ``VGI_CF_DO_TOKEN``, etc.) are read from the current
@@ -27,13 +27,18 @@ Exit code is 0 iff every test passed.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import csv
 import os
 import re
+import shutil
+import signal
 import statistics
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -68,7 +73,12 @@ def _pattern_to_regex(pattern: str) -> re.Pattern[str]:
 
 
 def discover(patterns: list[str], root: Path) -> list[Path]:
-    """Walk ``root`` for ``.test`` files matching the include/exclude patterns."""
+    """Walk ``root`` for ``.test`` / ``.test_slow`` files matching the patterns.
+
+    ``.test_slow`` files are part of the suite (unittest runs them for
+    ``test/*``); discovering only ``*.test`` silently dropped the stress tests
+    from every run_tests.py lane.
+    """
     includes = [p for p in patterns if not p.startswith("~")]
     excludes = [p[1:] for p in patterns if p.startswith("~")]
 
@@ -79,7 +89,7 @@ def discover(patterns: list[str], root: Path) -> list[Path]:
     exclude_rxs = [_pattern_to_regex(p) for p in excludes]
 
     matched: set[Path] = set()
-    for p in root.rglob("*.test"):
+    for p in (*root.rglob("*.test"), *root.rglob("*.test_slow")):
         rel = str(p.relative_to(root))
         if not any(rx.match(rel) for rx in include_rxs):
             continue
@@ -92,21 +102,206 @@ def discover(patterns: list[str], root: Path) -> list[Path]:
 # --- Execution ---
 
 
-def run_one(test_path: Path, unittest: Path, env: dict[str, str], extra_args: list[str]) -> dict:
-    """Invoke ``unittest [extra_args] <test_path>`` and capture everything."""
-    t0 = time.monotonic()
+# Running unittest process groups. Each test gets its own session (so a timeout
+# can kill its workers too), which also means a Ctrl-C to the runner no longer
+# reaches them: main() kills whatever is still here on the way out.
+_LIVE: set[int] = set()
+
+
+# Set once the run is stopping. A process started after it is set (a pool thread
+# racing the shutdown) kills itself at once, so nothing outlives the runner.
+_STOPPING = threading.Event()
+
+
+def _track(proc: subprocess.Popen) -> None:
+    _LIVE.add(proc.pid)
+    if _STOPPING.is_set():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _kill_live() -> None:
+    _STOPPING.set()
+    for pgid in list(_LIVE):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _thread_stacks(pid: int) -> str:
+    """Every thread's backtrace of a hung unittest -- the evidence a hang leaves."""
+    if shutil.which("gdb") is None:
+        return "(gdb not installed: no stacks)"
     try:
-        proc = subprocess.run(
-            [str(unittest), *extra_args, str(test_path)],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
+        out = subprocess.run(
+            ["gdb", "-p", str(pid), "-batch", "-ex", "thread apply all bt"],
+            capture_output=True, text=True, timeout=120, check=False,
         )
-        exit_code = proc.returncode
-        stdout = proc.stdout
-        stderr = proc.stderr
+        return out.stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"(gdb failed: {exc!r})"
+
+
+# A whole line: the log is read while the server writes it, so an unterminated
+# "PORT:12" may be the first half of "PORT:12345".
+_PORT_RE = re.compile(r"PORT:(\d+)\r?\n")
+
+
+def _start_server(cmd: str, log_path: Path, startup_timeout: float) -> tuple[subprocess.Popen, int]:
+    """Start one test's own worker server and wait for it to print ``PORT:<n>``."""
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            executable="/bin/bash",  # the command may use bash quoting (printf %q)
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    _track(proc)
+    deadline = time.monotonic() + startup_timeout
+    while time.monotonic() < deadline:
+        m = _PORT_RE.search(log_path.read_text(errors="replace"))
+        if m:
+            return proc, int(m.group(1))
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    _stop_server(proc)
+    raise RuntimeError(
+        f"worker server did not report a port within {startup_timeout:.0f}s "
+        f"(exit {proc.returncode}); log: {log_path}"
+    )
+
+
+def _stop_server(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    _LIVE.discard(proc.pid)
+
+
+def run_one(
+    test_path: Path,
+    unittest: Path,
+    env: dict[str, str],
+    extra_args: list[str],
+    timeout: float | None,
+    server_cmd: str | None = None,
+    log_dir: Path | None = None,
+    isolate_launcher: bool = False,
+) -> dict:
+    """Invoke ``unittest [extra_args] <test_path>`` and capture everything.
+
+    A file still running after ``timeout`` seconds is a hang: its thread stacks
+    are captured, then its whole process group (unittest and any worker it
+    spawned) is killed, and it fails -- rather than stalling the lane forever.
+
+    With ``server_cmd``, the file gets its own worker server: started before the
+    test (``VGI_TEST_WORKER`` points at it), killed after. Its startup time is
+    reported apart from the test's ``duration``.
+    """
+    if _STOPPING.is_set():
+        return {
+            "path": test_path,
+            "exit": -1,
+            "stdout": "",
+            "stderr": "",
+            "duration": 0.0,
+            "server_startup": 0.0,
+            "error": "the run was stopped before this file started",
+            "skip_reasons": {},
+        }
+    server = None
+    server_startup = 0.0
+    server_log = None
+    if server_cmd is not None:
+        assert log_dir is not None
+        server_log = log_dir / (str(test_path).replace("/", "__") + ".server.log")
+        s0 = time.monotonic()
+        try:
+            server, port = _start_server(server_cmd, server_log, startup_timeout=120)
+        except RuntimeError as exc:
+            return {
+                "path": test_path,
+                "exit": -1,
+                "stdout": "",
+                "stderr": "",
+                "duration": time.monotonic() - s0,
+                "server_startup": time.monotonic() - s0,
+                "error": str(exc),
+                "skip_reasons": {},
+            }
+        server_startup = time.monotonic() - s0
+        env = {**env, "VGI_TEST_WORKER": f"http://localhost:{port}"}
+    try:
+        result = _run_unittest(test_path, unittest, env, extra_args, timeout, isolate_launcher)
+    finally:
+        if server is not None:
+            _stop_server(server)
+    result["server_startup"] = server_startup
+    if result["exit"] != 0 and server_log is not None:
+        result["stderr"] += f"\n--- worker server log: {server_log} ---\n"
+    return result
+
+
+def _run_unittest(
+    test_path: Path,
+    unittest: Path,
+    env: dict[str, str],
+    extra_args: list[str],
+    timeout: float | None,
+    isolate_launcher: bool = False,
+) -> dict:
+    t0 = time.monotonic()
+    if isolate_launcher:
+        # launch: workers are pooled by a hash of (command, cwd, VGI_RPC_* env), so
+        # a value unique to this file gives it a warm pool of its own instead of
+        # queueing on the one every parallel file would otherwise share.
+        env = {**env, "VGI_RPC_TEST_POOL": f"{os.getpid()}:{test_path}"}
+    try:
+        proc = subprocess.Popen(
+            # CMake can register extension tests with absolute names. Match the
+            # same file whether the runner registered a relative or full path.
+            [str(unittest), *extra_args, "*" + str(test_path)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        _track(proc)
         error = None
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stacks = _thread_stacks(proc.pid)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+            stderr = f"{stderr}\n--- thread stacks at timeout ---\n{stacks}"
+            error = f"TIMEOUT: still running after {timeout:.0f}s (stacks below)"
+        finally:
+            if isolate_launcher:
+                # The launcher does not detach its workers: they stay in this
+                # file's process group after unittest exits. Nothing else uses
+                # them, so end the pool now rather than at its idle timeout.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            _LIVE.discard(proc.pid)
+        exit_code = proc.returncode
+        if exit_code == 0 and ("No test cases matched" in stdout or "No tests ran" in stdout):
+            exit_code = 1
+            error = "the runner matched no test cases for this file"
     except (OSError, subprocess.SubprocessError) as exc:
         # Treat infrastructural failures (binary missing, exec failure, etc.)
         # as test failures so we surface them in the summary rather than
@@ -323,7 +518,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--show-passes",
         action="store_true",
-        help="Print live PASS lines as tests complete (default: true if TTY).",
+        help="Print live PASS lines as tests complete (default: on).",
     )
     parser.add_argument(
         "--no-show-passes",
@@ -331,7 +526,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         action="store_false",
         help="Suppress PASS lines; only show FAILs and the summary.",
     )
-    parser.set_defaults(show_passes=sys.stdout.isatty())
+    # On by default, TTY or not: a log with one line per finished file is how a
+    # lane's progress (or its stall) is visible from outside.
+    parser.set_defaults(show_passes=True)
     parser.add_argument(
         "--top",
         type=int,
@@ -361,6 +558,23 @@ def main(argv: Iterable[str] | None = None) -> int:
         "that. Set it just below the lane's current count.",
     )
     parser.add_argument(
+        "--isolate-launcher",
+        action="store_true",
+        help="Give every test file its own pool of launch: workers (a per-file "
+        "VGI_RPC_TEST_POOL, which the launcher hashes into its pool key), and end that "
+        "pool when the file finishes. Without it every parallel file queues on one "
+        "shared pool per worker command.",
+    )
+    parser.add_argument(
+        "--server-per-test",
+        default=None,
+        metavar="CMD",
+        help="Give every test file its own worker server: a shell command that serves "
+        "the fixture worker over HTTP and prints PORT:<n> once listening. The runner "
+        "starts it before the file, sets VGI_TEST_WORKER=http://localhost:<n>, and kills "
+        "it after. Without it every file shares whatever VGI_TEST_WORKER names.",
+    )
+    parser.add_argument(
         "--allow-skip",
         action="append",
         default=[],
@@ -369,6 +583,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         "Repeatable. When any --allow-skip is given, an UNLISTED skip reason fails the "
         "run — so a test that silently stops executing is a failure, not a quieter "
         "green. Match is on the reason text the runner prints.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=float(os.environ.get("VGI_RUN_TESTS_TIMEOUT", "900")),
+        metavar="SECONDS",
+        help="Per-file limit (default: 900, override with VGI_RUN_TESTS_TIMEOUT; 0 = none). "
+        "A file past it is a hang: its thread stacks are printed, its process group is "
+        "killed, and it fails.",
     )
     parser.add_argument(
         "--test-config",
@@ -394,6 +617,18 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     env = os.environ.copy()
 
+    # Test files and their servers run in their own sessions, so a signal to the
+    # runner never reaches them: kill them on any exit, including a CI cancel
+    # (SIGTERM), not only on Ctrl-C.
+    atexit.register(_kill_live)
+
+    def _on_sigterm(signum: int, frame: object) -> None:
+        # The Ctrl-C path: cancel the queued files, kill the running ones.
+        _STOPPING.set()
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     # Auto-set VGI_TEST_DEDICATED_WORKER when the worker is a bare command
     # path (subprocess transport): each parallel unittest process spawns its
     # own private worker child, so SIGKILL-self tests like
@@ -417,20 +652,36 @@ def main(argv: Iterable[str] | None = None) -> int:
     total_serial = 0.0  # sum of per-test durations — what a serial run would take
 
     t0 = time.monotonic()
+    log_dir = Path(tempfile.mkdtemp(prefix="vgi-test-servers-")) if args.server_per_test else None
+    if log_dir is not None:
+        print(f"a worker server per test file; server logs: {log_dir}", file=sys.stderr)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(run_one, t, unittest, env, extra_args): t for t in tests}
+        timeout = args.timeout if args.timeout > 0 else None
+        futures = {
+            pool.submit(
+                run_one, t, unittest, env, extra_args, timeout, args.server_per_test, log_dir, args.isolate_launcher
+            ): t
+            for t in tests
+        }
         completed = 0
-        for fut in concurrent.futures.as_completed(futures):
-            r = fut.result()
-            results.append(r)
-            total_serial += r["duration"]
-            completed += 1
-            if r["exit"] == 0:
-                if args.show_passes:
+        try:
+            for fut in concurrent.futures.as_completed(futures):
+                r = fut.result()
+                results.append(r)
+                total_serial += r["duration"]
+                completed += 1
+                if r["exit"] == 0:
+                    if args.show_passes:
+                        print(_format_result_line(completed, len(tests), r))
+                else:
+                    _print_failure(r, completed, len(tests))
                     print(_format_result_line(completed, len(tests), r))
-            else:
-                _print_failure(r, completed, len(tests))
-                print(_format_result_line(completed, len(tests), r))
+        except KeyboardInterrupt:
+            # Before the pool's exit waits on threads blocked in communicate().
+            for f in futures:
+                f.cancel()
+            _kill_live()
+            raise
 
     _print_summary(
         results,
@@ -439,6 +690,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         top_n=args.top,
         show_all_timings=args.all_timings,
     )
+    startups = [r["server_startup"] for r in results if r.get("server_startup")]
+    if startups:
+        print(DIM(f"worker server startup: {sum(startups):.1f}s total, "
+                  f"median {statistics.median(startups):.2f}s, max {max(startups):.2f}s "
+                  f"over {len(startups)} servers"))
     if args.timings_csv is not None:
         _write_timings_csv(results, args.timings_csv)
         print(DIM(f"wrote timings to {args.timings_csv}"), file=sys.stderr)
@@ -476,4 +732,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Line-buffered even into a file or pipe, so a lane's log shows each
+    # finished test as it happens instead of all at once at the end.
+    sys.stdout.reconfigure(line_buffering=True)
     sys.exit(main())

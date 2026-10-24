@@ -1,7 +1,8 @@
 # Discovery validates auth options before I/O, just like ATTACH.
 require vgi
 
-set ignore_error_messages Unable to connect
+# Every case must validate before I/O; a connection attempt is a failure.
+set ignore_error_messages
 
 statement error
 SELECT * FROM vgi_catalogs('https://127.0.0.1:1', bearer_token := 'a', oauth_refresh_token := 'b');

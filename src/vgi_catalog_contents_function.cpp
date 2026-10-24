@@ -61,7 +61,7 @@ void VgiCatalogContentsScan(ClientContext &context, TableFunctionInput &data_p, 
 	vector<Value> info_names;
 	for (auto &schema : snapshot.schemas) {
 		schema_names.emplace_back(schema.name);
-		// Decoding checks SchemaInfo.path == SchemaContents.path.
+		// Decode the indexed SchemaInfo row from the shared metadata batch.
 		info_names.emplace_back(DecodeContentsSchemaInfo(schema).name);
 	}
 	output.SetValue(0, 0, Value::BIGINT(snapshot.catalog_version));
@@ -81,7 +81,7 @@ void RegisterVgiCatalogContentsFunction(ExtensionLoader &loader) {
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "Issue one catalog_contents RPC against an attached VGI catalog and return the answer: the snapshot's "
 	    "catalog_version and etag, whether the worker answered not_modified to if_none_match, and the schema "
-	    "names (from SchemaContents.path, and decoded from each SchemaInfo). No rows when the worker does not "
+	    "names (from the snapshot index, and decoded from each SchemaInfo). No rows when the worker does not "
 	    "advertise catalog_contents. A diagnostic; the catalog caches are not touched.",
 	    {"catalog"}, {LogicalType::VARCHAR},
 	    {"SELECT * FROM vgi_catalog_contents('my_catalog');",

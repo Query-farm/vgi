@@ -16,15 +16,15 @@
 #include "vgi_cookie_jar.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_compression.hpp"
+#include "vgi_http_params.hpp"
 #include "vgi_httpi.hpp"
 #include "vgi_iroh_native.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_unary_retry.hpp"
+#include "vgi_sha256.hpp"
 #include "vgi_transport.hpp"
-
-#include "mbedtls_wrapper.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -419,12 +419,10 @@ static std::string HttpPostArrowIpcInternal(
 			params.reset();
 		}
 		if (!params) {
-			auto owned = http_util.InitializeParameters(context, url);
+			auto owned = InitHttpParamsWithSecrets(context, url);
 			owned->timeout = timeout_seconds;
 			if (single_attempt) owned->retries = 0;
 			params = std::shared_ptr<HTTPParams>(owned.release());
-		} else if (!single_attempt) {
-			params->timeout = timeout_seconds;
 		}
 		PostRequestInfo post(url, headers, *params, reinterpret_cast<const_data_ptr_t>(req_body_data),
 		                     static_cast<idx_t>(req_body_size));
@@ -896,9 +894,10 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	// projection of the vgi_rpc.protocol routing key the body also carries --
 	// present so an edge device can act on the protocol without an Arrow parser,
 	// and checked against the body by the server. Reserved server-level methods
-	// belong to no protocol and stay flat at {base}/{method}.
+	// belong to no protocol and stay flat at {base}/{method}; the upload-URL
+	// method is mounted at {base}/__upload_url__/init.
 	std::string url = IsReservedRpcMethod(method_name)
-	                      ? base_url + "/" + method_name
+	                      ? base_url + "/" + method_name + (method_name == UPLOAD_URL_METHOD ? "/init" : "")
 	                      : base_url + "/" + std::string(protocol.name) + "/" + method_name;
 	ServerCapabilities local_caps;
 	auto *effective_caps = caps ? caps : &local_caps;
@@ -952,7 +951,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	                                          attach_opaque_data_digest, transaction_opaque_data_digest, conn_id_hex);
 
 	// Resolve external location pointer batches
-	result = MaybeResolveExternalLocation(context, result, base_url);
+	result = MaybeResolveExternalLocation(context, result, base_url, execution_id_hex, attach_opaque_data_digest,
+	                                      transaction_opaque_data_digest, conn_id_hex);
 
 	if (log_active) {
 		VGI_LOG(context, "http.invoke_unary_result",
@@ -966,14 +966,23 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 // External Location Support
 // ============================================================================
 
-std::string HttpGetBytes(ClientContext &context, const std::string &url, const std::atomic<bool> *cancellation) {
+std::string HttpGetBytes(ClientContext &context, const std::string &url, const std::atomic<bool> *cancellation,
+                         HttpSecrets secrets) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = http_util.InitializeParameters(context, url);
-
+	HTTPHeaders headers;
+	std::unique_ptr<HTTPParams> params;
+	if (secrets == HttpSecrets::LOOKUP) {
+		params = InitHttpParamsWithSecrets(context, url);
+	} else {
+		// Externalized batches are fetched from inside VgiTransaction::Start
+		// (e.g. a catalog_contents revalidation), where a secret lookup
+		// deadlocks; see vgi_http_params.hpp.
+		params = InitSecretFreeHttpParams(context);
+		headers.Insert("User-Agent", SecretFreeUserAgent(context));
+	}
 	ApplyHttpTimeout(context, *params);
 
-	HTTPHeaders headers;
 	headers.Insert("X-VGI-Accept-Encoding", ClientAcceptEncoding());
 	// No auth headers — pre-signed URLs break with extra Authorization headers
 
@@ -1004,8 +1013,14 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, const s
 		                  url);
 	}
 
-	// Decompress if the server indicates a codec we know.
+	// Browser HTTP already decodes standard Content-Encoding. As with RPC
+	// POSTs, only the custom encoding header still describes encoded bytes.
 	auto get_enc = ResolveResponseEncoding(*response);
+#if defined(__EMSCRIPTEN__)
+	if (!response->HasHeader("X-VGI-Content-Encoding")) {
+		get_enc = HttpEncoding::NONE;
+	}
+#endif
 	if (get_enc != HttpEncoding::NONE && !body.empty()) {
 		return Decompress(get_enc, body.data(), body.size());
 	}
@@ -1017,7 +1032,8 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
                                             const std::string &worker_path, const std::string &execution_id_hex,
                                              const std::string &attach_opaque_data_digest,
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata,
-                                             const std::atomic<bool> *cancellation) {
+                                             const std::atomic<bool> *cancellation, const std::string &conn_id_hex,
+                                             const std::string &transaction_opaque_data_digest) {
 	// The fetched URL is a pre-signed object, not the worker; name both.
 	auto location_error = [&](const char *error_subtype) {
 		auto extra_info = BuildHttpExtraInfo(error_subtype, location_url);
@@ -1044,14 +1060,9 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 		int sha_idx = pointer_metadata->FindKey(RPC_LOCATION_SHA256_KEY);
 		if (sha_idx >= 0) {
 			auto expected_hex = pointer_metadata->value(sha_idx);
-			// Compute SHA-256 of the fetched body bytes
-			auto raw_hash = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(body);
-			// Convert raw hash to hex string
-			char hex_buf[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT + 1];
-			duckdb_mbedtls::MbedTlsWrapper::ToBase16(const_cast<char *>(raw_hash.data()), hex_buf,
-			                                          duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_BYTES);
-			hex_buf[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT] = '\0';
-			std::string actual_hex(hex_buf, duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT);
+			// This wrapper uses the exported engine primitive on WASM; direct
+			// mbedtls calls are unavailable to dynamically loaded side modules.
+			auto actual_hex = VgiSha256Hex(body);
 
 			if (actual_hex != expected_hex) {
 				throw IOException(location_error(http_error::kChecksumMismatch),
@@ -1080,6 +1091,8 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 	opts.noun = "external location";
 	opts.execution_id_hex = execution_id_hex;
 	opts.attach_opaque_data_digest = attach_opaque_data_digest;
+	opts.transaction_opaque_data_digest = transaction_opaque_data_digest;
+	opts.conn_id_hex = conn_id_hex;
 	auto result = ReadWorkerUnaryStream(std::make_shared<arrow::io::BufferReader>(owned), opts);
 	if (result.batch && ClassifyBatch(result.batch, result.metadata) == RpcBatchType::EXTERNAL_LOCATION) {
 		throw IOException(location_error(http_error::kProtocolViolation),
@@ -1097,7 +1110,10 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 }
 
 UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context, UnaryResponseResult &result,
-                                                   const std::string &worker_path) {
+                                                   const std::string &worker_path, const std::string &execution_id_hex,
+                                                   const std::string &attach_opaque_data_digest,
+                                                   const std::string &transaction_opaque_data_digest,
+                                                   const std::string &conn_id_hex) {
 	if (!result.metadata) {
 		return std::move(result);
 	}
@@ -1107,7 +1123,8 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context, UnaryRe
 	}
 
 	auto location_url = result.metadata->value(loc_idx);
-	return ResolveExternalLocation(context, location_url, worker_path, "", "", result.metadata);
+	return ResolveExternalLocation(context, location_url, worker_path, execution_id_hex, attach_opaque_data_digest,
+	                               result.metadata, nullptr, conn_id_hex, transaction_opaque_data_digest);
 }
 
 // ============================================================================
@@ -1377,7 +1394,7 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = http_util.InitializeParameters(context, url);
+	auto params = InitHttpParamsWithSecrets(context, url);
 	ApplyHttpTimeout(context, *params);
 
 	HTTPHeaders headers;
@@ -1422,7 +1439,7 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 	auto batch = arrow::RecordBatch::Make(schema, 1, {count_array_result.ValueUnsafe()});
 
 	// POST to __upload_url__/init (HttpInvokeUnary normalizes base_url internally)
-	auto result = HttpInvokeUnary(context, base_url, "__upload_url__/init", batch, auth, nullptr, nullptr,
+	auto result = HttpInvokeUnary(context, base_url, UPLOAD_URL_METHOD, batch, auth, nullptr, nullptr,
 	                              "", "", "", "", VGI_MAIN_PROTOCOL, nullptr, nullptr, iroh_config);
 
 	if (!result.batch || result.batch->num_rows() == 0) {
@@ -1450,10 +1467,12 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const std::vec
                   HttpEncoding encoding) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = http_util.InitializeParameters(context, url);
+	// A pre-signed upload URL: no secrets (see vgi_http_params.hpp).
+	auto params = InitSecretFreeHttpParams(context);
 	ApplyHttpTimeout(context, *params);
 
 	HTTPHeaders headers;
+	headers.Insert("User-Agent", SecretFreeUserAgent(context));
 	std::string content_type = "application/octet-stream";
 
 	const uint8_t *body_data = data.data();

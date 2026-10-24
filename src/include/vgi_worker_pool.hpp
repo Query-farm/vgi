@@ -120,7 +120,7 @@ private:
 	// on Release. Never nullptr during a worker's pooled lifetime (unless
 	// passthrough mode). Destructor stops the thread and closes the fd.
 	std::unique_ptr<StderrDrainer> drainer_;
-	std::chrono::seconds idle_timeout_ {5};          // Default 5s, overridden by per-path config
+	std::chrono::seconds idle_timeout_ {defaults::WORKER_POOL_IDLE_LIMIT_SECONDS}; // overridden by per-path config
 };
 
 // Thread-safe singleton pool for reusing VGI worker subprocesses.

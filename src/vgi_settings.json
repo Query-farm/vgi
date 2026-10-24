@@ -635,7 +635,7 @@
   {
     "name": "vgi_worker_pool_idle_limit_seconds",
     "type": "BIGINT",
-    "default": 5,
+    "default": 60,
     "scope": "session",
     "effect": "Captured at ATTACH; re-ATTACH to apply changes to an existing catalog.",
     "platform": "native",

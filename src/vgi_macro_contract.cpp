@@ -2,6 +2,7 @@
 #include "vgi_macro_contract.hpp"
 #include "generated/vgi_protocol_schemas.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_record_access.hpp"
 #include "vgi_column_expression.hpp"
 #include "vgi_query_function.hpp"
 #include "vgi_rpc_types.hpp"

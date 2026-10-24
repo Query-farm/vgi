@@ -1,0 +1,288 @@
+# name: test/sql/integration/table_in_out/input_rows_per_call.test
+# description: A blended (RowTransformFunction) function's input_rows_per_call: the most
+#   input rows one worker call receives. The batched-LATERAL operator splits each input
+#   chunk's worker input (after dedup) into calls of at most that many rows, and maps each
+#   call's output back to the chunk's rows. blended_sliced declares 3, and reports in
+#   call_rows the row count of the call that produced each output row.
+#
+# Fixture contract: every SDK's fixture worker implements blended_sliced exactly so.
+#   blended_sliced(n BIGINT, page_size := 1000000 BIGINT, cache_ttl := 0 BIGINT)
+#     -> (i BIGINT, call_rows BIGINT)
+#   - A RowTransformFunction declaring input_rows_per_call = 3. It fails a call given
+#     more than 3 rows (any error; the message is not checked).
+#   - Output is blended_paged's for the call (rows i = 0 .. n-1 per input row, NULL or
+#     negative n counting as 0, page_size rows per reply, continued with
+#     vgi.status: HAVE_MORE_OUTPUT), plus call_rows = the call's input row count.
+#   - With cache_ttl > 0, each call's first reply carries vgi.cache.ttl = cache_ttl
+#     and vgi.cache.per_value; later replies never carry cache control.
+#   - Bind fails if page_size < 1 ("page_size must be at least 1, got <v>") or if
+#     cache_ttl < 0 ("cache_ttl must not be negative, got <v>").
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded. Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The declared limit is part of the function's catalog entry.
+statement ok
+SET threads = 1;
+
+# ---------------------------------------------------------------------------
+# Ten distinct inputs go out as calls of 3, 3, 3 and 1 rows.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT call_rows, count(*) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x) GROUP BY ALL ORDER BY ALL;
+----
+1	9
+3	36
+
+query II
+SELECT x, i FROM range(10) t(x), LATERAL ex.blended_sliced(t.x) WHERE x >= 8 ORDER BY x, i;
+----
+8	0
+8	1
+8	2
+8	3
+8	4
+8	5
+8	6
+8	7
+9	0
+9	1
+9	2
+9	3
+9	4
+9	5
+9	6
+9	7
+9	8
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT count(*) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x);
+
+query II
+SELECT count(*), max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_sliced%';
+----
+4	3
+
+statement ok
+CALL disable_logging();
+
+# ---------------------------------------------------------------------------
+# The split applies after dedup: x % 3 + 1 over 10 rows is 3 distinct values, one
+# call of 3; every output row is stamped with its own outer x.
+# ---------------------------------------------------------------------------
+
+query III
+SELECT count(*), max(call_rows), count(DISTINCT x) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x % 3 + 1);
+----
+19	3	10
+
+statement ok
+SET vgi_exchange_input_dedup = false;
+
+query II
+SELECT count(*), max(call_rows) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x % 3 + 1);
+----
+19	3
+
+statement ok
+RESET vgi_exchange_input_dedup;
+
+# ---------------------------------------------------------------------------
+# Equivalence with blended_explode across several input chunks, with and without
+# each call's output also continuing across replies (page_size 2).
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE explode_ref AS
+SELECT x, i FROM range(3000) t(x), LATERAL ex.blended_explode(t.x % 11);
+
+foreach page_size 2 1000000
+
+statement ok
+CREATE OR REPLACE TABLE sliced AS
+SELECT x, i, call_rows FROM range(3000) t(x), LATERAL ex.blended_sliced(t.x % 11, page_size := ${page_size});
+
+query I
+SELECT count(*) FROM (
+  (SELECT x, i FROM sliced EXCEPT ALL SELECT * FROM explode_ref)
+  UNION ALL
+  (SELECT * FROM explode_ref EXCEPT ALL SELECT x, i FROM sliced)
+);
+----
+0
+
+query I
+SELECT max(call_rows) <= 3 AND count(*) > 0 FROM sliced;
+----
+true
+
+endloop
+
+# Distinct inputs across chunks: 3000 rows, every call at most 3.
+query II
+SELECT count(*), max(call_rows) FROM range(3000) t(x), LATERAL ex.blended_sliced(1);
+----
+3000	1
+
+query II
+SELECT count(*), max(call_rows) FROM range(3000) t(x), LATERAL ex.blended_sliced(CAST(t.x % 2 AS BIGINT) + 1);
+----
+4500	2
+
+query II
+SELECT sum(i), max(call_rows) FROM (SELECT x FROM range(2500) t(x)) t, LATERAL ex.blended_sliced(t.x % 5);
+----
+5000	3
+
+# ---------------------------------------------------------------------------
+# Other call shapes: a literal call is one row; the row-by-row path sends one row.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT count(*), max(call_rows) FROM ex.blended_sliced(4);
+----
+4	1
+
+statement ok
+SET vgi_batch_lateral = false;
+
+query II
+SELECT count(*), max(call_rows) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x);
+----
+45	1
+
+statement ok
+RESET vgi_batch_lateral;
+
+# LEFT JOIN keeps rows with no output, across the split.
+query II
+SELECT count(*), count(i) FROM range(10) t(x) LEFT JOIN LATERAL ex.blended_sliced(t.x % 2) ON true;
+----
+10	5
+
+# Many threads: each thread's chunks split the same way.
+statement ok
+SET threads = 8;
+
+query II
+SELECT count(*), max(call_rows) FROM range(20000) t(x), LATERAL ex.blended_sliced(t.x % 5, page_size := 4);
+----
+40000	3
+
+statement ok
+RESET threads;
+
+# ---------------------------------------------------------------------------
+# Per-value cache across calls. With cache_ttl, each call's first reply advertises
+# per-value caching, so each call's values are stored. A second query with the same
+# values in another order misses the whole-chunk cache but is served entirely from
+# the per-value entries: no worker call. Sum over n = 0..9 of n(n-1)/2 = 120.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads = 1;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x, cache_ttl := 300);
+----
+45	120
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_sliced%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM range(10) t(x), LATERAL ex.blended_sliced(9 - t.x, cache_ttl := 300);
+----
+45	120
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_sliced%';
+----
+0
+
+# Served rows keep their own outer columns.
+query II
+SELECT x, i FROM range(10) t(x), LATERAL ex.blended_sliced(9 - t.x, cache_ttl := 300) WHERE x >= 7 ORDER BY x, i;
+----
+7	0
+7	1
+8	0
+
+# A call whose output continued is never stored, so the reordered repeat calls the
+# worker again — and still gets the same rows.
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x, page_size := 2, cache_ttl := 300);
+----
+45	120
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM range(10) t(x), LATERAL ex.blended_sliced(9 - t.x, page_size := 2, cache_ttl := 300);
+----
+45	120
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_sliced%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET threads;
+
+statement error
+SELECT * FROM ex.blended_sliced(3, page_size := 0);
+----
+page_size must be at least 1
+
+statement ok
+DETACH ex;

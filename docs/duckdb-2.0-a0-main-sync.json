@@ -1,0 +1,800 @@
+{
+  "status": "post_main_merge_compile_inventory_link_and_runtime_unqualified",
+  "engine_revision": "e1784fa4231072d7152b8aaa20977bdb8ff4ace3",
+  "engine_version": "v2.0.0-dev87872",
+  "native_revision": "e1dc7520d28dec8cc7414bb65e227e565b6ff560",
+  "native_merge_parent": "454fefa50b11f8bfe3065fb11aebf8f5761d7b3d",
+  "native_staged_snapshot_tree": "870ee358bdd9fc5aa5b8dbf9728252ee4c50fb10",
+  "source_archive_sha256": "1dba4c151618bb4c0efcdc77a5e7adc51ed29fe5ce159cf696e368c37a80ba6a",
+  "source_manifest_sha256": "7cd27e1f647d1cd52eddfe724e76f26c6d08429864889a2df6570db4627e80de",
+  "dependency_status_sha256": "660b25e941cad701ed7ea5aa58c76dd30471d6fac39312ac0e963a1ee7dcd79b",
+  "tools": {
+    "compiler": "c++ (GCC) 14.2.1 20250110 (Red Hat 14.2.1-7)",
+    "cmake": "cmake version 4.4.4",
+    "compiler_launcher": "/usr/local/bin/ccache"
+  },
+  "native_cpp_counts": {
+    "compiled": 54,
+    "failed": 56,
+    "not_attempted": 0
+  },
+  "translation_unit_counts": {
+    "compiled": 55,
+    "failed": 56,
+    "not_attempted": 0
+  },
+  "captured_error_count": 415,
+  "configure_exit": 0,
+  "build_exit": 1,
+  "remote_lane": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/vgi-native2-main-sync-20261024-bwhd8iln",
+  "engine_source_reused_read_only": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/vgi-native2-a0-20261024-irodudvw/engine",
+  "dependency_prefix_reused_read_only": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/src/vgi/build/release/vcpkg_installed/arm64-linux",
+  "engine_tracked_clean_after": true,
+  "dependency_status_unchanged_after": true,
+  "target_command_count": 112,
+  "engine_cpp_compile_command_count": 0,
+  "limits": "First 12 compiler errors per unit; shared-header failures may mask later errors. No runtime or final linking qualification.",
+  "previous_inventory": "duckdb-2.0-a0-diagnostics.json",
+  "changed_source_statuses": [
+    {
+      "source": "src/vgi_wire_codec.cpp",
+      "previous_status": "absent",
+      "current_status": "compiled"
+    },
+    {
+      "source": "src/generated/vgi_protocol_records.cpp",
+      "previous_status": "absent",
+      "current_status": "compiled"
+    },
+    {
+      "source": "src/vgi_http_params.cpp",
+      "previous_status": "absent",
+      "current_status": "failed",
+      "first_error": "src/vgi_http_params.cpp:27:29: error: \u2018duckdb::SettingLookupResult duckdb::vgi::{anonymous}::SecretFreeFileOpener::TryGetCurrentSetting(const std::string&, duckdb::Value&)\u2019 marked \u2018override\u2019, but does not override"
+    },
+    {
+      "source": "src/vgi_input_dedup.cpp",
+      "previous_status": "compiled",
+      "current_status": "failed",
+      "first_error": "src/vgi_input_dedup.cpp:377:27: error: \u2018class duckdb::DataChunk\u2019 has no member named \u2018SetCapacity\u2019; did you mean \u2018GetCapacity\u2019?"
+    }
+  ],
+  "post_snapshot_comment_only_change": {
+    "path": "src/generated/vgi_protocol_records.hpp",
+    "snapshot_sha256": "da913d89df35ed318f705ee9fe0cec91d34933275b0a0ee6056fb9ffefd45d06",
+    "final_header_sha256": "f2b096bb93bf21d861bc6932dfc6a9975d5d5a6b185f793d8b7d13ee2a917f44",
+    "description": "Code generation added projection-profile explanatory comments and changed its content-hash comment after the archive was transferred. No declarations or executable code changed; the active diagnostic source was not mutated."
+  },
+  "artifacts": {
+    "inventory.json": "505e7c39d96bbaf60f7e88d4773927c1547d68a5182324c4e7b6c774c983c274",
+    "source-manifest.json": "7cd27e1f647d1cd52eddfe724e76f26c6d08429864889a2df6570db4627e80de",
+    "configure.log": "81e966ccdbac2550f16a2701f4c0c944749494a9b0f97b6d4ecc5815d0532ff3",
+    "compile.log": "88e75d1268aaf06bd74cc2e573e7bf6821ef6065168063a035c28598b94ef91b",
+    "compile_commands.json": "9b5e1b56a9f756ebe170f87e2543e4ec3704e1ccf8020727614434535c73e1db",
+    "target-commands.txt": "da17bad31d7a7131de3ccc09159b0d4b5efdcbdb67aff5d9d71b2cf5b95956eb"
+  },
+  "translation_units": [
+    {
+      "source": "src/vgi_extension.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_settings.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/query_farm_telemetry.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_telemetry.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_telemetry_util.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_launcher_internal.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_launcher.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_launcher_cache.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_unix_socket.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_unix_socket_worker.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_named_pipe.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_logging.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_subprocess.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 1,
+      "first_error": "src/vgi_subprocess.cpp:728:41: error: \u2018class duckdb::ClientContext\u2019 has no member named \u2018interrupted\u2019; did you mean \u2018Interrupt\u2019?"
+    },
+    {
+      "source": "src/vgi_arrow_ipc.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_arrow_utils.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 3,
+      "first_error": "src/vgi_arrow_utils.cpp:32:49: error: no matching function for call to \u2018duckdb::ClientContext::TryGetCurrentSetting(const std::__cxx11::basic_string<char>&, duckdb::Value&)\u2019"
+    },
+    {
+      "source": "src/vgi_rpc_client.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_rpc_types.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_wire_codec.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/generated/vgi_protocol_records.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_schema_registry.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_stderr_drainer.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_unary_rpc.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_bind_protocol.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_transport.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_container_runtime.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_http_compression.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_http_client.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_http_params.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 5,
+      "first_error": "src/vgi_http_params.cpp:27:29: error: \u2018duckdb::SettingLookupResult duckdb::vgi::{anonymous}::SecretFreeFileOpener::TryGetCurrentSetting(const std::string&, duckdb::Value&)\u2019 marked \u2018override\u2019, but does not override"
+    },
+    {
+      "source": "src/vgi_http_function_connection.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 9,
+      "first_error": "src/vgi_http_function_connection.cpp:352:30: error: \u2018class duckdb::ClientContext\u2019 has no member named \u2018interrupted\u2019; did you mean \u2018Interrupt\u2019?"
+    },
+    {
+      "source": "src/vgi_iroh_config.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/vgi_iroh_config.cpp:77:59: error: no matching function for call to \u2018duckdb::StringUtil::CIEquals(const duckdb::Identifier&, const char [5])\u2019"
+    },
+    {
+      "source": "src/vgi_iroh_native.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_cookie_jar.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_oauth.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_oauth_env.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_oauth_store.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_catalogs.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/vgi_catalogs.cpp:47:99: error: invalid initialization of reference of type \u2018duckdb::named_parameter_map_t&\u2019 {aka \u2018std::unordered_map<duckdb::Identifier, duckdb::Value, duckdb::IdentifierHashFunction, duckdb::IdentifierEquality, std::allocator<std::pair<const duckdb::Identifier, duckdb::Value> > >&\u2019} from expression of type \u2018duckdb::named_argument_map_t\u2019 {aka \u2018duckdb::InsertionOrderPreservingMap<duckdb::Value, duckdb::Identifier, std::unordered_map<duckdb::Identifier, long unsigned int, duckdb::IdentifierHashFunction, duckdb::IdentifierEquality, std::allocator<std::pair<const duckdb::Identifier, long unsigned int> > > >\u2019}"
+    },
+    {
+      "source": "src/vgi_protocols.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 9,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_attach_tickets.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 9,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_reflection.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 1,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_hosted_protocols.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_location_policy.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_location_classify.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_batch_validation.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_table_function_impl.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/vgi_table_function_impl.hpp:945:69: error: \u2018TableFunctionDynamicToStringInput\u2019 was not declared in this scope; did you mean \u2018TableFunctionToStringInput\u2019?"
+    },
+    {
+      "source": "src/vgi_table_in_out_impl.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 4,
+      "first_error": "src/include/vgi_table_function_impl.hpp:945:69: error: \u2018TableFunctionDynamicToStringInput\u2019 was not declared in this scope; did you mean \u2018TableFunctionToStringInput\u2019?"
+    },
+    {
+      "source": "src/vgi_scalar_function_impl.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/vgi_scalar_function_impl.cpp:118:110: error: invalid initialization of reference of type \u2018const std::string&\u2019 {aka \u2018const std::__cxx11::basic_string<char>&\u2019} from expression of type \u2018duckdb::Identifier\u2019"
+    },
+    {
+      "source": "src/vgi_aggregate_function_impl.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 9,
+      "first_error": "src/vgi_aggregate_function_impl.cpp:641:42: error: \u2018duckdb::shared_ptr<duckdb::AggregateFunctionInfo> duckdb::BaseAggregateFunction::function_info\u2019 is protected within this context"
+    },
+    {
+      "source": "src/vgi_aggregate_streaming_impl.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_aggregate_window_impl.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_streaming_window_operator.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/vgi_streaming_window_operator.hpp:35:23: error: invalid covariant return type for \u2018virtual duckdb::vector<long unsigned int> duckdb::vgi::LogicalVgiStreamingWindow::GetTableIndex() const\u2019"
+    },
+    {
+      "source": "src/vgi_lateral_batch_operator.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 3,
+      "first_error": "src/include/vgi_lateral_batch_operator.hpp:63:23: error: invalid covariant return type for \u2018virtual duckdb::vector<long unsigned int> duckdb::vgi::LogicalVgiLateralBatch::GetTableIndex() const\u2019"
+    },
+    {
+      "source": "src/vgi_multi_scan_rewriter.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/vgi_multi_scan_rewriter.cpp:78:47: error: \u2018struct duckdb::ClientConfig\u2019 has no member named \u2018enable_optimizer\u2019; did you mean \u2018enable_profiler\u2019?"
+    },
+    {
+      "source": "src/vgi_table_branches_function.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 9,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_function_arguments_function.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_copy_from_impl.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 4,
+      "first_error": "src/include/vgi_table_function_impl.hpp:945:69: error: \u2018TableFunctionDynamicToStringInput\u2019 was not declared in this scope; did you mean \u2018TableFunctionToStringInput\u2019?"
+    },
+    {
+      "source": "src/vgi_copy_to_impl.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 3,
+      "first_error": "src/vgi_copy_to_impl.cpp:275:52: error: cannot convert \u2018const duckdb::Identifier\u2019 to \u2018const std::string&\u2019 {aka \u2018const std::__cxx11::basic_string<char>&\u2019}"
+    },
+    {
+      "source": "src/vgi_table_buffering_builders.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_table_buffering_impl.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 4,
+      "first_error": "src/include/vgi_table_buffering_impl.hpp:103:23: error: invalid covariant return type for \u2018virtual duckdb::vector<long unsigned int> duckdb::vgi::LogicalVgiTableBufferingFunction::GetTableIndex() const\u2019"
+    },
+    {
+      "source": "src/vgi_catalog_api.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/vgi_catalog_api.cpp:1763:29: error: \u2018class duckdb::ClientContext\u2019 has no member named \u2018interrupted\u2019; did you mean \u2018Interrupt\u2019?"
+    },
+    {
+      "source": "src/vgi_query_rpc.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_constraint_contract.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/vgi_constraint_contract.cpp:161:75: error: \u2018const class duckdb::ConstantExpression\u2019 has no member named \u2018value\u2019"
+    },
+    {
+      "source": "src/vgi_column_expression.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/vgi_column_expression.cpp:92:108: error: \u2018class duckdb::ConstantExpression\u2019 has no member named \u2018value\u2019"
+    },
+    {
+      "source": "src/vgi_projection_pushdown.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/vgi_table_function_impl.hpp:945:69: error: \u2018TableFunctionDynamicToStringInput\u2019 was not declared in this scope; did you mean \u2018TableFunctionToStringInput\u2019?"
+    },
+    {
+      "source": "src/vgi_column_metadata.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_macro_contract.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_index_contract.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 9,
+      "first_error": "src/vgi_index_contract.cpp:147:29: error: \u2018duckdb::vector<duckdb::Identifier> duckdb::ColumnRefExpression::column_names\u2019 is private within this context"
+    },
+    {
+      "source": "src/vgi_query_function.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 10,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_function_connection.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 1,
+      "first_error": "src/vgi_function_connection.cpp:1325:75: error: \u2018class duckdb::ClientContext\u2019 has no member named \u2018interrupted\u2019; did you mean \u2018Interrupt\u2019?"
+    },
+    {
+      "source": "src/vgi_client_timing.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_shm_segment.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_cancel_dispatcher.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_worker_pool.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_worker_pool_functions.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 3,
+      "first_error": "src/vgi_worker_pool_functions.cpp:40:81: error: invalid conversion from \u2018duckdb::unique_ptr<duckdb::FunctionData> (*)(duckdb::ClientContext&, duckdb::TableFunctionBindInput&, duckdb::vector<duckdb::LogicalType>&, duckdb::vector<std::__cxx11::basic_string<char> >&)\u2019 to \u2018duckdb::table_function_bind_t\u2019 {aka \u2018duckdb::unique_ptr<duckdb::FunctionData> (*)(duckdb::ClientContext&, duckdb::TableFunctionBindInput&, duckdb::vector<duckdb::LogicalType>&, duckdb::vector<duckdb::Identifier>&)\u2019} [-fpermissive]"
+    },
+    {
+      "source": "src/vgi_result_cache.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_exchange_cache_key.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 4,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_memo_arena.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_sqlite_backend.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_sha256.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_cache_identity.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_input_dedup.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 1,
+      "first_error": "src/vgi_input_dedup.cpp:377:27: error: \u2018class duckdb::DataChunk\u2019 has no member named \u2018SetCapacity\u2019; did you mean \u2018GetCapacity\u2019?"
+    },
+    {
+      "source": "src/vgi_result_cache_functions.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 6,
+      "first_error": "src/vgi_result_cache_functions.cpp:53:83: error: invalid conversion from \u2018duckdb::unique_ptr<duckdb::FunctionData> (*)(duckdb::ClientContext&, duckdb::TableFunctionBindInput&, duckdb::vector<duckdb::LogicalType>&, duckdb::vector<std::__cxx11::basic_string<char> >&)\u2019 to \u2018duckdb::table_function_bind_t\u2019 {aka \u2018duckdb::unique_ptr<duckdb::FunctionData> (*)(duckdb::ClientContext&, duckdb::TableFunctionBindInput&, duckdb::vector<duckdb::LogicalType>&, duckdb::vector<duckdb::Identifier>&)\u2019} [-fpermissive]"
+    },
+    {
+      "source": "src/vgi_cached_replay_connection.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_github.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_database_worker.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_worker_package_functions.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 7,
+      "first_error": "src/vgi_worker_package_functions.cpp:81:16: error: no matching function for call to \u2018duckdb::Parser::Parser()\u2019"
+    },
+    {
+      "source": "src/vgi_global_functions.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 2,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_github_functions.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 2,
+      "first_error": "src/vgi_github_functions.cpp:54:72: error: invalid conversion from \u2018duckdb::unique_ptr<duckdb::FunctionData> (*)(duckdb::ClientContext&, duckdb::TableFunctionBindInput&, duckdb::vector<duckdb::LogicalType>&, duckdb::vector<std::__cxx11::basic_string<char> >&)\u2019 to \u2018duckdb::table_function_bind_t\u2019 {aka \u2018duckdb::unique_ptr<duckdb::FunctionData> (*)(duckdb::ClientContext&, duckdb::TableFunctionBindInput&, duckdb::vector<duckdb::LogicalType>&, duckdb::vector<duckdb::Identifier>&)\u2019} [-fpermissive]"
+    },
+    {
+      "source": "src/vgi_wasm_async_pool.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/vgi_table_statistics_function.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 4,
+      "first_error": "src/vgi_table_statistics_function.cpp:84:44: error: no matching function for call to \u2018duckdb::Catalog::GetCatalog(duckdb::ClientContext&, std::__cxx11::basic_string<char>&)\u2019"
+    },
+    {
+      "source": "src/vgi_clear_cache.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 3,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_catalog_contents_function.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 6,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/vgi_secret_storage.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 5,
+      "first_error": "src/include/vgi_secret_storage.hpp:59:14: error: \u2018void duckdb::vgi::VgiRemoteSecretStorage::DropSecretByName(const std::string&, duckdb::OnEntryNotFound, duckdb::optional_ptr<duckdb::CatalogTransaction>)\u2019 marked \u2018override\u2019, but does not override"
+    },
+    {
+      "source": "src/vgi_attach_credentials.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/storage/vgi_catalog.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_catalog_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 4,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_schema_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 3,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_schema_entry.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_table_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 10,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_table_entry.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_view_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_index_entry.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 2,
+      "first_error": "src/include/storage/vgi_index_entry.hpp:15:16: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiIndexEntry::GetSchemaName() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_index_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 8,
+      "first_error": "src/include/storage/vgi_index_entry.hpp:15:16: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiIndexEntry::GetSchemaName() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_create_index.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 4,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_scalar_function_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 10,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_aggregate_function_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 9,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_table_function_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_macro_set.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_object_counts.cpp",
+      "generated": false,
+      "status": "compiled",
+      "captured_error_count": 0
+    },
+    {
+      "source": "src/storage/vgi_transaction.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 1,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "src/storage/vgi_physical_write.cpp",
+      "generated": false,
+      "status": "failed",
+      "captured_error_count": 12,
+      "first_error": "src/include/storage/vgi_catalog.hpp:40:21: error: invalid covariant return type for \u2018virtual std::string duckdb::VgiCatalog::GetDefaultSchema() const\u2019"
+    },
+    {
+      "source": "build/codegen/link/vgi_describe.c",
+      "generated": true,
+      "status": "compiled",
+      "captured_error_count": 0
+    }
+  ]
+}

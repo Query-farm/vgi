@@ -265,6 +265,11 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 		}
 		cond_sent_ = true;
 	}
+	if (pending_tick_) {
+		meta_keys.push_back(VGI_STATUS_KEY);
+		meta_values.push_back(VGI_STATUS_CONTINUE);
+		pending_tick_ = false;
+	}
 	std::shared_ptr<arrow::KeyValueMetadata> metadata;
 	if (!meta_keys.empty()) {
 		metadata = arrow::KeyValueMetadata::Make(meta_keys, meta_values);
@@ -379,7 +384,7 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
-			                                         bwm.custom_metadata, &context_.interrupted);
+			                                         bwm.custom_metadata, &context_.interrupted, GetConnIdHex());
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_, violation));
 			buffered_partition_values_bytes_.push_back(
@@ -465,18 +470,8 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		                             attach_params_ ? attach_params_->iroh() : nullptr,
 		                             &call_error_fields);
 		PublishHarvestedCapabilities(b_caps);
-		if (!resp.batch || resp.batch->num_rows() == 0) {
-			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Empty bind response from HTTP server [url: %s]", base_url_);
-		}
-		auto rcol = resp.batch->GetColumnByName("result");
-		if (!rcol) {
-			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Bind response missing 'result' column [url: %s]", base_url_);
-		}
-		auto bin_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(rcol);
-		if (!bin_arr || bin_arr->IsNull(0)) {
-			throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_).Rpc("bind"), "Bind response 'result' column is null [url: %s]", base_url_);
-		}
-		return DeserializeFromIpcBytesZeroCopy(*bin_arr, 0);
+		return UnwrapResultEnvelope(resp.batch, "bind",
+		                            HttpFunctionInfo(nullptr, base_url_, function_name_, function_type_));
 	};
 
 	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
@@ -640,8 +635,9 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		int loc_idx = header_result.header.metadata->FindKey(RPC_LOCATION_KEY);
 		if (loc_idx >= 0) {
 			auto location_url = header_result.header.metadata->value(loc_idx);
-			auto resolved = ResolveExternalLocation(context_, location_url, base_url_,
-			                                         "", "", header_result.header.metadata, &context_.interrupted);
+			auto resolved = ResolveExternalLocation(context_, location_url, base_url_, GetExecutionIdHex(),
+			                                         GetAttachOpaqueDataDigest(), header_result.header.metadata,
+			                                         &context_.interrupted, GetConnIdHex());
 			header_result.header.header_batch = resolved.batch;
 			header_result.header.metadata = resolved.metadata;
 		}
@@ -785,6 +781,19 @@ void HttpFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::Record
 	pending_input_ = reconciled;
 }
 
+void HttpFunctionConnection::WriteContinuationTick() {
+	if (!input_writer_opened_ || input_writer_closed_) {
+		throw IOException("HttpFunctionConnection::WriteContinuationTick called without an open input writer [url: %s]",
+		                  base_url_);
+	}
+	auto tick = arrow::RecordBatch::MakeEmpty(input_schema_);
+	if (!tick.ok()) {
+		throw IOException("Failed to build continuation tick: %s [url: %s]", tick.status().ToString(), base_url_);
+	}
+	pending_input_ = tick.ValueUnsafe();
+	pending_tick_ = true;
+}
+
 void HttpFunctionConnection::CloseInputWriter() {
 	input_writer_closed_ = true;
 }
@@ -809,21 +818,9 @@ namespace {
 std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseResult &response,
                                                               const std::string &method_name,
                                                               const std::string &base_url) {
-	if (!response.batch || response.batch->num_rows() == 0) {
-		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Empty response from %s [url: %s]", method_name, base_url);
-	}
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Response missing 'result' column from %s [url: %s]", method_name, base_url);
-	}
-	if (result_col->type()->id() != arrow::Type::BINARY) {
-		throw IOException(HttpFunctionInfo(error_subtype::kProtocolViolation, base_url, std::string(), std::string()).Rpc(method_name), "Response 'result' column has wrong type from %s [url: %s]", method_name, base_url);
-	}
-	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-	if (bin->IsNull(0)) {
-		return nullptr;
-	}
-	return vgi::DeserializeFromIpcBytesZeroCopy(*bin, 0);
+	return UnwrapResultEnvelope(response.batch, method_name,
+	                            HttpFunctionInfo(nullptr, base_url, std::string(), std::string()),
+	                            /*null_result_ok=*/true);
 }
 
 } // namespace
@@ -859,10 +856,7 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 		                      .Rpc("table_buffering_process"),
 		                  "table_buffering_process response missing data [url: %s]", base_url_);
 	}
-	auto col = inner->GetColumnByName("state_id");
-	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
-	auto view = bin_array->GetView(0);
-	return std::vector<uint8_t>(view.data(), view.data() + view.size());
+	return vgi::generated::Decode<vgi::generated::TableBufferingProcessResult>(inner, 0, base_url_).state_id;
 }
 
 std::vector<std::vector<uint8_t>>
@@ -889,18 +883,7 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 		                      .Rpc("table_buffering_combine"),
 		                  "table_buffering_combine response missing data [url: %s]", base_url_);
 	}
-	auto col = inner->GetColumnByName("finalize_state_ids");
-	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
-	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
-	auto offset = list_array->value_offset(0);
-	auto length = list_array->value_length(0);
-	std::vector<std::vector<uint8_t>> result;
-	result.reserve(length);
-	for (int64_t i = 0; i < length; ++i) {
-		auto v = values->GetView(offset + i);
-		result.emplace_back(v.data(), v.data() + v.size());
-	}
-	return result;
+	return vgi::generated::Decode<vgi::generated::TableBufferingCombineResult>(inner, 0, base_url_).finalize_state_ids;
 }
 
 void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
@@ -1066,33 +1049,44 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto buffer = arrow::Buffer::FromString(std::move(response_body));
 	auto input_stream = std::make_shared<arrow::io::BufferReader>(buffer);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input_stream);
+	const auto violation =
+	    HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_);
+	// Reset batch_index + partition_values BEFORE the loop (and before the
+	// empty-response return, so no flag outlives the reply it came from). The
+	// HTTP response may contain a data batch followed by a 0-row continuation
+	// batch carrying only STATE_KEY; resetting inside the loop would let
+	// the continuation batch's pass clear values parsed from the data
+	// batch.
+	const bool was_more_pending = last_more_output_;
+	last_batch_index_ = DConstants::INVALID_INDEX;
+	last_partition_values_bytes_.clear();
+	last_parent_row_bytes_.clear();
+	last_cache_control_ = VgiCacheControl{};
+	last_more_output_ = false;
 	if (!reader_result.ok()) {
+		// While output is pending this exchange was a continuation tick, which the
+		// worker must answer with a reply; an empty body would otherwise end the
+		// output silently (or, with a stale "more", tick forever).
+		if (was_more_pending) {
+			throw IOException(violation, "VGI HTTP worker function '%s' sent an empty response to a continuation tick",
+			                  function_name_);
+		}
 		// Empty response in exchange mode means no output for this input
 		return arrow::RecordBatch::Make(
 		    cached_output_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
 	}
 	auto reader = reader_result.ValueUnsafe();
 
-	const auto violation =
-	    HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_);
 	const auto log_error_context = HttpFunctionInfo(nullptr, base_url_, function_name_, function_type_);
 	std::shared_ptr<arrow::RecordBatch> output_batch;
 	std::string new_state_token;
-	// Reset batch_index + partition_values BEFORE the loop. The HTTP
-	// response may contain a data batch followed by a 0-row continuation
-	// batch carrying only STATE_KEY; resetting inside the loop would let
-	// the continuation batch's pass clear values parsed from the data
-	// batch.
-	last_batch_index_ = DConstants::INVALID_INDEX;
-	last_partition_values_bytes_.clear();
-	last_cache_control_ = VgiCacheControl{};
 
 	while (true) {
 		auto read_result = reader->ReadNext();
 		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
 			break;
 		}
-		auto &bwm = read_result.ValueUnsafe();
+		auto bwm = std::move(read_result).ValueUnsafe();
 
 		// Dispatch log/error batches
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
@@ -1109,21 +1103,21 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			continue;
 		}
 
-		// Resolve external location pointer batches.
-		// Stream_state is inside the resolved data, not on the pointer batch.
+		// Resolve external location pointer batches: splice the fetched batch
+		// in, then parse it like an inline one. Stream_state, batch_index,
+		// partition_values, parent_row and cache-control all ride the
+		// RESOLVED batch's metadata, not the pointer's. (The fetching reader
+		// already validated it.)
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
-			                                         bwm.custom_metadata, &context_.interrupted);
-			if (!output_batch) {
-				output_batch = resolved.batch;
-			}
-			new_state_token = ExtractStreamStateValue(resolved.metadata);
-			continue;
+			                                         bwm.custom_metadata, &context_.interrupted, GetConnIdHex());
+			bwm.batch = std::move(resolved.batch);
+			bwm.custom_metadata = std::move(resolved.metadata);
+		} else {
+			ValidateWorkerBatch(&context_, bwm.batch.get(), base_url_);
 		}
-
-		ValidateWorkerBatch(&context_, bwm.batch.get(), base_url_);
 
 		// Data batch — extract stream_state
 		new_state_token = ExtractStreamStateValue(bwm.custom_metadata);
@@ -1145,6 +1139,9 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			auto cc = ParseVgiCacheControl(bwm.custom_metadata);
 			if (cc.present) {
 				last_cache_control_ = cc;
+			}
+			if (HasMoreOutputStatus(bwm.custom_metadata)) {
+				last_more_output_ = true;
 			}
 		}
 		if (!output_batch) {

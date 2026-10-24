@@ -18,7 +18,10 @@ shift 2>/dev/null || true
 # different SDK's worker).
 PACKAGE_WORKER="${VGI_DATABASE_PACKAGE_WORKER:-uv run --project $VGI_PYTHON_DIR vgi-fixture-worker}"
 
-LOG_FILE="/tmp/vgi-http-test-server.log"
+# Per-run log: a fixed path is shared by concurrent lanes, which then read each
+# other's PORT: line and talk to the wrong server. Override with VGI_HTTP_SERVER_LOG.
+LOG_FILE="${VGI_HTTP_SERVER_LOG:-$(mktemp "${TMPDIR:-/tmp}/vgi-http-test-server.XXXXXX")}"
+echo "server log: $LOG_FILE"
 
 # Start HTTP server under coverage with auto-selected port
 cd "$VGI_PYTHON_DIR"
@@ -60,4 +63,4 @@ echo "HTTP server running on port $PORT (pid $SERVER_PID) [coverage enabled]"
 # Run tests
 VGI_TEST_WORKER="http://localhost:$PORT/vgi" \
 VGI_DATABASE_PACKAGE_WORKER="$PACKAGE_WORKER" \
-    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"
+    python3 scripts/run_tests.py --build "$BUILD_DIR" "$FILTER" "$@"

@@ -80,7 +80,7 @@ TEST_CASE("Canonical macro records reject malformed owners profiles and literal 
 	}
 }
 
-TEST_CASE("Macro list and bulk envelopes reject trailing data and absent family records", "[macro-contract]") {
+TEST_CASE("Macro listing envelopes reject trailing data and absent family records", "[macro-contract]") {
 	auto family = Family(Overload(Parameter()));
 	auto valid = vgi::SerializeToIpcBytes(family);
 	auto trailing = valid;
@@ -89,16 +89,10 @@ TEST_CASE("Macro list and bulk envelopes reject trailing data and absent family 
 	auto check = [&](Array binary, bool accepted) {
 		auto list = List(binary);
 		auto wrapper = arrow::RecordBatch::Make(arrow::schema({arrow::field("items", list->type())}), 1, {list});
-		vgi::VgiSchemaContents contents;
-		contents.worker_path = "test";
-		contents.rows = std::static_pointer_cast<arrow::StructArray>(
-		    Struct(arrow::schema({arrow::field("scalar_macros", list->type())}), {list}));
 		if (accepted) {
 			CHECK(vgi::UnwrapAndValidateItems(wrapper, "catalog_schema_contents_macros", "test").size() == 1);
-			CHECK(vgi::DecodeContentsMacros(contents, "SCALAR_MACRO").size() == 1);
 		} else {
 			CHECK_THROWS(vgi::UnwrapAndValidateItems(wrapper, "catalog_schema_contents_macros", "test"));
-			CHECK_THROWS(vgi::DecodeContentsMacros(contents, "SCALAR_MACRO"));
 		}
 	};
 	check(vgi::BuildBinaryScalarRequired(valid), true);
@@ -114,6 +108,40 @@ TEST_CASE("Macro list and bulk envelopes reject trailing data and absent family 
 	vgi::ThrowOnArrowError(writer->Close());
 	auto twice = sink->Finish().ValueOrDie();
 	check(vgi::BuildBinaryScalarRequired(std::vector<uint8_t>(twice->data(), twice->data() + twice->size())), false);
+}
+
+TEST_CASE("Macro collections retain every batch and reject a malformed later family", "[macro-contract]") {
+	auto family = Family(Overload(Parameter()));
+	auto second = family->SetColumn(family->schema()->GetFieldIndex("name"), family->schema()->GetFieldByName("name"),
+	                                vgi::BuildStringScalar("m2"))
+	                  .ValueOrDie();
+	auto stream = [&](const std::vector<std::shared_ptr<arrow::RecordBatch>> &batches) {
+		auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+		auto writer = arrow::ipc::MakeStreamWriter(sink, family->schema()).ValueOrDie();
+		for (const auto &batch : batches) vgi::ThrowOnArrowError(writer->WriteRecordBatch(*batch));
+		vgi::ThrowOnArrowError(writer->Close());
+		auto buffer = sink->Finish().ValueOrDie();
+		return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
+	};
+	auto decode = [&](const std::vector<uint8_t> &bytes) {
+		vgi::generated::SchemaInfo schema;
+		schema.path = {"main"};
+		vgi::generated::CatalogContentsResponse response;
+		response.schemas = vgi::SerializeRecord(schema);
+		response.macros = bytes;
+		auto contents = vgi::ParseCatalogContents(vgi::generated::ToBatch(response), "test");
+		REQUIRE(contents.schemas.size() == 1);
+		return vgi::DecodeContentsMacros(contents.schemas[0], "SCALAR_MACRO");
+	};
+	auto decoded = decode(stream({family, second}));
+	REQUIRE(decoded.size() == 2);
+	CHECK(decoded[0].name == "m");
+	CHECK(decoded[1].name == "m2");
+	CHECK(decode(stream({family->Slice(0, 0)})).empty());
+	auto trailing = stream({family});
+	trailing.push_back(0);
+	CHECK_THROWS(decode(trailing));
+	CHECK_THROWS(decode(stream({family, Family(Overload(Parameter(), "unknown"))})));
 }
 
 TEST_CASE("Native macro literal import preserves typed NULL and complex values", "[macro-contract]") {

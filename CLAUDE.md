@@ -86,8 +86,10 @@ is the guardrail.
 
 | Target | What it runs |
 |--------|--------------|
-| `make test_http` / `_debug` | Integration suite over HTTP (`test/run_http_integration.sh`; server log `/tmp/vgi-http-test-server.log`) |
+| `make test_http` / `_debug` | Integration suite over HTTP (`test/run_http_integration.sh`; per-run server log, path printed as `server log:`; `VGI_HTTP_SERVER_LOG` pins it) |
 | `make test_http_no_compression` | HTTP against a server advertising an **empty** `VGI-Supported-Encodings` (speaks no compression; an *absent* header means a pre-update server that still speaks zstd) |
+| `make test_http_demo_storage` | HTTP against a server that externalizes every response to its demo object store; the only lane fetching externalized results from inside `VgiTransaction::Start` (duckdb#22258 secret-lookup deadlock). |
+| `make test_launcher_external_storage` | Launcher suite against the fixture worker externalizing every result over the byte transport (`test/support/external_storage_worker.py`) |
 | `make test_unix`, `make test_shm` | AF_UNIX transport; shared-memory side channel |
 | `make test_all` / `_debug` | spawn, shm, unix, http, plus the bearer / versioned-tables / attach-options / no-compression HTTP variants |
 | `make test_docker` | Container suite against the vgi-sklearn image; skips cleanly without a runtime. `VGI_DOCKER_IMAGE`, `CONTAINER_RUNTIME` override. See `docs/container-transport.md` |
@@ -178,6 +180,21 @@ uv run --project ~/Development/vgi-python python \
 Use that script, not `python -m vgi.codegen.X > dest`: the shell truncates the destination before
 the generator runs, so a failing generator silently destroys the file. `--check` reports drift.
 vgi-python's `tests/test_generated_cpp_*.py` fail CI if checked-in headers diverge.
+`VGI_EXTENSION_ROOT=<checkout>` points the script at a checkout other than `~/Development/vgi`.
+
+**Protocol records are typed structs, not hand-parsed batches.** `vgi_protocol_records.hpp` has
+one struct per record and one `enum class` per protocol enum (Arrow only forward-declared);
+`vgi_protocol_records.cpp` has `ToBatch(record)` / `generated::Decode<T>(batch, row, worker)`
+plus `AllMethodSchemas()`, the per-method schema table the schema registry is built from. The
+codecs call the runtime in `vgi_wire_codec.{hpp,cpp}` — the only code that touches Arrow arrays
+for protocol records. Decoding is by column name: a missing nullable column is absent; a missing
+or null required column, a wrongly typed column, an unknown enum value or a repeated map key is a
+protocol error, as is a null in a non-nullable list/map or a null item in a list whose
+element is not optional. Enums accept only the canonical member name. Do not add leniency for an
+SDK that sends something else — fix the SDK. Use `DecodeIpcRecord<T>` / `SerializeRecord` for records carried as IPC blobs and
+`UnwrapResultEnvelope` for a unary `{result: binary}` response — never read a protocol column by
+hand. Deliberately hand-written: the zero-copy plan-page and `catalog_contents` decoders, and the
+attach-ticket / Identity / Reflection protocols.
 
 Requests are routed on **(protocol, method)**: `vgi_rpc.protocol` is required on raw transports
 and projected into the URL (`{base}/{protocol}/{method}`) over HTTP. Reserved methods
@@ -204,7 +221,7 @@ dereference it.
 `vgi_attach_parameters.hpp` (Arrow-free) ⊂ `vgi_catalog_metadata.hpp` (Arrow forward-declared)
 ⊂ `vgi_catalog_rpc.hpp` (Arrow IPC; only for `.cpp` files that issue catalog RPCs).
 
-Legitimate Arrow carriers (don't try to make them Arrow-free): `vgi_rpc_types.hpp`,
+Legitimate Arrow carriers (don't try to make them Arrow-free): `vgi_wire_codec.hpp`, `vgi_rpc_types.hpp`,
 `vgi_arrow_utils.hpp`, `vgi_arrow_ipc.hpp`, `vgi_function_connection.hpp`, `vgi_catalog_rpc.hpp`.
 
 `python3 scripts/header_reach.py` prints per-header TU reach; `--check` enforces the denylist on

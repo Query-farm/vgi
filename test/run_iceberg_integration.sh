@@ -18,7 +18,7 @@ set -euo pipefail
 VGI_PYTHON_DIR="${VGI_PYTHON_DIR:-$HOME/Development/vgi-python}"
 BUILD_DIR="${BUILD_DIR:-release}"
 HAYBARN="./build/${BUILD_DIR}/haybarn"
-UNITTEST="./build/${BUILD_DIR}/test/unittest"
+RUN_TESTS=(python3 scripts/run_tests.py --build "$BUILD_DIR")
 FILTER="${1:-test/sql/integration/catalog/multi_branch_iceberg.test}"
 shift 2>/dev/null || true
 
@@ -35,4 +35,4 @@ echo "iceberg extension available; running iceberg function-branch tests"
 
 VGI_TEST_WORKER="uv run --project ${VGI_PYTHON_DIR} vgi-fixture-worker" \
 	VGI_TEST_ICEBERG=1 \
-	"$UNITTEST" --test-config test/configs/no_error_skip.json "$FILTER" "$@"
+	"${RUN_TESTS[@]}" "$FILTER" "$@"

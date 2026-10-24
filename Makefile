@@ -10,6 +10,18 @@ VCPKG_TOOLCHAIN_PATH ?= $(wildcard ${PROJ_DIR}vcpkg/scripts/buildsystems/vcpkg.c
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
+# Resource benchmarks run on Linux. See benchmarks/README.md for the isolated
+# EC2 workflow, repeatable baselines, and CPU/allocation profiles.
+.PHONY: benchmark_build benchmark_test benchmark benchmark_compare
+benchmark_build:
+	bash benchmarks/build.sh $(BENCH_CMAKE_ARGS)
+benchmark_test:
+	VGI_BENCH_DRIVER="$(PROJ_DIR)build/benchmark/extension/vgi/vgi_bench_driver" python3 -m unittest discover -s benchmarks -v
+benchmark:
+	python3 benchmarks/bench.py run $(BENCH_ARGS)
+benchmark_compare:
+	python3 benchmarks/bench.py compare $(BENCH_ARGS)
+
 # VGI test worker (subprocess transport)
 VGI_TEST_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-worker
 
@@ -55,6 +67,8 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 VGI_ROWID_CONSTRAINT_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/rowid_constraint_worker.py
 # Hostile-data fixture (well-framed IPC with malformed buffer contents).
 VGI_MALFORMED_BATCH_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/malformed_batch_worker.py
+# The fixture worker with every result externalized (test_launcher_external_storage).
+VGI_EXTERNAL_STORAGE_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/external_storage_worker.py
 # The fixture worker without vgi_rpc.Reflection.v1, standing in for a worker
 # that predates reflection (test/sql/integration/reflection/pre_reflection.test).
 VGI_NO_REFLECTION_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/no_reflection_worker.py
@@ -68,6 +82,7 @@ VGI_NO_REFLECTION_WORKER ?= uv run --project $(HOME)/Development/vgi-python pyth
 # a vgi-python worker with writable-catalog support enabled; run them
 # explicitly via `make test_writable` when that worker is available.
 .PHONY: test_spawn test_spawn_debug test_unix test_unix_debug test_http test_http_debug \
+	test_http_demo_storage test_http_demo_storage_debug test_launcher_external_storage \
 	test_shm test_shm_debug \
 	test_launcher test_launcher_debug \
 	test_http_attach_ticket test_http_attach_ticket_debug \
@@ -219,7 +234,7 @@ test_launcher:
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/release/test/unittest --test-config test/configs/no_error_skip.json "test/*" \
+	python3 scripts/run_tests.py --build release --isolate-launcher "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test"
 
@@ -238,7 +253,7 @@ test_launcher_debug:
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/debug/test/unittest --test-config test/configs/no_error_skip.json "test/*" \
+	python3 scripts/run_tests.py --build debug --isolate-launcher "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test"
 
@@ -386,6 +401,30 @@ test_http_no_compression:
 test_http_no_compression_debug:
 	BUILD_DIR=debug ./test/run_http_no_compression_integration.sh
 
+# Launcher suite against the fixture worker externalizing every result (unary,
+# stream header, data) over the byte transport -- externalization is a server
+# setting, not an HTTP feature. See test/support/external_storage_worker.py.
+test_launcher_external_storage:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" $(MAKE) test_launcher VGI_TEST_WORKER="$(VGI_EXTERNAL_STORAGE_WORKER)"
+
+# HTTP suite against a server that externalizes every response (threshold
+# 1 byte) to its demo object store, so each result -- catalog RPCs included --
+# arrives as a vgi_rpc.location pointer the client fetches. The only lane that
+# reaches the externalized fetch from VgiTransaction::Start, where a secret
+# lookup self-deadlocks (duckdb#22258); run_tests.py's per-file timeout turns a
+# hang into a failure with thread stacks.
+test_http_demo_storage:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 \
+	    ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
+
+test_http_demo_storage_debug:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 BUILD_DIR=debug \
+	    ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
+
 # Container (OCI/Docker) transport tests (uses test/run_docker_integration.sh).
 # Skips cleanly when no container runtime is present, so it's safe to run
 # anywhere. Override VGI_DOCKER_IMAGE / CONTAINER_RUNTIME to target a different
@@ -419,19 +458,19 @@ test_iceberg_debug:
 # Writable catalog tests (subprocess transport) — opt-in, require a worker
 # with writable-catalog support.
 test_writable:
-	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/release/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/writable/*"
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" python3 scripts/run_tests.py --build release "test/sql/integration/writable/*"
 
 test_writable_debug:
-	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/debug/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/writable/*"
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" python3 scripts/run_tests.py --build debug "test/sql/integration/writable/*"
 
 # Minimal-writable tests run by default through test_spawn (the env var is
 # already wired there); this target is for running just the simple-writable
 # sqllogictests in isolation.
 test_simple_writable:
-	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/release/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/simple_writable/*"
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" python3 scripts/run_tests.py --build release "test/sql/integration/simple_writable/*"
 
 test_simple_writable_debug:
-	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/debug/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/simple_writable/*"
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" python3 scripts/run_tests.py --build debug "test/sql/integration/simple_writable/*"
 
 # The production shared-transport parity gate: identical SQLLogicTests over a
 # local Unix socket and HTTP.
@@ -534,7 +573,7 @@ test_database_workers: build_database_workers
 	VGI_DATABASE_PYTHON_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-python-worker" \
 	VGI_DATABASE_BUN_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-open-meteo" \
 	VGI_DATABASE_RUST_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-rust-worker.tar.gz" \
-	./build/release/test/unittest --test-config test/configs/no_error_skip.json "test/sql/integration/database_worker/real_*"
+	python3 scripts/run_tests.py --build release "test/sql/integration/database_worker/real_*"
 	VGI_DATABASE_PYTHON_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-python-worker" \
 	VGI_DATABASE_BUN_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-open-meteo" \
 	VGI_DATABASE_RUST_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-rust-worker.tar.gz" \

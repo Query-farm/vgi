@@ -1,0 +1,159 @@
+# name: test/sql/integration/table_in_out/continuation_classic.test
+# description: Continued output for a classic (TABLE-input) table-in-out function, which
+#   runs through the stock in-out path rather than the batched-LATERAL operator, on
+#   a per-substream connection, one reply per call. (A max_workers = 1 function runs
+#   on one shared connection and may not continue; workers refuse that at
+#   registration.)
+#
+# Fixture contract: every SDK's fixture worker implements it exactly so.
+#   paged_explode(data TABLE, page_size := 2 BIGINT, cache_ttl := 0 BIGINT,
+#                 fail_on_page := 0 BIGINT, revalidate := false BOOLEAN,
+#                 not_modified_more := false BOOLEAN) -> (i BIGINT)
+#   - Unless revalidate is true, the first reply of each input batch carries
+#     vgi.cache.ttl = cache_ttl when cache_ttl > 0, and no cache control otherwise.
+#     Later replies never carry it.
+#   - fail_on_page, revalidate and not_modified_more: see
+#     continuation_resume_error_revalidate.test.
+#   - The input table's first column is a count n (NULL or negative counts as 0); for
+#     each input row in order, the output is i = 0 .. n-1.
+#   - An input batch's output is cut into replies of page_size rows, in order; every
+#     reply but the last says more (vgi.status: HAVE_MORE_OUTPUT). A batch with no
+#     output is one empty reply; rows with no output after the last non-empty page
+#     add no reply.
+#   - Bind fails if page_size < 1 ("page_size must be at least 1, got <v>") or if
+#     cache_ttl < 0 ("cache_ttl must not be negative, got <v>").
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded. Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Every reply after an input's first is its own exchange turn — over HTTP, its own
+# request — so the many-page cases use small inputs and the multi-chunk cases bigger
+# pages. 30 rows of x % 7: 4 * 21 + 1 = 85 rows, whose i sum to 4 * 35 = 140. 3000
+# rows: 428 * 21 + 6 = 8994 rows, summing to 428 * 35 + 4 = 14984.
+foreach page_size 1 3
+
+query II
+SELECT count(*), sum(i) FROM ex.paged_explode((SELECT x % 7 AS n FROM range(30) t(x)), page_size := ${page_size});
+----
+85	140
+
+endloop
+
+foreach page_size 100 1000000
+
+query II
+SELECT count(*), sum(i) FROM ex.paged_explode((SELECT x % 7 AS n FROM range(3000) t(x)), page_size := ${page_size});
+----
+8994	14984
+
+endloop
+
+query I
+SELECT i FROM ex.paged_explode((SELECT 5 AS n), page_size := 2) ORDER BY i;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT count(*) FROM ex.paged_explode((SELECT x AS n FROM range(0) t(x)));
+----
+0
+
+query I
+SELECT count(*) FROM ex.paged_explode((SELECT CAST(NULL AS BIGINT) AS n UNION ALL SELECT 0 UNION ALL SELECT -3));
+----
+0
+
+# A LIMIT partway through the pages, then the next query on the same worker.
+query I
+SELECT count(*) FROM (SELECT i FROM ex.paged_explode((SELECT 2000 AS n), page_size := 10) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*) FROM ex.paged_explode((SELECT 7 AS n), page_size := 2);
+----
+7
+
+statement error
+SELECT * FROM ex.paged_explode((SELECT 3 AS n), page_size := 0);
+----
+page_size must be at least 1
+
+# Several pipelines at once (UNION ALL input, many threads), each continuing on its
+# own connection. Plus 2000 rows of x % 5: 400 * 10 = 4000 rows, whose i sum to
+# 400 * 10 = 4000.
+statement ok
+SET threads = 8;
+
+query II
+SELECT count(*), sum(i)
+FROM ex.paged_explode((SELECT x % 7 AS n FROM range(3000) t(x) UNION ALL SELECT x % 5 FROM range(2000) t(x)), page_size := 50);
+----
+12994	18984
+
+statement ok
+RESET threads;
+
+# Reply counts: one input batch of [3] in pages of 1 is 3 replies, 2 ticks.
+statement ok
+SET threads = 1;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM ex.paged_explode((SELECT 3 AS n), page_size := 1);
+----
+3
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue'
+  AND message LIKE '%paged_explode%';
+----
+2
+
+# A LIMIT met by the first reply asks for no more: output continues one reply per
+# call, so the pages after it are never fetched.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (SELECT i FROM ex.paged_explode((SELECT 2000 AS n), page_size := 10) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue'
+  AND message LIKE '%paged_explode%';
+----
+0
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH ex;

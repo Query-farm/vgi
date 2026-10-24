@@ -1,0 +1,26 @@
+{
+  "cases": [
+    {
+      "name": "window_cache_disabled",
+      "family": "window_cache",
+      "env": {"VGI_WINDOW_CACHE_MAX_BYTES": "0"},
+      "sql": "SELECT sum(length(v)) FROM (SELECT bench.main.vgi_window_listagg(c0) OVER (ORDER BY c0 ROWS BETWEEN CURRENT ROW AND CURRENT ROW) v FROM bench_strings(128,1,65536,64,0))",
+      "expected": "8388608"
+    },
+    {
+      "name": "window_cache_oversized",
+      "family": "window_cache",
+      "env": {"VGI_WINDOW_CACHE_MAX_BYTES": "1048576"},
+      "sql": "SELECT sum(length(v)) FROM (SELECT bench.main.vgi_window_listagg(c0) OVER (ORDER BY c0 ROWS BETWEEN CURRENT ROW AND CURRENT ROW) v FROM bench_strings(128,1,65536,64,0))",
+      "expected": "8388608"
+    },
+    {
+      "name": "cancel_window_cached_partition",
+      "family": "cancellation",
+      "env": {"VGI_STDERR_LOG": "1"},
+      "sql": "SELECT sum(length(v)) FROM (SELECT bench.main.vgi_window_listagg(c0) OVER (ORDER BY c0 ROWS BETWEEN CURRENT ROW AND CURRENT ROW) v FROM bench_strings(32768,1,4096,64,0))",
+      "expected": "3000",
+      "operation": "interrupt"
+    }
+  ]
+}

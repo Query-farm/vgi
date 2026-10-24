@@ -63,4 +63,4 @@ echo "Unix worker listening at $SOCKET_PATH (pid $SERVER_PID)"
 
 VGI_TEST_WORKER="unix://$SOCKET_PATH" \
 VGI_DATABASE_PACKAGE_WORKER="$PACKAGE_WORKER" \
-    ./build/$BUILD_DIR/test/unittest --test-config test/configs/no_error_skip.json "$FILTER" "$@"
+    python3 scripts/run_tests.py --build "$BUILD_DIR" "$FILTER" "$@"

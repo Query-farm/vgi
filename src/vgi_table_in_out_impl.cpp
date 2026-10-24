@@ -5,6 +5,7 @@
 #include "vgi_client_timing.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_metadata.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_exchange_cache_key.hpp" // exchange-mode result cache (M1)
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
@@ -87,6 +88,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->stability = stability;
 	copy->input_from_args = input_from_args;
 	copy->single_row_scan = single_row_scan;
+	copy->input_rows_per_call = input_rows_per_call;
 	copy->declared_input_types = declared_input_types;
 	return copy;
 }
@@ -183,6 +185,17 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 
 	bind_data->input_from_args = params.input_from_args;
 	bind_data->stability = params.stability;
+	if (params.input_rows_per_call.has_value()) {
+		if (!params.input_from_args || params.input_rows_per_call.value() < 1) {
+			throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
+			                      .Function(params.function_name, "TABLE_IN_OUT")
+			                      .Set(error_key::kActual, std::to_string(params.input_rows_per_call.value())),
+			                  "Function '%s' advertises input_rows_per_call = %lld; it must be a positive row count "
+			                  "on a blended (input_from_args) function",
+			                  params.function_name, (long long)params.input_rows_per_call.value());
+		}
+		bind_data->input_rows_per_call = static_cast<idx_t>(params.input_rows_per_call.value());
+	}
 
 	// Build arguments from the regular (non-TABLE) inputs.
 	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL.
@@ -777,6 +790,38 @@ ConvertInputToArrow(ClientContext &context, DataChunk &input, const VgiTableInOu
 	return DataChunkToArrow(context, casted, bind_data.input_schema);
 }
 
+// extra_info for a worker that broke the table-in-out exchange contract.
+static ErrorInfo LateralScanViolation(const VgiTableInOutBindData &bind_data) {
+	return std::move(ErrorInfo(error_subtype::kProtocolViolation)
+	                     .Function(bind_data.function_name, "TABLE_IN_OUT")
+	                     .Worker(bind_data.worker_path()));
+}
+
+// A 304 (vgi.cache.not_modified) stands for an input's whole stored output, so it
+// can only be an input's first and only reply: never one that says more, and never
+// a reply to a tick.
+static void RefuseContinuedNotModified(const VgiTableInOutBindData &bind_data, IFunctionConnection &conn) {
+	if (conn.GetLastCacheControl().not_modified) {
+		throw IOException(LateralScanViolation(bind_data),
+		                  "Worker '%s' function '%s' answered not_modified on a continued reply; a 304 must be "
+		                  "an input's only reply",
+		                  bind_data.worker_path(), bind_data.function_name);
+	}
+}
+
+// Continued output needs a connection of its own: a max_workers = 1 function runs on
+// one connection shared by every pipeline, which cannot leave output pending while
+// another pipeline's input waits. Workers refuse resume() with max_workers = 1 at
+// registration; this catches one that continues anyway.
+static void RefuseSharedContinuation(const VgiTableInOutBindData &bind_data, bool parallel) {
+	if (!parallel) {
+		throw IOException(LateralScanViolation(bind_data),
+		                  "Worker '%s' function '%s' continued its output (vgi.status: HAVE_MORE_OUTPUT), "
+		                  "which a max_workers = 1 function does not support",
+		                  bind_data.worker_path(), bind_data.function_name);
+	}
+}
+
 // ============================================================================
 // In-Out Function (Main Processing)
 // ============================================================================
@@ -839,36 +884,76 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			         {"output_rows", std::to_string(rows_copied)}});
 			return OperatorResultType::HAVE_MORE_OUTPUT;
 		}
-		// 2) First call: write the single synthesized input row ONCE, then close the
-		//    input writer so the worker can reach EOS (no deadlock).
-		if (!local_state.input_submitted) {
-			auto input_batch = ConvertInputToArrow(client_context, input, bind_data);
-			VGI_LOG(client_context, "table_in_out.scan_write_input",
-			        {{"conn", conn.GetConnIdHex()}, {"function_name", bind_data.function_name},
-			         {"input_rows", std::to_string(input_batch->num_rows())}});
-			conn.WriteInputBatch(input_batch);
-			conn.CloseInputWriter();
-			local_state.input_submitted = true;
-		}
+		// 2) Each read follows one write: the single synthesized input row (once), a
+		//    continuation tick while the worker says it has more output for that row,
+		//    then closing the input writer, after which the worker reaches EOS.
 		// 3) Drain to EOS INSIDE this call: skip empty-but-not-EOS batches (worker
 		//    heartbeat / 1->0). Return a >0-row chunk on the first non-empty batch;
-		//    return a 0-row chunk (SetCardinality(0)) only on nullptr (true EOS).
+		//    return a 0-row chunk (SetCardinality(0)) only on nullptr (true EOS). A run
+		//    of empty continued replies stays in this loop, so check for interrupts.
 		while (true) {
+			if (client_context.interrupted) {
+				throw InterruptException();
+			}
+			if (!local_state.input_submitted) {
+				auto input_batch = ConvertInputToArrow(client_context, input, bind_data);
+				VGI_LOG(client_context, "table_in_out.scan_write_input",
+				        {{"conn", conn.GetConnIdHex()}, {"function_name", bind_data.function_name},
+				         {"input_rows", std::to_string(input_batch->num_rows())}});
+				conn.WriteInputBatch(input_batch);
+				local_state.input_submitted = true;
+			} else if (local_state.more_pending) {
+				VGI_LOG(client_context, "table_in_out.continue",
+				        {{"conn", conn.GetConnIdHex()}, {"function_name", bind_data.function_name}});
+				conn.WriteContinuationTick();
+			} else if (!local_state.input_closed) {
+				conn.CloseInputWriter();
+				local_state.input_closed = true;
+			}
 			std::shared_ptr<arrow::RecordBatch> output_batch;
+			bool worker_exited = false;
 			try {
 				output_batch = conn.ReadDataBatch();
 			} catch (const IOException &) {
 				// Worker may exit right after input EOS (e.g. empty 1->0). Treat as
-				// clean end-of-stream, mirroring the scalar path's post-close read.
+				// clean end-of-stream, mirroring the scalar path's post-close read —
+				// but only once the input is closed: before that it owes a reply.
+				if (!local_state.input_closed) {
+					throw;
+				}
 				output_batch = nullptr;
+				worker_exited = true;
+			}
+			if (output_batch) {
+				if (local_state.input_closed) {
+					throw IOException(LateralScanViolation(bind_data),
+					                  "Worker '%s' function '%s' sent output after its input was closed",
+					                  bind_data.worker_path(), bind_data.function_name);
+				}
+				local_state.more_pending = conn.GetLastMoreOutput();
+				if (local_state.more_pending) {
+					RefuseSharedContinuation(bind_data, parallel);
+				}
+			} else if (!local_state.input_closed) {
+				throw IOException(LateralScanViolation(bind_data),
+				                  "Worker '%s' function '%s' ended its stream without answering its input",
+				                  bind_data.worker_path(), bind_data.function_name);
 			}
 			if (!output_batch) {
 				output.SetCardinality(0);
-				// Cancel-not-pool: the "no-finalize in-out worker returns to a clean
-				// accept-loop after input-EOS" transition is unproven for scan-mode,
-				// so drop the connection instead of pooling it.
 				if (parallel) {
-					local_state.connection.reset();
+					// Input was closed in step 2 and the output is now read to EOS, so a
+					// no-finalize worker is back at its accept loop: pool it, as the
+					// column-shape EOS below and the batched-lateral operator do. This
+					// used to drop the connection, which cost every literal call
+					// (`f('x')`) a fresh worker spawn. A finalize function still owes
+					// the worker its FINALIZE handshake, and a worker that broke the
+					// stream is never pooled.
+					if (!bind_data.has_finalize && !worker_exited) {
+						ReleaseSubstreamConnection(local_state.connection, bind_data, client_context);
+					} else {
+						local_state.connection.reset();
+					}
 				} else {
 					global_state.stream_finished = true;
 				}
@@ -900,12 +985,34 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		         {"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"output_rows", std::to_string(rows_copied)}});
-		return HasRemainingBatchData(local_state) ? OperatorResultType::HAVE_MORE_OUTPUT
-		                                          : OperatorResultType::NEED_MORE_INPUT;
+		return (HasRemainingBatchData(local_state) || local_state.more_pending) ? OperatorResultType::HAVE_MORE_OUTPUT
+		                                                                         : OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	// Convert input DataChunk to Arrow RecordBatch
+	// Continued output: ask for the next reply to the current input with a tick. One
+	// reply per call, even an empty one: returning HAVE_MORE_OUTPUT with no rows hands
+	// control back to DuckDB (which checks for interrupts) before the next tick.
+	auto read_continued_reply = [&]() {
+		VGI_LOG(client_context, "table_in_out.continue",
+		        {{"conn", conn.GetConnIdHex()}, {"function_name", bind_data.function_name}});
+		conn.WriteContinuationTick();
+		auto reply = conn.ReadDataBatch();
+		if (!reply) {
+			throw IOException(LateralScanViolation(bind_data),
+			                  "Worker '%s' function '%s' ended its stream while it had more output",
+			                  bind_data.worker_path(), bind_data.function_name);
+		}
+		local_state.more_pending = conn.GetLastMoreOutput();
+		RefuseContinuedNotModified(bind_data, conn);
+		return reply;
+	};
+
 	const bool timing = ClientTiming::Enabled();
+	std::shared_ptr<arrow::RecordBatch> output_batch;
+	if (local_state.more_pending) {
+		output_batch = read_continued_reply();
+	} else {
+	// Convert input DataChunk to Arrow RecordBatch
 	std::shared_ptr<arrow::RecordBatch> input_batch;
 	if (timing) {
 		ScopedNs _t(ClientTiming::Instance().convert_in_ns);
@@ -920,7 +1027,6 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	// log = proof of hit); a MISS runs the exchange and, once the worker's cc is
 	// latched + cacheable, stores the output. The lookup is unconditional (another
 	// substream may have already stored this input's output).
-	std::shared_ptr<arrow::RecordBatch> output_batch;
 	bool cache_hit = false;
 	VgiResultCacheKey batch_key;
 	// Conditional revalidation: a stale-but-revalidatable entry the worker can confirm
@@ -987,15 +1093,23 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			output_batch = conn.ReadDataBatch();
 		}
 
+		// Continued output for this input: the rest comes one reply per call, and is
+		// never cached (below).
+		const bool continued = output_batch && conn.GetLastMoreOutput();
+		if (continued) {
+			RefuseContinuedNotModified(bind_data, conn);
+		}
+
 		// Conditional revalidation: if we armed validators for this unit, clear them so
 		// the next input batch's exchange isn't a stray conditional request. If the
 		// worker answered 304 (a 0-row vgi.cache.not_modified batch), slide the stored
 		// entry's TTL and serve its bytes instead of re-storing — the payload is
 		// unchanged. Otherwise the fresh response falls through to normal capture below
 		// (replacing the stale entry).
+		// Only the first reply can answer 304, and only when it is the whole output.
 		if (reval_entry) {
 			conn.SetConditionalRequest("", "");
-			if (output_batch && output_batch->num_rows() == 0) {
+			if (!continued && output_batch && output_batch->num_rows() == 0) {
 				auto cc = conn.GetLastCacheControl();
 				if (cc.not_modified) {
 					SlideRevalidatedExchangeEntry(GetResultCache(client_context), *reval_entry, cc, global_state.cache_default_ttl_seconds,
@@ -1011,10 +1125,15 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			}
 		}
 
+		if (continued) {
+			RefuseSharedContinuation(bind_data, parallel);
+			local_state.more_pending = true;
+		}
+
 		// Latch the worker's cache-control advertisement off the first exchange
 		// output, then (if cacheable) memoize this input batch's output. Skip on the
 		// terminal EOS batch (nullptr) — there is nothing to cache and cc rides data.
-		if (!cache_hit && global_state.cache_eligible && output_batch) {
+		if (!cache_hit && global_state.cache_eligible && output_batch && !continued) {
 			GetResultCache(client_context).RecordExchangeMiss(); // fresh exchange (not a hit / 304)
 			if (!local_state.cache_cc_latched) {
 				local_state.cache_cc = conn.GetLastCacheControl();
@@ -1040,6 +1159,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			}
 		}
 	}
+	} // fresh input
 
 	if (!output_batch) {
 		// EOS - stream exhausted
@@ -1058,10 +1178,11 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		return OperatorResultType::FINISHED;
 	}
 
-	// Empty batch (0 rows) - worker consumed input but has no output yet
+	// Empty batch (0 rows) - worker consumed input but has no output yet, or an empty
+	// reply that more follow
 	if (output_batch->num_rows() == 0) {
 		output.SetCardinality(0);
-		return OperatorResultType::NEED_MORE_INPUT;
+		return local_state.more_pending ? OperatorResultType::HAVE_MORE_OUTPUT : OperatorResultType::NEED_MORE_INPUT;
 	}
 
 	// Type-confusion guard: the worker output batch's types must match what it
@@ -1091,8 +1212,8 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
 
-	return HasRemainingBatchData(local_state) ? OperatorResultType::HAVE_MORE_OUTPUT
-	                                          : OperatorResultType::NEED_MORE_INPUT;
+	return (HasRemainingBatchData(local_state) || local_state.more_pending) ? OperatorResultType::HAVE_MORE_OUTPUT
+	                                                                         : OperatorResultType::NEED_MORE_INPUT;
 }
 
 // ============================================================================

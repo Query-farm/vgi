@@ -10,6 +10,7 @@
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_record_access.hpp"
 #include "../../src/generated/vgi_protocol_schemas.hpp"
 
 using namespace duckdb;

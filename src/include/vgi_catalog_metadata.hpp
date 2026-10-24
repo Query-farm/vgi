@@ -447,9 +447,6 @@ enum class VgiFunctionType {
 	Aggregate       // Aggregate function: many inputs → one output
 };
 
-// Parse VgiFunctionType from wire format string
-// Returns nullopt for unrecognized values
-std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value);
 
 // Convert VgiFunctionType to string for error messages
 std::string VgiFunctionTypeToString(VgiFunctionType type);
@@ -466,9 +463,6 @@ enum class VgiOrderPreservation {
 	FixedOrder         // Output is in a fixed mandatory order; DuckDB serializes
 };
 
-// Parse VgiOrderPreservation from wire format string
-// Returns nullopt for unrecognized values
-std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string &value);
 
 // Partition shape declared by a table function over its
 // vgi.partition_column-annotated bind-schema fields. Mirrors DuckDB's
@@ -490,10 +484,6 @@ enum class VgiPartitionKind {
 	DisjointPartitions,
 };
 
-// Parse VgiPartitionKind from wire format string. Returns nullopt for
-// unrecognized values (treated as NotPartitioned by callers, matching
-// older-worker compatibility).
-std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value);
 
 // Scalar-function monotonicity in one argument while all other arguments are
 // held constant. This VGI-owned enum deliberately avoids DuckDB 2.0 headers so
@@ -719,6 +709,9 @@ struct VgiFunctionInfo {
 	// flag even without a TABLE-typed arg, and bind builds the input schema from
 	// the declared arg names + drives the literal single-row scan-mode.
 	bool input_from_args = false;
+	// Blended only: the most input rows one worker call receives. Each input chunk
+	// is split into calls of at most this many rows. Unset = a whole chunk per call.
+	std::optional<int64_t> input_rows_per_call;
 
 	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;
@@ -784,18 +777,21 @@ VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
                                                const std::string &worker_path);
 
-// One schema and everything in it, from catalog_contents: row `row` of the
-// response's `schemas` struct column, held in place (every schema of a
-// snapshot shares `rows`, and so the response buffers; nothing is copied).
-// Only `path` is read up front, to name the schema entry. The SchemaInfo and
-// each kind's item list are decoded on first use (DecodeContents* in
-// vgi_catalog_rpc.hpp), so a query touching two schemas does not pay to decode
-// the whole catalog. Each kind is complete: an empty list means none.
-struct VgiSchemaContents {
-	std::string name;              // SchemaNameFromPath(path)
-	std::vector<std::string> path; // SchemaContents.path; must equal SchemaInfo.path
-	std::shared_ptr<arrow::StructArray> rows;
+// A row in a catalog-wide metadata stream. Batches retain their IPC buffers;
+// indexing rows does not copy or materialize the metadata objects.
+struct VgiCatalogItemRef {
+	std::shared_ptr<arrow::RecordBatch> batch;
 	int64_t row = 0;
+};
+
+// One schema's rows from the six catalog-wide streams. Streams are opened
+// once and indexed by raw schema path and subtype when the snapshot arrives.
+// Full metadata objects are still materialized lazily by DecodeContents*.
+struct VgiSchemaContents {
+	std::string name; // SchemaNameFromPath(path)
+	std::vector<std::string> path;
+	VgiCatalogItemRef schema;
+	std::map<std::string, std::vector<VgiCatalogItemRef>> items;
 	std::string worker_path;
 };
 

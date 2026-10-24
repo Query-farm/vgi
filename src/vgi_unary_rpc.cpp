@@ -143,10 +143,8 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 }
 #endif // VGI_SUBPROCESS_TRANSPORT
 
-} // anonymous namespace
-
-UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
-                                          const std::shared_ptr<arrow::RecordBatch> &params) {
+UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const std::string &method_name,
+                                              const std::shared_ptr<arrow::RecordBatch> &params) {
 	if (IsHttpTransport(opts.worker_path)) {
 		// Keep-alive: check a client out of the per-catalog pool for this call
 		// and return it only on success. If HttpInvokeUnary throws, ``pooled``
@@ -416,6 +414,18 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		return AttemptUnaryRpc(opts, method_name, params, /*force_fresh=*/true);
 	}
 #endif
+}
+
+} // anonymous namespace
+
+UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
+                                          const std::shared_ptr<arrow::RecordBatch> &params) {
+	auto result = InvokeUnaryRpcOnTransport(opts, method_name, params);
+	// A worker with external storage configured externalizes a large unary
+	// result on any transport, not only HTTP: resolve the vgi_rpc.location
+	// pointer here, outside the respawn-retry above, so a failed fetch does not
+	// cost a worker. A no-op for HTTP, which resolved it already.
+	return MaybeResolveExternalLocation(opts.context, result, opts.worker_path);
 }
 
 } // namespace vgi

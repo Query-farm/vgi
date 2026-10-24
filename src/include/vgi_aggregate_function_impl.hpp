@@ -11,6 +11,8 @@
 #include "duckdb/function/aggregate_function.hpp"
 
 #include "vgi_catalog_metadata.hpp"
+#include "vgi_exception.hpp"
+#include "../generated/vgi_protocol_records.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -157,12 +159,12 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 // ============================================================================
 
 struct AggregateRpcResult {
-	// Outer vgi_rpc unary envelope: {result: Binary}. Legacy callers still use
-	// this and manually unwrap.
+	// Outer vgi_rpc unary envelope: {result: Binary}.
 	std::shared_ptr<arrow::RecordBatch> response_batch;
 	// Inner response batch, already unwrapped from the envelope and validated
 	// against the method's registered schema. May be null if the envelope's
-	// result column is null or the batch is empty. New code should prefer this.
+	// result column is null or the batch is empty. Decode it with
+	// DecodeAggregateResult<generated::...Result>().
 	std::shared_ptr<arrow::RecordBatch> inner_batch;
 };
 
@@ -179,6 +181,24 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
                                       const std::string &method_name,
                                       const std::shared_ptr<arrow::RecordBatch> &params,
                                       bool enable_logging = true);
+
+// extra_info for a malformed aggregate (incl. window / streaming) RPC response.
+ErrorInfo AggregateViolation(const VgiAggregateBindData &bind_data, const std::string &method_name);
+
+// The worker that serves `bind_data`'s aggregate.
+const std::string &AggregateWorkerPath(const VgiAggregateBindData &bind_data);
+
+[[noreturn]] void ThrowMissingAggregateResult(const VgiAggregateBindData &bind_data, const std::string &method_name);
+
+// The typed result of an aggregate RPC (the generated record for the method).
+template <class T>
+T DecodeAggregateResult(const AggregateRpcResult &rpc_result, const VgiAggregateBindData &bind_data,
+                        const std::string &method_name) {
+	if (!rpc_result.inner_batch) {
+		ThrowMissingAggregateResult(bind_data, method_name);
+	}
+	return generated::Decode<T>(rpc_result.inner_batch, 0, AggregateWorkerPath(bind_data));
+}
 
 } // namespace vgi
 } // namespace duckdb

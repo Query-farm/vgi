@@ -294,6 +294,8 @@ private:
 	idx_t last_batch_index_ = DConstants::INVALID_INDEX;
 	std::string last_partition_values_bytes_;
 	VgiCacheControl last_cache_control_;
+	// Whether the most recent data batch said vgi.status: HAVE_MORE_OUTPUT.
+	bool last_more_output_ = false;
 
 public:
 	idx_t GetLastBatchIndex() const override {
@@ -305,6 +307,10 @@ public:
 	VgiCacheControl GetLastCacheControl() const override {
 		return last_cache_control_;
 	}
+	bool GetLastMoreOutput() const override {
+		return last_more_output_;
+	}
+	void WriteContinuationTick() override;
 	void SetConditionalRequest(const std::string &if_none_match,
 	                           const std::string &if_modified_since) override {
 		cond_if_none_match_ = if_none_match;

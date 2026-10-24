@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "workers": {
+    "python": {"location": "${VGI_WORKSPACE}/vgi-python/.venv/bin/vgi-fixture-worker", "repo": "${VGI_WORKSPACE}/vgi-python"},
+    "rust": {"location": "${VGI_WORKSPACE}/vgi-rust/target/release/vgi-example-worker", "repo": "${VGI_WORKSPACE}/vgi-rust"},
+    "go": {"location": "${VGI_WORKSPACE}/vgi-go/vgi-example-worker-go", "repo": "${VGI_WORKSPACE}/vgi-go"},
+    "typescript": {"location": "${VGI_WORKSPACE}/vgi-typescript/bin/vgi-example-worker", "repo": "${VGI_WORKSPACE}/vgi-typescript"},
+    "java": {"location": "${VGI_WORKSPACE}/vgi-java/vgi-example-worker/build/install/vgi-example-worker/bin/vgi-example-worker", "repo": "${VGI_WORKSPACE}/vgi-java"},
+    "csharp": {"location": "${VGI_WORKSPACE}/vgi-csharp/fixtures/QueryFarm.Vgi.ExampleWorker/bin/Release/net10.0/vgi-example-worker", "repo": "${VGI_WORKSPACE}/vgi-csharp"},
+    "cpp": {"location": "${VGI_WORKSPACE}/vgi-c++/build/example-worker/vgi-example-worker", "repo": "${VGI_WORKSPACE}/vgi-c++"}
+  }
+}

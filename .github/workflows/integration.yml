@@ -35,6 +35,10 @@ jobs:
     name: Integration suite (launcher transport)
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    defaults:
+      run:
+        # Explicit bash enables pipefail: tee must not hide a failed test.
+        shell: bash
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
@@ -63,6 +67,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+
+      - name: Check native artifact selection
+        run: python3 -m unittest discover -s test/scripts -p 'test_*.py'
 
       - name: Install build toolchain
         run: |
@@ -122,6 +129,25 @@ jobs:
       - name: Build the extension (release)
         run: make release
 
+      # SDKs changing the wire contract need the matching development client
+      # before that revision is published to the signed community channel.
+      # Both executables statically link VGI and its core dependencies.
+      - name: Package native SDK CI executables
+        if: github.ref == 'refs/heads/main'
+        run: |
+          python3 scripts/ci_fetch_native_runner.py --pack \
+            --source "$GITHUB_WORKSPACE" --build build/release \
+            --output "$RUNNER_TEMP/vgi-native-runner"
+
+      - name: Upload native SDK CI executables
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vgi-native-runner-linux_amd64
+          path: ${{ runner.temp }}/vgi-native-runner/
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Run Filter v2 producer tests
         run: make test_filter_v2
 
@@ -149,9 +175,9 @@ jobs:
           VGI_PYTHON_DIR: /tmp/vgi-python
           QUERY_FARM_TELEMETRY_OPT_OUT: "1"
         run: |
-          make test_http_bearer 2>&1 | tee /tmp/vgi-bearer.log
+          ./test/run_http_bearer_integration.sh 'test/sql/integration/bearer_auth/*' --min-executed 2 2>&1 | tee /tmp/vgi-bearer.log
           make test_catalog_discovery_auth 2>&1 | tee /tmp/vgi-discovery-auth.log
-          ./build/release/test/unittest "test/sql/oauth/catalog_discovery_options.test" 2>&1 | tee /tmp/vgi-discovery-options.log
+          python3 scripts/run_tests.py --min-executed 1 'test/sql/oauth/catalog_discovery_options.test' 2>&1 | tee /tmp/vgi-discovery-options.log
 
       - name: Build pinned Iroh qualification bridge
         run: |
@@ -162,11 +188,10 @@ jobs:
           # This editable install REPLACES vgi-rpc in the fixture venv for the
           # rest of the job, so the pin governs every later step -- not just the
           # Iroh one. It must therefore stay at or above the version vgi-python
-          # itself requires (>=0.50.0: the error model's `vgi_rpc.errors`, the
-          # public reflection client). An older pin silently downgrades the
-          # whole suite; at 0.46 every fixture worker failed with
-          # "No module named 'vgi_rpc.errors'" once vgi-python required 0.50.
-          git -C /tmp/vgi-rpc-python checkout 609e333505bd50947c5893419131a63dea8f5649  # v0.50.0
+          # itself requires (>=0.52.0 for Identity.v2 and nullable grant expiry).
+          # An older pin silently downgrades every later worker invocation.
+          # This commit is the published v0.52.0 release.
+          git -C /tmp/vgi-rpc-python checkout e04ddfa56c19b4cd7cc1e3729d165c763b0d98c7  # v0.52.0
           uv pip install --python /tmp/vgi-python/.venv/bin/python --editable '/tmp/vgi-rpc-python[http]'
 
       - name: Run native Iroh raw and HTTP integration

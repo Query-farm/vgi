@@ -3,6 +3,7 @@
 #include "vgi_constraint_contract.hpp"
 #include "vgi_query_rpc.hpp"
 #include "vgi_macro_contract.hpp"
+#include "duckdb.hpp"
 #include <regex>
 #include <set>
 
@@ -484,6 +485,56 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow:
 	return batch;
 }
 
+std::shared_ptr<arrow::RecordBatch> UnwrapResultEnvelope(const std::shared_ptr<arrow::RecordBatch> &envelope,
+                                                         const std::string &method,
+                                                         const std::unordered_map<std::string, std::string> &info,
+                                                         bool null_result_ok, WorkerBatchValidation validation,
+                                                         std::shared_ptr<arrow::KeyValueMetadata> *custom_metadata) {
+	auto violation = [&]() {
+		return ErrorInfo(error_subtype::kProtocolViolation).Merge(info).Rpc(method);
+	};
+	// Name the worker in the message too (it is also in extra_info).
+	auto worker_it = info.find(error_key::kWorkerPath);
+	const std::string where = worker_it == info.end() ? std::string() : " [worker: " + worker_it->second + "]";
+	if (!envelope || envelope->num_rows() == 0) {
+		throw IOException(violation(), "VGI %s returned an empty response%s", method, where);
+	}
+	auto column = envelope->GetColumnByName("result");
+	if (!column) {
+		throw IOException(violation().Set(error_key::kField, "result"), "VGI %s response is missing its 'result' column%s",
+		                  method, where);
+	}
+	// Compare type ids: arrow::StringArray derives from arrow::BinaryArray, so a cast
+	// would accept a utf8 column and feed its bytes to the IPC decoder.
+	if (column->type_id() != arrow::Type::BINARY) {
+		throw IOException(violation().Set(error_key::kField, "result").ExpectedActual("binary", column->type()->ToString()),
+		                  "VGI %s response 'result' column has type %s, expected binary%s", method,
+		                  column->type()->ToString(), where);
+	}
+	const auto &binary = static_cast<const arrow::BinaryArray &>(*column);
+	if (binary.IsNull(0)) {
+		if (null_result_ok) {
+			return nullptr;
+		}
+		throw IOException(violation().Set(error_key::kField, "result"), "VGI %s response has a null 'result'%s", method, where);
+	}
+	try {
+		if (custom_metadata) {
+			auto view = binary.GetView(0);
+			auto decoded = DeserializeFromIpcBytesWithMetadata(reinterpret_cast<const uint8_t *>(view.data()),
+			                                                   view.size(), validation);
+			*custom_metadata = std::move(decoded.custom_metadata);
+			return std::move(decoded.batch);
+		}
+		return DeserializeFromIpcBytesZeroCopy(binary, 0, validation);
+	} catch (const std::exception &e) {
+		throw IOException(violation().Merge(ExtraInfoOf(e)),
+		                  "VGI %s response could not be decoded%s: %s. The worker likely returned a malformed or "
+		                  "out-of-date response shape for this method.",
+		                  method, where, RawMessageOf(e));
+	}
+}
+
 DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len,
                                                       WorkerBatchValidation validation) {
 	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
@@ -573,125 +624,15 @@ std::shared_ptr<arrow::Array> BuildEnumArray(const std::string &value,
 	return dict_array_result.ValueUnsafe();
 }
 
-// ============================================================================
-// BindRequest
-// ============================================================================
-
-std::shared_ptr<arrow::RecordBatch>
-BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
-                 const std::string &function_type, const std::vector<uint8_t> &input_schema_bytes,
-                 const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
-                 const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
-                 bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value,
-                 const CopyFromBindContext *copy_from, const CopyToBindContext *copy_to,
-                 const std::string &schema_name,
-                 const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
-	// FunctionType enum: SCALAR, TABLE, AGGREGATE
-	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
-
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-	arrays.push_back(BuildStringScalar(function_name));
-	arrays.push_back(BuildBinaryScalar(arguments_ipc_bytes));
-	arrays.push_back(BuildEnumArray(function_type, function_type_values));
-	arrays.push_back(BuildBinaryScalar(input_schema_bytes));
-	arrays.push_back(BuildBinaryScalar(settings_bytes));
-	arrays.push_back(BuildBinaryScalar(secrets_bytes));
-	arrays.push_back(BuildBinaryScalar(attach_opaque_data));
-	arrays.push_back(BuildBinaryScalar(transaction_opaque_data));
-
-	// resolved_secrets_provided: bool
-	{
-		arrow::BooleanBuilder builder;
-		CheckStatus(builder.Append(resolved_secrets_provided), "append resolved_secrets_provided");
-		arrays.push_back(FinishArray(builder, "resolved_secrets_provided"));
-	}
-
-	arrays.push_back(BuildNullableStringScalar(at_unit));
-	arrays.push_back(BuildNullableStringScalar(at_value));
-
-	// copy_from / copy_to: nested structs, ALWAYS present — null when this is
-	// not a COPY bind. They were previously appended only for a COPY, on the
-	// stated grounds that "the Python worker matches BindRequest fields by name
-	// and defaults this to None when absent, so omitting it is wire-safe". That
-	// held only for as long as every worker was permissive. A worker that
-	// validates its declared parameter contract (vgi-rpc-go compares with
-	// arrow Schema.Equal — order, name, type AND nullability) rejects a
-	// 12-column batch outright, and it is right to: the protocol declares 14
-	// fields, so a client sending 12 does not match its own contract.
-	//
-	// Order matters for the same reason, and it is the PROTOCOL's order that
-	// governs: copy_from, copy_to, then schema_name last (vgi/protocol.py's
-	// BindRequest). This builder used to emit schema_name before the copy
-	// fields, so even a 14-column batch would not have matched.
-	auto copy_from_type = arrow::struct_({
-	    arrow::field("format", arrow::utf8(), false),
-	    arrow::field("file_path", arrow::utf8(), false),
-	    arrow::field("expected_schema", arrow::binary(), false),
-	});
-	if (copy_from) {
-		std::vector<std::shared_ptr<arrow::Array>> children = {
-		    BuildStringScalar(copy_from->format),
-		    BuildStringScalar(copy_from->file_path),
-		    BuildBinaryScalar(copy_from->expected_schema_bytes),
-		};
-		auto struct_result = arrow::StructArray::Make(children, copy_from_type->fields());
-		if (!struct_result.ok()) {
-			throw IOException("Failed to build copy_from struct array: %s", struct_result.status().ToString());
-		}
-		arrays.push_back(struct_result.ValueUnsafe());
-	} else {
-		arrays.push_back(BuildNullStructScalar(copy_from_type));
-	}
-
-	auto copy_to_type = arrow::struct_({
-	    arrow::field("format", arrow::utf8(), false),
-	    arrow::field("file_path", arrow::utf8(), false),
-	});
-	if (copy_to) {
-		std::vector<std::shared_ptr<arrow::Array>> children = {
-		    BuildStringScalar(copy_to->format),
-		    BuildStringScalar(copy_to->file_path),
-		};
-		auto struct_result = arrow::StructArray::Make(children, copy_to_type->fields());
-		if (!struct_result.ok()) {
-			throw IOException("Failed to build copy_to struct array: %s", struct_result.status().ToString());
-		}
-		arrays.push_back(struct_result.ValueUnsafe());
-	} else {
-		arrays.push_back(BuildNullStructScalar(copy_to_type));
-	}
-
-	// Owning catalog schema; disambiguates a function name registered in more
-	// than one schema. Empty string serialises as null, which tells the worker
-	// to fall back to a cross-schema lookup by name. Last, per the protocol.
-	arrays.push_back(BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name)));
-	arrays.push_back(BuildNullableStringListScalar(argument_names));
-
-	return arrow::RecordBatch::Make(generated::BindRequestSchema(), 1, arrays);
-}
 
 // ============================================================================
 // BindResponse Parsing
 // ============================================================================
 
 BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+	auto wire = generated::Decode<generated::BindResponse>(batch, 0, worker_path);
 	BindResponseResult result;
-
-	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty BindResponse from worker [worker: %s]", worker_path);
-	}
-
-	// output_schema: binary (required)
-	auto schema_col = batch->GetColumnByName("output_schema");
-	if (!schema_col) {
-		throw IOException("BindResponse missing output_schema [worker: %s]", worker_path);
-	}
-	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(schema_col);
-	if (!binary_array || binary_array->IsNull(0)) {
-		throw IOException("BindResponse output_schema is null [worker: %s]", worker_path);
-	}
-	auto view = binary_array->GetView(0);
-	auto schema_buffer = arrow::Buffer::Wrap(view.data(), view.size());
+	auto schema_buffer = arrow::Buffer::Wrap(wire.output_schema.data(), wire.output_schema.size());
 	arrow::io::BufferReader reader(schema_buffer);
 	arrow::ipc::DictionaryMemo dict_memo;
 	auto schema_result = arrow::ipc::ReadSchema(&reader, &dict_memo);
@@ -701,15 +642,7 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 	}
 	result.output_schema = schema_result.ValueUnsafe();
 
-	// opaque_data: binary (nullable)
-	auto opaque_col = batch->GetColumnByName("opaque_data");
-	if (opaque_col) {
-		auto opaque_array = std::dynamic_pointer_cast<arrow::BinaryArray>(opaque_col);
-		if (opaque_array && !opaque_array->IsNull(0)) {
-			auto opaque_view = opaque_array->GetView(0);
-			result.opaque_data.assign(opaque_view.data(), opaque_view.data() + opaque_view.size());
-		}
-	}
+	result.opaque_data = wire.opaque_data.value_or(generated::Bytes {});
 
 	auto profiles = batch->GetColumnByName("projection_expression_profiles");
 	auto list = std::dynamic_pointer_cast<arrow::ListArray>(profiles);
@@ -759,278 +692,27 @@ std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
 	if (!batch || batch->num_rows() == 0) {
 		return std::nullopt;
 	}
-
-	// Check for lookup_secret_types column — if present and non-empty, this is a scope request
-	auto types_col = batch->GetColumnByName("lookup_secret_types");
-	if (!types_col) {
+	auto wire = generated::Decode<generated::BindResponse>(batch, 0, "");
+	// A non-empty lookup_secret_types makes this a secret-scope request; the three
+	// lists are parallel.
+	if (wire.lookup_secret_types.empty()) {
 		return std::nullopt;
 	}
-
-	auto types_list = std::dynamic_pointer_cast<arrow::ListArray>(types_col);
-	if (!types_list || types_list->IsNull(0)) {
-		return std::nullopt;
-	}
-
-	int64_t start = types_list->value_offset(0);
-	int64_t end = types_list->value_offset(1);
-	int64_t num_lookups = end - start;
-
-	if (num_lookups == 0) {
-		return std::nullopt; // Empty list — not a scope request
-	}
-
-	auto types_values = std::dynamic_pointer_cast<arrow::StringArray>(types_list->values());
-	if (!types_values) {
-		return std::nullopt;
-	}
-
-	// Parse scopes and names (parallel lists)
-	auto scopes_col = batch->GetColumnByName("lookup_scopes");
-	auto names_col = batch->GetColumnByName("lookup_names");
-
-	auto scopes_list = scopes_col ? std::dynamic_pointer_cast<arrow::ListArray>(scopes_col) : nullptr;
-	auto names_list = names_col ? std::dynamic_pointer_cast<arrow::ListArray>(names_col) : nullptr;
-
-	std::shared_ptr<arrow::StringArray> scopes_values;
-	std::shared_ptr<arrow::StringArray> names_values;
-	if (scopes_list && !scopes_list->IsNull(0)) {
-		scopes_values = std::dynamic_pointer_cast<arrow::StringArray>(scopes_list->values());
-	}
-	if (names_list && !names_list->IsNull(0)) {
-		names_values = std::dynamic_pointer_cast<arrow::StringArray>(names_list->values());
-	}
-
 	BindSecretScopeResponseResult result;
-	for (int64_t i = start; i < end; i++) {
+	for (size_t i = 0; i < wire.lookup_secret_types.size(); i++) {
 		BindSecretScopeResponseResult::Lookup lookup;
-		lookup.secret_type = types_values->GetString(i);
-		if (scopes_values && i < scopes_values->length() && !scopes_values->IsNull(i)) {
-			lookup.scope = scopes_values->GetString(i);
+		lookup.secret_type = std::move(wire.lookup_secret_types[i]);
+		if (i < wire.lookup_scopes.size()) {
+			lookup.scope = std::move(wire.lookup_scopes[i]);
 		}
-		if (names_values && i < names_values->length() && !names_values->IsNull(i)) {
-			lookup.name = names_values->GetString(i);
+		if (i < wire.lookup_names.size()) {
+			lookup.name = std::move(wire.lookup_names[i]);
 		}
 		result.lookups.push_back(std::move(lookup));
 	}
-
 	return result;
 }
 
-// ============================================================================
-// InitRequest
-// ============================================================================
-
-std::shared_ptr<arrow::RecordBatch>
-BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<uint8_t> &output_schema_bytes,
-                 const std::vector<uint8_t> &bind_opaque_data, const std::vector<int64_t> &projection_ids,
-                 std::shared_ptr<arrow::Buffer> pushdown_filters,
-                 std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
-                 const std::string &phase,
-                 const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data,
-                 const std::string &order_by_column_name, const std::string &order_by_direction,
-                 const std::string &order_by_null_order, int64_t order_by_limit,
-                 double tablesample_percentage, int64_t tablesample_seed,
-                 const std::optional<std::vector<uint8_t>> &finalize_state_id,
-                 const std::vector<uint8_t> &substream_id,
-                 const std::vector<std::string> &split_tokens) {
-	static const std::vector<std::string> phase_values = {
-	    "INPUT", "FINALIZE", "TABLE_BUFFERING", "TABLE_BUFFERING_FINALIZE",
-	};
-
-	auto phase_type = arrow::dictionary(arrow::int16(), arrow::utf8());
-
-	auto order_direction_type = arrow::dictionary(arrow::int16(), arrow::utf8());
-	auto order_null_order_type = arrow::dictionary(arrow::int16(), arrow::utf8());
-
-	// This record must match InitRequestSchema() in the generated header
-	// EXACTLY — every declared field, in the declared order, with the declared
-	// type and nullability. test/cpp/test_request_schema_parity.cpp asserts it.
-	//
-	// Exactly, not approximately: vgi-rpc-go validates a request record against
-	// its declared parameter contract with arrow.Schema.Equal, which is
-	// order-, name-, type- AND nullability-sensitive. Omitting a nullable field
-	// the client has no value for is NOT wire-safe there — it fails every call
-	// of that shape with "parameter schema mismatch", naming two 19-line
-	// schemas that differ in one row. `row_limit` is exactly that case: DuckDB
-	// has no limit to put in it (TableFunctionInitInput carries none), so it
-	// ships as an explicit null rather than being left out.
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-
-	// bind_call: binary (required)
-	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
-
-	// output_schema: binary (required)
-	arrays.push_back(BuildBinaryScalar(output_schema_bytes));
-
-	// bind_opaque_data: binary|null
-	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
-
-	// projection_ids: list<int64>|null
-	{
-		auto value_builder = std::make_shared<arrow::Int64Builder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		if (projection_ids.empty()) {
-			CheckStatus(list_builder.AppendNull(), "append null projection_ids");
-		} else {
-			CheckStatus(list_builder.Append(), "start projection_ids list");
-			for (int64_t id : projection_ids) {
-				CheckStatus(value_builder->Append(id), "append projection id");
-			}
-		}
-		arrays.push_back(FinishArray(list_builder, "projection_ids"));
-	}
-
-	// pushdown_filters: large_binary|null (zero-copy from arrow::Buffer, int64 offsets)
-	{
-		arrow::LargeBinaryBuilder builder;
-		if (!pushdown_filters || pushdown_filters->size() == 0) {
-			CheckStatus(builder.AppendNull(), "append null pushdown_filters");
-		} else {
-			CheckStatus(builder.Append(pushdown_filters->data(), static_cast<int64_t>(pushdown_filters->size())),
-			            "append pushdown_filters");
-		}
-		arrays.push_back(FinishArray(builder, "pushdown_filters"));
-	}
-
-	// join_keys: list<large_binary>|null (one entry per IN filter column)
-	{
-		auto value_builder = std::make_shared<arrow::LargeBinaryBuilder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		if (join_keys.empty()) {
-			CheckStatus(list_builder.AppendNull(), "append null join_keys");
-		} else {
-			CheckStatus(list_builder.Append(), "start join_keys list");
-			for (auto &buf : join_keys) {
-				CheckStatus(value_builder->Append(buf->data(), static_cast<int64_t>(buf->size())),
-				            "append join_keys buffer");
-			}
-		}
-		arrays.push_back(FinishArray(list_builder, "join_keys"));
-	}
-
-	// split_tokens: list<large_binary>|null — the splits this init redeems.
-	//
-	// A list rather than a single token because DataFusion's partition_count() IS
-	// its concurrency: it must bin-pack at planning time and read a whole group per
-	// partition, and without the list that would be N sequential inits. DuckDB always
-	// sends exactly one — it claims greedily, one split at a time, because it cannot
-	// see per-split cost and any grouping it invented would be a guess.
-	{
-		auto value_builder = std::make_shared<arrow::LargeBinaryBuilder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		if (split_tokens.empty()) {
-			CheckStatus(list_builder.AppendNull(), "append null split_tokens");
-		} else {
-			CheckStatus(list_builder.Append(), "start split_tokens list");
-			for (const auto &tok : split_tokens) {
-				CheckStatus(value_builder->Append(tok.data(), static_cast<int64_t>(tok.size())),
-				            "append split token");
-			}
-		}
-		arrays.push_back(FinishArray(list_builder, "split_tokens"));
-	}
-
-	// row_limit: int64|null — always null from DuckDB. TableFunctionInitInput
-	// carries no limit, and the Top-N `order_by_limit` means something
-	// different ("top K by that column"), so reusing it here would be a lie.
-	// DataFusion supplies a real value via TableProvider::scan(limit).
-	{
-		arrow::Int64Builder builder;
-		CheckStatus(builder.AppendNull(), "append null row_limit");
-		arrays.push_back(FinishArray(builder, "row_limit"));
-	}
-
-	// phase: dictionary(int16, utf8)|null
-	if (phase.empty()) {
-		arrays.push_back(BuildNullDictionaryArray(phase_type, phase_values));
-	} else {
-		arrays.push_back(BuildEnumArray(phase, phase_values));
-	}
-
-	// finalize_state_id: binary|null — required for phase=TABLE_BUFFERING_FINALIZE.
-	// Opaque worker-chosen bytes from table_buffering_combine.
-	{
-		arrow::BinaryBuilder builder;
-		if (finalize_state_id.has_value()) {
-			CheckStatus(
-			    builder.Append(finalize_state_id->data(),
-			                   static_cast<int32_t>(finalize_state_id->size())),
-			    "append finalize_state_id");
-		} else {
-			CheckStatus(builder.AppendNull(), "append null finalize_state_id");
-		}
-		arrays.push_back(FinishArray(builder, "finalize_state_id"));
-	}
-
-	// execution_id: binary|null
-	arrays.push_back(BuildBinaryScalar(execution_id));
-
-	// init_opaque_data: binary|null
-	arrays.push_back(BuildBinaryScalar(init_opaque_data));
-
-	// substream_id: binary|null — stable client-minted per-substream id for the
-	// parallel streaming table-in-out path. Empty => null (serial path / not a
-	// streaming table-in-out). See InitRequest.substream_id in vgi/protocol.py.
-	arrays.push_back(BuildBinaryScalar(substream_id));
-
-	// order_by_column_name: utf8|null
-	arrays.push_back(BuildNullableStringScalar(order_by_column_name));
-
-	// order_by_direction: dictionary(int16, utf8)|null — "ASC" or "DESC"
-	{
-		static const std::vector<std::string> direction_values = {"ASC", "DESC"};
-		if (order_by_direction.empty()) {
-			arrays.push_back(BuildNullDictionaryArray(order_direction_type, direction_values));
-		} else {
-			arrays.push_back(BuildEnumArray(order_by_direction, direction_values));
-		}
-	}
-
-	// order_by_null_order: dictionary(int16, utf8)|null — "NULLS_FIRST" or "NULLS_LAST"
-	{
-		static const std::vector<std::string> null_order_values = {"NULLS_FIRST", "NULLS_LAST"};
-		if (order_by_null_order.empty()) {
-			arrays.push_back(BuildNullDictionaryArray(order_null_order_type, null_order_values));
-		} else {
-			arrays.push_back(BuildEnumArray(order_by_null_order, null_order_values));
-		}
-	}
-
-	// order_by_limit: int64|null — combined limit+offset, -1 = null
-	{
-		arrow::Int64Builder builder;
-		if (order_by_limit < 0) {
-			CheckStatus(builder.AppendNull(), "append null order_by_limit");
-		} else {
-			CheckStatus(builder.Append(order_by_limit), "append order_by_limit");
-		}
-		arrays.push_back(FinishArray(builder, "order_by_limit"));
-	}
-
-	// tablesample_percentage: float64|null — -1.0 = null (no sample)
-	{
-		arrow::DoubleBuilder builder;
-		if (tablesample_percentage < 0.0) {
-			CheckStatus(builder.AppendNull(), "append null tablesample_percentage");
-		} else {
-			CheckStatus(builder.Append(tablesample_percentage), "append tablesample_percentage");
-		}
-		arrays.push_back(FinishArray(builder, "tablesample_percentage"));
-	}
-
-	// tablesample_seed: int64|null — -1 = null (no seed)
-	{
-		arrow::Int64Builder builder;
-		if (tablesample_seed < 0) {
-			CheckStatus(builder.AppendNull(), "append null tablesample_seed");
-		} else {
-			CheckStatus(builder.Append(tablesample_seed), "append tablesample_seed");
-		}
-		arrays.push_back(FinishArray(builder, "tablesample_seed"));
-	}
-
-	return arrow::RecordBatch::Make(generated::InitRequestSchema(), 1, arrays);
-}
 
 // ============================================================================
 // GlobalInitResponse Parsing
@@ -1038,44 +720,11 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 
 GlobalInitResponseResult ParseGlobalInitResponse(const std::shared_ptr<arrow::RecordBatch> &batch,
                                                  const std::string &worker_path) {
+	auto wire = generated::Decode<generated::GlobalInitResponse>(batch, 0, worker_path);
 	GlobalInitResponseResult result;
-
-	if (!batch || batch->num_rows() == 0) {
-		throw IOException("Empty GlobalInitResponse from worker [worker: %s]", worker_path);
-	}
-
-	// execution_id: binary (required)
-	auto exec_col = batch->GetColumnByName("execution_id");
-	if (exec_col) {
-		auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(exec_col);
-		if (binary_array && !binary_array->IsNull(0)) {
-			auto view = binary_array->GetView(0);
-			result.execution_id.assign(view.data(), view.data() + view.size());
-		}
-	}
-
-	// max_workers: int64 (default 1)
-	auto workers_col = batch->GetColumnByName("max_workers");
-	if (workers_col) {
-		auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(workers_col);
-		if (int_array && !int_array->IsNull(0)) {
-			result.max_workers = int_array->Value(0);
-		}
-	}
-	if (result.max_workers <= 0) {
-		result.max_workers = 1;
-	}
-
-	// opaque_data: binary|null
-	auto opaque_col = batch->GetColumnByName("opaque_data");
-	if (opaque_col) {
-		auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(opaque_col);
-		if (binary_array && !binary_array->IsNull(0)) {
-			auto view = binary_array->GetView(0);
-			result.opaque_data.assign(view.data(), view.data() + view.size());
-		}
-	}
-
+	result.execution_id = std::move(wire.execution_id);
+	result.max_workers = wire.max_workers > 0 ? wire.max_workers : 1;
+	result.opaque_data = wire.opaque_data.value_or(generated::Bytes {});
 	return result;
 }
 
@@ -1172,26 +821,7 @@ std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::
 // TableFunctionCardinalityRequest / TableCardinality
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const std::vector<uint8_t> &bind_call_bytes,
-                                                                         const std::vector<uint8_t> &bind_opaque_data) {
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
-	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
-	return arrow::RecordBatch::Make(generated::TableFunctionCardinalityRequestSchema(), 1, arrays);
-}
 
-namespace {
-
-//! A single-row int64 column holding null. The plan request declares several
-//! nullable int64 fields DuckDB never has a value for, and they must still be
-//! present (see BuildTableFunctionPlanRequest).
-std::shared_ptr<arrow::Array> NullInt64Scalar(const char *what) {
-	arrow::Int64Builder builder;
-	CheckStatus(builder.AppendNull(), what);
-	return FinishArray(builder, what);
-}
-
-} // namespace
 
 //! Build the inner ``TableFunctionPlanRequest`` record for the scan-planning RPC.
 //!
@@ -1206,177 +836,24 @@ std::shared_ptr<arrow::Array> NullInt64Scalar(const char *what) {
 //! default would be actively wrong for a compute-bound worker where bytes do not
 //! predict cost. ``min_splits`` IS sent, because thread count is the one sizing
 //! fact DuckDB genuinely knows.
-std::shared_ptr<arrow::RecordBatch>
-BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
-                              const std::vector<uint8_t> &bind_opaque_data,
-                              const std::vector<int32_t> &projection_ids,
-                              const std::vector<uint8_t> &pushdown_filters,
-                              int64_t min_splits, int64_t target_split_bytes,
-                              const std::vector<uint8_t> &cursor) {
-	// This record must match TableFunctionPlanRequestSchema() in the generated
-	// header EXACTLY — see BuildInitRequest for why a subset is not wire-safe
-	// (vgi-rpc-go compares with arrow.Schema.Equal). Most of these twenty
-	// fields are null from DuckDB and stay null; they are present because the
-	// protocol declares them, not because there is a value to send:
-	//
-	//   row_limit                — TableFunctionInitInput carries no limit
-	//   max_splits_per_response  — DuckDB enumerates in one page
-	//   refined_filters          — the plan is built from static filters only;
-	//                              join keys land after InitGlobal
-	//   start/end_position       — no streaming scan
-	//   order_by_* / tablesample_* — these reach the worker on the init call
-	//
-	// `filters_complete` is the one that carries real information: it is
-	// non-nullable, and DuckDB genuinely knows the answer. It plans from static
-	// filters only, so no refinement is ever coming and a worker must not hold
-	// splits back waiting for one.
-	auto dict_type = arrow::dictionary(arrow::int16(), arrow::utf8());
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
-	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
 
-	// projection_ids: list<int64>|null
-	{
-		auto value_builder = std::make_shared<arrow::Int64Builder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		if (projection_ids.empty()) {
-			CheckStatus(list_builder.AppendNull(), "append null projection_ids");
-		} else {
-			CheckStatus(list_builder.Append(), "open projection_ids list");
-			for (auto id : projection_ids) {
-				CheckStatus(value_builder->Append(static_cast<int64_t>(id)), "append projection id");
-			}
-		}
-		arrays.push_back(FinishArray(list_builder, "projection_ids"));
-	}
-
-	// pushdown_filters: large_binary|null
-	{
-		arrow::LargeBinaryBuilder builder;
-		if (pushdown_filters.empty()) {
-			CheckStatus(builder.AppendNull(), "append null pushdown_filters");
-		} else {
-			CheckStatus(builder.Append(pushdown_filters.data(), static_cast<int64_t>(pushdown_filters.size())),
-			            "append pushdown_filters");
-		}
-		arrays.push_back(FinishArray(builder, "pushdown_filters"));
-	}
-
-	// min_splits / target_split_bytes: int64|null. Non-positive means "omit" —
-	// the worker then sizes its own splits rather than obeying a fabricated number.
-	auto int_or_null = [](int64_t v, const char *what) -> std::shared_ptr<arrow::Array> {
-		arrow::Int64Builder b;
-		if (v > 0) {
-			CheckStatus(b.Append(v), what);
-		} else {
-			CheckStatus(b.AppendNull(), what);
-		}
-		return FinishArray(b, what);
-	};
-	// join_keys: list<large_binary>|null — always null. A plan is built from
-	// STATIC filters only; join-key values arrive after InitGlobal and prune
-	// WITHIN a split rather than deciding the split set.
-	{
-		auto value_builder = std::make_shared<arrow::LargeBinaryBuilder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		CheckStatus(list_builder.AppendNull(), "append null join_keys");
-		arrays.push_back(FinishArray(list_builder, "join_keys"));
-	}
-
-	arrays.push_back(NullInt64Scalar("row_limit"));
-	arrays.push_back(int_or_null(target_split_bytes, "target_split_bytes"));
-	arrays.push_back(int_or_null(min_splits, "min_splits"));
-	arrays.push_back(NullInt64Scalar("max_splits_per_response"));
-
-	arrays.push_back(BuildBinaryScalar(cursor));
-
-	// refined_filters: large_binary|null — always null, for the same reason
-	// join_keys is (see above).
-	{
-		arrow::LargeBinaryBuilder builder;
-		CheckStatus(builder.AppendNull(), "append null refined_filters");
-		arrays.push_back(FinishArray(builder, "refined_filters"));
-	}
-
-	// filters_complete: always true from DuckDB. The field tells a worker
-	// whether to hold splits back awaiting a narrower filter; DuckDB never
-	// sends one, so holding back would stall the scan forever.
-	{
-		arrow::BooleanBuilder builder;
-		CheckStatus(builder.Append(true), "append filters_complete");
-		arrays.push_back(FinishArray(builder, "filters_complete"));
-	}
-
-	// start_position / end_position: no streaming scan, so no position range.
-	arrays.push_back(BuildBinaryScalar({}));
-	arrays.push_back(BuildBinaryScalar({}));
-
-	// The order / sample hints reach the worker on the init call, not here.
-	arrays.push_back(BuildNullableStringScalar(""));
-	arrays.push_back(BuildNullDictionaryArray(dict_type, {"ASC", "DESC"}));
-	arrays.push_back(BuildNullDictionaryArray(dict_type, {"NULLS_FIRST", "NULLS_LAST"}));
-	arrays.push_back(NullInt64Scalar("order_by_limit"));
-	{
-		arrow::DoubleBuilder builder;
-		CheckStatus(builder.AppendNull(), "append null tablesample_percentage");
-		arrays.push_back(FinishArray(builder, "tablesample_percentage"));
-	}
-	arrays.push_back(NullInt64Scalar("tablesample_seed"));
-
-	return arrow::RecordBatch::Make(generated::TableFunctionPlanRequestSchema(), 1, arrays);
-}
-
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(const std::vector<uint8_t> &bind_call_bytes,
-                                                                        const std::vector<uint8_t> &bind_opaque_data) {
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
-	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
-	return arrow::RecordBatch::Make(generated::TableFunctionStatisticsRequestSchema(), 1, arrays);
-}
 
 // ============================================================================
 // TableFunctionDynamicToStringRequest / Response
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch>
-BuildTableFunctionDynamicToStringRequest(const std::vector<uint8_t> &bind_call_bytes,
-                                         const std::vector<uint8_t> &bind_opaque_data,
-                                         const std::vector<uint8_t> &global_execution_id) {
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
-	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
-	arrays.push_back(BuildBinaryScalarRequired(global_execution_id));
-	return arrow::RecordBatch::Make(generated::TableFunctionDynamicToStringRequestSchema(), 1, arrays);
-}
 
 InsertionOrderPreservingMap<std::string>
 ParseTableFunctionDynamicToStringResult(const std::shared_ptr<arrow::RecordBatch> &batch,
                                         const std::string &worker_path) {
-	(void)worker_path; // for parity with sibling parsers; reserved for richer error context
 	InsertionOrderPreservingMap<std::string> result;
 	if (!batch || batch->num_rows() == 0) {
 		return result;
 	}
-	auto keys_col = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("keys"));
-	auto values_col = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("values"));
-	if (!keys_col || !values_col || keys_col->IsNull(0) || values_col->IsNull(0)) {
-		return result;
-	}
-	auto keys_strings = std::dynamic_pointer_cast<arrow::StringArray>(keys_col->values());
-	auto values_strings = std::dynamic_pointer_cast<arrow::StringArray>(values_col->values());
-	if (!keys_strings || !values_strings) {
-		return result;
-	}
-	auto k_off = keys_col->value_offset(0);
-	auto k_len = keys_col->value_length(0);
-	auto v_off = values_col->value_offset(0);
-	auto v_len = values_col->value_length(0);
-	auto pairs = std::min(k_len, v_len);
-	for (int64_t i = 0; i < pairs; ++i) {
-		if (keys_strings->IsNull(k_off + i) || values_strings->IsNull(v_off + i)) {
-			continue;
-		}
-		result.insert(keys_strings->GetString(k_off + i), values_strings->GetString(v_off + i));
+	// Parallel keys / values lists, in the order the user's hook emitted them.
+	auto wire = generated::Decode<generated::TableFunctionDynamicToStringResult>(batch, 0, worker_path);
+	for (size_t i = 0; i < std::min(wire.keys.size(), wire.values.size()); ++i) {
+		result.insert(wire.keys[i], wire.values[i]);
 	}
 	return result;
 }
@@ -1384,29 +861,12 @@ ParseTableFunctionDynamicToStringResult(const std::shared_ptr<arrow::RecordBatch
 TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::shared_ptr<arrow::RecordBatch> &batch,
                                                                    const std::string &worker_path) {
 	TableFunctionCardinalityResult result;
-
 	if (!batch || batch->num_rows() == 0) {
 		return result; // Unknown cardinality
 	}
-
-	// estimate: int64|null
-	auto estimate_col = batch->GetColumnByName("estimate");
-	if (estimate_col) {
-		auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(estimate_col);
-		if (int_array && !int_array->IsNull(0)) {
-			result.estimate = int_array->Value(0);
-		}
-	}
-
-	// max: int64|null
-	auto max_col = batch->GetColumnByName("max");
-	if (max_col) {
-		auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(max_col);
-		if (int_array && !int_array->IsNull(0)) {
-			result.max = int_array->Value(0);
-		}
-	}
-
+	auto wire = generated::Decode<generated::TableFunctionCardinalityResult>(batch, 0, worker_path);
+	result.estimate = wire.estimate.value_or(-1);
+	result.max = wire.max_.value_or(-1);
 	return result;
 }
 
@@ -1426,32 +886,234 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::sh
 //! It lists formats DuckDB reads natively; extension-provided readers are omitted
 //! because whether they are loadable is a per-session question this static list
 //! cannot answer.
-static std::vector<uint8_t> BuildClientCapabilitiesBytes(bool query_enabled) {
-	// DuckDB has no streaming scan: saying false prevents a worker from
-	// returning an unbounded split this client could never terminate.
-	return SerializeToIpcBytes(generated::BuildClientCapabilities(
-	    "duckdb", {"parquet", "csv", "json"}, {"ducklake", "iceberg", "postgres", "mysql", "sqlite", "duckdb"}, false,
-	    {"vgi.filters.v2"}, /*catalog=*/BuildNativeConstraintCapabilities(), /*query_pushdown=*/query_enabled ? BuildClientQueryCapabilities() : nullptr));
+
+
+
+// ============================================================================
+// Inner request records (generated: src/generated/vgi_protocol_records.hpp)
+// ============================================================================
+//
+// Each builder fills the generated record and encodes it with ToBatch, which
+// produces exactly the protocol schema (every declared field, in order, with
+// the declared type and nullability). Exactness is load-bearing: vgi-rpc-go
+// validates a request against its declared contract with arrow.Schema.Equal, so
+// a missing nullable column fails every call. The callers' "empty means absent"
+// conventions are mapped to nullopt here.
+
+namespace {
+
+std::optional<int64_t> NonNegativeOrNull(int64_t value) {
+	return value < 0 ? std::nullopt : std::make_optional(value);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
-    const std::string &name,
-    const std::vector<uint8_t> &options_ipc_bytes,
-    const std::string &data_version_spec,
-    const std::string &implementation_version, bool query_enabled) {
-	// Matches vgi-python's CatalogAttachRequest (vgi/protocol.py:193). The
-	// pyarrow-inferred wire schema marks `options` as not null (even though
-	// the dataclass defaults it to None) and `data_version_spec` /
-	// `implementation_version` as nullable. Empty caller-supplied strings
-	// must be encoded as null — the worker treats None as "unconstrained",
-	// while "" is a concrete (and invalid) version string.
-	std::vector<std::shared_ptr<arrow::Array>> request_arrays;
-	request_arrays.push_back(BuildStringScalar(name));
-	request_arrays.push_back(BuildBinaryScalar(options_ipc_bytes));
-	request_arrays.push_back(BuildNullableStringScalar(data_version_spec));
-	request_arrays.push_back(BuildNullableStringScalar(implementation_version));
-	request_arrays.push_back(BuildBinaryScalar(BuildClientCapabilitiesBytes(query_enabled)));
-	return arrow::RecordBatch::Make(generated::CatalogAttachRequestSchema(), 1, request_arrays);
+template <class E>
+E RequireEnum(std::optional<E> parsed, const std::string &raw, const char *what) {
+	if (!parsed) {
+		throw InternalException("VGI: '%s' is not a valid %s", raw, what);
+	}
+	return *parsed;
+}
+
+generated::LargeBytes BufferOf(const std::vector<uint8_t> &bytes) {
+	return arrow::Buffer::FromVector(bytes);
+}
+
+} // namespace
+
+std::shared_ptr<arrow::RecordBatch>
+BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
+                 const std::string &function_type, const std::vector<uint8_t> &input_schema_bytes,
+                 const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
+                 const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
+                 bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value,
+                 const CopyFromBindContext *copy_from, const CopyToBindContext *copy_to,
+                 const std::string &schema_name,
+                 const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
+	generated::BindRequest request;
+	request.function_name = function_name;
+	request.arguments = arguments_ipc_bytes;
+	request.function_type =
+	    RequireEnum(generated::FunctionTypeFromWire(function_type), function_type, "FunctionType");
+	request.input_schema = BytesOrNull(input_schema_bytes);
+	request.settings = BytesOrNull(settings_bytes);
+	request.secrets = BytesOrNull(secrets_bytes);
+	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
+	request.transaction_opaque_data = BytesOrNull(transaction_opaque_data);
+	request.resolved_secrets_provided = resolved_secrets_provided;
+	request.at_unit = StringOrNull(at_unit);
+	request.at_value = StringOrNull(at_value);
+	// copy_from / copy_to are always present as columns, null unless this is a COPY bind.
+	if (copy_from) {
+		request.copy_from = generated::CopyFromContext {copy_from->format, copy_from->file_path,
+		                                                copy_from->expected_schema_bytes};
+	}
+	if (copy_to) {
+		request.copy_to = generated::CopyToContext {copy_to->format, copy_to->file_path};
+	}
+	// Owning catalog schema; null tells the worker to fall back to a cross-schema
+	// lookup by name.
+	request.schema_path = OptionalSingleSchemaPath(schema_name);
+	request.argument_names = argument_names;
+	return generated::ToBatch(request);
+}
+
+std::shared_ptr<arrow::RecordBatch>
+BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<uint8_t> &output_schema_bytes,
+                 const std::vector<uint8_t> &bind_opaque_data, const std::vector<int64_t> &projection_ids,
+                 std::shared_ptr<arrow::Buffer> pushdown_filters,
+                 std::vector<std::shared_ptr<arrow::Buffer>> join_keys, const std::string &phase,
+                 const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data,
+                 const std::string &order_by_column_name, const std::string &order_by_direction,
+                 const std::string &order_by_null_order, int64_t order_by_limit, double tablesample_percentage,
+                 int64_t tablesample_seed, const std::optional<std::vector<uint8_t>> &finalize_state_id,
+                 const std::vector<uint8_t> &substream_id, const std::vector<std::string> &split_tokens) {
+	generated::InitRequest request;
+	request.bind_call = bind_call_bytes;
+	request.output_schema = output_schema_bytes;
+	request.bind_opaque_data = BytesOrNull(bind_opaque_data);
+	if (!projection_ids.empty()) {
+		request.projection_ids = projection_ids;
+	}
+	if (pushdown_filters && pushdown_filters->size() > 0) {
+		request.pushdown_filters = std::move(pushdown_filters);
+	}
+	if (!join_keys.empty()) {
+		request.join_keys = std::move(join_keys);
+	}
+	// The splits this init redeems. A list because DataFusion bin-packs a group per
+	// partition; DuckDB claims greedily and always sends exactly one.
+	if (!split_tokens.empty()) {
+		request.split_tokens.emplace();
+		for (const auto &token : split_tokens) {
+			request.split_tokens->push_back(arrow::Buffer::FromString(token));
+		}
+	}
+	// row_limit stays null: TableFunctionInitInput carries no limit, and the Top-N
+	// order_by_limit means something different ("top K by that column").
+	if (!phase.empty()) {
+		request.phase = RequireEnum(generated::VgiInitPhaseFromWire(phase), phase, "VgiInitPhase");
+	}
+	// Opaque worker-chosen bytes from table_buffering_combine (TABLE_BUFFERING_FINALIZE).
+	request.finalize_state_id = finalize_state_id;
+	request.execution_id = BytesOrNull(execution_id);
+	request.init_opaque_data = BytesOrNull(init_opaque_data);
+	// Client-minted per-substream id of a parallel streaming table-in-out.
+	request.substream_id = BytesOrNull(substream_id);
+	request.order_by_column_name = StringOrNull(order_by_column_name);
+	if (!order_by_direction.empty()) {
+		request.order_by_direction =
+		    RequireEnum(generated::VgiOrderByDirectionFromWire(order_by_direction), order_by_direction,
+		                "VgiOrderByDirection");
+	}
+	if (!order_by_null_order.empty()) {
+		request.order_by_null_order =
+		    RequireEnum(generated::VgiNullOrderFromWire(order_by_null_order), order_by_null_order, "VgiNullOrder");
+	}
+	request.order_by_limit = NonNegativeOrNull(order_by_limit);
+	if (tablesample_percentage >= 0.0) {
+		request.tablesample_percentage = tablesample_percentage;
+	}
+	request.tablesample_seed = NonNegativeOrNull(tablesample_seed);
+	return generated::ToBatch(request);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const std::vector<uint8_t> &bind_call_bytes,
+                                                                         const std::vector<uint8_t> &bind_opaque_data) {
+	return generated::ToBatch(generated::TableFunctionCardinalityRequest {bind_call_bytes, BytesOrNull(bind_opaque_data)});
+}
+
+//! The inner ``TableFunctionPlanRequest`` for the scan-planning RPC. Only what DuckDB
+//! can supply is set; the rest of the twenty declared fields ride as nulls:
+//!
+//!   row_limit                — TableFunctionInitInput carries no limit
+//!   max_splits_per_response  — DuckDB enumerates in one page
+//!   join_keys, refined_filters — the plan is built from STATIC filters only; join
+//!                              keys arrive after InitGlobal and prune within a split
+//!   start/end_position       — no streaming scan
+//!   order_by_* / tablesample_* — these reach the worker on the init call
+//!
+//! ``target_split_bytes`` / ``min_splits`` are null when non-positive: DuckDB claims
+//! splits greedily as interchangeable units and has no basis to invent a byte target,
+//! while thread count (min_splits) is the one sizing fact it genuinely knows.
+//! ``filters_complete`` is always true: no narrower filter is ever coming, so a
+//! worker must not hold splits back waiting for one.
+std::shared_ptr<arrow::RecordBatch>
+BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
+                              const std::vector<uint8_t> &bind_opaque_data,
+                              const std::vector<int32_t> &projection_ids,
+                              const std::vector<uint8_t> &pushdown_filters, int64_t min_splits,
+                              int64_t target_split_bytes, const std::vector<uint8_t> &cursor) {
+	generated::TableFunctionPlanRequest request;
+	request.bind_call = bind_call_bytes;
+	request.bind_opaque_data = BytesOrNull(bind_opaque_data);
+	if (!projection_ids.empty()) {
+		request.projection_ids = std::vector<int64_t>(projection_ids.begin(), projection_ids.end());
+	}
+	if (!pushdown_filters.empty()) {
+		request.pushdown_filters = BufferOf(pushdown_filters);
+	}
+	if (target_split_bytes > 0) {
+		request.target_split_bytes = target_split_bytes;
+	}
+	if (min_splits > 0) {
+		request.min_splits = min_splits;
+	}
+	request.cursor = BytesOrNull(cursor);
+	request.filters_complete = true;
+	return generated::ToBatch(request);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(const std::vector<uint8_t> &bind_call_bytes,
+                                                                        const std::vector<uint8_t> &bind_opaque_data) {
+	return generated::ToBatch(generated::TableFunctionStatisticsRequest {bind_call_bytes, BytesOrNull(bind_opaque_data)});
+}
+
+std::shared_ptr<arrow::RecordBatch>
+BuildTableFunctionDynamicToStringRequest(const std::vector<uint8_t> &bind_call_bytes,
+                                         const std::vector<uint8_t> &bind_opaque_data,
+                                         const std::vector<uint8_t> &global_execution_id) {
+	return generated::ToBatch(generated::TableFunctionDynamicToStringRequest {
+	    bind_call_bytes, BytesOrNull(bind_opaque_data), global_execution_id});
+}
+
+//! What THIS client can do, so a worker can tailor what it advertises. Sent on
+//! every attach. ``native_formats`` lets a worker return a FORMAT branch ("read
+//! these 40 parquet files") instead of materializing rows; it lists only formats
+//! DuckDB reads natively, since whether an extension reader is loadable is a
+//! per-session question. DuckDB has no streaming scan, so it says so: a worker
+//! must not return an unbounded split this client could never terminate.
+static std::vector<uint8_t> ClientCapabilitiesBytes(bool query_enabled) {
+	generated::ClientCapabilities caps;
+	caps.engine = "duckdb";
+	caps.native_formats = {"parquet", "csv", "json"};
+	caps.catalogs = {"ducklake", "iceberg", "postgres", "mysql", "sqlite", "duckdb"};
+	caps.can_stream = false;
+	caps.filter_encodings = {"vgi.filters.v2"};
+	caps.catalog = BuildNativeConstraintCapabilities();
+	if (query_enabled) {
+		generated::ClientQueryCapabilities query;
+		query.encodings = {VGI_QUERY_ENCODING};
+		query.semantic_profiles = {VGI_QUERY_EXPLICIT_PROFILE};
+		query.engine_version = DuckDB::LibraryVersion();
+		query.max_query_bytes = VGI_QUERY_MAX_SQL_BYTES;
+		caps.query_pushdown = std::move(query);
+	}
+	return SerializeRecord(caps);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(const std::string &name,
+                                                              const std::vector<uint8_t> &options_ipc_bytes,
+                                                              const std::string &data_version_spec,
+                                                              const std::string &implementation_version, bool query_enabled) {
+	// Empty version constraints are null: the worker treats None as "unconstrained",
+	// while "" would be a concrete (and invalid) version string.
+	generated::CatalogAttachRequest request;
+	request.name = name;
+	request.options = BytesOrNull(options_ipc_bytes);
+	request.data_version_spec = StringOrNull(data_version_spec);
+	request.implementation_version = StringOrNull(implementation_version);
+	request.client_capabilities = ClientCapabilitiesBytes(query_enabled);
+	return generated::ToBatch(request);
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
@@ -1459,53 +1121,15 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
     const std::string &name, const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
     const std::vector<std::vector<uint8_t>> &constraint_definitions,
     const std::vector<uint8_t> &transaction_opaque_data) {
-	static const std::vector<std::string> on_conflict_values = {"ERROR", "IGNORE", "REPLACE"};
-
-	// Serialize the columns schema to IPC bytes
-	auto columns_bytes = SerializeSchemaToIpcBytes(columns_schema);
-
-	auto batch_schema = generated::TableCreateRequestSchema();
-
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-
-	// attach_opaque_data: binary (required)
-	{
-		arrow::BinaryBuilder builder;
-		CheckStatus(builder.Append(attach_opaque_data.data(), attach_opaque_data.size()), "append attach_opaque_data");
-		arrays.push_back(FinishArray(builder, "attach_opaque_data"));
-	}
-
-	// schema_path: list<utf8>
-	arrays.push_back(BuildStringListScalar(schema_path));
-
-	// name: utf8
-	arrays.push_back(BuildStringScalar(name));
-
-	// columns: binary (serialized Arrow schema)
-	{
-		arrow::BinaryBuilder builder;
-		CheckStatus(builder.Append(columns_bytes.data(), columns_bytes.size()), "append columns");
-		arrays.push_back(FinishArray(builder, "columns"));
-	}
-
-	// on_conflict: dictionary(int16, utf8)
-	arrays.push_back(BuildEnumArray(on_conflict, on_conflict_values));
-
-	arrays.push_back(BuildBinaryListScalar(constraint_definitions));
-
-	// transaction_opaque_data: binary (nullable)
-	arrays.push_back(BuildBinaryScalar(transaction_opaque_data));
-
-	// The 1.5 adapter has not selected table metadata/options/layout profiles.
-	for (const char *name : {"comment", "tags", "options", "layout"}) {
-		auto nulls = arrow::MakeArrayOfNull(batch_schema->GetFieldByName(name)->type(), 1);
-		if (!nulls.ok()) {
-			throw InternalException("Could not build optional table metadata: %s", nulls.status().ToString());
-		}
-		arrays.push_back(nulls.ValueUnsafe());
-	}
-
-	return arrow::RecordBatch::Make(batch_schema, 1, arrays);
+	generated::TableCreateRequest request;
+	request.attach_opaque_data = attach_opaque_data;
+	request.schema_path = schema_path;
+	request.name = name;
+	request.columns = SerializeSchemaToIpcBytes(columns_schema);
+	request.on_conflict = RequireEnum(generated::OnConflictFromWire(on_conflict), on_conflict, "OnConflict");
+	request.constraint_definitions = constraint_definitions;
+	request.transaction_opaque_data = BytesOrNull(transaction_opaque_data);
+	return generated::ToBatch(request);
 }
 
 } // namespace vgi

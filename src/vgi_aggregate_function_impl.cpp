@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_aggregate_function_impl.hpp"
+#include "vgi_arrow_ipc.hpp"
 #include "vgi_batch_validation.hpp"
 #include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
@@ -83,19 +84,16 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	auto secrets = vgi::ExtractVgiSecrets(context, required_secrets);
 	auto secrets_ipc_bytes = vgi::BuildSecretsBatch(context, secrets);
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateBindRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(arguments_bytes),
-	                                 vgi::MakeSingleBinaryArray(schema_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(settings_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(secrets_ipc_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                                 vgi::BuildNullableStringListScalar(argument_names),
-	                             });
-	return vgi::generated::BuildAggregateBindParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateBindRequest request;
+	request.function_name = function_name;
+	request.arguments = std::move(arguments_bytes);
+	request.input_schema = std::move(schema_bytes);
+	request.settings = vgi::BytesOrNull(settings_bytes);
+	request.secrets = vgi::BytesOrNull(secrets_ipc_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	request.argument_names = argument_names;
+	return vgi::generated::BuildAggregateBindParams(vgi::SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
@@ -106,16 +104,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
 
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateUpdateRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(execution_id),
-	                                 vgi::MakeSingleBinaryArray(batch_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                             });
-	return vgi::generated::BuildAggregateUpdateParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateUpdateRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.input_batch = std::move(batch_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	return vgi::generated::BuildAggregateUpdateParams(vgi::SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
@@ -126,16 +121,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
 
 	auto batch_bytes = vgi::SerializeToIpcBytes(merge_batch);
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateCombineRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(execution_id),
-	                                 vgi::MakeSingleBinaryArray(batch_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                             });
-	return vgi::generated::BuildAggregateCombineParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateCombineRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.merge_batch = std::move(batch_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	return vgi::generated::BuildAggregateCombineParams(vgi::SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
@@ -151,17 +143,14 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 	auto &os_buf = os_buf_result.ValueUnsafe();
 	auto schema_bytes = std::vector<uint8_t>(os_buf->data(), os_buf->data() + os_buf->size());
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateFinalizeRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(execution_id),
-	                                 vgi::MakeSingleBinaryArray(gid_bytes),
-	                                 vgi::MakeSingleBinaryArray(schema_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                             });
-	return vgi::generated::BuildAggregateFinalizeParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateFinalizeRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.group_ids_batch = std::move(gid_bytes);
+	request.output_schema = std::move(schema_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	return vgi::generated::BuildAggregateFinalizeParams(vgi::SerializeRecord(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
@@ -172,28 +161,33 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
 
 	auto gid_bytes = vgi::SerializeToIpcBytes(group_ids_batch);
 
-	auto request =
-	    arrow::RecordBatch::Make(vgi::generated::AggregateDestructorRequestSchema(), 1,
-	                             {
-	                                 vgi::MakeSingleStringArray(function_name),
-	                                 vgi::MakeSingleBinaryArray(execution_id),
-	                                 vgi::MakeSingleBinaryArray(gid_bytes),
-	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
-	                             });
-	return vgi::generated::BuildAggregateDestructorParams(vgi::SerializeToIpcBytes(request));
+	vgi::generated::AggregateDestructorRequest request;
+	request.function_name = function_name;
+	request.execution_id = execution_id;
+	request.group_ids_batch = std::move(gid_bytes);
+	request.attach_opaque_data = vgi::BytesOrNull(attach_opaque_data);
+	request.schema_path = vgi::OptionalSingleSchemaPath(schema_name);
+	return vgi::generated::BuildAggregateDestructorParams(vgi::SerializeRecord(request));
 }
 
 } // anonymous namespace
 
 namespace vgi {
 
-// extra_info for a malformed aggregate RPC response.
-static ErrorInfo AggregateViolation(const VgiAggregateBindData &bind_data, const std::string &method_name) {
+ErrorInfo AggregateViolation(const VgiAggregateBindData &bind_data, const std::string &method_name) {
 	return std::move(ErrorInfo(error_subtype::kProtocolViolation)
 	                     .Rpc(method_name)
 	                     .Function(bind_data.function_name, "AGGREGATE")
 	                     .Worker(bind_data.attach_params->worker_path()));
+}
+
+const std::string &AggregateWorkerPath(const VgiAggregateBindData &bind_data) {
+	return bind_data.attach_params->worker_path();
+}
+
+void ThrowMissingAggregateResult(const VgiAggregateBindData &bind_data, const std::string &method_name) {
+	throw IOException(AggregateViolation(bind_data, method_name), "VGI %s returned no result for '%s' [worker: %s]",
+	                  method_name, bind_data.function_name, AggregateWorkerPath(bind_data));
 }
 
 // ============================================================================
@@ -248,30 +242,8 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	std::shared_ptr<arrow::RecordBatch> inner;
 	const auto &worker_path = bind_data.attach_params->worker_path();
 	if (response.batch && response.batch->num_rows() > 0) {
-		auto result_col = response.batch->GetColumnByName("result");
-		if (!result_col) {
-			throw IOException(AggregateViolation(bind_data, method_name),
-			                  "Response missing 'result' column from %s [worker: %s]", method_name,
-			                  worker_path);
-		}
-		if (result_col->type()->id() != arrow::Type::BINARY) {
-			throw IOException(
-			    AggregateViolation(bind_data, method_name).ExpectedActual("binary", result_col->type()->ToString()),
-			    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
-			    method_name, result_col->type()->ToString(), worker_path);
-		}
-		auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-		if (!bin->IsNull(0)) {
-			auto v = bin->GetView(0);
-			try {
-				inner = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()),
-				                                v.size(), GetWorkerBatchValidation(&context));
-			} catch (const std::exception &e) {
-				throw IOException(AggregateViolation(bind_data, method_name).Merge(ExtraInfoOf(e)),
-				                  "Failed to deserialize IPC response for %s [worker: %s]: %s", method_name,
-				                  worker_path, RawMessageOf(e));
-			}
-		}
+		inner = UnwrapResultEnvelope(response.batch, method_name, AggregateViolation(bind_data, method_name),
+		                             /*null_result_ok=*/true, GetWorkerBatchValidation(&context));
 	}
 	ValidateResponseSchema(inner, method_name, worker_path);
 	return {response.batch, inner};
@@ -527,38 +499,9 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_finalize", request);
 
-	// Extract result_batch from response
-	if (!rpc_result.response_batch || rpc_result.response_batch->num_rows() == 0) {
-		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize returned empty response for '%s'", bind_data.function_name);
-	}
-
-	// The response is wrapped in the standard vgi_rpc format:
-	// { "result": binary } where result contains the serialized AggregateFinalizeResponse
-	auto response_result_col = rpc_result.response_batch->GetColumnByName("result");
-	if (!response_result_col) {
-		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize response missing 'result' column for '%s'", bind_data.function_name);
-	}
-	auto response_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(response_result_col);
-	if (!response_binary || response_binary->IsNull(0)) {
-		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize response has null result for '%s'", bind_data.function_name);
-	}
-	// Unwrap: result column contains the serialized AggregateFinalizeResponse dataclass
-	auto response_view = response_binary->GetView(0);
-	auto response_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(response_view.data()), response_view.size());
-
-	// AggregateFinalizeResponse has a "result_batch" binary column
-	auto rb_col = response_batch->GetColumnByName("result_batch");
-	if (!rb_col) {
-		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize response missing 'result_batch' field for '%s'", bind_data.function_name);
-	}
-	auto rb_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(rb_col);
-	if (!rb_binary || rb_binary->IsNull(0)) {
-		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize response has null result_batch for '%s'", bind_data.function_name);
-	}
-	auto rb_view = rb_binary->GetView(0);
-	auto result_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(),
-	                                            GetWorkerBatchValidation(&context));
+	auto finalize = DecodeAggregateResult<generated::AggregateFinalizeResult>(rpc_result, bind_data,
+	                                                                          "aggregate_finalize");
+	auto result_batch = DeserializeFromIpcBytes(finalize.result_batch, GetWorkerBatchValidation(&context));
 
 	if (!result_batch || result_batch->num_columns() != 1) {
 		throw IOException(AggregateViolation(bind_data, "aggregate_finalize"), "VGI aggregate_finalize returned invalid result for '%s'", bind_data.function_name);
@@ -818,53 +761,21 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 	// Call aggregate_bind to get execution_id
 	auto rpc_result = InvokeAggregateRpc(context, *bind_data, "aggregate_bind", request);
 
-	if (rpc_result.response_batch && rpc_result.response_batch->num_rows() > 0) {
-		// Unwrap: {result: binary} -> AggregateBindResponse dataclass
-		auto wrapper_col = rpc_result.response_batch->GetColumnByName("result");
-		if (wrapper_col) {
-			auto wrapper_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(wrapper_col);
-			if (wrapper_binary && !wrapper_binary->IsNull(0)) {
-				auto wrapper_view = wrapper_binary->GetView(0);
-				auto response_batch = DeserializeFromIpcBytes(
-				    reinterpret_cast<const uint8_t *>(wrapper_view.data()), wrapper_view.size());
-
-				auto exec_id_col = response_batch->GetColumnByName("execution_id");
-				if (exec_id_col) {
-					auto binary_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(exec_id_col);
-					if (binary_arr && !binary_arr->IsNull(0)) {
-						auto view = binary_arr->GetView(0);
-						bind_data->exec_state->execution_id.assign(
-						    reinterpret_cast<const uint8_t *>(view.data()),
-						    reinterpret_cast<const uint8_t *>(view.data()) + view.size());
-					}
-				}
-
-				// Extract output_schema from bind response (allows dynamic return types)
-				auto os_col = response_batch->GetColumnByName("output_schema");
-				if (os_col) {
-					auto os_binary = std::dynamic_pointer_cast<arrow::BinaryArray>(os_col);
-					if (os_binary && !os_binary->IsNull(0)) {
-						auto os_view = os_binary->GetView(0);
-						auto os_buf = std::make_shared<arrow::Buffer>(
-						    reinterpret_cast<const uint8_t *>(os_view.data()), os_view.size());
-						auto reader = std::make_shared<arrow::io::BufferReader>(os_buf);
-						arrow::ipc::DictionaryMemo dict_memo;
-						auto schema_result = arrow::ipc::ReadSchema(reader.get(), &dict_memo);
-						if (schema_result.ok() && schema_result.ValueUnsafe()->num_fields() > 0) {
-							bind_data->resolved_output_schema = schema_result.ValueUnsafe();
-							// Update the bound function's return type to match
-							ArrowSchemaWrapper c_schema;
-							ArrowTableSchema arrow_table;
-							vector<LogicalType> out_types;
-							vector<string> out_names;
-							ArrowSchemaToDuckDBTypes(context, bind_data->resolved_output_schema,
-							                         c_schema, arrow_table, out_types, out_names);
-							if (!out_types.empty()) {
-								function.return_type = out_types[0];
-							}
-						}
-					}
-				}
+	auto bind_result = DecodeAggregateResult<generated::AggregateBindResult>(rpc_result, *bind_data, "aggregate_bind");
+	bind_data->exec_state->execution_id = std::move(bind_result.execution_id);
+	// A non-empty output_schema overrides the declared return type (dynamic return types).
+	if (!bind_result.output_schema.empty()) {
+		auto schema = DeserializeSchema(bind_result.output_schema);
+		if (schema && schema->num_fields() > 0) {
+			bind_data->resolved_output_schema = schema;
+			ArrowSchemaWrapper c_schema;
+			ArrowTableSchema arrow_table;
+			vector<LogicalType> out_types;
+			vector<string> out_names;
+			ArrowSchemaToDuckDBTypes(context, bind_data->resolved_output_schema, c_schema, arrow_table, out_types,
+			                         out_names);
+			if (!out_types.empty()) {
+				function.return_type = out_types[0];
 			}
 		}
 	}

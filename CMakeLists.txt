@@ -38,6 +38,29 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
+option(BUILD_VGI_BENCHMARKS "Build the Linux CPU/memory benchmark host" OFF)
+option(VGI_BENCH_ARROW_PROBE "Expose Arrow allocator diagnostics in the benchmark extension only" OFF)
+if(BUILD_VGI_BENCHMARKS)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "VGI benchmarks require Linux resource accounting")
+  endif()
+  add_executable(vgi_bench_driver benchmarks/driver.cpp)
+  target_include_directories(vgi_bench_driver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include)
+  target_link_libraries(vgi_bench_driver duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS} ${CMAKE_DL_LIBS})
+  link_threads(vgi_bench_driver "")
+  link_extension_libraries(vgi_bench_driver "")
+  # Independent tests for the shared scalar/LATERAL input grouping. The second
+  # executable forces hash collisions without altering the extension build.
+  foreach(dedup_test vgi_dedup_tests vgi_dedup_collision_tests)
+    add_executable(${dedup_test} test/cpp/test_main.cpp test/cpp/test_input_dedup.cpp src/vgi_input_dedup.cpp)
+    target_include_directories(${dedup_test} PRIVATE src/include duckdb/src/include duckdb/third_party/catch)
+    target_link_libraries(${dedup_test} duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+    link_threads(${dedup_test} "")
+    link_extension_libraries(${dedup_test} "")
+  endforeach()
+  target_compile_definitions(vgi_dedup_collision_tests PRIVATE VGI_DEDUP_TEST_HASH_COLLISIONS)
+endif()
+
 # Native Iroh is compiled into the DuckDB extension as a Rust static library.
 # Emscripten keeps using the application-owned browser adapter. Release builds
 # build from pinned source; local developers may point at a sibling checkout or
@@ -299,6 +322,8 @@ src/vgi_arrow_ipc.cpp
 src/vgi_arrow_utils.cpp
 src/vgi_rpc_client.cpp
 src/vgi_rpc_types.cpp
+src/vgi_wire_codec.cpp
+src/generated/vgi_protocol_records.cpp
 src/vgi_schema_registry.cpp
 src/vgi_stderr_drainer.cpp
 src/vgi_unary_rpc.cpp
@@ -307,6 +332,7 @@ src/vgi_transport.cpp
 src/vgi_container_runtime.cpp
 src/vgi_http_compression.cpp
 src/vgi_http_client.cpp
+src/vgi_http_params.cpp
 src/vgi_http_function_connection.cpp
 src/vgi_iroh_config.cpp
 src/vgi_iroh_native.cpp
@@ -406,6 +432,13 @@ endif()
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+if(VGI_BENCH_ARROW_PROBE)
+  if(NOT BUILD_VGI_BENCHMARKS)
+    message(FATAL_ERROR "VGI_BENCH_ARROW_PROBE requires BUILD_VGI_BENCHMARKS")
+  endif()
+  target_sources(${LOADABLE_EXTENSION_NAME} PRIVATE benchmarks/arrow_probe.cpp)
+endif()
+
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
@@ -493,6 +526,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_telemetry.cpp
     test/cpp/test_attach_credentials.cpp
     test/cpp/test_request_schema_parity.cpp
+    test/cpp/test_protocol_records.cpp
     test/cpp/test_protocol_routing.cpp
     test/cpp/test_hosted_protocols.cpp
     test/cpp/test_sab_stream.cpp
@@ -505,6 +539,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_webworker_function_connection.cpp
     src/vgi_rpc_client.cpp
     src/vgi_rpc_types.cpp
+    src/vgi_wire_codec.cpp
+    src/generated/vgi_protocol_records.cpp
     src/vgi_batch_validation.cpp
     src/vgi_bind_protocol.cpp
     src/vgi_arrow_utils.cpp
@@ -634,7 +670,8 @@ if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS
     BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   add_executable(vgi_http_interrupt_tests
     test/cpp/test_main.cpp
-    test/cpp/test_http_interrupt.cpp)
+    test/cpp/test_http_interrupt.cpp
+    test/cpp/test_http_secret_free.cpp)
   target_include_directories(vgi_http_interrupt_tests PRIVATE
     src/include
     duckdb/src/include
@@ -653,6 +690,8 @@ option(BUILD_VGI_CATALOG_TESTS "Build catalog metadata integration tests" OFF)
 if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
   add_executable(vgi_catalog_tests
     test/cpp/test_main.cpp
+    test/cpp/test_protocol_records.cpp
+    test/cpp/test_request_schema_parity.cpp
     test/cpp/test_schema_metadata.cpp
     test/cpp/test_query_bind.cpp
     test/cpp/test_constraint_contract.cpp

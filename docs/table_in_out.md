@@ -307,3 +307,127 @@ plus the `parent_row` parse in `vgi_function_connection.cpp` /
 `vgi_http_function_connection.cpp` and the reused exchange helpers
 (`AcquireBlendedInputConnection` threads projection) in `vgi_table_in_out_impl.cpp`.
 
+## Continued Output (several replies for one input)
+
+A table-in-out exchange answers each input batch with one reply, but a worker may
+need several: one upstream API page per reply, or more output than it wants to
+build at once. It says so on the reply's metadata, `vgi.status: HAVE_MORE_OUTPUT`,
+and the client asks for the next reply with a **continuation tick**: a zero-row
+batch of the input schema carrying `vgi.status: CONTINUE`. Each tick is an
+ordinary exchange turn (one input, one reply), so vgi-rpc is unchanged and HTTP
+needs nothing new: the worker's resume position rides the stream state token like
+any other exchange state. Every reply's `parent_row` indexes the same, last real
+input. While output is pending a tick is the only valid input, and a tick is valid
+only then; a worker refuses anything else. There is no capability negotiation.
+
+More rules every worker must follow:
+
+- **Answer every tick with a reply.** An empty HTTP body, or end-of-stream, in
+  answer to a tick is a protocol violation. A reply may be empty and still say
+  more; the client returns it to DuckDB as an empty `HAVE_MORE_OUTPUT` and ticks on
+  the next call, so a long run of empty pages can be cancelled.
+- **Never answer `not_modified` on a continued reply.** A 304 stands for an
+  input's whole stored output, so it must be the input's only reply: one that says
+  more, or answers a tick, fails the query.
+- **Send nothing when the input closes while output is pending.** A LIMIT stops
+  ticking and closes the input; the worker drops the pending output and ends its
+  stream. The client relies on this to drain and pool the connection.
+
+A literal call (`f(5)`) closes its input only once the worker has no more output,
+and a worker that sends output after that close fails the query ("sent output
+after its input was closed").
+
+The extension handles it on every exchange path. `IFunctionConnection` parses the
+status in `ReadDataBatch` (`GetLastMoreOutput()`) and writes ticks
+(`WriteContinuationTick()`) on the subprocess, HTTP and webworker transports.
+
+- **Batched LATERAL** (`PhysicalVgiLateralBatch`): keeps the chunk's exchange state
+  (`ChunkExchange`: the shipped rows, dedup groups, per-value mapping, the current
+  call) across `Execute` returns, and returns `HAVE_MORE_OUTPUT` while the loaded
+  reply has rows or the worker said more; the next call sends the tick.
+- **Stock in-out, per-substream connection**: continues one reply per call
+  (`local_state.more_pending`).
+- **Stock in-out, one shared connection** (the catalog's `FunctionInfo.max_workers = 1`): not supported.
+  Several pipelines take turns on that connection under `exchange_mutex`, so it
+  cannot leave output pending; a continued reply there is a protocol violation, and
+  workers refuse `resume()` with `max_workers = 1` at registration.
+- **Literal call** (`single_row_scan`): the input writer now closes only once the
+  worker has no more output; before, it closed right after the single input row.
+
+A LIMIT simply stops asking: no more ticks go out, and closing the input at
+teardown ends the worker's stream with the output still pending. On the stock path
+and the literal call a LIMIT met by the first reply sends no tick. Batched LATERAL
+sits under a delim join, which DuckDB drains a whole input chunk at a time, so
+there a LIMIT stops only between chunks: every page of the current chunk's calls is
+still fetched. `input_rows_per_call` bounds how much that is.
+
+**Caching.** Continued output is never cached. A chunk any of whose replies
+continued is not stored in the whole-chunk (M2) cache, and a call whose output
+continued stores no per-value entries; an M1 (stock path) input whose output
+continued is not stored. Output that fits in one reply is cached as before.
+
+### Implementing it in an SDK
+
+The rules above, as a worker framework sees them. The Python SDK
+(`vgi/protocol.py`, `TableInOutExchangeState.exchange`) is the reference.
+
+- **Where the status rides.** `vgi.status` is the custom metadata of the batch
+  itself: the input batch for `CONTINUE`, the reply batch for `HAVE_MORE_OUTPUT`.
+  Some RPC libraries surface an input batch's metadata separately (a call-context
+  field) on one transport and on the batch on another; read it wherever the batch's
+  metadata arrives.
+- **The framework must see "more".** The next input must be a tick exactly when
+  the last reply said more, so route "more" through the SDK's emit API, where the
+  framework records it, not through raw reply metadata it cannot see.
+- **One reply per turn.** A turn (an input or a tick) is answered by exactly one
+  batch; a reply that says more is that batch. Refuse a turn that emits none or
+  several.
+- **State.** The resume position must survive between HTTP turns. Where the SDK
+  serializes exchange state into the HTTP state token (Python, Go, Rust,
+  TypeScript, Java), it lives there along with a "more pending" flag; where the
+  SDK's HTTP server keeps the live stream between requests (C#, C++, C), it
+  already survives. Refuse a function that can continue but has no state of its
+  own to resume from, at registration or worker startup, or at compile time where
+  the language can (an empty state type).
+- **Validators belong to one input.** `vgi.cache.if_none_match` /
+  `if_modified_since` arrive with a real input and apply to that input's first
+  reply only; the client never sends them on a tick. Reset them on every real
+  input, and do not offer them to the reply of a tick.
+- **What the framework refuses.** A tick with no output pending, a tick with rows,
+  real input while output is pending, cache control on a tick's reply, "more"
+  outside a table-in-out exchange, and (at registration) continuation on a function
+  whose catalog `max_workers` is 1 (at registration or worker startup). An SDK
+  that never advertises `max_workers` cannot hit that last case.
+- **What only the client enforces.** `not_modified` on a reply that says more, or
+  on a tick's reply: a framework need not block it (the `not_modified_more` fixture
+  sends one on purpose), and the extension fails the query.
+- **Errors.** An error while output is pending ends the stream; the client discards
+  the connection, so nothing needs to clear the pending flag.
+- **`input_rows_per_call`.** Validate it at registration as well (a positive
+  integer, row-transform functions only); the extension refuses it at bind too.
+- **Generated protocol code.** Regenerate one SDK's checkout with vgi-python's
+  `scripts/regen_generated.py --only <repo> --root <repo>=<path>`; without
+  `--only` it writes every sibling checkout it finds. vgi-c++ (`scripts/regenerate_protocol.sh`)
+  and vgi-c (`scripts/generate_protocol.py`) generate their schema code with their
+  own scripts, from a vgi-python checkout.
+
+## Input Rows Per Call
+
+A blended function may declare `Meta.input_rows_per_call = N` (catalog
+`FunctionInfo.input_rows_per_call`, nullable `int64`; unset = a whole chunk per
+call). The batched-LATERAL operator then sends each chunk's worker input — after
+dedup and per-value hits — as calls of at most N rows, in order, and maps each
+call's replies back through the call's offset (and the dedup groups) to the
+chunk's rows. A call's output may itself continue. Conditional revalidation is
+armed only for a chunk that goes out as one call; per-value entries are stored per
+call. The literal call and the row-by-row path already send one row per call.
+`N < 1`, or `N` on a function that is not blended, fails at bind.
+
+Tests: `test/sql/integration/table_in_out/lateral_continuation.test` (blended:
+every call shape, page sizes, dedup, threads, LIMIT, cache, and reply counts via
+the `table_in_out.continue` log event), `input_rows_per_call.test` (the split,
+its interaction with dedup, continuation and per-value caching),
+`continuation_classic.test` (the stock path), `continuation_resume_error_revalidate.test`
+(a worker error while output is pending, then pool reuse; revalidation answered with
+continued output). Fixture contracts — which every SDK's fixture worker must implement —
+are in each file's header.

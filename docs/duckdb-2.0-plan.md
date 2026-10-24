@@ -50,12 +50,14 @@ by itself a reason to postpone its wire design to another version.
 
 ### Automatic whole-query pushdown plan — October 24, 2026
 
-**A0 initial compile inventory recorded:** the isolated audited-2.0 configuration
-passes; 53 of 107 native C++ sources compile and 54 fail, with every source
-attempted. Generated version metadata also compiles. See the
-[diagnostic checkpoint](duckdb-2.0-a0-diagnostics.md) for exact pins, error groups,
-reproduction and the next A1 batch. Engine/loadable linking and runtime remain
-blocked; these counts are not a percentage of the port. The 1.5 build is unchanged.
+**A0 compile inventory refreshed after main integration:** the isolated
+audited-2.0 configuration passes; 54 of 110 native C++ sources compile and 56
+fail, with every source attempted. Generated version metadata also compiles.
+The [diagnostic checkpoint](duckdb-2.0-a0-diagnostics.md#main-integration-refresh--october-24-2026)
+preserves the original 53/107 result and records the merged source, new errors
+and reproduction. Engine/loadable linking and runtime remain blocked; these
+counts are not a percentage of the port. The merged preparation's selected 1.5
+build and tests pass on the unchanged engine pin.
 
 **Still open.** Ordinary SQL over attached VGI tables does not yet move its joins
 and aggregates to the provider. Explicit `vgi_query(...)`, bounded scalar
@@ -78,11 +80,12 @@ and `areas.query` / `automatic_query_pushdown_plan_2026_10_24` in the companion
 manifest. This planning checkpoint reviewed native `38fe3c775bd3`, Python
 `0566afd7f12a`, the retained 1.5 engine `105edd31b57f`, and exact 2.0 source
 `e1784fa42310`. Haybarn HEAD was `5ab8a76db12a`; select and reconcile the actual
-implementation pin in A0. No 2.0 build or runtime qualification is claimed here.
+implementation pin in A0. Both compile inventories use the audited `e1784fa42310`
+pin; no 2.0 link or runtime qualification is claimed here.
 
 | Checkpoint | Reviewable result | Rough effort |
 | --- | --- | --- |
-| A0: isolated 2.0 build | Initial compile inventory recorded: all 107 native C++ sources attempted, 53 compiled/54 failed. Configuration passes; linking is blocked by compile failures. Retain the working 1.5 lane. | Initial checkpoint reached; original budget 1–3 engineer-days |
+| A0: isolated 2.0 build | Main-integration inventory refreshed: all 110 native C++ sources attempted, 54 compiled/56 failed. Original inventory retained. Configuration passes; linking is blocked by compile failures. The working 1.5 lane passes selected checks. | Initial checkpoint reached and refreshed; original budget 1–3 engineer-days |
 | A1: basic 2.0 reads | ATTACH, table lookup, ordinary scans and explicit query execution. Port identifier/name APIs, optional default schema, column ownership, bound functions, plan bindings and Arrow cardinality. | 4–10 days |
 | A2: real provider | A bounded SQL provider whose ordinary scans and queries share the existing backend transaction/snapshot; incremental result bounds and active-query cancellation. Can begin on 1.5 alongside A0/A1. | 4–8 days |
 | A3: eligible plan export | Whole read-only SELECT roots from one attachment; bound SQL export before existing scalar projection/multi-scan transforms; exact output mapping and safe local decline. | 3–6 days |
@@ -91,8 +94,9 @@ implementation pin in A0. No 2.0 build or runtime qualification is claimed here.
 
 Dependencies are A0 → A1 → A3, then A2 + A3 → A4 → A5. A2 can progress in
 parallel with the native port. Review and land each checkpoint independently.
-The largest unknown is the absent 2.0 compile-error inventory: narrow the
-estimate after A0/A1 before committing to a schedule.
+The compile inventory now identifies shared API blockers; later errors remain
+masked until those declarations compile. Narrow the estimate after A1 before
+committing to a schedule.
 
 Planning range: **2–5 engineer-weeks for a first end-to-end demonstration;
 5–10 engineer-weeks for a bounded qualified pilot**, including contingency.
@@ -703,11 +707,13 @@ secure-view/trigger requirements still need their own implementation and tests.
 The normal generator now covers the separate C++ SDK's public headers and
 registry as well as the native adapter, Go, Rust, TypeScript, Java, C#, and the
 browser client. The shared IPC corpus includes capability and option-definition
-records. The development snapshot has **74 RPC methods** and hash
+records. That historical development snapshot had **74 RPC methods** and hash
 `98309fc84d6bdb9c01c70986a3ddc53596a9dfaba4325297be22f601e3a4e6a2`.
-It is **unpublished**: retained local `vgi.v2` / `2.1.0` labels must not be used
-to republish a changed stable contract. The combined version decision and freeze
-remain outstanding.
+The October 24 main integration now carries the published baseline label
+`vgi.v2` / `2.2.0` and 85 methods in development. Our combined breaking successor
+remains **unpublished**: the inherited label is a placeholder and must not be
+used to republish a changed stable contract. The final major version, matching
+routing name, and shared freeze remain outstanding.
 
 Validation on macOS arm64, pinned 1.5 engine:
 
@@ -1836,7 +1842,7 @@ strings remain unpublished placeholders until the complete contract is frozen.
 | Refreshed Haybarn baseline | `e1784fa4231072d7152b8aaa20977bdb8ff4ace3` on local `next-2.0` | Completed upstream merge; source-audit baseline and later 2.0 build target. Not yet pushed. |
 | Merged upstream revision | `c65ca930b9fe39b2e8d8ed8821018dca650965f4`, October 12 upstream tip | 3,107 incoming commits since Haybarn's previous merge. |
 | Haybarn 2.0 extension tooling | `c583007af3506d8fac93e328c98dc16566cb4428` | Uses reusable `build.yml`; VGI currently calls the older `_extension_distribution.yml`. |
-| VGI protocol | `2.1.0` in [the generated version header](../src/generated/vgi_protocol_version.hpp) | DuckDB's version and VGI's protocol version are independent. An engine upgrade alone does not require a wire version bump. |
+| VGI protocol | Published baseline `2.2.0`, inherited in [the generated development version header](../src/generated/vgi_protocol_version.hpp) after the October 24 main integration | The combined breaking successor remains unpublished and needs its final major version/routing name. DuckDB's engine version and VGI's protocol version are independent. |
 | Native dependencies | Haybarn httpfs `94d8fee6ea02ce952bab164e22689afe8f0cd8ed`; 1.5.5 CI images | These are 1.5 pins, not qualified 2.0 dependencies. |
 | WASM dependencies | Separate config with 1.5.1-era httpfs and an absolute local DuckLake path | WASM needs its own coordinated host, engine, extension, and dependency update. |
 
@@ -1915,12 +1921,12 @@ remaining port.
    behind one compatibility boundary. Use separate engine-specific catalog or
    filter implementations if their semantics differ substantially. Assess the
    cost after the first build instead of spreading version checks everywhere.
-4. **Coordinate one protocol migration.** Keep released `vgi.v2` / `2.1.0`
+4. **Coordinate one protocol migration.** Keep released `vgi.v2` / `2.2.0`
    artifacts available while developing the combined successor. Collect all
    included wire changes before freezing and publishing it. Both the 1.5 and
    2.0 adapters should implement the successor contract, with engine-specific
    capability limits. Exact major/minor matching means additive changes alone
-   do not make mixed 2.1/new-version deployments interoperable.
+   do not make mixed 2.2/new-version deployments interoperable.
 5. **Ship distinct binaries.** Each artifact must identify its engine revision,
    platform, and build identity. A 1.5 extension binary is not a 2.0 artifact.
 
@@ -1941,8 +1947,10 @@ inconsistent operations, or removing legacy forms materially improves the
 contract, evaluate one major release instead. Do not lock in redundant legacy
 interfaces merely to preserve a minor version number. A major release would
 also need its matching routing name and a documented deployment transition.
-Protocol preparation begins with SDK plumbing using the existing contract;
-the published protocol remains 2.1.0 until the combined successor is ready.
+Main now publishes `vgi.v2` / `2.2.0`; the October 24 integration retains that
+label as a development placeholder. Our combined breaking successor is still
+unpublished and requires a final major version, matching routing name and
+coordinated migration before release.
 
 The current version rules are declared in `vgi-python/vgi/protocol.py`:
 new methods/defaulted optional fields are additive; changing existing
@@ -2284,8 +2292,9 @@ coordinate the release with P3.
 - Publish a support matrix tying engine, VGI artifact, worker protocol/SDK,
   Arrow/dependency versions, and platform together. Keep 1.5 artifacts available.
 - Release matched SDKs and both engine adapters for the frozen protocol package.
-  Document that retaining the `vgi.v2` routing name does not make 2.1 and 2.2
-  peers compatible; use the final chosen major/minor and transition policy.
+  Document that retaining the `vgi.v2` routing name does not make published 2.2
+  peers compatible with this breaking successor; use the final chosen major/minor
+  and matching routing name and transition policy.
 
 **Exit:** native parity is established, each advertised platform has executed
 qualification results, and signed installation/load tests pass. A native preview

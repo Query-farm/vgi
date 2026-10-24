@@ -2,7 +2,7 @@
 #pragma once
 
 // Client side of attach tickets (vgi.attach_tickets.v1) and sealed grants
-// (vgi_rpc.Identity.v1 issue_grant). Spec: vgi-python
+// (vgi_rpc.Identity.v2 issue_grant). Spec: vgi-python
 // docs/protocol/vgi-attach-tickets.md.
 //
 // A ticket says WHAT to attach (the catalog and the options the user attached
@@ -19,6 +19,8 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include <optional>
+
 namespace duckdb {
 
 class ClientContext;
@@ -28,8 +30,8 @@ namespace vgi {
 struct CatalogRpcContext;
 
 inline constexpr const char *ATTACH_TICKETS_PROTOCOL_NAME = "vgi.attach_tickets.v1";
-inline constexpr const char *ATTACH_TICKETS_PROTOCOL_VERSION = "1.0.0";
-inline constexpr const char *IDENTITY_PROTOCOL_NAME = "vgi_rpc.Identity.v1";
+inline constexpr const char *ATTACH_TICKETS_PROTOCOL_VERSION = "2.0.0";
+inline constexpr const char *IDENTITY_PROTOCOL_NAME = "vgi_rpc.Identity.v2";
 // The ATTACH option a user types, and the reserved catalog_attach option the
 // worker redeems (spec §6).
 inline constexpr const char *ATTACH_TICKET_OPTION = "attach_ticket";
@@ -58,16 +60,16 @@ struct VgiRetainedAttach {
 
 struct VgiIssuedGrant {
 	std::string token;
-	double expires_at = 0; // Unix seconds
+	int64_t expires_at_us = 0; // timestamp[us, UTC]
 	std::string grant_id;
 };
 
 struct VgiAttachTicket {
 	std::string ticket;
-	double expires_at = 0; // Unix seconds; +inf for no expiry
+	std::optional<int64_t> expires_at_us; // timestamp[us, UTC]; nullopt = no expiry
 };
 
-// vgi_rpc.Identity.v1 issue_grant(purpose, scopes = [], ttl_seconds) as the
+// vgi_rpc.Identity.v2 issue_grant(purpose, scopes = [], ttl_seconds) as the
 // catalog's caller. `identity_version` is the version reflection reported ("" for none).
 VgiIssuedGrant InvokeIssueGrant(const CatalogRpcContext &ctx, ClientContext &context,
                                 const std::string &identity_version, const std::string &purpose, int64_t ttl_seconds);

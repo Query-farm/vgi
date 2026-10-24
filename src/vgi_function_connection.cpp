@@ -592,19 +592,31 @@ void FunctionConnection::WriteTransportRpc(
 }
 
 UnaryResponseResult FunctionConnection::ReadTransportUnary() {
-	if (transport_input_) {
-		return ReadUnaryResponse(transport_input_, &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
-		                         GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
-	}
-	return ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
-	                         GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
+	auto result =
+	    transport_input_
+	        ? ReadUnaryResponse(transport_input_, &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
+	                            GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex())
+	        : ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
+	                            GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
+	// A worker with external storage externalizes a large result over any
+	// transport; resolve its vgi_rpc.location pointer as the HTTP path does.
+	return MaybeResolveExternalLocation(context_, result, worker_path_, GetExecutionIdHex(),
+	                                    GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(), GetConnIdHex());
 }
 
 StreamHeaderResult FunctionConnection::ReadTransportHeader() {
-	if (transport_input_) {
-		return ReadStreamHeader(transport_input_, &context_, worker_path_, TransportPid());
+	auto header = transport_input_ ? ReadStreamHeader(transport_input_, &context_, worker_path_, TransportPid())
+	                               : ReadStreamHeader(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid());
+	// An externalized stream header, as HttpFunctionConnection::PerformInit resolves it.
+	if (header.header_batch && header.metadata && header.metadata->FindKey(RPC_LOCATION_KEY) >= 0) {
+		UnaryResponseResult pointer {header.header_batch, header.metadata};
+		auto resolved = MaybeResolveExternalLocation(context_, pointer, worker_path_, GetExecutionIdHex(),
+		                                             GetAttachOpaqueDataDigest(), GetTransactionOpaqueDataDigest(),
+		                                             GetConnIdHex());
+		header.header_batch = std::move(resolved.batch);
+		header.metadata = std::move(resolved.metadata);
 	}
-	return ReadStreamHeader(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid());
+	return header;
 }
 
 void FunctionConnection::EnsureWorkerSpawned() {
@@ -670,22 +682,8 @@ BindResult FunctionConnection::PerformBindRpc() {
 			throw;
 		}
 
-		if (!response.batch || response.batch->num_rows() == 0) {
-			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Empty bind response from worker", worker_path_, TransportPid(), "");
-		}
-
-		auto result_col = response.batch->GetColumnByName("result");
-		if (!result_col) {
-			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response missing 'result' column", worker_path_, TransportPid(), "");
-		}
-
-		auto bin_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-		if (!bin_array || bin_array->IsNull(0)) {
-			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "Bind response 'result' column is null", worker_path_, TransportPid(), "");
-		}
-
-		auto v = bin_array->GetView(0);
-		auto bind_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+		auto bind_batch = UnwrapResultEnvelope(
+		    response.batch, "bind", FunctionInfo(function_name_, function_type_, nullptr).Worker(worker_path_, TransportPid()));
 		ValidateResponseSchema(bind_batch, "bind", worker_path_);
 		return bind_batch;
 	};
@@ -1120,6 +1118,7 @@ void FunctionConnection::ResetForNextSplit() {
 	last_partition_values_bytes_.clear();
 	last_parent_row_bytes_.clear();
 	last_cache_control_ = {};
+	last_more_output_ = false;
 	cond_if_none_match_.clear();
 	cond_if_modified_since_.clear();
 
@@ -1323,7 +1322,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			const std::string location_url = result.custom_metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_, GetExecutionIdHex(),
 			                                        GetAttachOpaqueDataDigest(), result.custom_metadata,
-			                                        &context_.interrupted);
+			                                        &context_.interrupted, GetConnIdHex());
 			result.batch = resolved.batch;
 			result.custom_metadata = resolved.metadata;
 		}
@@ -1473,6 +1472,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// lockstep timing as last_batch_index_). Cheap: a few FindKeys, only on
 		// the data-batch path; present=false when no vgi.cache.* key is set.
 		last_cache_control_ = ParseVgiCacheControl(result.custom_metadata);
+		last_more_output_ = HasMoreOutputStatus(result.custom_metadata);
 
 		// We're committed to returning this data batch. NOW send the next tick —
 		// after FreeAllocation + shm resolve above — so the worker's allocator
@@ -1560,6 +1560,25 @@ void FunctionConnection::OpenInputWriter() {
 		fields.emplace_back("function_name", function_name_);
 		fields.emplace_back("input_schema_fields", std::to_string(input_schema_->num_fields()));
 		VGI_LOG(context_, "function_connection.input_writer_opened", fields);
+	}
+}
+
+void FunctionConnection::WriteContinuationTick() {
+	if (!input_writer_opened_ || input_writer_closed_) {
+		ThrowVgiIOException("FunctionConnection::WriteContinuationTick called without an open input writer", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
+	}
+	auto tick = arrow::RecordBatch::MakeEmpty(input_schema_);
+	if (!tick.ok()) {
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr),
+		                         "Failed to build continuation tick: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                         GetExecutionIdHex(), tick.status().ToString());
+	}
+	auto write_status = input_writer_->WriteRecordBatch(*tick.ValueUnsafe(), ContinuationTickMetadata());
+	if (!write_status.ok()) {
+		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr),
+		                         "Failed to write continuation tick: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                         GetExecutionIdHex(), write_status.ToString());
 	}
 }
 
@@ -1777,24 +1796,9 @@ namespace {
 std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResult &response,
                                                          const std::string &method_name,
                                                          const std::string &worker_path) {
-	if (!response.batch || response.batch->num_rows() == 0) {
-		ThrowVgiIOException("Empty response from " + method_name, worker_path, -1, "");
-	}
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		ThrowVgiIOException("Response missing 'result' column from " + method_name, worker_path, -1, "");
-	}
-	if (result_col->type()->id() != arrow::Type::BINARY) {
-		ThrowVgiIOException("Response 'result' column has wrong type from " + method_name, worker_path, -1, "");
-	}
-	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-	if (bin->IsNull(0)) {
-		// Empty-schema responses (e.g. table_buffering_destructor) emit null
-		// result; return null so caller can detect and skip column lookup.
-		return nullptr;
-	}
-	auto v = bin->GetView(0);
-	return vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+	// Empty-schema responses (e.g. table_buffering_destructor) emit a null result;
+	// return null so the caller can skip column lookup.
+	return UnwrapResultEnvelope(response.batch, method_name, ErrorInfo().Worker(worker_path), /*null_result_ok=*/true);
 }
 
 } // namespace
@@ -1836,10 +1840,7 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, c
 	if (!inner || inner->num_rows() == 0) {
 		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_process response missing data", worker_path_, TransportPid(), "");
 	}
-	auto col = inner->GetColumnByName("state_id");
-	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
-	auto view = bin_array->GetView(0);
-	return std::vector<uint8_t>(view.data(), view.data() + view.size());
+	return vgi::generated::Decode<vgi::generated::TableBufferingProcessResult>(inner, 0, worker_path_).state_id;
 }
 
 std::vector<std::vector<uint8_t>>
@@ -1858,18 +1859,7 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name, c
 	if (!inner || inner->num_rows() == 0) {
 		ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, error_subtype::kProtocolViolation), "table_buffering_combine response missing data", worker_path_, TransportPid(), "");
 	}
-	auto col = inner->GetColumnByName("finalize_state_ids");
-	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
-	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
-	auto offset = list_array->value_offset(0);
-	auto length = list_array->value_length(0);
-	std::vector<std::vector<uint8_t>> result;
-	result.reserve(length);
-	for (int64_t i = 0; i < length; ++i) {
-		auto v = values->GetView(offset + i);
-		result.emplace_back(v.data(), v.data() + v.size());
-	}
-	return result;
+	return vgi::generated::Decode<vgi::generated::TableBufferingCombineResult>(inner, 0, worker_path_).finalize_state_ids;
 }
 
 void FunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,

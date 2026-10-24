@@ -1,0 +1,522 @@
+# name: test/sql/integration/table_in_out/lateral_continuation.test
+# description: Continued output for blended (RowTransformFunction) table-in-out. A worker
+#   may answer one input batch with several replies: it emits each with more=True
+#   (vgi.status: HAVE_MORE_OUTPUT) and is asked for the next with a zero-row tick
+#   (vgi.status: CONTINUE). blended_paged(n, page_size := k) is blended_explode's output
+#   (rows 0..n-1 per input row, with parent_row provenance) returned k rows per reply,
+#   so every result here must equal blended_explode's.
+#
+# Fixture contract: every SDK's fixture worker implements blended_paged exactly so.
+#   blended_paged(n BIGINT, page_size := 2 BIGINT, cache_ttl := 0 BIGINT,
+#                 fail_on_page := 0 BIGINT, revalidate := false BOOLEAN,
+#                 not_modified_more := false BOOLEAN) -> (i BIGINT)
+#   - fail_on_page, revalidate and not_modified_more: see
+#     continuation_resume_error_revalidate.test.
+#   - A RowTransformFunction: n is the per-row input column; page_size and cache_ttl
+#     are named, bind-time arguments.
+#   - Bind fails if page_size < 1 ("page_size must be at least 1, got <v>") or if
+#     cache_ttl < 0 ("cache_ttl must not be negative, got <v>").
+#   - For an input batch, input row r with count n (NULL or negative counts as 0)
+#     produces rows i = 0 .. n-1, parent_row r, rows ordered by r then i.
+#   - That output is cut into replies of page_size rows, in order; a reply may span
+#     input rows. Every reply but the last says more (vgi.status: HAVE_MORE_OUTPUT).
+#     A batch with no output is one empty reply. Input rows with no output after the
+#     last non-empty page add no reply.
+#   - Unless revalidate is true, the first reply of each input batch carries
+#     vgi.cache.ttl = cache_ttl when cache_ttl > 0, and no cache control otherwise.
+#     Later replies never carry it.
+#   - The resume position (the batch's counts and a position in them) is kept in
+#     serializable stream state, so continuation works over HTTP; no output rows are
+#     kept there.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded. Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ---------------------------------------------------------------------------
+# Literal call (one input row): each page_size gives the same rows.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT i FROM ex.blended_paged(5) ORDER BY i;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT i FROM ex.blended_paged(5, page_size := 1) ORDER BY i;
+----
+0
+1
+2
+3
+4
+
+# page_size equal to the output: exactly one full page.
+query I
+SELECT count(*) FROM ex.blended_paged(4, page_size := 4);
+----
+4
+
+# page_size larger than the output.
+query I
+SELECT count(*) FROM ex.blended_paged(4, page_size := 1000);
+----
+4
+
+# No output at all.
+query I
+SELECT count(*) FROM ex.blended_paged(0);
+----
+0
+
+# ---------------------------------------------------------------------------
+# Correlated call shapes: comma join, LATERAL, LEFT JOIN LATERAL. The correlated
+# column must be stamped onto every row of every page.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT x, i FROM range(4) t(x), ex.blended_paged(t.x) ORDER BY x, i;
+----
+1	0
+2	0
+2	1
+3	0
+3	1
+3	2
+
+query II
+SELECT x, i FROM range(4) t(x), LATERAL ex.blended_paged(t.x, page_size := 1) ORDER BY x, i;
+----
+1	0
+2	0
+2	1
+3	0
+3	1
+3	2
+
+# LEFT JOIN keeps input rows with no output (n = 0, n = NULL) as NULL rows.
+query II
+SELECT n, i
+FROM (VALUES (0), (2), (NULL)) t(n) LEFT JOIN LATERAL ex.blended_paged(t.n, page_size := 1) ON true
+ORDER BY n NULLS LAST, i NULLS FIRST;
+----
+0	NULL
+2	0
+2	1
+NULL	NULL
+
+# An empty input produces nothing.
+query I
+SELECT count(*) FROM range(0) t(x), LATERAL ex.blended_paged(t.x);
+----
+0
+
+# ---------------------------------------------------------------------------
+# Equivalence with blended_explode over several input chunks (3000 rows > 2048),
+# for page sizes from one row per reply to one reply per chunk. Closed form: the
+# sum of x % 7 over range(3000) is 428 * 21 + (0 + 1 + 2 + 3) = 8994 rows.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE explode_ref AS
+SELECT x, i FROM range(3000) t(x), LATERAL ex.blended_explode(t.x % 7);
+
+query I
+SELECT count(*) FROM explode_ref;
+----
+8994
+
+foreach page_size 1 3 2048 100000
+
+statement ok
+CREATE OR REPLACE TABLE paged AS
+SELECT x, i FROM range(3000) t(x), LATERAL ex.blended_paged(t.x % 7, page_size := ${page_size});
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM paged EXCEPT ALL SELECT * FROM explode_ref)
+  UNION ALL
+  (SELECT * FROM explode_ref EXCEPT ALL SELECT * FROM paged)
+);
+----
+0
+
+endloop
+
+# ---------------------------------------------------------------------------
+# One input row whose pages each exceed the 2048-row output slice: the operator
+# slices every reply and continues between them. 5000 rows in pages of 3000.
+# ---------------------------------------------------------------------------
+
+foreach page_size 100 3000
+
+query IIIII
+SELECT count(*), min(n), max(n), min(i), max(i)
+FROM (VALUES (5000)) v(n), LATERAL ex.blended_paged(v.n, page_size := ${page_size});
+----
+5000	5000	5000	0	4999
+
+query I
+SELECT count(DISTINCT i) FROM (VALUES (5000)) v(n), LATERAL ex.blended_paged(v.n, page_size := ${page_size});
+----
+5000
+
+endloop
+
+# ---------------------------------------------------------------------------
+# Input dedup: the worker sees each distinct argument once, and provenance maps
+# every page back over each argument's original rows. Dedup on == dedup off.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_exchange_input_dedup = true;
+
+statement ok
+CREATE TABLE dedup_on AS
+SELECT x, i FROM range(2500) t(x), LATERAL ex.blended_paged(t.x % 4, page_size := 3);
+
+statement ok
+SET vgi_exchange_input_dedup = false;
+
+statement ok
+CREATE TABLE dedup_off AS
+SELECT x, i FROM range(2500) t(x), LATERAL ex.blended_paged(t.x % 4, page_size := 3);
+
+statement ok
+RESET vgi_exchange_input_dedup;
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM dedup_on EXCEPT ALL SELECT * FROM dedup_off)
+  UNION ALL
+  (SELECT * FROM dedup_off EXCEPT ALL SELECT * FROM dedup_on)
+);
+----
+0
+
+# 625 rows of each of 0..3: 625 * (0 + 1 + 2 + 3) = 3750.
+query I
+SELECT count(*) FROM dedup_on;
+----
+3750
+
+# Rows sharing an argument keep their own outer columns.
+query II
+SELECT id, i
+FROM (VALUES (100, 2), (200, 2), (300, 3)) t(id, n), LATERAL ex.blended_paged(t.n, page_size := 1)
+ORDER BY id, i;
+----
+100	0
+100	1
+200	0
+200	1
+300	0
+300	1
+300	2
+
+# ---------------------------------------------------------------------------
+# Batched operator == row-by-row path.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_batch_lateral = false;
+
+statement ok
+CREATE TABLE rowbyrow AS
+SELECT x, i FROM range(300) t(x), LATERAL ex.blended_paged(t.x % 7, page_size := 2);
+
+statement ok
+RESET vgi_batch_lateral;
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM rowbyrow EXCEPT ALL SELECT * FROM explode_ref WHERE x < 300)
+  UNION ALL
+  (SELECT * FROM explode_ref WHERE x < 300 EXCEPT ALL SELECT * FROM rowbyrow)
+);
+----
+0
+
+# ---------------------------------------------------------------------------
+# Many threads: every chunk's pages are its own, whatever thread runs it.
+# 20000 rows of x % 5: 4000 * (0 + 1 + 2 + 3 + 4) = 40000.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads = 8;
+
+query II
+SELECT count(*), sum(i) FROM range(20000) t(x), LATERAL ex.blended_paged(t.x % 5, page_size := 3);
+----
+40000	40000
+
+statement ok
+RESET threads;
+
+# ---------------------------------------------------------------------------
+# LIMIT stops the query partway through the output.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (SELECT i FROM range(3000) t(x), LATERAL ex.blended_paged(t.x % 7, page_size := 3) LIMIT 10);
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT i FROM ex.blended_paged(100000, page_size := 10) LIMIT 5);
+----
+5
+
+# The connection stays usable after a LIMIT left output pending.
+query I
+SELECT count(*) FROM ex.blended_paged(7, page_size := 2);
+----
+7
+
+# ---------------------------------------------------------------------------
+# Reply counts: the output really arrives as separate replies, each after a
+# continuation tick (one table_in_out.continue event per tick). A worker that put
+# all of an input's output in one reply would pass every result check above and
+# fail these.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads = 1;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Literal call: 5 rows in pages of 2 = 3 replies = 2 ticks.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM ex.blended_paged(5, page_size := 2);
+----
+5
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue'
+  AND message LIKE '%blended_paged%';
+----
+2
+
+# Exactly one full page: one reply, no tick, no trailing empty reply.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM ex.blended_paged(4, page_size := 4);
+----
+4
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue'
+  AND message LIKE '%blended_paged%';
+----
+0
+
+# LATERAL over one chunk: 6 rows in pages of 1 = 6 replies to 1 input = 5 ticks.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM range(4) t(x), LATERAL ex.blended_paged(t.x, page_size := 1);
+----
+6
+
+query II
+SELECT
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'),
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue')
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%blended_paged%';
+----
+1	5
+
+# Two input chunks (2048 + 952 rows of x % 7): each ships its 7 distinct values
+# once, whose 21 rows come back in 7 pages of 3: 2 inputs, 2 * 6 ticks.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM range(3000) t(x), LATERAL ex.blended_paged(t.x % 7, page_size := 3);
+----
+8994
+
+query II
+SELECT
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'),
+  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue')
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%blended_paged%';
+----
+2	12
+
+# A LIMIT stops asking for pages: 100000 rows in pages of 10 would be 9999 ticks.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (SELECT i FROM ex.blended_paged(100000, page_size := 10) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*) < 3
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue'
+  AND message LIKE '%blended_paged%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET threads;
+
+# ---------------------------------------------------------------------------
+# Bind-time validation of the named arguments.
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM ex.blended_paged(3, page_size := 0);
+----
+page_size must be at least 1
+
+statement error
+SELECT * FROM range(3) t(x), LATERAL ex.blended_paged(t.x, page_size := -1);
+----
+page_size must be at least 1
+
+statement error
+SELECT * FROM ex.blended_paged(3, cache_ttl := -5);
+----
+cache_ttl must not be negative
+
+# ---------------------------------------------------------------------------
+# Result cache. With cache_ttl the first reply advertises vgi.cache.ttl. Output that
+# fits in one reply is cached as usual; output continued across replies is never
+# cached, so a repeat scan asks the worker again.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads = 1;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CREATE TABLE cache_in AS SELECT * FROM range(6) r(x);
+
+# One reply per chunk (15 rows, page_size 100): stored, then served from the cache.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM cache_in, LATERAL ex.blended_paged(cache_in.x, page_size := 100, cache_ttl := 300);
+----
+15
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%blended_paged%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM cache_in, LATERAL ex.blended_paged(cache_in.x, page_size := 100, cache_ttl := 300);
+----
+15
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_paged%';
+----
+0
+
+# Continued across replies (page_size 2): nothing stored, and the repeat asks the worker.
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, i FROM cache_in, LATERAL ex.blended_paged(cache_in.x, page_size := 2, cache_ttl := 300) ORDER BY x, i;
+----
+1	0
+2	0
+2	1
+3	0
+3	1
+3	2
+4	0
+4	1
+4	2
+4	3
+5	0
+5	1
+5	2
+5	3
+5	4
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%blended_paged%';
+----
+0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM cache_in, LATERAL ex.blended_paged(cache_in.x, page_size := 2, cache_ttl := 300);
+----
+15
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_paged%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH ex;

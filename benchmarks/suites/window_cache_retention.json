@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "name": "window_64mib_default_budget",
+      "family": "window_retention",
+      "sql": "SELECT sum(length(v)) FROM (SELECT bench.main.vgi_window_listagg(c0) OVER (ORDER BY c0 ROWS BETWEEN CURRENT ROW AND CURRENT ROW) v FROM bench_strings(1024,1,65536,64,0))",
+      "expected": "67108864"
+    },
+    {
+      "name": "window_128mib_budget384",
+      "family": "window_retention",
+      "env": {"VGI_WINDOW_CACHE_MAX_BYTES": "402653184"},
+      "sql": "SELECT sum(length(v)) FROM (SELECT bench.main.vgi_window_listagg(c0) OVER (ORDER BY c0 ROWS BETWEEN CURRENT ROW AND CURRENT ROW) v FROM bench_strings(2048,1,65536,64,0))",
+      "expected": "134217728"
+    },
+    {
+      "name": "window_16_partitions_default_budget",
+      "family": "window_retention",
+      "threads": 4,
+      "sql": "SELECT sum(length(v)) FROM (SELECT bench.main.vgi_window_listagg(c0) OVER (PARTITION BY CAST(substr(c0,65513,20) AS BIGINT) % 16 ORDER BY c0 ROWS BETWEEN CURRENT ROW AND CURRENT ROW) v FROM bench_strings(2048,1,65536,64,0))",
+      "expected": "134217728"
+    }
+  ]
+}

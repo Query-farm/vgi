@@ -65,6 +65,8 @@ inline std::string MapOnConflict(OnCreateConflict conflict) {
 // ``cookie_jar`` is the per-catalog HTTP session cookie store (null for
 // subprocess transport); if present, Set-Cookie response headers are captured
 // into it and Cookie request headers are read from it on subsequent RPCs.
+// Optionally return the temporary connection's capability snapshot for reuse
+// by the attached catalog; capabilities remain scoped to this attachment.
 CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const std::string &catalog_name,
                                         ClientContext &context, bool worker_debug = false, bool use_pool = true,
                                         const std::shared_ptr<CatalogAuth> &auth = nullptr,
@@ -76,7 +78,8 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         std::optional<std::string> launcher_state_dir = std::nullopt,
                                         std::shared_ptr<void> worker_artifact_anchor = nullptr,
                                         const std::string &tcp_proxy = "",
-                                        std::shared_ptr<IrohClientConfig> iroh = nullptr);
+                                        std::shared_ptr<IrohClientConfig> iroh = nullptr,
+                                        ServerCapabilities *discovered_capabilities = nullptr);
 
 // Notify the worker that an attachment has been detached and may be released.
 void InvokeCatalogDetach(const CatalogRpcContext &ctx, ClientContext &context);
@@ -127,12 +130,17 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, Cl
 VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context,
                                          const std::optional<std::string> &if_none_match = std::nullopt);
 
+// Validate and index every row/batch of the six embedded metadata streams.
+VgiCatalogContents ParseCatalogContents(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                       const std::string &worker_path,
+                                       const std::optional<std::string> &if_none_match = std::nullopt);
+
 // The `vgi_catalog_contents` setting (default true). False means the client
 // never calls catalog_contents: neither to load nor to revalidate.
 bool UseCatalogContents(ClientContext &context);
 
 // Decode a catalog_contents schema's SchemaInfo (lazily, on first use).
-// Throws if its path differs from SchemaContents.path.
+// Its row was associated with this raw path when the snapshot was indexed.
 VgiSchemaInfo DecodeContentsSchemaInfo(const VgiSchemaContents &contents);
 
 // Decode one kind of a catalog_contents schema entry (done lazily, on a set's
