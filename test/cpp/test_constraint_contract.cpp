@@ -53,6 +53,34 @@ std::vector<uint8_t> GetDefinition(const vgi::VgiTableInfo &table) {
 	vgi::RecordBatchSingleRow row(batch, 0, "ConstraintInfo", "test");
 	return row["definition"].value_not_null<std::vector<uint8_t>>();
 }
+std::vector<uint8_t> PathDefinition(const std::vector<std::vector<std::string>> &values,
+                                  const std::string &kind = "NOT_NULL") {
+	auto strings = std::make_shared<arrow::StringBuilder>();
+	auto inner = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), strings);
+	arrow::ListBuilder paths(arrow::default_memory_pool(), inner);
+	REQUIRE(paths.Append().ok());
+	for (const auto &path : values) {
+		REQUIRE(inner->Append().ok());
+		for (const auto &component : path)
+			REQUIRE(strings->Append(component).ok());
+	}
+	return vgi::SerializeToIpcBytes(arrow::RecordBatch::Make(
+	    vgi::generated::ConstraintDefinitionSchema(), 1,
+	    {vgi::BuildEnumArray(kind, {"NOT_NULL", "UNIQUE", "PRIMARY_KEY", "CHECK", "FOREIGN_KEY"}),
+	     paths.Finish().ValueOrDie(), arrow::MakeArrayOfNull(arrow::utf8(), 1).ValueOrDie(),
+	     vgi::BuildOptionalBinaryScalar(std::nullopt), vgi::BuildOptionalBinaryScalar(std::nullopt)}));
+}
+vgi::VgiTableInfo NestedTable() {
+	vgi::VgiTableInfo table;
+	table.schema_name = "main";
+	table.name = "t";
+	table.arrow_schema = arrow::schema({
+	    arrow::field("record", arrow::struct_({arrow::field("a.b", arrow::int32(), false)})),
+	    arrow::field("record.a.b", arrow::int32(), false)});
+	table.constraints = {ConstraintRecord(PathDefinition({{"record", "a.b"}}), "nested-key"),
+	                     ConstraintRecord(PathDefinition({{"record.a.b"}}), "literal-key")};
+	return table;
+}
 std::vector<uint8_t> CheckExpression(const std::string &sql = "budget >= 0") {
 	auto context = arrow::StructArray::Make(
 	    {vgi::BuildStringScalar("UTC"), vgi::BuildStringScalar("binary"), vgi::BuildStringScalar("asc"),
@@ -125,6 +153,87 @@ TEST_CASE("Native constraint facts reject downgrade identity ambiguity and nulla
 	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
 	table = NativeTable();
 	table.constraints[0].push_back(0);
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+}
+
+TEST_CASE("Nested NOT NULL facts preserve nullable parents and raw path identities", "[constraint-contract]") {
+	auto table = NestedTable();
+	auto original = table.constraints;
+	vgi::DecodeNativeConstraints(table);
+	CHECK(table.constraints == original);
+	CHECK(table.arrow_schema->field(0)->nullable());
+	CHECK(table.not_null_constraints == std::vector<int> {1});
+	REQUIRE(table.not_null_constraint_refs.size() == 1);
+	CHECK(table.not_null_constraint_refs.count("record.a.b") == 1);
+	CHECK(vgi::BuildNativeNotNullChange(table, "record", false).empty());
+	CHECK_FALSE(vgi::BuildNativeNotNullChange(table, "record", true).empty());
+	// Facts alone do not grant write authority, even when all constraints are nested.
+	table.arrow_schema = arrow::schema({table.arrow_schema->field(0)});
+	table.constraints.resize(1);
+	vgi::DecodeNativeConstraints(table);
+	CHECK(table.not_null_constraints.empty());
+	CHECK(table.not_null_constraint_refs.empty());
+	vgi::CatalogAttachResult attached;
+	attached.constraint_profiles = {vgi::VGI_CONSTRAINT_READ};
+	CHECK_NOTHROW(vgi::RequireNativeConstraintRead(attached, table));
+	CHECK_THROWS(vgi::RequireNativeConstraintWrite(attached, table));
+	attached.constraint_profiles.insert(vgi::VGI_CONSTRAINT_ENFORCE);
+	CHECK_NOTHROW(vgi::RequireNativeConstraintWrite(attached, table));
+	DuckDB db(nullptr);
+	Connection connection(db);
+	auto create = vgi::CreateTableInfoFromVgiTable(*connection.context, table, "main");
+	CHECK(create.constraints.empty());
+}
+
+TEST_CASE("Nested NOT NULL facts require exact fields and recursive nullability agreement", "[constraint-contract]") {
+	for (const auto &path : std::vector<std::vector<std::string>> {
+	         {}, {"record", "missing"}, {"record", "a", "b"}, {"record.a.b", "child"},
+	         {"record", ""}, std::vector<std::string>(65, "record")}) {
+		auto table = NestedTable();
+		table.constraints[0] = ConstraintRecord(PathDefinition({path}), "nested-key");
+		CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	}
+	auto table = NestedTable();
+	table.arrow_schema = arrow::schema({
+	    arrow::field("record", arrow::struct_({arrow::field("a.b", arrow::int32())})),
+	    table.arrow_schema->field(1)});
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	// A mutation snapshot is checked against the pre-mutation Arrow schema.
+	CHECK_NOTHROW(vgi::DecodeNativeConstraints(table, false));
+	table = NestedTable();
+	table.constraints.erase(table.constraints.begin());
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	table = NestedTable();
+	table.arrow_schema = arrow::schema({arrow::field("record", arrow::struct_({
+	    arrow::field("a.b", arrow::int32(), false), arrow::field("a.b", arrow::int32(), false)})),
+	    table.arrow_schema->field(1)});
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	table = NestedTable();
+	table.row_id_column = 0;
+	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	for (const auto &kind : {"UNIQUE", "PRIMARY_KEY"}) {
+		table = NestedTable();
+		table.constraints[0] = ConstraintRecord(PathDefinition({{"record", "a.b"}}, kind), "nested-key");
+		CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	}
+}
+
+TEST_CASE("Constraint nullability does not expose collection or logical type storage", "[constraint-contract]") {
+	for (const auto &metadata : {arrow::key_value_metadata({"ARROW:extension:name"}, {"example"}),
+	                             arrow::key_value_metadata({"vgi.logical_type.name"}, {"variant"})}) {
+		auto table = NestedTable();
+		table.arrow_schema = arrow::schema({table.arrow_schema->field(0)->WithMetadata(metadata)});
+		table.constraints.clear();
+		CHECK_NOTHROW(vgi::DecodeNativeConstraints(table));
+		table.constraints = {ConstraintRecord(PathDefinition({{"record", "a.b"}}))};
+		CHECK_THROWS(vgi::DecodeNativeConstraints(table));
+	}
+	auto table = NestedTable();
+	table.arrow_schema = arrow::schema({arrow::field("items", arrow::list(arrow::field(
+	    "item", arrow::struct_({arrow::field("k", arrow::utf8(), false)}), false)))});
+	table.constraints.clear();
+	CHECK_NOTHROW(vgi::DecodeNativeConstraints(table));
+	table.constraints = {ConstraintRecord(PathDefinition({{"items", "k"}}))};
 	CHECK_THROWS(vgi::DecodeNativeConstraints(table));
 }
 

@@ -110,18 +110,65 @@ Reference ReadRef(const std::vector<uint8_t> &bytes, const std::string &kind) {
 		Identifier(result.owner);
 	return result;
 }
-std::vector<std::string> Paths(RecordBatchSingleRow &row, const char *field) {
+using ColumnPath = std::vector<std::string>;
+std::vector<ColumnPath> ReadPaths(RecordBatchSingleRow &row, const char *field) {
 	auto paths = row[field].value_not_null<std::vector<std::vector<std::string>>>();
 	Require(paths.size() <= 1024, "too many column paths");
-	std::vector<std::string> names;
-	std::set<std::string> seen;
+	std::set<ColumnPath> seen;
 	for (const auto &path : paths) {
-		Require(path.size() == 1, "native 1.5 does not support nested constraint column paths");
-		Identifier(path[0]);
-		Require(seen.insert(path[0]).second, "duplicate constraint path");
+		Require(!path.empty() && path.size() <= 64, "empty or oversized constraint column path");
+		for (const auto &component : path)
+			Identifier(component);
+		Require(seen.insert(path).second, "duplicate constraint path");
+	}
+	return paths;
+}
+std::vector<std::string> TopLevelNames(const std::vector<ColumnPath> &paths) {
+	std::vector<std::string> names;
+	for (const auto &path : paths) {
+		Require(path.size() == 1, "native 1.5 supports nested constraint paths only for NOT_NULL facts");
 		names.push_back(path[0]);
 	}
 	return names;
+}
+bool OrdinaryStruct(const arrow::Field &field) {
+	if (field.type()->id() != arrow::Type::STRUCT)
+		return false;
+	if (field.metadata()) {
+		for (const auto &key : field.metadata()->keys()) {
+			if (key == "ARROW:extension:name" || key.compare(0, 17, "vgi.logical_type.") == 0)
+				return false;
+		}
+	}
+	return true;
+}
+void ResolveNotNullPath(const VgiTableInfo &info, const ColumnPath &path) {
+	auto index = info.arrow_schema->GetFieldIndex(path[0]);
+	Require(index >= 0 && index != info.row_id_column,
+	        "constraint references a missing, ambiguous, or synthetic column");
+	auto field = info.arrow_schema->field(index);
+	for (size_t depth = 1; depth < path.size(); ++depth) {
+		Require(OrdinaryStruct(*field), "constraint path must traverse ordinary STRUCT fields, not storage members");
+		auto &type = static_cast<const arrow::StructType &>(*field->type());
+		index = type.GetFieldIndex(path[depth]);
+		Require(index >= 0, "constraint references a missing or ambiguous nested field");
+		field = type.field(index);
+	}
+}
+void ValidateNullability(const arrow::FieldVector &fields, const ColumnPath &prefix,
+                         const std::set<ColumnPath> &required, int row_id_column) {
+	for (size_t i = 0; i < fields.size(); ++i) {
+		if (prefix.empty() && static_cast<int>(i) == row_id_column)
+			continue;
+		const auto &field = fields[i];
+		auto path = prefix;
+		path.push_back(field->name());
+		Require(field->nullable() == !required.count(path),
+		        "Arrow nullability disagrees with canonical NOT_NULL/PRIMARY_KEY");
+		// Collection and logical-type storage children are not table column paths.
+		if (OrdinaryStruct(*field))
+			ValidateNullability(field->type()->fields(), path, required, row_id_column);
+	}
 }
 std::shared_ptr<arrow::Array> PathArray(const std::vector<std::string> &names) {
 	auto text = std::make_shared<arrow::StringBuilder>();
@@ -320,7 +367,7 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 	info.foreign_key_constraints.clear();
 	info.not_null_constraint_refs.clear();
 	std::set<std::string> keys, labels;
-	std::set<int> required;
+	std::set<ColumnPath> required;
 	for (const auto &bytes : info.constraints) {
 		auto batch = Decode(bytes, generated::ConstraintInfoSchema());
 		RecordBatchSingleRow row(batch, 0, "ConstraintInfo", "constraint");
@@ -336,7 +383,7 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 		    Decode(row["definition"].value_not_null<std::vector<uint8_t>>(), generated::ConstraintDefinitionSchema());
 		RecordBatchSingleRow def(definition, 0, "ConstraintDefinition", "constraint");
 		auto kind = def["kind"].value_not_null<std::string>();
-		auto names = Paths(def, "column_paths");
+		auto paths = ReadPaths(def, "column_paths");
 		if (!definition->GetColumnByName("declared_name")->IsNull(0)) {
 			auto label = def["declared_name"].value_not_null<std::string>();
 			Identifier(label);
@@ -346,7 +393,7 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 		auto target_bytes = row["referenced_constraint"].value_or(std::vector<uint8_t>());
 		Require((kind == "CHECK") == !definition->GetColumnByName("check_expression")->IsNull(0),
 		        "inconsistent CHECK payload");
-		Require(kind == "CHECK" ? names.empty() : !names.empty(), "invalid constraint column paths");
+		Require(kind == "CHECK" ? paths.empty() : !paths.empty(), "invalid constraint column paths");
 		Require(kind == "NOT_NULL" || kind == "UNIQUE" || kind == "PRIMARY_KEY" || kind == "FOREIGN_KEY" || kind == "CHECK",
 		        "unknown constraint kind");
 		Require((kind == "FOREIGN_KEY") == !definition->GetColumnByName("foreign_key")->IsNull(0) &&
@@ -356,6 +403,22 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 			info.check_constraints.push_back(ReadCheck(def["check_expression"].value_not_null<std::vector<uint8_t>>(), info));
 			continue;
 		}
+		if (kind == "NOT_NULL") {
+			Require(paths.size() == 1, "NOT_NULL requires one column");
+			const auto &path = paths[0];
+			ResolveNotNullPath(info, path);
+			required.insert(path);
+			// DuckDB 1.5 represents NOT NULL only on top-level columns. Preserve
+			// nested facts in info.constraints and Arrow nullability; the negotiated
+			// provider enforces writes. A required child must never make its parent
+			// nonnullable or supply the identity for ALTER COLUMN parent DROP NOT NULL.
+			if (path.size() == 1) {
+				info.not_null_constraints.push_back(info.arrow_schema->GetFieldIndex(path[0]));
+				info.not_null_constraint_refs[path[0]].push_back(ref_bytes);
+			}
+			continue;
+		}
+		auto names = TopLevelNames(paths);
 		std::vector<int> indices;
 		for (const auto &name : names) {
 			auto index = info.arrow_schema->GetFieldIndex(name);
@@ -363,15 +426,10 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 			        "constraint references a missing, ambiguous, or synthetic column");
 			indices.push_back(index);
 		}
-		if (kind == "NOT_NULL") {
-			Require(indices.size() == 1, "NOT_NULL requires one column");
-			info.not_null_constraints.push_back(indices[0]);
-			required.insert(indices[0]);
-			info.not_null_constraint_refs[names[0]].push_back(ref_bytes);
-		} else if (kind == "PRIMARY_KEY") {
+		if (kind == "PRIMARY_KEY") {
 			Require(info.primary_key_constraints.empty(), "multiple primary keys");
 			info.primary_key_constraints.push_back(indices);
-			required.insert(indices.begin(), indices.end());
+			required.insert(paths.begin(), paths.end());
 		} else if (kind == "UNIQUE") {
 			info.unique_constraints.push_back(indices);
 		} else {
@@ -381,7 +439,7 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 			auto target = ReadRef(target_bytes, "constraint");
 			Require(table.schema == info.schema_name && target.schema == table.schema && target.owner == table.name,
 			        "FK must reference an identified key in the same schema");
-			auto pk_names = Paths(fk, "referenced_column_paths");
+			auto pk_names = TopLevelNames(ReadPaths(fk, "referenced_column_paths"));
 			Require(pk_names.size() == names.size(), "FK arity mismatch");
 			Require(fk["match"].value_not_null<std::string>() == "SIMPLE", "native 1.5 requires MATCH SIMPLE");
 			for (const char *action : {"on_update", "on_delete"}) {
@@ -393,12 +451,7 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 		}
 	}
 	if (check_nullability) {
-		for (int i = 0; i < info.arrow_schema->num_fields(); ++i) {
-			if (i == info.row_id_column)
-				continue;
-			Require(info.arrow_schema->field(i)->nullable() == !required.count(i),
-			        "Arrow nullability disagrees with canonical NOT_NULL/PRIMARY_KEY");
-		}
+		ValidateNullability(info.arrow_schema->fields(), {}, required, info.row_id_column);
 	}
 }
 

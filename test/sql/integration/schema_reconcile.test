@@ -74,6 +74,54 @@ SELECT count(*) FROM sr.main.demo WHERE tags[1].k = 'env';
 ----
 2
 
+# Preserving required nested fields must preserve their write enforcement too.
+# Each failing statement contains one row: this checks rejection before that
+# row is persisted, without claiming whole-statement rollback across batches.
+statement error
+INSERT INTO sr.main.demo (id, ts, nested, tags) VALUES
+    (999,
+     TIMESTAMPTZ '2026-04-27 14:00:00+00',
+     {'a': NULL::INTEGER, 'b': 'rejected', 'ts2': NULL::TIMESTAMPTZ},
+     [{'k': 'env', 'v': 'rejected'::BLOB}]);
+----
+NULL supplied for non-nullable field 'a'
+
+query II
+SELECT id, nested.a FROM sr.main.demo ORDER BY id;
+----
+1	10
+2	20
+
+statement error
+UPDATE sr.main.demo
+SET nested = {'a': NULL::INTEGER, 'b': 'rejected', 'ts2': NULL::TIMESTAMPTZ}
+WHERE id = 1;
+----
+NULL supplied for non-nullable field 'a'
+
+query IIT
+SELECT id, nested.a, nested.b FROM sr.main.demo ORDER BY id;
+----
+1	10	one
+2	20	NULL
+
+# List element fields are Arrow storage nullability, not nested SQL constraint
+# paths. They still reach the provider unchanged and must reject NULL values.
+statement error
+INSERT INTO sr.main.demo (id, ts, nested, tags) VALUES
+    (999,
+     TIMESTAMPTZ '2026-04-27 14:00:00+00',
+     {'a': 30, 'b': 'rejected', 'ts2': NULL::TIMESTAMPTZ},
+     [{'k': NULL::VARCHAR, 'v': NULL::BLOB}]);
+----
+NULL supplied for non-nullable field 'k'
+
+query IIT
+SELECT id, nested.a, tags[1].k FROM sr.main.demo ORDER BY id;
+----
+1	10	env
+2	20	env
+
 # ============================================================================
 # UPDATE — exercises rowid + selected-column reshape on a partial column set.
 # Both top-level (id) and nested (ts2 inside the struct) update paths matter.

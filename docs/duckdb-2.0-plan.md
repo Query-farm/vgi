@@ -20,6 +20,19 @@ October 23 combined review and remote checks cover every scope and field mapping
 P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
 not a frozen protocol or a native DuckDB 2.0 port.
 
+**Nested NOT NULL follow-up (October 24):** the 1.5 adapter now imports enforced,
+ALL_ROWS nested STRUCT facts using exact raw paths and recursive Arrow
+nullability checks. It retains canonical facts without marking nullable parents
+NOT NULL or using child identities for parent ALTER operations. Provider write
+enforcement remains required. The previously failing schema-reconciliation test,
+including new rejected-NULL INSERT/UPDATE and unchanged-data checks, passes over
+subprocess and HTTP. The full native integration rerun passed 347 files, with 32
+optional-service/transport skips and zero failures. The earlier failure records
+below are historical. Native
+unit coverage also checks nullable parents, literal dotted names, malformed paths,
+storage-field exclusions and mutation snapshots. Full regression and cross-SDK
+results are recorded in the companion manifest's nested-NOT_NULL checkpoint.
+
 **Scope correction (2026-10-15):** retain the existing transaction and streamed
 write fundamentals. No savepoints, durable mutation replay/status service or
 general statement ticket/receipt framework is included. Audit the existing
