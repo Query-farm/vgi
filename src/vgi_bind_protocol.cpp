@@ -107,8 +107,14 @@ BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_byt
 	auto bind_response = ParseBindResponse(bind_response_batch, worker_label);
 	auto output_schema_bytes = SerializeSchemaToIpcBytes(bind_response.output_schema);
 
-	return BindResult {bind_response.output_schema, bind_response.opaque_data, std::move(bind_request_bytes),
-	                   output_schema_bytes, secret_dependent, SecretScopeFor(secret_dependent, resolved_secrets)};
+	return BindResult {bind_response.output_schema,
+	                   bind_response.opaque_data,
+	                   std::move(bind_request_bytes),
+	                   output_schema_bytes,
+	                   secret_dependent,
+	                   SecretScopeFor(secret_dependent, resolved_secrets),
+	                   bind_response.projection_expression_profiles,
+	                   SerializeToIpcBytes(bind_response_batch)};
 }
 
 BindResult PerformBindProtocol(
@@ -192,8 +198,14 @@ BindResult PerformBindProtocol(
 
 	// `secrets` is now exactly what the final bind_request_bytes carried —
 	// including any scoped secrets merged in by the two-phase retry.
-	return BindResult {bind_response.output_schema, bind_response.opaque_data, std::move(bind_request_bytes),
-	                   output_schema_bytes, secret_dependent, SecretScopeFor(secret_dependent, secrets)};
+	return BindResult {bind_response.output_schema,
+	                   bind_response.opaque_data,
+	                   std::move(bind_request_bytes),
+	                   output_schema_bytes,
+	                   secret_dependent,
+	                   SecretScopeFor(secret_dependent, secrets),
+	                   bind_response.projection_expression_profiles,
+	                   SerializeToIpcBytes(bind_response_batch)};
 }
 
 } // namespace vgi

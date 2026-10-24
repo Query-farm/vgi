@@ -424,7 +424,14 @@ std::shared_ptr<arrow::RecordBatch> InvokeProtocolUnary(const CatalogRpcContext 
 	}
 	std::shared_ptr<arrow::RecordBatch> payload;
 	try {
-		payload = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
+		if (method_name == "table_function_projection") {
+			auto bytes = binary_array->GetView(0);
+			if (bytes.size() > 8 * 1024 * 1024)
+				throw IOException("Projection response exceeds 8 MiB");
+			payload = DeserializeVgiQueryRecord(std::vector<uint8_t>(bytes.begin(), bytes.end()));
+		} else {
+			payload = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
+		}
 	} catch (const std::exception &e) {
 		throw IOException(reflection_violation().Merge(ExtraInfoOf(e)), "Could not decode the %s/%s reply [worker: %s]: %s",
 		                  protocol_name, method_name, worker_path, RawMessageOf(e));

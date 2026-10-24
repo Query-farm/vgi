@@ -72,7 +72,7 @@ The remaining included work before freeze is:
 | Column expressions and metadata | Implemented: canonical DEFAULT/USING, strict `comment`/`tags` metadata, and bounded virtual generated CREATE/discovery/read. Generated definitions reuse `SqlExpression`, field types and existing dependency records. These are mandatory successor representations, with no new capability checks. | Broader generated grammar/types, generated-table writes and provider acceptance remain qualification work. Native 1.5 rejects generated ALTER ADD; stored generation and engine compression enums are excluded. Tags remain in authoritative Arrow metadata because its column API lacks public tag access. |
 | Default schema absence | Implemented: `CatalogAttachResult.default_schema` is nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Python and SDKs preserve absence; native 1.5 rejects it before publishing the attachment. Native 2.0 optional-default execution remains part of the later adapter port. Never invent `main`, split dots, or introduce nested default search paths. |
 | Macro cleanup | Implemented: required nonempty overload families replace the duplicate parent definition fields. Simple macros use one-element families through local authoring helpers. No family-only capability check. | Native 1.5 loads complete scalar/table families; typed defaults, declarations, docs and owner context remain distinct. Native SQL CREATE MACRO, general dependency extraction and broader body/context support remain separate qualification work. Function argument defaults are unchanged. |
-| Optimizer preparation | Keep projection expressions/result mapping and repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | Filter v2 is a predicate contract, not a general scalar projection language. Prove typed scalar results, support decisions before optimizer replacement, slot/filter remapping, local residuals and query-scoped repeatability. The existing `table_function_plan` call occurs too late for remote decline. No proposed projection record is frozen yet. |
+| Optimizer preparation | Implement optional structured scalar projection negotiation; keep repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | `table_function_projection` accepts or declines a subset before optimizer replacement. Canonical expressions have exact Arrow result fields appended after unchanged source fields. Qualify the bounded native1.5 proof and broader mappings; query-scoped repeatability remains open. Existing `table_function_plan` remains late split enumeration. |
 
 The user withdrew the proposed DEFAULT/USING capability flags: this is an
 unpublished wire change, so it needs no additional opt-in. `SqlExpression.profile`
@@ -329,6 +329,49 @@ focused boundary/corpus reruns cover the final 3-valid/20-invalid schema vectors
 All six SDKs pass that corpus and their targeted regressions. Five generated-value
 queries pass against each SDK on the final native binary, also over TypeScript
 HTTP. This SDK query subset excludes unrelated catalog constraint enumeration.
+
+### Optional scalar projection negotiation — October 23, 2026
+
+The combined successor now has an explicit optional execution contract:
+`BindResponse.projection_expression_profiles`,
+`TableFunctionProjectionRequest`, `TableFunctionProjectionResponse`, and the
+pure `table_function_projection` RPC. This is separate from the existing
+column-selection flag and execution-time split planning.
+
+Each proposal pairs canonical `SqlExpression` IPC records with exact Arrow
+result fields. The response selects an ordered subset with `accepted_indices`
+and supplies complete replacement bind state. Original source fields remain
+unchanged; selected result fields append in proposal order. DuckDB replaces
+only accepted expressions and keeps the local projection, residual expressions
+and their source columns. An empty offer or valid decline uses ordinary local
+evaluation. Malformed acceptance and later execution failures remain errors;
+there is no execute-then-local retry or new preparation-resource lifecycle.
+
+The native1.5 adapter initially qualifies total builtin `INTEGER` to `BIGINT`
+casts over ordinary non-generated catalog table scans whose backing function
+owner resolves. Unsupported contexts, throwing expressions, direct function
+calls, generated/nested/rowid/partitioned/delegated scans remain local.
+Accepted scans disable split enumeration, result caching and filter/order/
+statistics/sampling hints until those expanded-schema paths are qualified.
+Offered binds disable prepared-statement bind reuse before optimization;
+prepared executions bind and negotiate afresh. Copies retain accepted state;
+serialized restoration requires identical original bind identity and complete
+provider state, and rejects changed state explicitly.
+
+Python and all six worker SDKs provide default-decline callbacks, structured
+validation and a portable reference provider. The companion specification is
+`vgi-python/docs/protocol/projection-expressions.md`; the shared public-RPC
+runner is `conformance/projection-expressions/run_worker.py`. Native tests
+add actual optimizer acceptance/decline traces and bind-copy/serialization
+checks. Exact results are recorded in the companion manifest's
+`projection_expressions_2026_10_23` checkpoint and
+`logs/expression-pushdown-20261023-VQa0w4` on EC2.
+
+This completes the bounded projection contract checkpoint, not the full P1
+optimizer scope. Bind-specific repeatability and its mutable-provider proof,
+broader projection qualification, remaining provider/release gates and the
+native2 engine port remain open. The DuckDB pin and published `vgi.v2/2.1.0`
+version are unchanged; these fields join the same unpublished major successor.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference

@@ -72,6 +72,7 @@
 #include "vgi_catalogs.hpp"
 #include "vgi_protocols.hpp"
 #include "vgi_query_function.hpp"
+#include "vgi_projection_pushdown.hpp"
 #include "vgi_attach_tickets.hpp"
 #include "vgi_reflection.hpp"
 #include "vgi_copy_from_impl.hpp"
@@ -3767,6 +3768,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Built-in settings and their validation/defaults/docs share src/vgi_settings.json.
 	vgi::RegisterVgiSettings(config);
 	vgi::RegisterVgiMultiScanRewriter(config);
+	vgi::RegisterVgiProjectionOptimizer(config);
 	OptimizerExtension::Register(config, VgiStreamingWindowOptimizer());
 	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
 	vgi::RegisterVgiLateralBatchRewriter(config);

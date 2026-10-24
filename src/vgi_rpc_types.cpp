@@ -3,6 +3,8 @@
 #include "vgi_constraint_contract.hpp"
 #include "vgi_query_rpc.hpp"
 #include "vgi_macro_contract.hpp"
+#include <regex>
+#include <set>
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_ipc.hpp"
@@ -707,6 +709,24 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 			auto opaque_view = opaque_array->GetView(0);
 			result.opaque_data.assign(opaque_view.data(), opaque_view.data() + opaque_view.size());
 		}
+	}
+
+	auto profiles = batch->GetColumnByName("projection_expression_profiles");
+	auto list = std::dynamic_pointer_cast<arrow::ListArray>(profiles);
+	if (!list || list->IsNull(0) || list->value_type()->id() != arrow::Type::STRING || list->value_length(0) > 64) {
+		throw IOException("Invalid BindResponse projection_expression_profiles");
+	}
+	auto values = std::static_pointer_cast<arrow::StringArray>(list->values());
+	static const std::regex profile_name("[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*\\.v[1-9][0-9]*");
+	std::set<std::string> seen;
+	for (int64_t i = list->value_offset(0); i < list->value_offset(0) + list->value_length(0); ++i) {
+		if (values->IsNull(i))
+			throw IOException("NULL projection expression profile");
+		auto profile = values->GetString(i);
+		if (profile.size() > 256 || !std::regex_match(profile, profile_name) || !seen.insert(profile).second) {
+			throw IOException("Invalid or duplicate projection expression profile");
+		}
+		result.projection_expression_profiles.push_back(std::move(profile));
 	}
 
 	return result;

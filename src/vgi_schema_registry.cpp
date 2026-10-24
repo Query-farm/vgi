@@ -125,6 +125,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		m["table_function_cardinality"] =
 		    ResponseSchema{TableFunctionCardinalityResultSchema(), nullptr, false, nullptr};
 		m["table_function_plan"] = ResponseSchema{TableFunctionPlanResultSchema(), nullptr, false, nullptr};
+		m["table_function_projection"] = ResponseSchema{TableFunctionProjectionResultSchema(), nullptr, false, nullptr};
 		m["table_function_dynamic_to_string"] =
 		    ResponseSchema{TableFunctionDynamicToStringResultSchema(), nullptr, false, nullptr};
 		m["bind"] = ResponseSchema{BindResultSchema(), nullptr, false, nullptr};
@@ -259,6 +260,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"init", &InitParamsSchema},
 		    {"table_function_cardinality", &TableFunctionCardinalityParamsSchema},
 		    {"table_function_plan", &TableFunctionPlanParamsSchema},
+		    {"table_function_projection", &TableFunctionProjectionParamsSchema},
 		    {"table_function_dynamic_to_string", &TableFunctionDynamicToStringParamsSchema},
 		    {"table_function_statistics", &TableFunctionStatisticsParamsSchema},
 		    {"aggregate_bind", &AggregateBindParamsSchema},

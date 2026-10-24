@@ -37,6 +37,8 @@ struct BindResult {
 	// The result cache keys on it, so a changed or dropped secret misses. Empty
 	// when not secret_dependent, or when hashing failed (cache must then refuse).
 	std::string secret_scope;
+	std::vector<std::string> projection_expression_profiles;
+	std::vector<uint8_t> bind_response_bytes;
 };
 
 // Result from init RPC call

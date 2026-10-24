@@ -18,6 +18,7 @@
 #include "vgi_exchange_cache_key.hpp" // SerializeSettingsForKey / SerializeProjectionForKey (shared)
 #include "vgi_sha256.hpp"             // VgiSha256Hex (per-partition discriminator)
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_constraint_contract.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_extension.hpp"
 #include "vgi_logging.hpp"
@@ -214,9 +215,20 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
 	}
 }
 
+bool VgiTableFunctionBindData::SupportStatementCache() const {
+	// The table binder copies this flag before optimizer callbacks run. An
+	// offered scan must rebind even if its particular proposal later declines.
+	return !explicit_query && projection_response_bytes.empty() &&
+	       std::find(bind_result.projection_expression_profiles.begin(),
+	                 bind_result.projection_expression_profiles.end(),
+	                 VGI_CONSTRAINT_SCALAR_READ) == bind_result.projection_expression_profiles.end();
+}
+
 unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	auto result = make_uniq<VgiTableFunctionBindData>();
 	result->explicit_query = explicit_query;
+	result->projection_request_bytes = projection_request_bytes;
+	result->projection_response_bytes = projection_response_bytes;
 	result->query_preparation = query_preparation;
 
 	// Worker identification + invocation inputs (shared_ptr / value copies).
@@ -1690,6 +1702,10 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
                                           TableFunctionInitInput &input,
                                           const std::vector<int32_t> &projection_ids) {
 	CacheEligibility e;
+	if (!bind_data.projection_response_bytes.empty()) {
+		e.ineligible_reason = "expression_projection";
+		return e;
+	}
 	// Global master switch.
 	Value master;
 	if (context.TryGetCurrentSetting("vgi_result_cache", master) && !master.GetValue<bool>()) {

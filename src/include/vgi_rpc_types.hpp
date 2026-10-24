@@ -196,6 +196,7 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 struct BindResponseResult {
 	std::shared_ptr<arrow::Schema> output_schema;
 	std::vector<uint8_t> opaque_data;   // Empty if null
+	std::vector<std::string> projection_expression_profiles;
 };
 
 // Parse BindResponse from a deserialized RecordBatch (1 row).

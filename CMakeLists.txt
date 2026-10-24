@@ -341,6 +341,7 @@ src/vgi_catalog_api.cpp
 src/vgi_query_rpc.cpp
 src/vgi_constraint_contract.cpp
 src/vgi_column_expression.cpp
+src/vgi_projection_pushdown.cpp
 src/vgi_column_metadata.cpp
     src/vgi_macro_contract.cpp
 src/vgi_index_contract.cpp
@@ -657,6 +658,7 @@ if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
     test/cpp/test_constraint_contract.cpp
     test/cpp/test_column_expression.cpp
     test/cpp/test_generated_columns.cpp
+    test/cpp/test_projection_pushdown.cpp
     test/cpp/test_column_metadata.cpp
     test/cpp/test_default_schema.cpp
     test/cpp/test_macro_contract.cpp

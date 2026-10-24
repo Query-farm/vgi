@@ -16,6 +16,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_column_expression.hpp"
+#include "vgi_projection_pushdown.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_multi_scan_rewriter.hpp"
@@ -1017,6 +1018,12 @@ void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional
 	serializer.WriteProperty(102, "table", table.name);
 	serializer.WriteProperty(103, "at_unit", bind_data.at_unit);
 	serializer.WriteProperty(104, "at_value", bind_data.at_value);
+	serializer.WritePropertyWithDefault(
+	    105, "projection_request",
+	    vector<uint8_t>(bind_data.projection_request_bytes.begin(), bind_data.projection_request_bytes.end()));
+	serializer.WritePropertyWithDefault(
+	    106, "projection_response",
+	    vector<uint8_t>(bind_data.projection_response_bytes.begin(), bind_data.projection_response_bytes.end()));
 }
 
 unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &deserializer, TableFunction &function) {
@@ -1025,6 +1032,8 @@ unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &de
 	auto table = deserializer.ReadProperty<string>(102, "table");
 	auto at_unit = deserializer.ReadProperty<string>(103, "at_unit");
 	auto at_value = deserializer.ReadProperty<string>(104, "at_value");
+	auto projection_request = deserializer.ReadPropertyWithDefault<vector<uint8_t>>(105, "projection_request");
+	auto projection_response = deserializer.ReadPropertyWithDefault<vector<uint8_t>>(106, "projection_response");
 	auto &context = deserializer.Get<ClientContext &>();
 
 	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table);
@@ -1038,6 +1047,10 @@ unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &de
 	// callback returns, so the copy ends up identical to a fresh bind.
 	unique_ptr<FunctionData> bind_data;
 	function = vgi_entry.GetScanFunctionImpl(context, bind_data, at_unit, at_value);
+	if (!projection_request.empty() || !projection_response.empty()) {
+		vgi::RestoreProjectionAcceptance(context, bind_data->Cast<vgi::VgiTableFunctionBindData>(), function,
+		                                 projection_request, projection_response);
+	}
 	return bind_data;
 }
 
