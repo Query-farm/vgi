@@ -5,8 +5,8 @@
 on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
 
 **Build/test workflow:** edit the isolated worktrees locally, then synchronize
-source changes to `ec2-user@98.81.121.120` and build/test there (resumed October 23;
-previous addresses `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
+source changes to `ec2-user@3.82.45.233` and build/test there (same instance, resumed October 24;
+previous addresses `98.81.121.120`, `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
 Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
@@ -47,6 +47,75 @@ before release. Schema/table options, nested field alteration, complete view
 metadata, constraints, indexes, macros, triggers, and query execution belong in
 the same contract review. A feature's later engine implementation date is not
 by itself a reason to postpone its wire design to another version.
+
+### Automatic whole-query pushdown plan — October 24, 2026
+
+**Still open.** Ordinary SQL over attached VGI tables does not yet move its joins
+and aggregates to the provider. Explicit `vgi_query(...)`, bounded scalar
+projection and per-bind repeatability are working preparation, not completion
+of that optimizer feature. The source review found no demonstrated missing
+wire field: retain the existing preparation/release, typed parameter/context,
+object/output manifest and TABLE execution contracts.
+
+The detailed A0–A5 plan and acceptance boundaries are in the companion
+[query design](../../vgi-python-duckdb2/docs/protocol/vgi-catalog-query-pushdown-design.md#implementation-checkpoint--october-24-2026)
+and `areas.query` / `automatic_query_pushdown_plan_2026_10_24` in the companion
+manifest. This planning checkpoint reviewed native `38fe3c775bd3`, Python
+`0566afd7f12a`, the retained 1.5 engine `105edd31b57f`, and exact 2.0 source
+`e1784fa42310`. Haybarn HEAD was `5ab8a76db12a`; select and reconcile the actual
+implementation pin in A0. No 2.0 build or runtime qualification is claimed here.
+
+| Checkpoint | Reviewable result | Rough effort |
+| --- | --- | --- |
+| A0: isolated 2.0 build | Exact engine/toolchain pins and a complete compile/link diagnostic inventory; retain the working 1.5 lane. | 1–3 engineer-days |
+| A1: basic 2.0 reads | ATTACH, table lookup, ordinary scans and explicit query execution. Port identifier/name APIs, optional default schema, column ownership, bound functions, plan bindings and Arrow cardinality. | 4–10 days |
+| A2: real provider | A bounded SQL provider whose ordinary scans and queries share the existing backend transaction/snapshot; incremental result bounds and active-query cancellation. Can begin on 1.5 alongside A0/A1. | 4–8 days |
+| A3: eligible plan export | Whole read-only SELECT roots from one attachment; bound SQL export before existing scalar projection/multi-scan transforms; exact output mapping and safe local decline. | 3–6 days |
+| A4: automatic replacement | Native automatic capability/request/context handling, complete object/output manifest, verified replacement using the existing executor. A normal JOIN + GROUP BY runs remotely once. | 4–8 days |
+| A5: bounded pilot | Differential semantics, mutable snapshot, plan-copy/prepared freshness, cancellation/cleanup and subprocess/HTTP evidence; EXPLAIN and measured result traffic. | 5–10 days |
+
+Dependencies are A0 → A1 → A3, then A2 + A3 → A4 → A5. A2 can progress in
+parallel with the native port. Review and land each checkpoint independently.
+The largest unknown is the absent 2.0 compile-error inventory: narrow the
+estimate after A0/A1 before committing to a schedule.
+
+Planning range: **2–5 engineer-weeks for a first end-to-end demonstration;
+5–10 engineer-weeks for a bounded qualified pilot**, including contingency.
+The table totals 21–45 engineer-days before contingency, assuming one experienced
+engineer, one DuckDB-backed provider and Linux ARM64. These are source-review
+judgments, not measured remaining work or elapsed-time promises. The first
+demonstration is an intermediate A2–A4 result, not an additional work package.
+
+The first demonstration is ordinary SQL joining two logical VGI tables, filtering
+and grouping with COUNT, with explicit ordering. Evidence must show one remote
+execution, no ordinary scan execution, identical results/types to local execution
+under the same data snapshot, and final grouped rows on the result stream. A
+valid decline retains the original local join/aggregate; absent support makes no
+preparation request. Preparation and EXPLAIN must not execute the query.
+
+Use the existing early bound-plan hook and `LogicalPlanSQLExporter::Export`.
+Keep the parsed consuming `RemoteExecute` route disabled; a new engine decline
+hook is only a conditional alternative if a concrete bound-export limitation
+requires it. Preserve the original plan until a fully verified replacement
+exists. Unsupported shapes may stay local; malformed/unauthorized responses and
+execution failures remain errors, with no local replay.
+
+Two limits need explicit implementation proof. First, the finite reference's
+transaction token does not demonstrate shared mutable data visibility: it uses
+fresh DuckDB connections and immutable data. Reuse the existing transaction
+owner and prove a real snapshot; add no savepoints or recovery framework.
+Second, the audited exporter rejects `BOUND_PARAMETER`. The first automatic
+milestone leaves parameterized queries local; later typed-placeholder/exporter
+integration can reuse the existing parameter wire format. The explicit API's
+typed parameter support remains available.
+
+Full nested schemas, DDL/writes, COPY, advanced operators, automatic parameters,
+all-platform distribution and full M0–M4 parity are outside this pilot estimate.
+The monolithic extension source list still requires mechanical compatibility
+edits or explicit module exclusions for an isolated read target. Excluding a
+module must not advertise its capability. Keep automatic support opt-in and
+claim only the qualified provider/operator matrix. Existing P1–P3, wrapped-IPC
+and wider provider qualification gates remain open.
 
 ### Combined protocol review — October 23, 2026
 
@@ -2044,9 +2113,11 @@ DuckDB catalog feature.
 
 ## Implementation milestones
 
-M0–M4 describe the later native engine port and its qualification. They remain
-in the plan but are not the active implementation order during 1.5.x protocol
-preparation. P0/P1 and engine-independent P2 work proceed first.
+M0–M4 describe the full native engine port and its qualification. The October 24
+automatic-query A0–A5 plan selects the minimum read path from M0–M2 for a bounded
+pilot; it does not require all catalog/write/platform parity first or complete
+those milestones by itself. The working 1.5 lane remains unchanged. Remaining
+P1–P3 contract/provider gates continue alongside that later adapter work.
 
 ### M0 Establish the engine and build lane
 
