@@ -542,6 +542,9 @@ test_column_paths:
 test_dependencies:
 	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" python3 test/run_dependencies.py
 
+test_default_schema:
+	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" python3 test/run_default_schema.py
+
 # Semantic column/object dependency closures against the durable metadata reference.
 test_semantic_alter:
 	python3 test/run_semantic_alter.py --python "$(VGI_PYTHON_DIR)"
@@ -638,6 +641,7 @@ test_python:
 	        "~test/sql/duckdb2/required_filter_paths.test" \
 	        "~test/sql/duckdb2/view_alias_metadata.test" \
 	        "~test/sql/duckdb2/schema_dependencies.test" \
+	        "~test/sql/duckdb2/default_schema.test" \
 	        "~test/sql/integration/writable/*" \
 	        "~test/sql/vgi_worker_pool.test"
 	@$(MAKE) test_python_crash
@@ -748,10 +752,10 @@ test_rust:
 	VGI_BAD_ENUM_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-bad-enum" \
 	    python3 scripts/run_tests.py -j 6 $(VGI_COVERAGE_GATE) "test/sql/integration/*"
 
-# Run the column reference, then the integration suite against every language implementation. Keeps going
-# on failure so one language's result doesn't mask the others, then exits
-# non-zero if any failed.
-test_languages: test_column_paths test_dependencies
+# Run dedicated native references, then the six SDK targets wired below.
+# The C++ SDK integration lane currently runs separately from this aggregate.
+# Keep going on failure so one language's result does not mask the others.
+test_languages: test_column_paths test_dependencies test_default_schema
 	@rc=0; \
 	for t in test_python test_go test_rust test_typescript test_java test_csharp; do \
 		echo "==================== $$t ===================="; \

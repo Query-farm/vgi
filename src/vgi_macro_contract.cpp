@@ -10,7 +10,148 @@
 #include "duckdb/function/table/arrow.hpp"
 #include <arrow/util/byte_size.h>
 
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/tableref/list.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/common/string_util.hpp"
+
 namespace duckdb {
+static void QualifyWorkerFunctions(QueryNode &node, const case_insensitive_set_t &worker_functions,
+                                   const string &catalog_name, const string &schema_name, const case_insensitive_set_t &ctes);
+
+static void QualifyWorkerFunctions(ParsedExpression &expression, const case_insensitive_set_t &worker_functions,
+                                   const string &catalog_name, const string &schema_name, const case_insensitive_set_t &ctes) {
+	if (expression.HasParameter())
+		throw InvalidInputException("VGI macro bodies cannot contain query parameters");
+	if (expression.GetExpressionClass() == ExpressionClass::WINDOW) {
+		throw NotImplementedException("VGI native macro window expressions require a qualified adapter");
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expression.Cast<FunctionExpression>();
+		if (!function.catalog.empty())
+			throw InvalidInputException("VGI macro body cannot name a client catalog");
+		if (!function.schema.empty()) {
+			function.catalog = catalog_name;
+		} else if (worker_functions.find(function.function_name) != worker_functions.end()) {
+			function.catalog = catalog_name;
+			function.schema = schema_name;
+		} else {
+			// Built-ins must not be rebound to a caller's temporary macro.
+			function.catalog = SYSTEM_CATALOG;
+			function.schema = DEFAULT_SCHEMA;
+		}
+	} else if (expression.GetExpressionClass() == ExpressionClass::CAST) {
+		auto &cast = expression.Cast<CastExpression>();
+		if (cast.cast_type.id() == LogicalTypeId::UNBOUND) {
+			auto &type = UnboundType::GetTypeExpression(cast.cast_type);
+			if (type->GetExpressionClass() != ExpressionClass::TYPE ||
+			    !type->Cast<TypeExpression>().GetCatalog().empty() ||
+			    !type->Cast<TypeExpression>().GetSchema().empty()) {
+				throw NotImplementedException("VGI macro cast requires an unqualified built-in type");
+			}
+			cast.cast_type = UnboundType::TryDefaultBind(cast.cast_type);
+			if (cast.cast_type.IsUnbound())
+				throw NotImplementedException("VGI macro cast requires a built-in type");
+		}
+	} else if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expression.Cast<SubqueryExpression>();
+		QualifyWorkerFunctions(*subquery.subquery->node, worker_functions, catalog_name, schema_name, ctes);
+	}
+
+	ParsedExpressionIterator::EnumerateChildren(expression, [&](ParsedExpression &child) {
+		QualifyWorkerFunctions(child, worker_functions, catalog_name, schema_name, ctes);
+	});
+}
+
+static void QualifyWorkerTable(TableRef &ref, const case_insensitive_set_t &worker_functions,
+                               const string &catalog_name, const string &schema_name,
+                               const case_insensitive_set_t &ctes) {
+	auto expression = [&](unique_ptr<ParsedExpression> &expr) {
+		if (expr) QualifyWorkerFunctions(*expr, worker_functions, catalog_name, schema_name, ctes);
+	};
+	switch (ref.type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &table = ref.Cast<BaseTableRef>();
+		if (table.at_clause) expression(table.at_clause->ExpressionMutable());
+		if (!table.catalog_name.empty())
+			throw InvalidInputException("VGI macro body cannot name a client catalog");
+		if (table.schema_name.empty() && ctes.count(table.table_name)) return;
+		table.catalog_name = catalog_name;
+		if (table.schema_name.empty()) table.schema_name = schema_name;
+		break;
+	}
+	case TableReferenceType::SUBQUERY:
+		QualifyWorkerFunctions(*ref.Cast<SubqueryRef>().subquery->node, worker_functions,
+		                       catalog_name, schema_name, ctes);
+		break;
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		QualifyWorkerTable(*join.left, worker_functions, catalog_name, schema_name, ctes);
+		QualifyWorkerTable(*join.right, worker_functions, catalog_name, schema_name, ctes);
+		expression(join.condition);
+		break;
+	}
+	case TableReferenceType::TABLE_FUNCTION:
+		expression(ref.Cast<TableFunctionRef>().function);
+		break;
+	case TableReferenceType::EXPRESSION_LIST:
+		for (auto &row : ref.Cast<ExpressionListRef>().values)
+			for (auto &value : row) expression(value);
+		break;
+	case TableReferenceType::EMPTY_FROM:
+		break;
+	default:
+		throw NotImplementedException("VGI native macro table reference requires a qualified adapter");
+	}
+}
+
+static void QualifyWorkerFunctions(QueryNode &node, const case_insensitive_set_t &worker_functions,
+                                   const string &catalog_name, const string &schema_name,
+                                   const case_insensitive_set_t &outer_ctes) {
+	if (node.type != QueryNodeType::SELECT_NODE && node.type != QueryNodeType::SET_OPERATION_NODE)
+		throw NotImplementedException("VGI native macro query qualification requires SELECT or set operations");
+	// CTE relation names occupy a separate namespace from callable functions.
+	// Definitions see prior CTEs and outer scopes; the body sees all local CTEs.
+	auto ctes = outer_ctes;
+	for (auto &entry : node.cte_map.map) {
+		QualifyWorkerFunctions(*entry.second->query->node, worker_functions, catalog_name, schema_name, ctes);
+		ctes.insert(entry.first);
+	}
+	auto expression = [&](unique_ptr<ParsedExpression> &expr) {
+		if (expr) QualifyWorkerFunctions(*expr, worker_functions, catalog_name, schema_name, ctes);
+	};
+	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+		for (auto &child : node.Cast<SetOperationNode>().children)
+			QualifyWorkerFunctions(*child, worker_functions, catalog_name, schema_name, ctes);
+	} else {
+		auto &select = node.Cast<SelectNode>();
+		for (auto &expr : select.select_list) expression(expr);
+		for (auto &expr : select.groups.group_expressions) expression(expr);
+		expression(select.where_clause);
+		expression(select.having);
+		expression(select.qualify);
+		QualifyWorkerTable(*select.from_table, worker_functions, catalog_name, schema_name, ctes);
+	}
+	ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, expression);
+}
+
+void vgi::QualifyNativeMacroQuery(QueryNode &node, const case_insensitive_set_t &worker_functions,
+                                 const string &catalog_name, const string &schema_name) {
+	QualifyWorkerFunctions(node, worker_functions, catalog_name, schema_name, {});
+}
+
+void vgi::QualifyNativeMacroExpression(ParsedExpression &expression,
+                                      const case_insensitive_set_t &worker_functions,
+                                      const string &catalog_name, const string &schema_name) {
+	QualifyWorkerFunctions(expression, worker_functions, catalog_name, schema_name, {});
+}
+
 namespace vgi {
 namespace {
 void Require(bool condition, const char *message) {

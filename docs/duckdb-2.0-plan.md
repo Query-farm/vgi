@@ -20,6 +20,52 @@ October 23 combined review and remote checks cover every scope and field mapping
 P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
 not a frozen protocol or a native DuckDB 2.0 port.
 
+**Full language SQL integration checkpoint (October 24):** the configured
+sqllogictest lanes now pass against the same final native 1.5 binary across all
+seven SDKs, including both TypeScript Arrow backends. This supersedes the earlier
+coverage claim: the prior 347-pass integration run used the Python worker;
+SDK unit tests and selected native probes were not a full language matrix.
+
+| Worker | Passing SQL files | Expected skips |
+| --- | ---: | ---: |
+| Python | 356 | 33 |
+| Go | 358 | 32 |
+| Rust | 342 | 37 |
+| TypeScript, each Arrow backend | 342 | 46 |
+| Java | 336 | 37 |
+| C# | 342 | 37 |
+| C++ | 341 | 38 |
+
+The original minimum-executed and skip-allowlist gates pass. Python, TypeScript,
+Java and C# additionally pass their separate two-file subprocess crash lanes;
+Go, Rust and C++ exercise those cases in their primary subprocess lanes. Optional
+services/extensions, absent provider fixtures and other transports remain explicit
+skips. Existing file exclusions remain documented in each lane; the five dedicated
+native reference SQL files run separately. `make test_languages` currently wires
+six SDK targets; C++ was qualified separately over the whole integration tree.
+This is not full HTTP, external-service, platform or DuckDB 2 runtime qualification.
+
+The matrix exposed and fixed incomplete Go inline bind records, ordinary Go
+fixture nullability defaults, unqualified immutable constraint declarations,
+missing read-capability selection and historical constraint snapshots. Fixture
+facts now come from actual immutable scan rows; no generic enforcement capability
+is inferred. Native macro import now handles scoped nonrecursive CTEs and set
+operations, including AT-expression qualification. Unrelated table reads under
+NOCASE avoid eagerly evaluating neighboring generated/default columns; actual
+expression-bearing table and macro invocation guards remain. The runner selects
+one exact registration per SQL file, and malformed-metadata fixtures corrupt the
+current batched wire paths rather than bypassed object serializers.
+
+The rebuilt loadable extension and CLI pass load/query checks. Native contract
+checks pass 12 cases/165 assertions; the column/reference SQL passes 3 files/252
+assertions, with dependency and nullable-default checks also passing. Full changed
+SDK unit suites pass. Exact sources, commands, skip reasons, timings and binary
+hashes are recorded under `logs/full-language-slt-20261024-75jtiyf_` on the owned
+EC2 workspace and in the companion protocol manifest checkpoint. The default
+engine pin is unchanged. These are integration results, not a main-merge or release
+approval: the breaking successor still needs its final version/routing identity
+and P1–P3 release qualification; M0–M4 and automatic whole-query pushdown remain open.
+
 **Nested NOT NULL follow-up (October 24):** the 1.5 adapter now imports enforced,
 ALL_ROWS nested STRUCT facts using exact raw paths and recursive Arrow
 nullability checks. It retains canonical facts without marking nullable parents

@@ -1,0 +1,38 @@
+"""Select one registered SQL test per file, including packaged native runners."""
+
+import importlib.util
+from pathlib import Path
+import unittest
+
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts/run_tests.py"
+SPEC = importlib.util.spec_from_file_location("run_tests", SCRIPT)
+runner = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(runner)
+
+
+class TestRegistrationSelection(unittest.TestCase):
+    def setUp(self):
+        self.path = Path("test/sql/integration/stateful.test")
+
+    def test_duplicate_relative_and_absolute_executes_relative_once(self):
+        selected = runner._select_test_names(
+            [self.path], [str(self.path), "/build/vgi/" + str(self.path)]
+        )
+        self.assertEqual(selected, {self.path: str(self.path)})
+
+    def test_packaged_runner_absolute_registration(self):
+        absolute = "/original/build/vgi/" + str(self.path)
+        self.assertEqual(runner._select_test_names([self.path], [absolute]), {self.path: absolute})
+
+    def test_missing_registration_fails_instead_of_passing_zero_assertions(self):
+        with self.assertRaisesRegex(ValueError, "found 0"):
+            runner._select_test_names([self.path], ["test/sql/unrelated.test"])
+
+    def test_ambiguous_absolute_registration_fails(self):
+        with self.assertRaisesRegex(ValueError, "found 2"):
+            runner._select_test_names([self.path], ["/a/" + str(self.path), "/b/" + str(self.path)])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -6,6 +6,10 @@ require-env VGI_VIEW_ALIAS_WORKER
 
 require vgi
 
+# Explicitly enable bulk discovery; each fixture selects its intended path.
+statement ok
+SET vgi_catalog_contents=true;
+
 statement ok
 ATTACH 'views' AS v (TYPE vgi, LOCATION '${VGI_VIEW_ALIAS_WORKER}');
 
@@ -100,14 +104,16 @@ security
 statement ok
 DETACH bad;
 
+# Malformed bulk framing is checked through the direct diagnostic: ordinary
+# discovery may fall back to per-schema RPCs after a rejected optional snapshot.
 # Security mode missing through bulk metadata.
 statement ok
 ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=missing VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
 
 statement error
-SELECT * FROM bad.main.v;
+SELECT * FROM vgi_catalog_contents('bad');
 ----
-security
+catalog_contents: 'views' stream has an incompatible metadata schema
 
 statement ok
 DETACH bad;
@@ -141,7 +147,7 @@ statement ok
 ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=null VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
 
 statement error
-SELECT * FROM bad.main.v;
+SELECT * FROM vgi_catalog_contents('bad');
 ----
 security
 
@@ -177,9 +183,9 @@ statement ok
 ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=wrong_type VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
 
 statement error
-SELECT * FROM bad.main.v;
+SELECT * FROM vgi_catalog_contents('bad');
 ----
-security
+catalog_contents: 'views' stream has an incompatible metadata schema
 
 statement ok
 DETACH bad;
@@ -213,7 +219,7 @@ statement ok
 ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=barrier VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
 
 statement error
-SELECT * FROM bad.main.v;
+SELECT * FROM duckdb_views() WHERE database_name = 'bad';
 ----
 security
 
@@ -249,7 +255,7 @@ statement ok
 ATTACH 'views' AS bad (TYPE vgi, LOCATION 'env VGI_VIEW_SECURITY_MODE=unknown VGI_VIEW_METADATA_PATH=bulk ${VGI_VIEW_ALIAS_WORKER}');
 
 statement error
-SELECT * FROM bad.main.v;
+SELECT * FROM duckdb_views() WHERE database_name = 'bad';
 ----
 security
 

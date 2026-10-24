@@ -11,6 +11,25 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
+# Metadata import must not reject unrelated lookups in a nondefault context.
+# Invoking a provider macro still requires its declared evaluation context.
+statement ok
+PRAGMA default_collation='NOCASE';
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'macro';
+----
+2
+
+statement error
+SELECT example.main.vgi_multiply(2, 3);
+----
+native adapter supports only the default explicit evaluation context
+
+statement ok
+PRAGMA default_collation='binary';
+
 # ============================================================================
 # Macro inventory: macros should appear in duckdb_functions()
 # ============================================================================

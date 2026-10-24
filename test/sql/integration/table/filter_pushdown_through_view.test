@@ -243,6 +243,11 @@ SELECT count(*) FROM v_echo WHERE s ILIKE '%ROW%';
 statement ok
 PRAGMA default_collation='NOCASE';
 
+# Force metadata lookup in the new context. Loading a plain table must not
+# evaluate unrelated generated/default columns from the same schema.
+statement ok
+CALL vgi_clear_cache();
+
 query T
 SELECT DISTINCT pushed_filters FROM v_echo WHERE s = 'ROW_5';
 ----
@@ -252,6 +257,12 @@ query I
 SELECT count(*) FROM v_echo WHERE s = 'ROW_5';
 ----
 1
+
+# Context-sensitive generated columns still reject an unsupported context.
+statement error
+SELECT * FROM example.data.generated_sequence;
+----
+native adapter supports only the default explicit evaluation context
 
 # ============================================================================
 # Cleanup

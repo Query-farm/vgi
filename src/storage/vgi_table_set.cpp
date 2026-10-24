@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_constraint_contract.hpp"
+#include "vgi_column_expression.hpp"
 #include "storage/vgi_table_set.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -98,6 +99,18 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 		         {"outcome", fast_outcome},
 		         {"triggered_load", "false"}});
 		return cached_result;
+	}
+
+	if (eager_path) {
+		try {
+			vgi::NativeColumnEvaluationContext(context);
+		} catch (const InvalidInputException &) {
+			// Importing neighboring defaults/generated expressions can bind or
+			// evaluate them. In an unsupported context, fetch just the requested
+			// table so a plain scan does not depend on those unrelated columns.
+			// A requested expression-bearing table retains its normal guards.
+			eager_path = false;
+		}
 	}
 
 	if (eager_path) {

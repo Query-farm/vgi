@@ -171,7 +171,9 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # SDK fixture workers may additionally ship implementation-specific backing
 # scans that are not part of the portable fixture surface. C# uses
 # generated_sequence_scan because its generated-columns table needs a distinct
-# three-column projected scanner. The exchange-cache probes are also excluded
+# three-column projected scanner. Other SDKs use projection_sequence for
+# their projection contract fixture. C# uses geo_points for its fixed
+# geometry table. The exchange-cache probes are also excluded
 # from the portable inventory count, then validated as an exact optional set so
 # a partial registration still fails.
 query I
@@ -188,7 +190,9 @@ WHERE database_name = 'example' AND function_type = 'table'
     'cached_reval_sum_all',
     'cached_serial_echo',
     'cached_slow_sum_all',
-    'generated_sequence_scan'
+    'generated_sequence_scan',
+    'projection_sequence',
+    'geo_points'
   );
 ----
 173

@@ -7,6 +7,11 @@
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_rpc_types.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "../../src/generated/vgi_protocol_schemas.hpp"
 #include <cstdlib>
 
@@ -51,6 +56,58 @@ unique_ptr<MaterializedQueryResult> Query(Connection &con, const std::string &sq
 	return result;
 }
 } // namespace
+
+TEST_CASE("Macro query qualification preserves CTE scopes and callable ownership", "[macro-contract]") {
+	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	Connection con(db);
+	Query(con, "ATTACH ':memory:' AS owner");
+	Query(con, "CREATE SCHEMA owner.s");
+	Query(con, "CREATE TABLE owner.s.base AS SELECT 7 AS value");
+	Query(con, "CREATE TEMP TABLE base AS SELECT 99 AS value");
+	Query(con, "CREATE MACRO owner.s.sequence(n) AS TABLE SELECT * FROM range(n)");
+	Query(con, "CREATE MACRO sequence(n) AS TABLE SELECT 100 AS range");
+	Query(con, "CREATE MACRO abs(n) AS 100");
+	auto qualified = [&](const string &sql) {
+		Parser parser;
+		parser.ParseQuery(sql);
+		auto &select = parser.statements[0]->Cast<SelectStatement>();
+		vgi::QualifyNativeMacroQuery(*select.node, {"sequence"}, "owner", "s");
+		return Query(con, select.ToString());
+	};
+	auto result = qualified("WITH sequence AS (SELECT * FROM range(3)) "
+	                        "SELECT * FROM sequence UNION ALL SELECT * FROM sequence(0)");
+	CHECK(result->RowCount() == 3);
+	CHECK(result->GetValue(0, 2).GetValue<int64_t>() == 2);
+	result = qualified("WITH base AS (SELECT * FROM base) SELECT * FROM base");
+	CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 7);
+	result = qualified("WITH q AS (SELECT 7 AS value) "
+	                   "SELECT (SELECT value FROM (WITH q AS (SELECT 9 AS value) SELECT * FROM q)), "
+	                   "(SELECT value FROM q), abs(-2)");
+	CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 9);
+	CHECK(result->GetValue(1, 0).GetValue<int32_t>() == 7);
+	CHECK(result->GetValue(2, 0).GetValue<int32_t>() == 2);
+	{
+		Parser parser;
+		parser.ParseQuery("SELECT * FROM base AT (VERSION => sequence(1))");
+		auto &select = parser.statements[0]->Cast<SelectStatement>();
+		vgi::QualifyNativeMacroQuery(*select.node, {"sequence"}, "owner", "s");
+		auto &table = select.node->Cast<SelectNode>().from_table->Cast<BaseTableRef>();
+		auto &call = table.at_clause->ExpressionMutable()->Cast<FunctionExpression>();
+		CHECK(call.catalog == "owner");
+		CHECK(call.schema == "s");
+		CHECK(call.function_name == "sequence");
+	}
+	for (const auto &sql : {"SELECT * FROM main.main.base", "SELECT main.main.abs(-1)",
+	                       "SELECT * FROM base AT (VERSION => main.main.abs(1))",
+	                       "SELECT * FROM base AT (VERSION => $1)",
+	                       "WITH RECURSIVE q AS (SELECT 1 UNION ALL SELECT * FROM q) SELECT * FROM q"}) {
+		Parser parser;
+		parser.ParseQuery(sql);
+		auto &select = parser.statements[0]->Cast<SelectStatement>();
+		CHECK_THROWS(vgi::QualifyNativeMacroQuery(*select.node, {}, "owner", "s"));
+	}
+}
 
 TEST_CASE("Canonical macro records reject malformed owners profiles and literal metadata", "[macro-contract]") {
 	auto valid = Family(Overload(Parameter()));

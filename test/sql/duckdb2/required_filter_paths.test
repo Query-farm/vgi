@@ -190,7 +190,7 @@ ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=null ${V
 statement error
 SELECT count(*) FROM bad.main.literal;
 ----
-Invalid required_filters
+Column 'required_filters' has unexpected null value
 
 statement ok
 DETACH bad;
@@ -201,7 +201,7 @@ ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=null_gro
 statement error
 SELECT count(*) FROM bad.main.literal;
 ----
-Invalid required_filters
+Column 'required_filters[]' has unexpected null value
 
 statement ok
 DETACH bad;
@@ -223,7 +223,7 @@ ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=null_pat
 statement error
 SELECT count(*) FROM bad.main.literal;
 ----
-Invalid required_filters
+Column 'required_filters[][]' has unexpected null value
 
 statement ok
 DETACH bad;
@@ -245,7 +245,7 @@ ATTACH 'paths' AS bad (TYPE vgi, LOCATION 'env VGI_REQUIRED_FILTER_MODE=null_com
 statement error
 SELECT count(*) FROM bad.main.literal;
 ----
-Invalid required_filters
+Column 'required_filters[][][]' has unexpected null value
 
 statement ok
 DETACH bad;

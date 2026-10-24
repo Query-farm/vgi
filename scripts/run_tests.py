@@ -195,6 +195,7 @@ def run_one(
     server_cmd: str | None = None,
     log_dir: Path | None = None,
     isolate_launcher: bool = False,
+    test_name: str | None = None,
 ) -> dict:
     """Invoke ``unittest [extra_args] <test_path>`` and capture everything.
 
@@ -240,7 +241,7 @@ def run_one(
         server_startup = time.monotonic() - s0
         env = {**env, "VGI_TEST_WORKER": f"http://localhost:{port}"}
     try:
-        result = _run_unittest(test_path, unittest, env, extra_args, timeout, isolate_launcher)
+        result = _run_unittest(test_path, unittest, env, extra_args, timeout, isolate_launcher, test_name)
     finally:
         if server is not None:
             _stop_server(server)
@@ -257,6 +258,7 @@ def _run_unittest(
     extra_args: list[str],
     timeout: float | None,
     isolate_launcher: bool = False,
+    test_name: str | None = None,
 ) -> dict:
     t0 = time.monotonic()
     if isolate_launcher:
@@ -266,9 +268,9 @@ def _run_unittest(
         env = {**env, "VGI_RPC_TEST_POOL": f"{os.getpid()}:{test_path}"}
     try:
         proc = subprocess.Popen(
-            # CMake can register extension tests with absolute names. Match the
-            # same file whether the runner registered a relative or full path.
-            [str(unittest), *extra_args, "*" + str(test_path)],
+            # A file can be registered under both relative and absolute names.
+            # Select one exact registration so stateful tests execute once.
+            [str(unittest), *extra_args, test_name or str(test_path)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -476,6 +478,32 @@ def _write_timings_csv(results: list[dict], path: Path) -> None:
 # --- CLI ---
 
 
+def _select_test_names(tests: list[Path], registered: Iterable[str]) -> dict[Path, str]:
+    names = set(registered)
+    selected = {}
+    for test in tests:
+        relative = test.as_posix()
+        if relative in names:
+            selected[test] = relative
+            continue
+        matches = sorted(name for name in names if name.endswith("/" + relative))
+        if len(matches) != 1:
+            raise ValueError(f"{test}: expected one registration, found {len(matches)}")
+        selected[test] = matches[0]
+    return selected
+
+
+def _registered_test_names(unittest: Path, tests: list[Path]) -> dict[Path, str]:
+    listing = subprocess.run(
+        [str(unittest), "--list-test-names-only", "*test/*"],
+        capture_output=True, text=True, timeout=30,
+    )
+    # Catch returns the number of listed tests (modulo 256), not zero on success.
+    if listing.returncode < 0:
+        raise ValueError(f"test registration listing failed: {listing.stderr}")
+    return _select_test_names(tests, listing.stdout.splitlines())
+
+
 def _find_unittest(root: Path, build: str) -> Path:
     p = root / "build" / build / "test" / "unittest"
     if not p.exists():
@@ -614,6 +642,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not tests:
         print(YELLOW("no tests matched the given patterns"), file=sys.stderr)
         return 1
+    try:
+        test_names = _registered_test_names(unittest, tests)
+    except (ValueError, subprocess.TimeoutExpired) as exc:
+        print(RED(str(exc)), file=sys.stderr)
+        return 1
 
     env = os.environ.copy()
 
@@ -659,7 +692,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         timeout = args.timeout if args.timeout > 0 else None
         futures = {
             pool.submit(
-                run_one, t, unittest, env, extra_args, timeout, args.server_per_test, log_dir, args.isolate_launcher
+                run_one, t, unittest, env, extra_args, timeout, args.server_per_test, log_dir,
+                args.isolate_launcher, test_names[t]
             ): t
             for t in tests
         }
