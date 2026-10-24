@@ -111,6 +111,7 @@ void Apply(ClientContext &context, VgiTableFunctionBindData &data, TableFunction
 	data.bind_result.output_schema = accepted.output_schema;
 	data.bind_result.output_schema_bytes = SerializeSchemaToIpcBytes(accepted.output_schema);
 	data.bind_result.opaque_data = std::move(parsed.opaque_data);
+	data.bind_result.repeatability = parsed.repeatability;
 	data.bind_result.bind_response_bytes = SerializeToIpcBytes(accepted.bind_result);
 	std::swap(data.c_schema.arrow_schema, c_schema.arrow_schema);
 	data.arrow_table = std::move(arrow_table);
@@ -297,6 +298,8 @@ ProjectionAcceptance ValidateProjectionAcceptance(const std::vector<uint8_t> &re
 	Require(accepted.bind_result->GetColumnByName("projection_expression_profiles")
 	            ->Equals(original->GetColumnByName("projection_expression_profiles")),
 	        "acceptance changed projection profiles");
+	Require(ParseBindResponse(accepted.bind_result).repeatability == ParseBindResponse(original).repeatability,
+	        "acceptance changed repeatability");
 	auto fields = source->fields();
 	for (auto index : accepted.indices)
 		fields.push_back(results->field(index));

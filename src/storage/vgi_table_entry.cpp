@@ -999,18 +999,15 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 
 void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                           const TableFunction &function) {
-	// The scan function carries no callable arguments; everything needed to
-	// rebuild it lives in the bind data. Persist only the table identity (and
-	// AT clause), mirroring DuckDB's own TableScanSerialize — the heavy bind
-	// state (Arrow schema, worker connection params, pushdown capabilities) is
-	// re-derived from the catalog entry on deserialize.
+	// Rebuild the scan from its catalog identity and AT clause. Accepted
+	// projections and query-scoped snapshots additionally retain their exact
+	// bind identity, so a copy cannot silently switch provider state.
 	auto &bind_data = bind_data_p->Cast<vgi::VgiTableFunctionBindData>();
 	if (!bind_data.table_entry) {
 		// Only the catalog-scan path installs these callbacks, and it always
 		// sets table_entry. A null here means foreign bind data reached this
 		// callback — a wiring bug, not a user error.
-		throw SerializationException(
-		    "vgi_table_scan cannot be serialized without an originating table entry");
+		throw SerializationException("vgi_table_scan cannot be serialized without an originating table entry");
 	}
 	auto &table = *bind_data.table_entry;
 	serializer.WriteProperty(100, "catalog", table.ParentCatalog().GetName());
@@ -1024,6 +1021,19 @@ void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional
 	serializer.WritePropertyWithDefault(
 	    106, "projection_response",
 	    vector<uint8_t>(bind_data.projection_response_bytes.begin(), bind_data.projection_response_bytes.end()));
+	const auto stable = bind_data.bind_result.repeatability == vgi::BindRepeatability::STABLE_WITHIN_QUERY;
+	if (stable &&
+	    (bind_data.bind_result.bind_request_bytes.empty() || bind_data.bind_result.bind_response_bytes.empty())) {
+		throw SerializationException("Repeatable VGI scan is missing its original bind state");
+	}
+	serializer.WritePropertyWithDefault(107, "repeatable_bind_request",
+	                                    stable ? vector<uint8_t>(bind_data.bind_result.bind_request_bytes.begin(),
+	                                                             bind_data.bind_result.bind_request_bytes.end())
+	                                           : vector<uint8_t>());
+	serializer.WritePropertyWithDefault(108, "repeatable_bind_result",
+	                                    stable ? vector<uint8_t>(bind_data.bind_result.bind_response_bytes.begin(),
+	                                                             bind_data.bind_result.bind_response_bytes.end())
+	                                           : vector<uint8_t>());
 }
 
 unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &deserializer, TableFunction &function) {
@@ -1034,6 +1044,8 @@ unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &de
 	auto at_value = deserializer.ReadProperty<string>(104, "at_value");
 	auto projection_request = deserializer.ReadPropertyWithDefault<vector<uint8_t>>(105, "projection_request");
 	auto projection_response = deserializer.ReadPropertyWithDefault<vector<uint8_t>>(106, "projection_response");
+	auto repeatable_request = deserializer.ReadPropertyWithDefault<vector<uint8_t>>(107, "repeatable_bind_request");
+	auto repeatable_result = deserializer.ReadPropertyWithDefault<vector<uint8_t>>(108, "repeatable_bind_result");
 	auto &context = deserializer.Get<ClientContext &>();
 
 	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table);
@@ -1050,6 +1062,19 @@ unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &de
 	if (!projection_request.empty() || !projection_response.empty()) {
 		vgi::RestoreProjectionAcceptance(context, bind_data->Cast<vgi::VgiTableFunctionBindData>(), function,
 		                                 projection_request, projection_response);
+	}
+	if (!repeatable_request.empty() || !repeatable_result.empty()) {
+		auto &restored = bind_data->Cast<vgi::VgiTableFunctionBindData>().bind_result;
+		// This engine's table-plan copy rebinds. Do not silently replace the
+		// original snapshot, including when a projection has replaced its state.
+		if (repeatable_request.empty() || repeatable_result.empty() ||
+		    restored.repeatability != vgi::BindRepeatability::STABLE_WITHIN_QUERY ||
+		    !std::equal(repeatable_request.begin(), repeatable_request.end(), restored.bind_request_bytes.begin(),
+		                restored.bind_request_bytes.end()) ||
+		    !std::equal(repeatable_result.begin(), repeatable_result.end(), restored.bind_response_bytes.begin(),
+		                restored.bind_response_bytes.end())) {
+			throw SerializationException("Repeatable VGI source bind state changed; bind a fresh query");
+		}
 	}
 	return bind_data;
 }

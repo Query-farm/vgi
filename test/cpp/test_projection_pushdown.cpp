@@ -28,19 +28,20 @@ Schema Source() {
 Schema Results() {
 	return arrow::schema({arrow::field("wide", arrow::int64()), arrow::field("wide_other", arrow::int64())});
 }
-Batch Bind(const Schema &schema, const std::vector<std::string> &profiles = {vgi::VGI_CONSTRAINT_SCALAR_READ}) {
-	return arrow::RecordBatch::Make(vgi::generated::BindResultSchema(), 1,
-	                                {vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(schema)),
-	                                 vgi::BuildBinaryScalarRequired({1, 2}), vgi::BuildStringListScalar({}),
-	                                 vgi::BuildStringListScalar({}), vgi::BuildStringListScalar({}),
-	                                 vgi::BuildStringListScalar(profiles)});
+Batch Bind(const Schema &schema, const std::vector<std::string> &profiles = {vgi::VGI_CONSTRAINT_SCALAR_READ},
+           const std::string &repeatability = "UNKNOWN") {
+	return arrow::RecordBatch::Make(
+	    vgi::generated::BindResultSchema(), 1,
+	    {vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(schema)), vgi::BuildBinaryScalarRequired({1, 2}),
+	     vgi::BuildStringListScalar({}), vgi::BuildStringListScalar({}), vgi::BuildStringListScalar({}),
+	     vgi::BuildStringListScalar(profiles), vgi::BuildEnumArray(repeatability, {"UNKNOWN", "STABLE_WITHIN_QUERY"})});
 }
 Batch Replace(const Batch &batch, const std::string &name, const std::shared_ptr<arrow::Array> &value) {
 	auto columns = batch->columns();
 	columns[batch->schema()->GetFieldIndex(name)] = value;
 	return arrow::RecordBatch::Make(batch->schema(), 1, columns);
 }
-Bytes Request() {
+Bytes Request(const std::string &repeatability = "UNKNOWN") {
 	auto value = std::make_shared<arrow::LargeBinaryBuilder>();
 	arrow::ListBuilder expressions(arrow::default_memory_pool(), value);
 	vgi::ThrowOnArrowError(expressions.Append());
@@ -54,8 +55,9 @@ Bytes Request() {
 	    vgi::generated::TableFunctionProjectionRequestSchema(), 1,
 	    {vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(
 	         Replace(vgi::BuildBindRequest("scan", {}, "TABLE"), "schema_path", vgi::BuildStringListScalar({"main"})))),
-	     vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(Bind(Source()))), values,
-	     vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(Results()))}));
+	     vgi::BuildBinaryScalarRequired(
+	         vgi::SerializeToIpcBytes(Bind(Source(), {vgi::VGI_CONSTRAINT_SCALAR_READ}, repeatability))),
+	     values, vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(Results()))}));
 }
 Batch Response(const std::vector<int64_t> &indices, const Batch &bind = nullptr) {
 	auto result = bind ? vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(bind))
@@ -95,6 +97,18 @@ TEST_CASE("Projection response retains base identity and validates partial resul
 	CHECK_THROWS(vgi::ValidateProjectionAcceptance(request, Response({0}, Bind(Expanded({0}), {}))));
 	auto secrets = Replace(Bind(Expanded({0})), "lookup_scopes", vgi::BuildStringListScalar({"scope"}));
 	CHECK_THROWS(vgi::ValidateProjectionAcceptance(request, Response({0}, secrets)));
+}
+
+TEST_CASE("Projection acceptance preserves the source repeatability claim", "[projection-contract][repeatability]") {
+	for (auto original : {"UNKNOWN", "STABLE_WITHIN_QUERY"}) {
+		auto request = Request(original);
+		CHECK_NOTHROW(vgi::ValidateProjectionAcceptance(
+		    request, Response({0}, Bind(Expanded({0}), {vgi::VGI_CONSTRAINT_SCALAR_READ}, original))));
+		auto changed = std::string(original) == "UNKNOWN" ? "STABLE_WITHIN_QUERY" : "UNKNOWN";
+		CHECK_THROWS_WITH(vgi::ValidateProjectionAcceptance(
+		                      request, Response({0}, Bind(Expanded({0}), {vgi::VGI_CONSTRAINT_SCALAR_READ}, changed))),
+		                  Catch::Contains("changed repeatability"));
+	}
 }
 
 TEST_CASE("Projection acceptance rejects type nullability metadata and envelope drift", "[projection-contract]") {

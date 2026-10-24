@@ -13,6 +13,7 @@
 
 #include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "vgi_batch_validation.hpp"
+#include "vgi_protocol.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -197,6 +198,7 @@ struct BindResponseResult {
 	std::shared_ptr<arrow::Schema> output_schema;
 	std::vector<uint8_t> opaque_data;   // Empty if null
 	std::vector<std::string> projection_expression_profiles;
+	BindRepeatability repeatability = BindRepeatability::UNKNOWN;
 };
 
 // Parse BindResponse from a deserialized RecordBatch (1 row).

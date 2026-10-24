@@ -728,6 +728,24 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 		}
 		result.projection_expression_profiles.push_back(std::move(profile));
 	}
+	// Enum dictionaries are transport encodings: validate the decoded value,
+	// without assuming dictionary index ordering chosen by a particular SDK.
+	auto repeatability = std::dynamic_pointer_cast<arrow::DictionaryArray>(batch->GetColumnByName("repeatability"));
+	if (!repeatability || !repeatability->type()->Equals(arrow::dictionary(arrow::int16(), arrow::utf8())) ||
+	    repeatability->IsNull(0) || !repeatability->ValidateFull().ok()) {
+		throw IOException("Invalid BindResponse repeatability");
+	}
+	auto names = std::static_pointer_cast<arrow::StringArray>(repeatability->dictionary());
+	auto index = repeatability->GetValueIndex(0);
+	if (names->IsNull(index)) {
+		throw IOException("NULL BindResponse repeatability value");
+	}
+	auto name = names->GetString(index);
+	if (name == "STABLE_WITHIN_QUERY") {
+		result.repeatability = BindRepeatability::STABLE_WITHIN_QUERY;
+	} else if (name != "UNKNOWN") {
+		throw IOException("Unsupported BindResponse repeatability '%s'", name);
+	}
 
 	return result;
 }

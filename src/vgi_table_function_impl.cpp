@@ -218,7 +218,9 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
 bool VgiTableFunctionBindData::SupportStatementCache() const {
 	// The table binder copies this flag before optimizer callbacks run. An
 	// offered scan must rebind even if its particular proposal later declines.
-	return !explicit_query && projection_response_bytes.empty() &&
+	// A query-scoped snapshot also cannot survive into a prepared execution.
+	return !explicit_query && bind_result.repeatability == BindRepeatability::UNKNOWN &&
+	       projection_response_bytes.empty() &&
 	       std::find(bind_result.projection_expression_profiles.begin(),
 	                 bind_result.projection_expression_profiles.end(),
 	                 VGI_CONSTRAINT_SCALAR_READ) == bind_result.projection_expression_profiles.end();
@@ -328,14 +330,17 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 				                                         bind_data.worker_path(), !bind_data.required_secrets.empty(),
 				                                         resolved_secrets);
 
-				VGI_LOG(context, "table_function.inline_bind_used",
-				        {{"worker_path", bind_data.worker_path()},
-				         {"function_name", bind_data.function_name}});
-
-				ApplyBindResultToBindData(context, bind_data, std::move(bind_result),
-				                          /*conn_id=*/"", /*worker_pid=*/-1,
-				                          return_types, names);
-				return;
+				// Catalog metadata can outlive the query that produced it. A
+				// query-scoped snapshot must come from a fresh bind below.
+				if (bind_result.repeatability == BindRepeatability::UNKNOWN) {
+					VGI_LOG(context, "table_function.inline_bind_used",
+					        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
+					ApplyBindResultToBindData(context, bind_data, std::move(bind_result),
+					                          /*conn_id=*/"", /*worker_pid=*/-1, return_types, names);
+					return;
+				}
+				VGI_LOG(context, "table_function.inline_bind_query_snapshot_bypassed",
+				        {{"function_name", bind_data.function_name}});
 			} catch (const std::exception &e) {
 				VGI_LOG(context, "table_function.inline_bind_error",
 				        {{"worker_path", bind_data.worker_path()},
@@ -1702,6 +1707,12 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
                                           TableFunctionInitInput &input,
                                           const std::vector<int32_t> &projection_ids) {
 	CacheEligibility e;
+	// Cache keys do not include the provider snapshot in opaque_data. A
+	// subsequent bind may observe different rows even at the same catalog version.
+	if (bind_data.bind_result.repeatability == BindRepeatability::STABLE_WITHIN_QUERY) {
+		e.ineligible_reason = "query_scoped_repeatability";
+		return e;
+	}
 	if (!bind_data.projection_response_bytes.empty()) {
 		e.ineligible_reason = "expression_projection";
 		return e;

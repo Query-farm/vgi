@@ -22,6 +22,10 @@ namespace vgi {
 // vgi_rpc-based Function Protocol Types
 // ============================================================================
 
+// Provider guarantee for repeated scans of the exact same bind state in one
+// statement. Independent binds and prepared executions need not share a snapshot.
+enum class BindRepeatability : uint8_t { UNKNOWN, STABLE_WITHIN_QUERY };
+
 // Result from bind RPC call
 struct BindResult {
 	std::shared_ptr<arrow::Schema> output_schema;
@@ -39,6 +43,7 @@ struct BindResult {
 	std::string secret_scope;
 	std::vector<std::string> projection_expression_profiles;
 	std::vector<uint8_t> bind_response_bytes;
+	BindRepeatability repeatability = BindRepeatability::UNKNOWN;
 };
 
 // Result from init RPC call

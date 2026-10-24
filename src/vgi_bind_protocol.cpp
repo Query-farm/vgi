@@ -114,7 +114,8 @@ BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_byt
 	                   secret_dependent,
 	                   SecretScopeFor(secret_dependent, resolved_secrets),
 	                   bind_response.projection_expression_profiles,
-	                   SerializeToIpcBytes(bind_response_batch)};
+	                   SerializeToIpcBytes(bind_response_batch),
+	                   bind_response.repeatability};
 }
 
 BindResult PerformBindProtocol(
@@ -205,7 +206,8 @@ BindResult PerformBindProtocol(
 	                   secret_dependent,
 	                   SecretScopeFor(secret_dependent, secrets),
 	                   bind_response.projection_expression_profiles,
-	                   SerializeToIpcBytes(bind_response_batch)};
+	                   SerializeToIpcBytes(bind_response_batch),
+	                   bind_response.repeatability};
 }
 
 } // namespace vgi

@@ -72,7 +72,7 @@ The remaining included work before freeze is:
 | Column expressions and metadata | Implemented: canonical DEFAULT/USING, strict `comment`/`tags` metadata, and bounded virtual generated CREATE/discovery/read. Generated definitions reuse `SqlExpression`, field types and existing dependency records. These are mandatory successor representations, with no new capability checks. | Broader generated grammar/types, generated-table writes and provider acceptance remain qualification work. Native 1.5 rejects generated ALTER ADD; stored generation and engine compression enums are excluded. Tags remain in authoritative Arrow metadata because its column API lacks public tag access. |
 | Default schema absence | Implemented: `CatalogAttachResult.default_schema` is nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Python and SDKs preserve absence; native 1.5 rejects it before publishing the attachment. Native 2.0 optional-default execution remains part of the later adapter port. Never invent `main`, split dots, or introduce nested default search paths. |
 | Macro cleanup | Implemented: required nonempty overload families replace the duplicate parent definition fields. Simple macros use one-element families through local authoring helpers. No family-only capability check. | Native 1.5 loads complete scalar/table families; typed defaults, declarations, docs and owner context remain distinct. Native SQL CREATE MACRO, general dependency extraction and broader body/context support remain separate qualification work. Function argument defaults are unchanged. |
-| Optimizer preparation | Implement optional structured scalar projection negotiation; keep repeatability in this release's P1 scope. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | `table_function_projection` accepts or declines a subset before optimizer replacement. Canonical expressions have exact Arrow result fields appended after unchanged source fields. Qualify the bounded native1.5 proof and broader mappings; query-scoped repeatability remains open. Existing `table_function_plan` remains late split enumeration. |
+| Optimizer preparation | Structured scalar projection negotiation is implemented; bind-specific repeatability and Go outer IPC fixes are in source, awaiting remote qualification. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | `table_function_projection` accepts or declines before optimizer replacement. The new `BindResponse.repeatability` defaults to `UNKNOWN`; stable binds preserve their snapshot and obtain fresh prepared-execution state. Run mutable-provider/native/SDK proofs on EC2, then finish broader mappings. Existing `table_function_plan` remains late split enumeration. |
 
 The user withdrew the proposed DEFAULT/USING capability flags: this is an
 unpublished wire change, so it needs no additional opt-in. `SqlExpression.profile`
@@ -372,6 +372,39 @@ optimizer scope. Bind-specific repeatability and its mutable-provider proof,
 broader projection qualification, remaining provider/release gates and the
 native2 engine port remain open. The DuckDB pin and published `vgi.v2/2.1.0`
 version are unchanged; these fields join the same unpublished major successor.
+
+### Repeatability and Go wrapped IPC — October 24, 2026
+
+The next source checkpoint appends one required dictionary enum,
+`BindResponse.repeatability`, with `UNKNOWN` and `STABLE_WITHIN_QUERY` values.
+SDK defaults remain conservative. A stable claim covers equivalent scans of
+the same complete bound state within one statement; separate binds may observe
+different committed data. Projection acceptance preserves the claim exactly.
+Existing opaque bind/transaction state carries the consistency anchor, without
+a new query coordinator, snapshot token, release call or retry permission.
+
+The native 1.5 source preserves the claim through copies, disables prepared
+bind reuse and result caching for stable binds, and bypasses stale stable inline
+catalog bind results. Serialized table-plan restoration rejects changed
+original bind state. DuckDB 1.5 has no repeatability optimizer callback. The
+later 2.0 port must also address its catalog-table classification shortcut;
+merely setting `is_repeatable` is insufficient for unknown VGI table scans.
+
+The isolated Go RPC dependency now checks complete wrapped single-batch IPC,
+including trailing data and truncated messages. The projection request opts
+into an 8 MiB raw limit before decoding. Physical EOF and explicit EOS remain
+valid. The SDK requires this dependency interface at compile time; publishing
+and pinning the paired dependency is a release prerequisite.
+
+The specification is `vgi-python/docs/protocol/scan-repeatability.md`. Mutable
+SQLite, signed HTTP, continuation, prepared execution, stale inline metadata,
+cache and copy tests are authored. The shared SDK runner adds claim validation
+and an optional Go framing mode. EC2 at `98.81.121.120` is unreachable, so this
+checkpoint has no new build/runtime qualification. No local builds/tests were
+substituted. Browser regeneration, remote source synchronization and runtime
+evidence remain pending. Existing historical test results do not validate this
+new field. The engine pin, published protocol version and P1-P3/M0-M4 release
+gates are unchanged.
 
 The first deliverable is tested protocol/SDK groundwork on 1.5.x: capability
 plumbing, shared representations, complete contract inventory, and reference
