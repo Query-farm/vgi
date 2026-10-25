@@ -5,8 +5,8 @@
 on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
 
 **Build/test workflow:** edit the isolated worktrees locally, then synchronize
-source changes to `ec2-user@3.82.45.233` and build/test there (same instance, resumed October 24;
-previous addresses `98.81.121.120`, `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
+source changes to `ec2-user@18.234.89.245` and build/test there (same instance, resumed October 25;
+previous addresses `3.82.45.233`, `98.81.121.120`, `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
 Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
@@ -19,6 +19,39 @@ qualify any protocol/native migration gate.
 October 23 combined review and remote checks cover every scope and field mapping.
 P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
 not a frozen protocol or a native DuckDB 2.0 port.
+
+**Explicit statement scope update (October 25):** named aliases and ENUMs remain
+explicitly deferred at the user's request. Reopen only bounded explicit remote
+DML/DDL through the existing query preparation/release and TABLE execution RPCs.
+The new optional `vgi.remote.statement.v1` / `statement` selection requires an
+existing transaction. Fixed output-schema metadata distinguishes a one-row
+command result (`affected_rows: nullable int64`, NULL for DDL) from RETURNING
+rows. No new RPC or request/response field is selected. This is a semantic wire
+extension within the unpublished successor; unchanged record schemas/hash do
+not imply compatibility with older validators.
+
+The Python reference passes on DuckDB 1.5.5: the full Python suite has 4,646
+passes and 129 skips; all 18 existing native read-query scenarios pass. A
+separate-process localhost HTTP example proves DML/DDL commit, readback and
+rollback. Strict generation checks across all SDKs, Ruff and focused mypy pass.
+Runtime evidence is recorded in `explicit_statement_checkpoint_2026_10_25`
+in the companion manifest. Preparation/bind must be effect-free; EOS completes
+the statement, with commit/rollback remaining the existing separate operations.
+Failed, canceled, expired or incomplete executions must prevent commit. DDL
+readback uses the existing catalog-version and discovery APIs. Raw CONNECT,
+scripts, transaction/session-control SQL, nontransactional effects, sequences,
+triggers and multiple inputs remain outside this checkpoint.
+
+**Native boundary:** keep `vgi_query` read-only. Its TABLE scan can be pruned by
+LIMIT 0 or an unused SELECT branch, and it does not declare a modified database
+or invalidate same-transaction catalog caches. A native statement entry point
+must register modification, fully drain execution before success, and invalidate
+caches. CALL rewriting or a `RemoteExecute` hook alone is not proof of those
+properties. The detailed audit and reuse decision are in the companion
+[query design](../../vgi-python-duckdb2/docs/protocol/vgi-catalog-query-pushdown-design.md#explicit-statement-reuse-audit--october-25-2026).
+This supersedes the DML/DDL part of the older statement deferral, not the read-only
+automatic-pushdown scope or raw-session deferral. No native mutation entry point,
+2.0 enablement, protocol freeze or release is claimed.
 
 **Full language SQL integration checkpoint (October 24):** the configured
 sqllogictest lanes now pass against the same final native 1.5 binary across all
