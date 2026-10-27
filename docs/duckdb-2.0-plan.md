@@ -5,8 +5,8 @@
 on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
 
 **Build/test workflow:** edit the isolated worktrees locally, then synchronize
-source changes to `ec2-user@18.234.89.245` and build/test there (same instance, resumed October 25;
-previous addresses `3.82.45.233`, `98.81.121.120`, `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
+source changes to `ec2-user@54.224.166.207` and build/test there (same instance, resumed October 27;
+previous addresses `18.234.89.245`, `3.82.45.233`, `98.81.121.120`, `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
 Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
@@ -19,6 +19,35 @@ qualify any protocol/native migration gate.
 October 23 combined review and remote checks cover every scope and field mapping.
 P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
 not a frozen protocol or a native DuckDB 2.0 port.
+
+**Python IPC framing checkpoint (October 27):** the isolated `vgi-rpc-python`
+branch `codex/single-record-ipc-framing` at `99b3090` now dispatches typed values
+through their existing byte decoder. This restores VGI's raw 8 MiB check before
+Arrow decoding. The default decoder rejects extra batches, trailing bytes and
+truncated framing while preserving physical EOF, legacy/modern EOS, dictionary
+batches and the utility's empty/schema-only convention. Streaming transport
+frames remain unchanged. Both bounded decoders normalize PyArrow's plain
+`OSError` for truncated bodies into malformed-value errors; HTTP returns 400,
+and malformed generic unary results retain `TransportError` handling.
+
+Remote qualification passes: the full RPC suite has 5,736 passes/19 skips, and
+the full VGI Python suite has 4,661 passes/129 skips. The public projection runner
+passes all 27 standard cases and all 37 extended cases over subprocess and real
+localhost HTTP, including every partial EOS length. HTTP status probes also pass.
+All 18 native read-query scenarios pass on the unchanged 1.5 build. The Python
+SQL integration lane passes 356 files with 33 expected skips, plus both dedicated
+subprocess crash/recovery files; its minimum-executed and skip-allowlist gates
+pass. Other language lanes were not repeated for this Python dependency fix.
+The baseline extra-batch failure was reproduced before applying the fix. Evidence is in
+`python_rpc_framing_checkpoint_2026_10_27` in the companion manifest and
+`qualification/python-framing-20261027-zJPaPY` on EC2.
+
+This closes the Python framing/raw-size qualification gap for these paths.
+Publish and pin the tested Python and Go RPC fixes before release; the shared
+VGI environment still has published Python RPC 0.52.0 installed, with the patched
+source selected explicitly for these runs. No wire fields or capabilities changed.
+Final protocol identity, broader release qualification and the DuckDB 2.0 port
+remain open.
 
 **Explicit statement scope update (October 25):** named aliases and ENUMs remain
 explicitly deferred at the user's request. Reopen only bounded explicit remote
@@ -253,7 +282,7 @@ The remaining included work before freeze is:
 | Column expressions and metadata | Implemented: canonical DEFAULT/USING, strict `comment`/`tags` metadata, and bounded virtual generated CREATE/discovery/read. Generated definitions reuse `SqlExpression`, field types and existing dependency records. These are mandatory successor representations, with no new capability checks. | Broader generated grammar/types, generated-table writes and provider acceptance remain qualification work. Native 1.5 rejects generated ALTER ADD; stored generation and engine compression enums are excluded. Tags remain in authoritative Arrow metadata because its column API lacks public tag access. |
 | Default schema absence | Implemented: `CatalogAttachResult.default_schema` is nullable; a present value is one raw top-level identifier. NULL means no implicit default. | Python and SDKs preserve absence; native 1.5 rejects it before publishing the attachment. Native 2.0 optional-default execution remains part of the later adapter port. Never invent `main`, split dots, or introduce nested default search paths. |
 | Macro cleanup | Implemented: required nonempty overload families replace the duplicate parent definition fields. Simple macros use one-element families through local authoring helpers. No family-only capability check. | Native 1.5 loads complete scalar/table families; typed defaults, declarations, docs and owner context remain distinct. Native SQL CREATE MACRO, general dependency extraction and broader body/context support remain separate qualification work. Function argument defaults are unchanged. |
-| Optimizer preparation | Structured scalar projection negotiation, bind-specific repeatability and Go outer IPC fixes have bounded native 1.5 / SDK qualification. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | `table_function_projection` accepts or declines before optimizer replacement. The new `BindResponse.repeatability` defaults to `UNKNOWN`; stable binds preserve their snapshot and obtain fresh prepared-execution state. Mutable-provider/native/SDK proofs pass on EC2; finish broader provider and native 2.0 mappings. Python outer wrapped-IPC qualification remains open. Existing `table_function_plan` remains late split enumeration. |
+| Optimizer preparation | Structured scalar projection negotiation, bind-specific repeatability and Go/Python outer IPC fixes have bounded native 1.5 / SDK qualification. Reuse current split selection, parallelism hints, ordering and diagnostic strings. | `table_function_projection` accepts or declines before optimizer replacement. The new `BindResponse.repeatability` defaults to `UNKNOWN`; stable binds preserve their snapshot and obtain fresh prepared-execution state. Mutable-provider/native/SDK proofs pass on EC2; finish broader provider and native 2.0 mappings. Publish/pin the qualified RPC dependencies before release. Existing `table_function_plan` remains late split enumeration. |
 
 The user withdrew the proposed DEFAULT/USING capability flags: this is an
 unpublished wire change, so it needs no additional opt-in. `SqlExpression.profile`
@@ -595,8 +624,10 @@ The SDK checks also corrected request-local EOF handling in Java, C#, Rust and
 TypeScript and stale C++ test hash expectations. Python's generic RPC wrapper
 still discards an extra outer IPC batch before its typed validator runs; its
 19 required semantic cases pass, but complete outer framing/raw-size rejection
-remains a dependency-level release prerequisite. No additional Python protocol
-adapter or generic dependency change was introduced here.
+remains a dependency-level release prerequisite at this checkpoint. The October
+27 Python IPC framing checkpoint above closes this qualification gap; publication
+and pinning remain pending. No additional Python protocol adapter or generic
+dependency change was introduced in the October 24 checkpoint.
 
 Exact SDK counts, browser artifact hash and native SDK query/copy evidence are
 recorded in the companion manifest's `scan_repeatability_and_go_framing_2026_10_24`
