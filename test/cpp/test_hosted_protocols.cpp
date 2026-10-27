@@ -21,7 +21,7 @@ namespace {
 VgiProtocolListing Listing(const std::string &server_id) {
 	VgiProtocolListing listing;
 	listing.server_id = server_id;
-	listing.protocols.push_back({"vgi.v2", "2.1.0", std::string(64, 'a'), false, ""});
+	listing.protocols.push_back({"vgi.v3", "3.0.0", std::string(64, 'a'), false, ""});
 	listing.protocols.push_back({REFLECTION_PROTOCOL_NAME, "", std::string(64, 'b'), false, ""});
 	return listing;
 }
@@ -41,8 +41,8 @@ TEST_CASE("hosted-protocols cache fetches once per connection generation", "[ref
 	auto second = cache.GetOrFetch(WorkerConnectionGeneration(location), fetch);
 	REQUIRE(fetches == 1);
 	REQUIRE(first == second);
-	REQUIRE(first->Find("vgi.v2") != nullptr);
-	REQUIRE(first->Find("vgi.v2")->version == "2.1.0");
+	REQUIRE(first->Find("vgi.v3") != nullptr);
+	REQUIRE(first->Find("vgi.v3")->version == "3.0.0");
 	REQUIRE(first->Find("vgi.attach_tickets.v1") == nullptr);
 
 	// A re-established connection may reach an upgraded worker.
@@ -73,11 +73,11 @@ TEST_CASE("hosted-protocols cache does not cache a failed fetch", "[reflection]"
 	REQUIRE(fetches == 1);
 }
 
-TEST_CASE("a pre-reflection worker is taken to host exactly vgi.v2", "[reflection]") {
+TEST_CASE("a pre-reflection worker is taken to host exactly vgi.v3", "[reflection]") {
 	auto listing = PreReflectionListing();
 	REQUIRE(listing.predates_reflection);
 	REQUIRE(listing.protocols.size() == 1);
-	REQUIRE(listing.protocols[0].name == "vgi.v2");
+	REQUIRE(listing.protocols[0].name == "vgi.v3");
 	REQUIRE(listing.protocols[0].version.empty());
 	REQUIRE(listing.protocols[0].hash.empty());
 	REQUIRE(listing.Find(REFLECTION_PROTOCOL_NAME) == nullptr);

@@ -3,7 +3,7 @@
 # group: [vgi_integration_protocol_version]
 
 # The fixture worker advertises protocol_version 99.0.0 (a deliberate major
-# bump) while the C++ extension declares and sends 1.0.0 on every request. The
+# bump) while the C++ extension declares and sends 3.0.0 on every request. The
 # vgi-rpc framework enforces an exact major+minor match at the dispatch
 # boundary, so the very first RPC ATTACH issues (catalog discovery) must fail
 # with a directional ProtocolVersionError that round-trips back as an

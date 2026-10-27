@@ -257,7 +257,7 @@ TEST_CASE("protected unary HTTP mutations are not replayed after dispatch", "[ht
 			SlowServer server(std::chrono::milliseconds(100), mode);
 			Fixture fixture;
 			auto &context = fixture.context();
-			auto url = server.Url(std::string("/vgi.v2/") + method);
+			auto url = server.Url(std::string("/vgi.v3/") + method);
 			RpcErrorContext error_context;
 			error_context.fields[error_key::kRpcMethod] = method;
 			std::shared_ptr<HTTPParams> cached;
@@ -284,7 +284,7 @@ TEST_CASE("read-only unary HTTP calls preserve configured retries", "[http-no-re
 	SlowServer server(std::chrono::milliseconds(100), SlowServer::Reply::ERROR);
 	Fixture fixture;
 	auto &context = fixture.context();
-	auto url = server.Url("/vgi.v2/catalog_index_get");
+	auto url = server.Url("/vgi.v3/catalog_index_get");
 	RpcErrorContext error_context;
 	error_context.fields[error_key::kRpcMethod] = "catalog_index_get";
 	context.RunFunctionInTransaction([&] {

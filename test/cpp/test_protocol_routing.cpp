@@ -99,7 +99,7 @@ TEST_CASE("a secret-service request names the secret protocol, not the worker pr
 
 	REQUIRE(MetadataValue(md, RPC_PROTOCOL_KEY) == std::string(generated::VGI_SECRET_PROTOCOL_NAME));
 	// The two protocols are versioned independently — the secret service's 1.x
-	// has nothing to do with the worker protocol's 2.x. Name and version travel
+	// has nothing to do with the worker protocol's 3.x. Name and version travel
 	// together so a request can never carry one protocol's name and another's
 	// version, which routes to a binding that then rejects it.
 	REQUIRE(MetadataValue(md, RPC_PROTOCOL_VERSION_KEY) ==

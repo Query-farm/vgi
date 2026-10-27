@@ -17,7 +17,7 @@
 // worker connection (see WorkerConnectionGeneration) or vgi_clear_cache().
 //
 // A worker that predates reflection is not an error: it is treated (and
-// cached) as hosting exactly `vgi.v2`.
+// cached) as hosting exactly `vgi.v3`.
 
 #include <memory>
 #include <optional>
@@ -55,7 +55,7 @@ std::shared_ptr<const VgiProtocolListing> GetHostedProtocols(ClientContext &cont
 
 // Whether the catalog's worker hosts `protocol_name`: nullopt when it does
 // not, otherwise its declared version ("" when it declares none, or when the
-// worker predates reflection and the protocol is the implied `vgi.v2`).
+// worker predates reflection and the protocol is the implied `vgi.v3`).
 std::optional<std::string> HostsProtocol(ClientContext &context, const VgiCatalog &catalog,
                                          const std::string &protocol_name);
 std::optional<std::string> HostsProtocol(ClientContext &context, const std::shared_ptr<VgiAttachParameters> &params,

@@ -3,7 +3,7 @@
 #              predates vgi-rpc reflection) answers a reflection request with
 #              protocol_not_supported. By location, vgi_protocols() reports
 #              that cause; by attached catalog it is not an error: the worker
-#              is taken to host exactly vgi.v2 (no version or hash known), and
+#              is taken to host exactly vgi.v3 (no version or hash known), and
 #              that answer is cached like any other.
 #              Fixture: test/support/no_reflection_worker.py (vgi-python's
 #              fixture worker with reflection not hosted).
@@ -27,7 +27,7 @@ SELECT * FROM vgi_protocols('${VGI_NO_REFLECTION_WORKER}');
 ----
 does not host vgi_rpc.Reflection.v1, so it cannot list its protocols: it predates vgi-rpc reflection
 
-# vgi.v2 is unaffected: the worker attaches and serves queries.
+# vgi.v3 is unaffected: the worker attaches and serves queries.
 statement ok
 ATTACH 'example' AS old_worker (TYPE vgi, LOCATION '${VGI_NO_REFLECTION_WORKER}');
 
@@ -40,13 +40,13 @@ CALL truncate_duckdb_logs();
 query IIII
 SELECT * FROM vgi_protocols(catalog := 'old_worker');
 ----
-0	vgi.v2	NULL	NULL
+0	vgi.v3	NULL	NULL
 
 # Cached: the "predates reflection" answer is not re-asked per call.
 query IIII
 SELECT * FROM vgi_protocols(catalog := 'old_worker');
 ----
-0	vgi.v2	NULL	NULL
+0	vgi.v3	NULL	NULL
 
 query I
 SELECT count(*) FROM duckdb_logs()
@@ -54,7 +54,7 @@ WHERE type = 'VGI' AND message LIKE '%reflection.list_protocols%' AND message LI
 ----
 1
 
-# vgi.v2 queries keep working against it.
+# vgi.v3 queries keep working against it.
 query I
 SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = 'old_worker';
 ----

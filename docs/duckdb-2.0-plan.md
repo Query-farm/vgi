@@ -20,6 +20,18 @@ October 23 combined review and remote checks cover every scope and field mapping
 P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
 not a frozen protocol or a native DuckDB 2.0 port.
 
+**Successor protocol identity (October 27):** the combined breaking protocol now
+uses `vgi.v3` / `3.0.0` across the extension and all seven SDKs. Generated routing,
+versions, registries and catalog contract fingerprints move together. Reflection
+and publication namespaces use the new identity; existing v2 snapshots are not
+reused. Auxiliary protocols and SDK package versions remain independently versioned.
+The build remains on DuckDB 1.5. Strict generation checks, Python lint/types,
+focused checks in all seven SDKs, and native subprocess/HTTP identity checks
+pass. The rebuilt CLI advertises the new name and version. Independent review
+found no missed active identity or unintended auxiliary-protocol change. Evidence
+is recorded in `protocol_identity_checkpoint_2026_10_27`; the full coordinated
+candidate matrix and remaining release gates still precede a VGI main merge or release.
+
 **RPC dependency publication (October 27):** the fixes are merged and released
 as [Python RPC 0.52.3](https://github.com/Query-farm/vgi-rpc-python/releases/tag/v0.52.3)
 and [Go RPC 0.36.0](https://github.com/Query-farm/vgi-rpc-go/releases/tag/v0.36.0).
@@ -36,9 +48,8 @@ EC2 environment now uses published Python RPC and disables the historical Go
 workspace override.
 
 The publication/dependency blocker is closed. This does not merge the VGI
-preparation branches or finalize their incompatible protocol identity. The
-final version/routing decision and qualification of that coordinated candidate
-remain before the VGI merge. Evidence and Go SDK results are recorded in
+preparation branches. The successor identity is now `vgi.v3` / `3.0.0`;
+qualification of that coordinated candidate remains before the VGI merge. Evidence and Go SDK results are recorded in
 `rpc_publication_checkpoint_2026_10_27` in the companion manifest.
 
 **Python IPC framing checkpoint (October 27):** the isolated `vgi-rpc-python`
@@ -1987,7 +1998,7 @@ strings remain unpublished placeholders until the complete contract is frozen.
 | Refreshed Haybarn baseline | `e1784fa4231072d7152b8aaa20977bdb8ff4ace3` on local `next-2.0` | Completed upstream merge; source-audit baseline and later 2.0 build target. Not yet pushed. |
 | Merged upstream revision | `c65ca930b9fe39b2e8d8ed8821018dca650965f4`, October 12 upstream tip | 3,107 incoming commits since Haybarn's previous merge. |
 | Haybarn 2.0 extension tooling | `c583007af3506d8fac93e328c98dc16566cb4428` | Uses reusable `build.yml`; VGI currently calls the older `_extension_distribution.yml`. |
-| VGI protocol | Published baseline `2.2.0`, inherited in [the generated development version header](../src/generated/vgi_protocol_version.hpp) after the October 24 main integration | The combined breaking successor remains unpublished and needs its final major version/routing name. DuckDB's engine version and VGI's protocol version are independent. |
+| VGI protocol | Unpublished successor `vgi.v3` / `3.0.0`, declared in [the generated development version header](../src/generated/vgi_protocol_version.hpp); published baseline remains `vgi.v2` / `2.2.0` | The combined breaking successor identity is selected. Coordinated qualification and release remain open. DuckDB's engine version and VGI's protocol version are independent. |
 | Native dependencies | Haybarn httpfs `94d8fee6ea02ce952bab164e22689afe8f0cd8ed`; 1.5.5 CI images | These are 1.5 pins, not qualified 2.0 dependencies. |
 | WASM dependencies | Separate config with 1.5.1-era httpfs and an absolute local DuckLake path | WASM needs its own coordinated host, engine, extension, and dependency update. |
 

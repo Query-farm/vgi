@@ -112,7 +112,7 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 std::shared_ptr<arrow::RecordBatch> InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
                                                                   ClientContext &context);
 
-// One unary call to a non-vgi.v2 protocol through the catalog's connection and
+// One unary call to a non-vgi.v3 protocol through the catalog's connection and
 // auth (routing key and, when non-empty, version from `protocol`). Returns the
 // decoded one-row payload of the binary `result` envelope; decode it by name.
 // Worker errors surface as VgiRpcException carrying error_kind / error_code.

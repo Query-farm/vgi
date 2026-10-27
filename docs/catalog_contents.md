@@ -1,9 +1,12 @@
 # `catalog_contents`: load a whole catalog in one RPC
 
-`catalog_contents` was introduced in protocol 2.1.0. Protocol **2.2.0** changes
+`catalog_contents` was introduced in protocol 2.1.0. Protocol 2.2.0 changed
 its wire representation to six Arrow collections spanning the whole catalog.
-The protocol routing name remains `vgi.v2`; clients and workers must agree on
-the minor wire revision. See [the implementation plan](catalog_contents_batching_plan.md).
+The combined successor retains that representation under **`vgi.v3` / `3.0.0`**,
+with the updated catalog record schemas. Clients and workers must agree on the
+protocol routing name and major/minor wire revision. See
+[protocol routing](protocol_routing.md) and the
+[historical batching implementation plan](catalog_contents_batching_plan.md).
 
 ## Problem
 

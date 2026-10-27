@@ -1,6 +1,6 @@
 # Scalar argument monotonicity
 
-VGI protocol 2.0 includes an optional `FunctionInfo.argument_monotonicity`
+VGI includes an optional `FunctionInfo.argument_monotonicity`
 field immediately after `null_handling`. Its Arrow type is nullable
 `list<utf8>` with these uppercase values:
 

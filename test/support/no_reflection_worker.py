@@ -6,7 +6,7 @@ Every released VGI SDK hosts reflection on every transport, so a real
 pre-reflection worker is no longer buildable from a current SDK. This one
 answers a reflection request exactly as such a worker's server does -- with
 ``protocol_not_supported`` -- while serving the ordinary fixture catalogs over
-``vgi.v2``. Drives test/sql/integration/reflection/pre_reflection.test.
+``vgi.v3``. Drives test/sql/integration/reflection/pre_reflection.test.
 
 Run as ``uv run --project <vgi-python> python test/support/no_reflection_worker.py``
 (stdin/stdout, or ``--unix PATH`` under the launcher, like the fixture worker).

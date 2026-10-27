@@ -37,7 +37,7 @@ extension cannot redact SQL captured by a client or an external query logger.
 
 ## Hosted protocols
 
-Every VGI worker hosts `vgi.v2`, and every worker built on vgi-rpc 0.46 or later
+Every VGI worker hosts `vgi.v3`, and every worker built on vgi-rpc 0.46 or later
 also hosts `vgi_rpc.Reflection.v1` on every transport. Optional capabilities
 (attach tickets, report services, identity) are separate vgi-rpc protocols, so
 "does this worker support X" means "does its reflection list X".
@@ -53,7 +53,7 @@ SELECT * FROM vgi_protocols(catalog := 'business_data');
 
 | Column | Type | Meaning |
 | --- | --- | --- |
-| `position` | `INTEGER` | 0-based order as the worker listed it: `vgi.v2` first, then the worker's own protocols, then framework ones such as reflection. |
+| `position` | `INTEGER` | 0-based order as the worker listed it: `vgi.v3` first, then the worker's own protocols, then framework ones such as reflection. |
 | `protocol_name` | `VARCHAR` | Wire name, the routing key every request carries. The major version is part of it. |
 | `protocol_version` | `VARCHAR` | Declared semver. `NULL` when the protocol declares none (reflection itself). |
 | `protocol_hash` | `VARCHAR` | 64 lowercase hex: a fingerprint of the protocol's wire surface, identical in every SDK that hosts the same protocol. |
@@ -62,7 +62,7 @@ The reserved `features` list on the wire is always empty and is not shown.
 
 A worker that predates reflection answers `protocol_not_supported` (or, before
 routing keys, `method_not_implemented`). By LOCATION that is an error naming
-the cause. By catalog it is not: the worker is taken to host exactly `vgi.v2`,
+the cause. By catalog it is not: the worker is taken to host exactly `vgi.v3`,
 reported as one row with `NULL` version and hash. The catalog form fails with a
 binder error for an alias that is not attached or not `TYPE vgi`, and rejects
 the LOCATION-only options (auth, `iroh_*`), since the catalog's own are used.

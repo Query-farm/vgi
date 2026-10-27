@@ -273,7 +273,7 @@ static ErrorInfo CatalogProtocolViolation(const std::string &method_name, const 
 // stderr pipe buffer fills), and stale-pool retry.
 //
 // `protocol` selects the routing key (and the URL's protocol segment on HTTP).
-// Only `vgi.v2` methods have entries in the schema registry, so request
+// Only `vgi.v3` methods have entries in the schema registry, so request
 // validation applies to those alone; other protocols' callers decode by name.
 static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const std::string &method_name,
                                             const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context,

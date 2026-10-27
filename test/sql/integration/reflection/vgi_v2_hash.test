@@ -1,10 +1,10 @@
 # name: test/sql/integration/reflection/vgi_v2_hash.test
-# description: Cross-SDK drift guard for the vgi.v2 surface. Every SDK's
+# description: Cross-SDK drift guard for the vgi.v3 surface. Every SDK's
 #              fixture worker must report, via vgi_rpc.Reflection.v1, the
-#              same vgi.v2 protocol_version and protocol_hash as the
+#              same vgi.v3 protocol_version and protocol_hash as the
 #              reference (vgi-python's VgiProtocol). The hash covers every
 #              method name and request/response schema, so an SDK that adds,
-#              drops, renames or retypes a vgi.v2 method fails here. Uses only
+#              drops, renames or retypes a vgi.v3 method fails here. Uses only
 #              reflection, which every worker hosts on every transport.
 # group: [vgi_integration_reflection]
 
@@ -14,14 +14,12 @@ require vgi
 
 require httpfs
 
-# The unpublished combined-protocol development snapshot. The expected hash
-# is computed from vgi-python's complete VgiProtocol, then pinned in every SDK.
-# This worktree has not published a new stable protocol version. At the final
-# combined freeze, change the version here and in all generated/native/SDK
-# artifacts together. Development snapshot hashes must never be published as
-# replacements for the existing stable 2.2.0 contract.
+# The combined successor uses vgi.v3 / 3.0.0. The expected hash is computed
+# from vgi-python's complete VgiProtocol, then pinned in every SDK. Keep the
+# version and hash aligned with the generated/native/SDK artifacts. The file
+# name is retained for existing integration-suite selection rules.
 query II
 SELECT protocol_version, protocol_hash
-FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE protocol_name = 'vgi.v2';
+FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE protocol_name = 'vgi.v3';
 ----
-2.2.0	41f61f37c7ce42f63f3ca47f8861508f3f356d2422a5b8a0bab48ff92c0857a8
+3.0.0	50e9404173bee3262e96b8939eb5c425463336abca2a17916812d68b6e0f6cad

@@ -10,7 +10,7 @@
 //   vgi_protocols(catalog := '<attached alias>')
 //       Reads the attached catalog's cached listing (vgi_reflection.hpp), the
 //       same answer the extension's own capability checks use. A worker that
-//       predates reflection lists just vgi.v2, with no version or hash.
+//       predates reflection lists just vgi.v3, with no version or hash.
 #include "vgi_protocols.hpp"
 
 #include <string>
@@ -212,14 +212,14 @@ void RegisterVgiProtocolsFunction(ExtensionLoader &loader) {
 	CreateTableFunctionInfo info(std::move(set));
 	const char *description = "List the vgi-rpc protocols a VGI worker hosts, from its "
 	                          "vgi_rpc.Reflection.v1 list_protocols, one row "
-	                          "per protocol in the worker's order (vgi.v2 first): position, "
+	                          "per protocol in the worker's order (vgi.v3 first): position, "
 	                          "protocol_name, protocol_version (NULL when "
 	                          "the protocol declares none) and protocol_hash. Pass a worker location "
 	                          "with the same authentication and "
 	                          "iroh_* options as vgi_catalogs(), or catalog := an attached VGI "
 	                          "catalog's alias to use its connection "
 	                          "and cached answer. A worker that predates reflection is an error by "
-	                          "location, and lists only vgi.v2 "
+	                          "location, and lists only vgi.v3 "
 	                          "(NULL version and hash) by catalog.";
 	info.descriptions.push_back(vgi::MakeFunctionDescription(description, {"worker_path"}, {LogicalType::VARCHAR},
 	                                                         {"SELECT * FROM vgi_protocols('./worker');"}));

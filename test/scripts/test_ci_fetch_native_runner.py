@@ -38,7 +38,7 @@ class NativeArtifactTests(unittest.TestCase):
         manifest = {
             "revision": "b" * 40 if self.bad_revision else self.revision,
             "platform": "linux_amd64",
-            "protocol_version": "2.2.0",
+            "protocol_version": "3.0.0",
             "sha256": {name: runner.digest(staging / name) for name in ("unittest", "haybarn")},
         }
         (staging / "manifest.json").write_text(json.dumps(manifest))

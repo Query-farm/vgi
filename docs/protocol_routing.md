@@ -19,7 +19,7 @@ version):
 
 | Constant | Routing key | Used by |
 |---|---|---|
-| `VGI_MAIN_PROTOCOL` | `vgi.v2` | everything: `bind`, `init`, `catalog_*`, aggregates, `table_buffering_*` |
+| `VGI_MAIN_PROTOCOL` | `vgi.v3` | everything: `bind`, `init`, `catalog_*`, aggregates, `table_buffering_*` |
 | `VGI_SECRET_PROTOCOL` | `vgi.secret.v1` | `secret_lookup` against Orchard's standalone secret service |
 | `REFLECTION_PROTOCOL_NAME` (`vgi_hosted_protocols.hpp`) | `vgi_rpc.Reflection.v1` | `list_protocols`: `vgi_protocols()` and the per-catalog capability check `vgi::HostsProtocol` |
 
@@ -27,19 +27,23 @@ Reflection declares no version and is exempt from the version gate, so its
 requests carry no `vgi_rpc.protocol_version` key at all: the serializers omit
 the key for any `VgiProtocolId` whose version is empty.
 
-The major version is part of the name, so an incompatible major is a *different*
-protocol: a stale client's request 404s instead of reaching a handler that then
-rejects it — an answer any proxy or load balancer understands without an Arrow
-parser. `vgi.v2` and a future `vgi.v3` are co-hostable on one server during a
-migration for the same reason.
+The combined successor identifies itself as **`vgi.v3` / `3.0.0`**. Its
+breaking catalog, macro and expression contracts are distinct from the
+published `vgi.v2` / `2.2.0` surface. The major version is part of the routing
+name, so a request for an unsupported major is rejected before entering that
+protocol's handlers. Over HTTP, ordinary requests use `{base}/vgi.v3/{method}`.
 
 The application wire revision is checked separately: peers must agree on its
-major and minor components. A coordinated incompatible revision can therefore
-increment the minor version while retaining the routing name. Catalog metadata
-collections use this mechanism for `2.1` → `2.2` under `vgi.v2`; old and new
-clients fail the version gate before exchanging catalog data. Patch revisions
-must remain wire compatible. This is distinct from protocols that promise
-backward-compatible minor additions or choose a new major routing namespace.
+major and minor components; patch revisions must remain wire compatible. The
+historical catalog metadata transition used `2.1` → `2.2` under `vgi.v2`.
+The combined successor uses a new major and routing namespace instead.
+
+Deploy matched consumers and workers, with old and new versions at separate
+endpoints/processes during migration. Drain old sessions and transactions,
+then reattach and reprepare on the new deployment. Protocol routing can
+technically distinguish co-hosted versions, but this release does not provide
+a legacy encoder, a version-aware router or live token/transaction migration.
+The secret and reflection protocols retain their independent names and versions.
 
 Reserved server-level methods (`__transport_options__`, `__upload_url__`) belong
 to no protocol: the server resolves them from a built-in table *before* routing

@@ -2,7 +2,7 @@
 # description: vgi_protocols() lists what a worker hosts, from its
 #              vgi_rpc.Reflection.v1 list_protocols, by location and by
 #              attached catalog. Asserts only what every SDK's fixture worker
-#              must satisfy: vgi.v2 is listed first with a semver; reflection
+#              must satisfy: vgi.v3 is listed first with a semver; reflection
 #              itself and conformance.Secondary.v1 (hosted by every SDK
 #              fixture since the multi-protocol release) are listed; every
 #              hash is 64 lowercase hex; positions are 0..n-1; and both call
@@ -20,17 +20,17 @@ require httpfs
 query II
 SELECT position, protocol_name FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE position = 0;
 ----
-0	vgi.v2
+0	vgi.v3
 
 query I
 SELECT regexp_full_match(protocol_version, '[0-9]+\.[0-9]+\.[0-9]+.*')
-FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE protocol_name = 'vgi.v2';
+FROM vgi_protocols('${VGI_TEST_WORKER}') WHERE protocol_name = 'vgi.v3';
 ----
 true
 
 query I
 SELECT count(*) FROM vgi_protocols('${VGI_TEST_WORKER}')
-WHERE protocol_name IN ('vgi.v2', 'vgi_rpc.Reflection.v1', 'conformance.Secondary.v1');
+WHERE protocol_name IN ('vgi.v3', 'vgi_rpc.Reflection.v1', 'conformance.Secondary.v1');
 ----
 3
 
@@ -94,7 +94,7 @@ true
 query II
 SELECT position, protocol_name FROM vgi_protocols(catalog := 'example') WHERE position = 0;
 ----
-0	vgi.v2
+0	vgi.v3
 
 # The catalog form is cached per catalog: one list_protocols per attach until
 # vgi_clear_cache() or DETACH. The queries above already fetched it.

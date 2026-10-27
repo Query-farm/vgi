@@ -5,7 +5,7 @@
 // and the per-catalog cache of that answer. Deliberately light (std only, no
 // Arrow, no DuckDB) so vgi_attach_parameters.hpp can hold the cache by value.
 //
-// Every VGI worker hosts `vgi.v2`, and every worker built on vgi-rpc >= 0.46
+// Every VGI worker hosts `vgi.v3`, and every worker built on vgi-rpc >= 0.46
 // also hosts `vgi_rpc.Reflection.v1` on every transport. Optional features
 // (attach tickets, report services, identity) are separate protocols, so
 // "does this worker support X" is "does its reflection list X". The extension
@@ -29,7 +29,7 @@ inline constexpr const char *REFLECTION_PROTOCOL_NAME = "vgi_rpc.Reflection.v1";
 
 // One hosted protocol (a ProtocolSummary on the wire).
 struct VgiHostedProtocol {
-	// Wire name: the routing key, e.g. "vgi.v2".
+	// Wire name: the routing key, e.g. "vgi.v3".
 	std::string name;
 	// Declared semver; empty when the protocol declares none (reflection
 	// itself) or the worker predates reflection.
@@ -41,12 +41,12 @@ struct VgiHostedProtocol {
 	std::string deprecation_message;
 };
 
-// A worker's whole answer, in the order the worker listed it (`vgi.v2` first,
+// A worker's whole answer, in the order the worker listed it (`vgi.v3` first,
 // then worker-supplied protocols, then framework ones).
 struct VgiProtocolListing {
 	// True when the worker does not host vgi_rpc.Reflection.v1 (it answered
 	// protocol_not_supported / method_not_implemented / UNIMPLEMENTED). Such a
-	// worker is treated as hosting exactly `vgi.v2`, with no version or hash:
+	// worker is treated as hosting exactly `vgi.v3`, with no version or hash:
 	// `protocols` then holds that one synthesized entry.
 	bool predates_reflection = false;
 	std::string server_id;
