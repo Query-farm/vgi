@@ -38,7 +38,40 @@ October 23 combined review and remote checks cover every scope and field mapping
 P1–P3 and the full M0–M4 release gates remain open. The native 2.0/nanoarrow port
 builds and passes the bounded checks recorded below. Automatic whole-query
 pushdown, nested-schema support, broader 2.0 type/grammar coverage, and platform
-and dependency-release qualification remain separate work.
+and engine-distribution qualification remain separate work.
+
+**Coordinated SDK release checkpoint (October 28):** published and verified
+Python **0.48.0**, Go **0.38.0**, Rust **0.48.0** (all three crates),
+TypeScript **0.47.0**, Java **0.45.0**, C# **0.22.1**, and C++ **0.13.0**.
+These releases speak `vgi.v3` / `3.0.0` and require a matching native VGI
+extension. Existing `vgi.v2` native releases require the previous SDK versions.
+Java RPC **0.33.2** and `QueryFarm.Arrow` **23.0.0-queryfarm.4** are also
+published. Registry downloads and clean consumers close the earlier Java,
+Rust and C# candidate/overlay publication gates; historical matrix hashes
+below remain evidence of those earlier runs, not of a new full matrix.
+
+C# 0.22.1 additionally fixes the duplicate official Arrow assemblies exposed
+by a clean transitive NuGet consumer. The consumer now runs without manual
+exclusions or DLL overlays. Native Rust fixtures build from registry packages
+and pass 178 unit cases / 2,721 assertions. Release source checks and SDK unit,
+transport and package checks are recorded in the
+[release manifest](duckdb-2.0-sdk-releases.json).
+
+Release CI also exposed a native SHM process-pool lifetime bug. Commit
+`090095d` keeps private subprocesses that advertised SHM out of generic pool
+reuse. Each adapter (1.5 and 2.0) passes four SHM cases / 35 assertions and two
+ordinary pooling cases / 18 assertions, with zero skips. The regression fails
+before the fix on both adapters. Private SHM executions now start a fresh
+process; within-execution SHM and retained batch leases remain supported.
+
+All SDK CI pins now select the updated 1.5 runner at `7b1e1fb` from
+`release/vgi-v3-ci-20261028`. Its artifact is uploaded; final native and some
+SDK followup checks remain in progress at this checkpoint. Python
+[PR 98](https://github.com/Query-farm/vgi-python/pull/98) remains open for its
+final cross-platform checks. Its Python 3.13 fixes pass the full run plus
+targeted reruns (4,656 unique passes, 145 skips, zero unresolved failures).
+All fixes are committed and pushed. Native development remains on `v2.0`;
+native main has not been merged and engine distribution has not been released.
 
 **Published Rust fixture checkpoint (October 28):** `vgi`, `vgi-protocol`,
 and `vgi-client` 0.48.0 are published on crates.io. Native SAB fixtures now use
@@ -171,9 +204,9 @@ pushdown diagnostic; DuckDB 2.0 can omit redundant range predicates. The complet
 split regression passes without changing the SDK's public filter API. C# requires
 the scoped empty-STRUCT fix committed at `e4489a8212bd` in
 `vgi-rpc-csharp-empty-struct`: 14 focused tests and the native all-types echo pass.
-Its integration lane uses an explicitly recorded Arrow DLL overlay. This fix is
-committed but unpublished; the existing published Arrow package still has the
-empty-STRUCT limitation.
+That historical integration lane used an explicitly recorded Arrow DLL overlay.
+The release checkpoint above supersedes that dependency limitation with the
+published Arrow package and clean NuGet consumer verification.
 
 Runtime qualification found and repaired a DELETE RETURNING shape mismatch:
 DuckDB 2.0 appended scan virtual columns, while provider responses contain only

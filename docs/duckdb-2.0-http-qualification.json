@@ -237,7 +237,12 @@
     "OAuth discovery used a synthetic local authorization service; no real identity-provider login was performed.",
     "The explicitly gated Iceberg service, companion/container fixtures, and opt-in GitHub network lane remain outside this configuration.",
     "Linux ARM64 Clang development artifacts; no platform/browser or release-packaging qualification.",
-    "Java/Rust dependency candidate limits from the native checkpoint still apply. The C# Arrow and SDK context fixes are committed but unpublished.",
     "Fault probes cover failed HTTP exchanges and producer disconnects, not exhaustive malformed HTTP-200 IPC-body validation."
-  ]
+  ],
+  "historical_dependency_limit": "Java/Rust dependency candidate limits from the native checkpoint still apply. The C# Arrow and SDK context fixes are committed but unpublished.",
+  "sdk_release_checkpoint_2026_10_28": {
+    "manifest": "duckdb-2.0-sdk-releases.json",
+    "status": "published_packages_verified",
+    "note": "Java/Rust/C# package publication gates closed by registry verification and clean consumer checks. This does not relabel the historical full HTTP matrix as a rerun of every released artifact."
+  }
 }

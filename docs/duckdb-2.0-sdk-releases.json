@@ -1,0 +1,204 @@
+{
+  "date": "2026-10-28",
+  "protocol": {
+    "name": "vgi.v3",
+    "version": "3.0.0"
+  },
+  "frameworkReleases": [
+    {
+      "language": "Python",
+      "version": "0.48.0",
+      "tagCommit": "66f1674409b43ffe41b55ce5f4da7494b73ce362",
+      "repo": "vgi-python",
+      "package": "vgi-python",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-python/releases/tag/v0.48.0",
+      "followupCommit": "219bb329ce1548166e33bb1a41f1f6f699a1a84d",
+      "pullRequest": "https://github.com/Query-farm/vgi-python/pull/98",
+      "mergeStatus": "open_pending_final_checks",
+      "wheelSha256": "62e013101ccbef21ea385fbe457c4f68895a0d07269ce48d9c5c4d7d40d0dc68",
+      "publishRun": 40722393668,
+      "validation": {
+        "initialJoinedUniqueUnitPasses": 4609,
+        "initialSkips": 192,
+        "python313": {
+          "fullPassesBeforeFinalFix": 4654,
+          "fullFailuresBeforeFinalFix": 2,
+          "skips": 145,
+          "targetedFinalPasses": 47,
+          "joinedUniquePasses": 4656,
+          "unresolvedFailures": 0
+        },
+        "followups": "Portable subprocess readiness, explicit CI interpreter selection, deferred test annotations and corrected example generic arity; final hosted checks pending."
+      }
+    },
+    {
+      "language": "Go",
+      "version": "0.38.0",
+      "tagCommit": "20a28f35de0b3e7b82f7f5bab10405204011e61b",
+      "mainCommit": "2022a023bcb9d8b84deaf7532ef9e9e0e3725a50",
+      "repo": "vgi-go",
+      "package": "github.com/Query-farm/vgi-go",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-go/releases/tag/v0.38.0"
+    },
+    {
+      "language": "Rust",
+      "version": "0.48.0",
+      "tagCommit": "a14e7f9425d16575b29d469aa0cfa24f4fd20497",
+      "mainCommit": "af1b2b810db7ed642205d002cf8c8a4c2817dcf8",
+      "repo": "vgi-rust",
+      "packages": [
+        "vgi-protocol",
+        "vgi",
+        "vgi-client"
+      ],
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-rust/releases/tag/v0.48.0"
+    },
+    {
+      "language": "TypeScript",
+      "version": "0.47.0",
+      "tagCommit": "bab9d6426ce17ec37d0a181b82e746c06525bd97",
+      "repo": "vgi-typescript",
+      "package": "@query-farm/vgi",
+      "status": "registry_verified",
+      "buildTests": {
+        "arrowjs": {
+          "pass": 743,
+          "skip": 68
+        },
+        "flechette": {
+          "pass": 744,
+          "skip": 67
+        },
+        "facadeCasesPerBackend": 17
+      },
+      "publishRun": 40716977147,
+      "ciRun": 40717443840,
+      "releaseUrl": "https://github.com/Query-farm/vgi-typescript/releases/tag/v0.47.0",
+      "mainCommit": "3268f46f7a8223761b933241f3f6704e5f163cba"
+    },
+    {
+      "language": "Java",
+      "version": "0.45.0",
+      "tagCommit": "79befaac60efe0f83d7f29bf10d54d435d05a4fb",
+      "repo": "vgi-java",
+      "package": "farm.query:vgi",
+      "status": "registry_verified",
+      "jarSha256": "4311ac1797348c88215d051dc64f58d57a760123a3a18a968fbb492aac2d7acb",
+      "publishRun": 40719189749,
+      "releaseUrl": "https://github.com/Query-farm/vgi-java/releases/tag/v0.45.0",
+      "mainCommit": "d9d2013b71d4daefaddf35efb14f730cf0297347"
+    },
+    {
+      "language": "C#",
+      "version": "0.22.1",
+      "repo": "vgi-csharp",
+      "package": "QueryFarm.Vgi",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-csharp/releases/tag/v0.22.1",
+      "mainCommit": "a344702825db1bb41fabb806ae8a5b30c3b69727",
+      "tagCommit": "54690dd843734584a37b1eb8bddfc42888138b73",
+      "packageSha256": "89fb3e31e70f1336a42f6a55f95523aaa2b2c66b34e0c89d977e9f6d11e53658",
+      "unitPasses": 770,
+      "publishRun": 40723396733,
+      "ciRun": 40725168378,
+      "verification": "Clean NuGet-only transitive consumer: vgi.v3 identity, empty STRUCT, SDK Arrow filtering and DuckDB.NET SQL; no DLL overlay or manual exclusions."
+    },
+    {
+      "language": "C++",
+      "version": "0.13.0",
+      "repo": "vgi-cpp",
+      "status": "source_release_verified",
+      "tagCommit": "96099e324533bcc9046cb1181b14b52dc7cfba1a",
+      "formatFollowup": "ed07f2460b414a3da4faaebe360eca3bab57714a",
+      "unitCases": 94,
+      "launcherCases": 333,
+      "httpCases": 327,
+      "compiler": "Clang 22.1.8",
+      "integrationRun": 40718776984,
+      "releaseUrl": "https://github.com/Query-farm/vgi-cpp/releases/tag/v0.13.0",
+      "mainCommit": "a75108c1cce07418316bf6a35446ea13131d8f53",
+      "sourceArchiveSha256": "c2287762b573056cb899f1128d46c5ddf8cf76a9e9254f2a5d852920b0f3f301"
+    }
+  ],
+  "dependencies": [
+    {
+      "package": "farm.query:vgirpc",
+      "version": "0.33.2",
+      "repo": "vgi-rpc-java",
+      "status": "registry_verified"
+    },
+    {
+      "package": "QueryFarm.Arrow",
+      "version": "23.0.0-queryfarm.4",
+      "repo": "vgi-rpc-csharp",
+      "status": "registry_verified",
+      "packageSha256": "db370f72518da85107c62e6d01357646c870132f900befe817b74956246368c5"
+    }
+  ],
+  "nativeRegistryFixtureCommit": "b5e5343",
+  "firstNativeCi": {
+    "commit": "a83ff7e8cd46aa840a10e78fe9b31603931824c2",
+    "branch": "release/vgi-v3-ci-20261028",
+    "run": 40716383941,
+    "artifact": 12829133928,
+    "status": "passed"
+  },
+  "status": "published_artifacts_verified_final_ci_followups_pending",
+  "compatibility": "Coordinated vgi.v3/3.0.0 release: use with a matching native extension. Published vgi.v2 native main requires the previous SDK versions.",
+  "native": {
+    "branch": "v2.0",
+    "registryFixtureCommit": "b5e5343",
+    "shmFixCommit": "090095defb1e65916196d70cccc7111aff96ae97",
+    "mainMerged": false,
+    "distributionPublished": false,
+    "registryFixtureUnits": {
+      "cases": 178,
+      "assertions": 2721,
+      "source": "crates.io only; default CMake SAB library paths"
+    },
+    "shmRegression": {
+      "adapters": [
+        "DuckDB 1.5",
+        "DuckDB 2.0"
+      ],
+      "before": "Same metadata reuse regression fails on both adapters.",
+      "afterPerAdapter": {
+        "shmCases": 4,
+        "shmAssertions": 35,
+        "ordinaryPoolCases": 2,
+        "ordinaryPoolAssertions": 18,
+        "skips": 0
+      },
+      "extensionSha256": {
+        "1.5": "b035a9c606dec6c0d1e37313b42d3cc3d0a30b97faff9a5df7f459c07588e3bd",
+        "2.0": "3e98aabd6c7fe777dd74b18d78f500273eec79f14fbec6c3039c37644ea54a0f"
+      },
+      "tradeoff": "Private subprocesses that advertised SHM are excluded from generic pool reuse. SHM within an execution, retained batch leases, ordinary process pooling and shared launcher lifecycles remain supported."
+    }
+  },
+  "finalNativeCi": {
+    "branch": "release/vgi-v3-ci-20261028",
+    "commit": "7b1e1fbbe745d77fdacf52d6d135fa3ef4491d48",
+    "run": 40724940464,
+    "artifact": 12831004726,
+    "status": "artifact_uploaded_integration_in_progress",
+    "sdkPinsUpdated": true
+  },
+  "remainingAtCheckpoint": [
+    "Python PR98 merge after final CI40726736862 and integration40726736565; repository auto-merge is unavailable.",
+    "Native1.5 CI and some final SDK CI pin followup runs are still in progress. Published artifacts and recorded local regressions are verified.",
+    "Broader DuckDB2 migration gates remain in duckdb-2.0-plan.md; this release checkpoint does not complete automatic whole-query pushdown, nested schemas, all type/grammar features or platform distribution."
+  ],
+  "evidenceRoot": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/qualification",
+  "evidenceManifests": [
+    "sdk-v3-releases-20261028/qualification.json",
+    "sdk-v3-releases-20261028/registry-verification.json",
+    "java-releases-20261028-identity-native/releases.json",
+    "java-releases-20261028-identity-native/shm-pool-fix.json",
+    "csharp-release-20261028/evidence/summary.json"
+  ],
+  "rootEvidenceDirectory": "sdk-releases-20261028-root"
+}

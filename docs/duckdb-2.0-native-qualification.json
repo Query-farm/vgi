@@ -274,10 +274,6 @@
     "sql-matrix-clang/qualification.json": "76ab33cfd7ea7759706c496603fd3d5a653afeeef443c5a85bf1f4f60dff587f",
     "clang-qualification/frozen-hash-audit-final.json": "4cad1c4a11326fb1ba509d1bb41158db3e1a368f71b4350f5fe830a70cfaeac4"
   },
-  "dependency_limits": [
-    "Java uses the qualified RPC 0.33.2 candidate; matched publication remains a release gate.",
-    "C# uses only the Apache.Arrow.dll overlay from committed empty-STRUCT fix e4489a8212bddec01162f78ff14d632c5c95a4d8; the fix is unpublished."
-  ],
   "csharp_arrow_overlay_sha256": "727e401ba1ffb9d8b6c4e26054bf3003177d8e9f12f8be65145bcb57fb59d7c1",
   "outstanding_scope": [
     "Automatic whole-query pushdown and nested-schema support.",
@@ -327,5 +323,17 @@
       "native-registry-units.exit"
     ],
     "note": "Supersedes the candidate-library dependency limitation. Earlier matrix artifacts and hashes above remain the historical evidence; this checkpoint rebuilds and qualifies the native unit executable with registry dependencies."
+  },
+  "historical_dependency_limits": [
+    "Java uses the qualified RPC 0.33.2 candidate; matched publication remains a release gate.",
+    "C# uses only the Apache.Arrow.dll overlay from committed empty-STRUCT fix e4489a8212bddec01162f78ff14d632c5c95a4d8; the fix is unpublished."
+  ],
+  "dependency_limits": [],
+  "sdk_release_checkpoint_2026_10_28": {
+    "manifest": "duckdb-2.0-sdk-releases.json",
+    "status": "published_packages_verified",
+    "supersedes": "Earlier Java candidate and C# Arrow overlay publication limitations; historical suite artifacts above are unchanged.",
+    "shm_fix_commit": "090095defb1e65916196d70cccc7111aff96ae97",
+    "final_ci": "Some native and SDK followup checks still in progress; Python PR98 open pending final checks."
   }
 }
