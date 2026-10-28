@@ -2,8 +2,7 @@
 # description: Tiny request bodies skip compression (identity); large bodies still compress
 # group: [vgi_integration_http]
 #
-# Sub-KiB request bodies (producer ticks, 1-row exchanges, small unary
-# envelopes) are posted uncompressed with NO Content-Encoding header — zstd
+# Sub-KiB request bodies are posted uncompressed with NO Content-Encoding header — zstd
 # would burn CPU and often grow them. Larger bodies keep the zstd default.
 # Observed via the http.response log event's req_encoding field.
 
@@ -19,22 +18,30 @@ statement ok
 CALL enable_logging(level := 'debug');
 
 statement ok
-ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
-
-statement ok
 CALL truncate_duckdb_logs();
 
-# One-row scalar exchange → body well under 1 KiB → identity.
+# Catalog discovery has an empty request envelope. A one-row exchange is not
+# necessarily small: its opaque state can already exceed the compression cutoff.
+query I
+SELECT count(*) > 0 FROM vgi_catalogs('${VGI_TEST_WORKER}');
+----
+true
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%http.response%' AND message LIKE '%/catalog_catalogs%'
+    AND message LIKE '%req_encoding=none%'
+    AND TRY_CAST(regexp_extract(message, 'req_raw_bytes=([0-9]+)', 1) AS BIGINT) < 1024;
+----
+true
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
 query I
 SELECT ex.double(21);
 ----
 42
-
-query I
-SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
-    AND message LIKE '%http.response%' AND message LIKE '%req_encoding=none%';
-----
-true
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -47,7 +54,9 @@ SELECT count(*) FROM (SELECT ex.double(i) AS d FROM range(5000) t(i)) WHERE d IS
 
 query I
 SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
-    AND message LIKE '%http.response%' AND message LIKE '%req_encoding=zstd%';
+    AND message LIKE '%http.response%' AND message LIKE '%/init/exchange%'
+    AND message LIKE '%req_encoding=zstd%'
+    AND TRY_CAST(regexp_extract(message, 'req_raw_bytes=([0-9]+)', 1) AS BIGINT) >= 1024;
 ----
 true
 
