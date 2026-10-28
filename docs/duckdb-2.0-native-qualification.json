@@ -284,27 +284,17 @@
     "Automatic whole-query pushdown and nested-schema support.",
     "Nested TUPLE/VARIANT value transport and broader DuckDB 2.0 grammar/feature qualification.",
     "Iroh, optional companions, other platforms and browser qualification.",
-    "Pinned 2.0 CI/distribution, final engine ABI/version metadata and coordinated dependency publication.",
-    "Full HTTP worker integration against the DuckDB 2.0/nanoarrow artifact; targeted native HTTP checks alone do not qualify every SDK over HTTP."
+    "Pinned 2.0 CI/distribution, final engine ABI/version metadata and coordinated dependency publication."
   ],
   "primary_checkout": "~/Development/vgi",
   "http_coverage": {
-    "status": "targeted_native_checks_passed_full_worker_integration_outstanding",
-    "native_http_suite": {
-      "cases": 9,
-      "assertions": 276,
-      "scope": [
-        "GET/POST cancellation",
-        "POST single-dispatch policy",
-        "GET configured retries",
-        "secret isolation"
-      ]
-    },
-    "parameter_clone_suite": {
-      "cases": 2,
-      "assertions": 17
-    },
-    "full_language_matrix_over_http": false,
-    "note": "The language matrix skips HTTP-specific integration, authentication, compression and optional versioning cases. The final reference truncation probes use launcher/subprocess, not HTTP."
+    "status": "passed_configured_local_http_suites",
+    "summary": "duckdb-2.0-http-qualification.json",
+    "canonical_make_passed": 329,
+    "canonical_make_skipped": 49,
+    "sdk_file_passes": 2774,
+    "sdk_expected_skips": 252,
+    "unresolved_failures": 0,
+    "note": "Counts overlap across modes. Scope, candidate limits and preserved attempts are in the HTTP summary."
   }
 }

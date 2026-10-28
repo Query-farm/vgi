@@ -55,11 +55,11 @@ extensions and `v2.0.0-dev88798` shell link. Loading the new extension succeeds.
 The Clang 15.0.7 build uses all 48 host CPUs. The full native unit suite passes
 178 cases / 2,716 assertions; the filter suite passes 17 cases / 243 assertions.
 Settings pass 8 / 137 and cancellation passes
-9 / 37, and the HTTP suite passes 9 cases / 276 assertions. This is targeted
-HTTP coverage for cancellation, retry policy and secret isolation, with the
-separate parameter-clone tests above. The eight-language/backend matrix below
-does not establish full HTTP qualification: its HTTP-specific integration,
-authentication, compression and optional HTTP versioning cases are skipped.
+9 / 37, and the native HTTP suite passes 9 cases / 276 assertions for
+cancellation, retry policy and secret isolation, with the separate
+parameter-clone tests above. The first language matrix below used local worker
+transports. The subsequent full configured HTTP matrix is recorded separately
+after that table.
 The final catalog
 qualification covers all 88 cases, including every worker/corpus-backed case
 and both hidden tests, with zero skips. Five engine cases / 537 assertions cover
@@ -95,6 +95,46 @@ evidence is under `clang-qualification`, `catalog-clang-final` and
 [qualification summary](duckdb-2.0-native-qualification.json) records source
 commits, frozen artifact hashes, test counts, targeted proofs and the exact
 evidence-manifest hashes. The final audit confirms the binaries stayed unchanged.
+
+**HTTP integration checkpoint (October 28):** the existing `make test_http`
+target passes against the same Clang/nanoarrow binaries: **329 files passed,
+49 fixture/service gates, exit 0**, in 197 seconds using 24 file jobs. It was
+invoked as `make test_http VGI_RPC_PYTHON_DIR=` to use the qualified installed
+RPC package; the Makefile otherwise prepended a stale host development checkout.
+That startup-only failed attempt is preserved and excluded from coverage.
+
+The separately configured eight-language/backend HTTP matrix passes **2,774
+SDK/file pairs**, with 252 explicit skips and no unresolved failures: Python
+354/24, Go 349/29, Rust 348/31, TypeScript ArrowJS 341/37, TypeScript Flechette
+341/37, Java 345/33, C# 351/28 and C++ 345/33 (passes/skips). Main and ordinary
+versioned/attach-option workers use HTTP; auxiliary malformed/local-package
+fixtures retain their documented standalone transport. Targeted HTTP-only
+checks replace prior skips in the coverage union rather than adding duplicate
+passes. The final C# SDK change received a complete fresh HTTP run.
+
+The configured supplemental HTTP fixtures cover 362 of 378 unique SQL files,
+with 16 explicit optional-service/transport gates, including bearer auth,
+synthetic OAuth discovery, attach tickets, versioning, attach options,
+identity/gzip/zstd encoding and externalized responses from the local demo
+object store. These counts overlap the language matrix and Make target.
+Additional focused checks cover 18 explicit-query scenarios, 12 projection
+scenarios and six producer-disconnect/healthy-control scenarios over HTTP.
+Preparation-response loss proves error propagation without replay; it does not
+claim resource reclamation after the entire provider process dies.
+
+Three fixes are committed: `ace0ea5` makes the compression test measure an
+actual small discovery request (424 bytes) instead of assuming a one-row
+exchange is small; Python `95c66a2f0b03` finishes its one-shot writable scan in
+the emitting turn; C# `0c3f5c25062a` forwards existing authentication context to
+table initialization and uses the principal in the cache-identity fixture.
+The C# change adds no wire field. Its four dispatch cases and full HTTP run
+pass; the Python change passes all six HTTP and six subprocess write files.
+No native binary was rebuilt for these fixes. See the
+[HTTP qualification summary](duckdb-2.0-http-qualification.json) for exact
+commands, hashes, preserved failures and candidate dependency limits.
+
+This is local HTTP qualification. Real S3/identity-provider services, optional
+companion/container deployments and other platforms remain outside this run.
 
 The first complete GCC eight-lane framework-language SQLLogic matrix finished with
 shared adapter failures: Python 326 passed / 30 failed / 33 skipped, Go 334/24/32,
@@ -164,9 +204,9 @@ query parameters, strict IPC framing and metadata validation have been ported
 to nanoarrow. All 24 final reference checks pass; together with the catalog
 interrupt test they cover all 18 explicit-query scenarios. Projection,
 repeatability and catalog contracts also pass. The truncated IPC probes run
-over launcher and subprocess transports, not HTTP. Default-schema SQL also
-passes 19 assertions. Full HTTP worker integration remains to be run against
-this DuckDB 2.0/nanoarrow artifact.
+over launcher and subprocess transports. Default-schema SQL also passes 19
+assertions. Subsequent HTTP worker integration and HTTP producer-disconnect
+checks are recorded in the separate HTTP checkpoint above.
 
 DuckDB 2.0 adaptation includes bound function signatures, raw `Identifier`
 conversion at catalog boundaries, nullable default schemas, active

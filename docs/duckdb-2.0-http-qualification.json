@@ -1,0 +1,243 @@
+{
+  "status": "passed_configured_local_http_suites",
+  "date": "2026-10-28",
+  "branch": "v2.0",
+  "primary_checkout": "~/Development/vgi",
+  "native_test_commit": "ace0ea5",
+  "native_artifact_unchanged": true,
+  "extension_sha256": "e66f6ff29d0268f7613be13f26183fdbdfda106d6cfba059dbc97f453d0996e0",
+  "engine_sha256": "675553bf2698e64ebcc1b39c5558abe4ab4728f5012778778407afc442646ece",
+  "remote_evidence_root": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/vgi-native2-nano-20261027-1i9LOE/evidence/http-qualification-20261028",
+  "canonical_make": {
+    "command": [
+      "make",
+      "test_http",
+      "VGI_RPC_PYTHON_DIR="
+    ],
+    "cwd": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/vgi-native2-nano-20261027-1i9LOE/native",
+    "build": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/vgi-native2-nano-20261027-1i9LOE/build-clang",
+    "environment": {
+      "VGI_PYTHON_DIR": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/src/vgi-python",
+      "UV_NO_SYNC": "1",
+      "VGI_RUN_TESTS_JOBS": "24",
+      "TMPDIR": "/dev/shm/vgi-canonical-http-final-20261028",
+      "duckdb_local_extension_repo": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/vgi-native2-nano-20261027-1i9LOE/build-clang/repository"
+    },
+    "exit_code": 0,
+    "seconds": 197.0843915939331,
+    "passed": 329,
+    "skipped": 49,
+    "failed": 0,
+    "note": "VGI_RPC_PYTHON_DIR= prevents the Makefile default from importing a stale host development RPC checkout. Uses the qualified installed RPC. Initial startup-only attempt is archived and excluded."
+  },
+  "sdk_matrix": {
+    "passed": 2774,
+    "skipped": 252,
+    "unresolved_failures": 0,
+    "counting": "Unique SQLLogic test files per SDK lane; targeted variants replace the corresponding raw skipped/failed record and are not double-counted.",
+    "transport_scope": "Main workers and normal versioned/attach-option secondary catalogs use real HTTP endpoints. Canonical malformed/local-package/simple-write auxiliary fixtures remain explicitly recorded standalone commands.",
+    "lanes": {
+      "python": {
+        "status": "passed",
+        "passed": 354,
+        "skipped": 24,
+        "selected_files": 378,
+        "execution_floor": 300,
+        "selected_files_sha256": "d25f3a9a1237efd8e808d57d045035524249c152fd7d8769b6d1954ebc24016a",
+        "exclusions": [
+          "~test/sql/integration/writable/*",
+          "~test/sql/integration/projection_pushdown_repro.test"
+        ],
+        "sdk_commit": "dd37d26016581a8f163c05a71244bc8ce83fae32",
+        "targeted_proof_count": 1
+      },
+      "go": {
+        "status": "passed",
+        "passed": 349,
+        "skipped": 29,
+        "selected_files": 378,
+        "execution_floor": 305,
+        "selected_files_sha256": "d25f3a9a1237efd8e808d57d045035524249c152fd7d8769b6d1954ebc24016a",
+        "exclusions": [
+          "~test/sql/integration/writable/*",
+          "~test/sql/integration/projection_pushdown_repro.test"
+        ],
+        "sdk_commit": "ae8f35dc8324c7869648cb2ffd27bf0721397692",
+        "targeted_proof_count": 5
+      },
+      "rust": {
+        "status": "passed",
+        "passed": 348,
+        "skipped": 31,
+        "selected_files": 379,
+        "execution_floor": 290,
+        "selected_files_sha256": "cf43d594e8e7b535f25864622cb5ea2ac201659d61bbfd91acd3341671ca38eb",
+        "exclusions": [
+          "~test/sql/integration/writable/*"
+        ],
+        "sdk_commit": "a14e7f9425d16575b29d469aa0cfa24f4fd20497",
+        "targeted_proof_count": 4
+      },
+      "typescript-arrowjs": {
+        "status": "passed",
+        "passed": 341,
+        "skipped": 37,
+        "selected_files": 378,
+        "execution_floor": 290,
+        "selected_files_sha256": "0e5fe940fcf35335873bafceb65d668fd770b7a1bfc9a4ee870c9760a1e50027",
+        "exclusions": [
+          "~test/sql/integration/writable/*",
+          "~test/sql/integration/schema_reconcile.test"
+        ],
+        "sdk_commit": "5ddfd82510db16f3d5a674ddcf8277d922bdfc82",
+        "targeted_proof_count": 5
+      },
+      "typescript-flechette": {
+        "status": "passed",
+        "passed": 341,
+        "skipped": 37,
+        "selected_files": 378,
+        "execution_floor": 290,
+        "selected_files_sha256": "0e5fe940fcf35335873bafceb65d668fd770b7a1bfc9a4ee870c9760a1e50027",
+        "exclusions": [
+          "~test/sql/integration/writable/*",
+          "~test/sql/integration/schema_reconcile.test"
+        ],
+        "sdk_commit": "5ddfd82510db16f3d5a674ddcf8277d922bdfc82",
+        "targeted_proof_count": 5
+      },
+      "java": {
+        "status": "passed",
+        "passed": 345,
+        "skipped": 33,
+        "selected_files": 378,
+        "execution_floor": 295,
+        "selected_files_sha256": "d25f3a9a1237efd8e808d57d045035524249c152fd7d8769b6d1954ebc24016a",
+        "exclusions": [
+          "~test/sql/integration/writable/*",
+          "~test/sql/integration/projection_pushdown_repro.test"
+        ],
+        "sdk_commit": "0789d65560eaf4476dcc027e8c60e5af148b45e5",
+        "targeted_proof_count": 6
+      },
+      "csharp": {
+        "status": "passed",
+        "passed": 351,
+        "skipped": 28,
+        "selected_files": 379,
+        "execution_floor": 318,
+        "selected_files_sha256": "cf43d594e8e7b535f25864622cb5ea2ac201659d61bbfd91acd3341671ca38eb",
+        "exclusions": [
+          "~test/sql/integration/writable/*"
+        ],
+        "sdk_commit": "0c3f5c25062ac88effdbe2ee8ec225d48e30311f",
+        "targeted_proof_count": 0
+      },
+      "cpp": {
+        "status": "passed",
+        "passed": 345,
+        "skipped": 33,
+        "selected_files": 378,
+        "execution_floor": 290,
+        "selected_files_sha256": "d25f3a9a1237efd8e808d57d045035524249c152fd7d8769b6d1954ebc24016a",
+        "exclusions": [
+          "~test/sql/integration/writable/*",
+          "~test/sql/integration/projection_pushdown_repro.test"
+        ],
+        "sdk_commit": "40eea1c662aec4cf679e38e34830ff5f921c6b5b",
+        "targeted_proof_count": 3
+      }
+    }
+  },
+  "supplemental": {
+    "passed_unique_sql_files": 362,
+    "gated_sql_files": 16,
+    "counting": "Coverage is deduplicated by SQLLogic source path across the full demo-storage lane and explicitly configured supplemental HTTP fixtures. Mode assertion counts overlap and must not be added as unique coverage. Original setup/fixture failures remain intact and are superseded only by linked successful records; no native rebuild occurred.",
+    "additional_mode_counts": {
+      "special": {
+        "total": 14,
+        "passed": 14,
+        "assertions": 338
+      },
+      "compressed-external": {
+        "total": 6,
+        "passed": 6,
+        "assertions": 132
+      },
+      "small-body-fixed": {
+        "total": 2,
+        "passed": 2,
+        "assertions": 20
+      },
+      "late-materialization-fixed": {
+        "total": 2,
+        "passed": 2,
+        "assertions": 106
+      },
+      "simple-writable-fixed": {
+        "total": 12,
+        "passed": 12,
+        "assertions": 288
+      }
+    },
+    "oauth_scenarios": 6,
+    "note": "Overlaps the language matrix and canonical Make target; do not add totals as unique coverage."
+  },
+  "focused_http": {
+    "query_scenarios": 18,
+    "projection_scenarios": 12,
+    "scan_disconnect_and_control_scenarios": 6,
+    "total_scenarios": 36,
+    "limits": [
+      "Preparation-response loss kills the whole HTTP fixture process; the test proves one preparation and zero query executions, not cleanup after provider death.",
+      "Healthy interruption proves one execution, usable connection, successful DETACH and no retained provider query resources."
+    ]
+  },
+  "fixes": {
+    "native_http_compression_fixture": {
+      "commit": "ace0ea5",
+      "sha256": "9964acacd6e0618223439c05abd8f3b5ad4a967b6225d87d34d11d0e8b15dac3",
+      "reason": "Use a measured sub-1024-byte discovery request for identity encoding; one-row scalar requests can exceed the compression cutoff."
+    },
+    "python_simple_writable": {
+      "local_commit": "95c66a2f0b03b7da9bc5a6d8242c5eebce989879",
+      "file": "vgi/_test_fixtures/simple_writable.py",
+      "qualified_override": "simple_writable.fixed.py",
+      "sha256": "33107ee2a31c93f7adf473113c038f13a9a49fc2483899c645f958c761be493d",
+      "remote_shared_sdk_modified": false,
+      "proof": "simple-writable-fixed/summary.json",
+      "http_cases": 6,
+      "subprocess_cases": 6,
+      "total_assertions": 288,
+      "lint": {
+        "source_path_check": "simple-writable-ruff-source-path.log",
+        "format_check": "simple-writable-ruff-format.log",
+        "note": "Initial lint against the relocated evidence filename did not apply package/per-file configuration; rerun via --stdin-filename vgi/_test_fixtures/simple_writable.py passed."
+      }
+    },
+    "csharp_table_init_identity": {
+      "commit": "0c3f5c25062ac88effdbe2ee8ec225d48e30311f",
+      "wire_change": false,
+      "dispatch_cases": 4,
+      "full_http_files_passed": 351,
+      "expected_skips": 28,
+      "description": "Optional TableInitParams.Ctx forwarded from existing InitAsync context; example cache_whoami captures verified principal. Four dispatch unit cases, five targeted HTTP cases, then full C# HTTP rerun. Same unpublished Arrow empty-struct DLL overlay retained."
+    }
+  },
+  "evidence_sha256": {
+    "matrix-py-go-rust-csharp/qualification.json": "6874e26271f94ccbff251aeacad40bc0cb963944bce2ad47cd617c83526fcd87",
+    "supplemental/summary.json": "bee650c5769cbc64562a7fc63965631be639158ea47aff2edd39d45d425cc892",
+    "focused/qualification.json": "9a519075b75e405f6e65c8c0c273aefe62681760e767a8b00d6d3d6aa8497b05",
+    "canonical-make/command.json": "f1385078fe176f96f7066addc1adca0e8295a1ed71491f3241427515c8a17f57",
+    "canonical-make/exit.json": "ff57416dd61dc14c3a17822f1cdd65826b1b184e129623fdb461b7c26747a03c",
+    "canonical-make/run.log": "f7ec642f4b96851a70585b2f6cc3e2e9455b96eb8373a46cc3b179d740f9f816"
+  },
+  "limits": [
+    "Real S3 credentials/backend integration was not exercised; externalized location pointers and uncompressed/gzip/zstd object fetches were tested against the local demo object store.",
+    "OAuth discovery used a synthetic local authorization service; no real identity-provider login was performed.",
+    "The explicitly gated Iceberg service, companion/container fixtures, and opt-in GitHub network lane remain outside this configuration.",
+    "Linux ARM64 Clang development artifacts; no platform/browser or release-packaging qualification.",
+    "Java/Rust dependency candidate limits from the native checkpoint still apply. The C# Arrow and SDK context fixes are committed but unpublished.",
+    "Fault probes cover failed HTTP exchanges and producer disconnects, not exhaustive malformed HTTP-200 IPC-body validation."
+  ]
+}
