@@ -109,7 +109,7 @@ unique_ptr<FunctionData> VgiProtocolsBind(ClientContext &context, TableFunctionB
 				throw BinderException("vgi_protocols: %s is only valid with a worker location; catalog "
 				                      ":= uses "
 				                      "the attached catalog's connection and authentication",
-				                      kv.first);
+				                      kv.first.GetIdentifierName());
 			}
 		}
 		bind_data->catalog_alias = catalog_value.GetValue<string>();

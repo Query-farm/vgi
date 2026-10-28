@@ -398,6 +398,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// savings). Expression pushdown is intentionally
 			// skipped for the same reason.
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
+			table_func.supports_complex_join_filters = false;
 			if (is_buffering) {
 				table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
 				if (table_func.filter_pushdown) {
@@ -423,6 +424,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// Attach function info
 			table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(target, func_info);
 
+			vgi::SetVgiFunctionArgumentNames(table_func, arg_types.positional_names);
 			func_set.AddFunction(table_func);
 		} else {
 			// Create a regular table function
@@ -431,6 +433,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			                         vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 			table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
+			table_func.supports_complex_join_filters = false;
 			table_func.sampling_pushdown = func_info.sampling_pushdown.value_or(false);
 			table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 			if (table_func.filter_pushdown) {
@@ -510,6 +513,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
 			table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(target, func_info);
 
+			vgi::SetVgiFunctionArgumentNames(table_func, arg_types.positional_names);
 			func_set.AddFunction(table_func);
 		}
 

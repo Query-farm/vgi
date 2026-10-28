@@ -84,7 +84,7 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 		}
 		auto spec_it = specs.find(key_lower);
 		if (spec_it == specs.end()) {
-			throw BinderException("Unsupported option '%s' for COPY ... FROM (FORMAT %s)", key,
+			throw BinderException("Unsupported option '%s' for COPY ... FROM (FORMAT %s)", key.GetIdentifierName(),
 			                      carrier.format_name);
 		}
 		// COPY options are a list of Values; scalar options carry exactly one.

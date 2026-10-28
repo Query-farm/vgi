@@ -9,6 +9,15 @@
 namespace duckdb {
 namespace vgi {
 
+// Parameter names belong to the signature in DuckDB 2.0; descriptions alone
+// do not populate duckdb_functions() or the names supplied to bind callbacks.
+inline void SetVgiFunctionArgumentNames(SimpleFunction &function, const vector<string> &names) {
+	auto &signature = function.GetSignature();
+	for (idx_t i = 0; i < names.size(); i++) {
+		signature.GetParameter(i).SetName(Identifier(names[i]));
+	}
+}
+
 // Optional named options are **kwargs entries: omitting an option leaves it
 // absent in TableFunctionBindInput::named_parameters.
 inline void AddVgiFunctionOption(SimpleFunction &function, Identifier name, LogicalType type) {

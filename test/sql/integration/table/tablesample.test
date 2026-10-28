@@ -100,7 +100,7 @@ SELECT n, sample_percentage FROM example.sample_echo(3) TABLESAMPLE SYSTEM(25%);
 query II
 EXPLAIN SELECT * FROM example.sample_echo(10) TABLESAMPLE SYSTEM(10%);
 ----
-physical_plan	<!REGEX>:.*STREAMING_SAMPLE.*
+physical_plan	<!REGEX>:.*Streaming Sample.*
 
 # ============================================================================
 # Cleanup

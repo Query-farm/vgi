@@ -1094,8 +1094,24 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 			}
 		}
 
-		auto append_filter = [&](const TableFilter &candidate, bool inherited_advisory) {
+		std::function<void(const TableFilter &, bool)> append_filter;
+		append_filter = [&](const TableFilter &candidate, bool inherited_advisory) {
 			bool advisory = inherited_advisory || ExpressionFilter::IsOptionalFilter(candidate);
+			const auto &candidate_expression = ExpressionFilter::GetExpressionFilter(candidate, "VGI advisory conjuncts");
+			// Runtime join bounds may share an advisory AND with an unsupported
+			// Bloom/prefix filter. Each conjunct is independently safe to omit;
+			// do not discard serializable min/max bounds with its sibling.
+			const Expression *expr = candidate_expression.expr.get();
+			while (auto child = ExpressionFilter::GetOptionalFilterChild(*expr)) {
+				expr = child.get();
+			}
+			if (advisory && expr->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+				for (const auto &child : expr->Cast<BoundConjunctionExpression>().GetChildren()) {
+					ExpressionFilter conjunct(child->Copy());
+					append_filter(conjunct, true);
+				}
+				return;
+			}
 			try {
 				auto expression = serializer.SerializeFilter(candidate, worker_col_idx, col_name, advisory);
 				if (!expression) {
@@ -1125,23 +1141,32 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 			append_filter(filter, false);
 			continue;
 		}
-		// Keep required conjuncts together, preserving their evaluation/error order.
+		// PushFilter builds nested binary ANDs. Separate advisory leaves at
+		// every AND level, keeping required leaves together in evaluation order.
 		vector<unique_ptr<Expression>> required;
-		for (const auto &child : expression.expr->Cast<BoundConjunctionExpression>().GetChildren()) {
-			if (ExpressionFilter::IsOptionalExpression(*child)) {
-				if (!VgiAdvisoryFilterCanThrow(*child)) {
-					ExpressionFilter advisory(child->Copy());
+		std::function<void(const Expression &)> collect_conjuncts;
+		collect_conjuncts = [&](const Expression &child) {
+			if (child.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+				for (const auto &nested : child.Cast<BoundConjunctionExpression>().GetChildren()) {
+					collect_conjuncts(*nested);
+				}
+			} else if (ExpressionFilter::IsOptionalExpression(child)) {
+				if (!VgiAdvisoryFilterCanThrow(child)) {
+					ExpressionFilter advisory(child.Copy());
 					append_filter(advisory, true);
 				}
 			} else {
-				required.push_back(child->Copy());
+				required.push_back(child.Copy());
 			}
-		}
+		};
+		collect_conjuncts(*expression.expr);
 		if (!required.empty()) {
 			ExpressionFilter mandatory(BoundConjunctionExpression::Create(ExpressionType::CONJUNCTION_AND, std::move(required)));
 			append_filter(mandatory, false);
 		}
 	}
+	// An empty snapshot still establishes the evaluation context for later
+	// Top-N deltas. Keep that envelope even when every static predicate was optional.
 	yyjson_mut_obj_add_val(serializer.GetDoc(), document, "predicates", predicates);
 
 	// Write JSON string

@@ -22,31 +22,31 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 query II
 EXPLAIN SELECT * FROM example.sequence(10000) WHERE n > 100000;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # Out of range below the min → EMPTY_RESULT
 query II
 EXPLAIN SELECT * FROM example.sequence(10000) WHERE n < -1;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # In-range filter → scan retained
 query II
 EXPLAIN SELECT * FROM example.sequence(10000) WHERE n > 5000;
 ----
-physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+physical_plan	<!REGEX>:.*Empty Result.*
 
 # Exactly the max → within bounds, scan retained
 query II
 EXPLAIN SELECT * FROM example.sequence(10) WHERE n = 9;
 ----
-physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+physical_plan	<!REGEX>:.*Empty Result.*
 
 # One past the max → eliminated
 query II
 EXPLAIN SELECT * FROM example.sequence(10) WHERE n = 10;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # ============================================================================
 # Actual execution still works — stats are additive, not destructive.
@@ -72,20 +72,20 @@ SELECT count(*) FROM example.sequence(10000) WHERE n > 100000;
 query II
 EXPLAIN SELECT * FROM example.double_sequence(100) WHERE n > 1000.0;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # In range → scan retained
 query II
 EXPLAIN SELECT * FROM example.double_sequence(100) WHERE n > 50.0;
 ----
-physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+physical_plan	<!REGEX>:.*Empty Result.*
 
 # With increment: double_sequence(5, increment:=0.5) → n in [0.0, 2.0]
 # So WHERE n > 10.0 must be eliminated.
 query II
 EXPLAIN SELECT * FROM example.double_sequence(5, increment := 0.5) WHERE n > 10.0;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # ============================================================================
 # Negative control: a function without a statistics() override must NOT
@@ -100,7 +100,7 @@ physical_plan	<REGEX>:.*EMPTY_RESULT.*
 query II
 EXPLAIN SELECT * FROM example.generator_exception(100) WHERE n > 999999;
 ----
-physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+physical_plan	<!REGEX>:.*Empty Result.*
 
 # ============================================================================
 # Catalog table with stats provided by the scan function (not the catalog).
@@ -121,19 +121,19 @@ SELECT count(*) FROM example.data.funny_numbers;
 query II
 EXPLAIN SELECT * FROM example.data.funny_numbers WHERE n > 200000;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # Below min — eliminated.
 query II
 EXPLAIN SELECT * FROM example.data.funny_numbers WHERE n < 0;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # In range — scan retained.
 query II
 EXPLAIN SELECT * FROM example.data.funny_numbers WHERE n > 50000;
 ----
-physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+physical_plan	<!REGEX>:.*Empty Result.*
 
 # The catalog helper vgi_table_statistics() returns 0 rows for funny_numbers
 # because the Table descriptor declares no column statistics. This proves the

@@ -14,6 +14,7 @@
 #include "storage/vgi_schema_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_function_docs.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_global_functions.hpp"
@@ -83,9 +84,12 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 			return_type = output_types[0];
 		}
 
-		// Create the scalar function with positional arguments only
-		// DuckDB's ScalarFunction doesn't have built-in named parameter support
+		// Build the positional signature from the advertised types. Logical
+		// parameter names are installed below before catalog registration.
 		ScalarFunction scalar_func(arg_types.positional_types, return_type, vgi::VgiScalarFunctionExecute);
+
+		// Remote execution can report errors for otherwise well-typed inputs.
+		scalar_func.SetFallible();
 
 		// Set stability from function metadata, defaulting to CONSISTENT
 		// to match the DuckDB default.
@@ -132,6 +136,7 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 		scalar_func.SetInitStateCallback(vgi::VgiScalarFunctionInitLocalState);
 		scalar_func.SetBindCallback(vgi::VgiScalarFunctionBind);
 
+		vgi::SetVgiFunctionArgumentNames(scalar_func, arg_types.positional_names);
 		func_set.AddFunction(scalar_func);
 
 		// Create function description with full metadata

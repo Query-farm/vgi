@@ -786,7 +786,8 @@ private:
 		    "Table '%s.%s.%s' requires WHERE filters on: %s. Missing: %s. "
 		    "Add predicates targeting those columns (or a filter on a parent struct) "
 		    "to avoid scanning the entire table.",
-		    vgi.ParentCatalog().GetName(), vgi.ParentSchema().name, vgi.name,
+		    vgi.ParentCatalog().GetName().GetIdentifierName(), vgi.ParentSchema().name.GetIdentifierName(),
+		    vgi.name.GetIdentifierName(),
 		    JoinGroups(required), JoinGroups(missing));
 	}
 
@@ -3783,6 +3784,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		scan_func.deserialize = VgiTableEntry::VgiTableScanDeserialize;
 		scan_func.projection_pushdown = true;
 		scan_func.filter_pushdown = true;
+		scan_func.supports_complex_join_filters = false;
 		CreateTableFunctionInfo scan_info(scan_func);
 		scan_info.descriptions.push_back(vgi::MakeFunctionDescription(
 		    "Internal: the physical scan operator for tables in an attached VGI catalog. DuckDB binds it "

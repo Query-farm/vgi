@@ -37,7 +37,7 @@ query II
 EXPLAIN SELECT * FROM example.spatial_filter_example(100)
 WHERE geom && ST_MakeEnvelope(0, 0, 0.5, 0.5);
 ----
-physical_plan	<!REGEX>:(?s).*FILTER.*SPATIAL_FILTER_EXAMPLE.*
+physical_plan	<!REGEX>:(?s).*Filter.*Spatial Filter Example.*
 
 # ============================================================================
 # SPATIAL: && bbox filter
@@ -121,7 +121,7 @@ query II
 EXPLAIN SELECT * FROM example.expression_filter_test(100)
 WHERE list_contains(tags, 'tag_0');
 ----
-physical_plan	<!REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
+physical_plan	<!REGEX>:(?s).*Filter.*Expression Filter Test.*
 
 # ============================================================================
 # NON-SPATIAL: Prove bound string functions are pushed down
@@ -131,19 +131,19 @@ query II
 EXPLAIN SELECT * FROM example.expression_filter_test(100)
 WHERE starts_with(name, 'item_9');
 ----
-physical_plan	<!REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
+physical_plan	<!REGEX>:(?s).*Filter.*Expression Filter Test.*
 
 query II
 EXPLAIN SELECT * FROM example.expression_filter_test(100)
 WHERE ends_with(name, '_9');
 ----
-physical_plan	<!REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
+physical_plan	<!REGEX>:(?s).*Filter.*Expression Filter Test.*
 
 query II
 EXPLAIN SELECT * FROM example.expression_filter_test(100)
 WHERE contains(name, '_5');
 ----
-physical_plan	<!REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
+physical_plan	<!REGEX>:(?s).*Filter.*Expression Filter Test.*
 
 # ============================================================================
 # NON-SPATIAL: Prove unsupported function is NOT pushed (FILTER node exists)
@@ -153,7 +153,7 @@ query II
 EXPLAIN SELECT * FROM example.expression_filter_test(100)
 WHERE length(name) > 7;
 ----
-physical_plan	<REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
+physical_plan	<REGEX>:(?s).*Filter.*Expression Filter Test.*
 
 # ============================================================================
 # NON-SPATIAL: list_contains

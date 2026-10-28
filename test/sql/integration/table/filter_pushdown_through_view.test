@@ -4,7 +4,7 @@
 #              underlying VGI table". Finding: a plain view over a VGI table DOES push
 #              =, IN, range, BETWEEN, equality, and LIKE 'prefix%' down to the worker —
 #              identical to a direct scan. Pushdown legitimately stops only when the view
-#              transforms the column, or the LIKE pattern has no constant prefix.
+#              transforms the column or uses an unsupported collation.
 # group: [vgi_integration_table]
 
 # example.data.filter_echo_table is backed by FilterEchoTableScanFunction
@@ -185,39 +185,34 @@ SELECT count(*) FROM v_upper WHERE su LIKE 'ROW_1%';
 ----
 11
 
-# 4b. LIKE with no constant prefix (leading wildcard) -> no range rewrite, and
-#     the adapter cannot encode the pattern as an exact standard call, so
-#     nothing pushes. True both directly and through the plain view.
-query T
-SELECT DISTINCT pushed_filters FROM v_echo WHERE s LIKE '%row%';
+# 4b. DuckDB 2.0 lowers these leading-wildcard patterns to standard contains
+#     and ends_with calls. They push through the view without a range rewrite.
+#     Check both pushdown and exact rows without depending on SDK debug rendering.
+query II
+SELECT count(*), count(DISTINCT pushed_filters) = 1 AND min(pushed_filters) <> '(none)'
+FROM v_echo WHERE s LIKE '%row%';
 ----
-(none)
+100	true
 
-query T
-SELECT DISTINCT pushed_filters FROM v_echo WHERE s LIKE '%5';
+query II
+SELECT count(*), count(DISTINCT pushed_filters) = 1 AND min(pushed_filters) <> '(none)'
+FROM v_echo WHERE s LIKE '%5';
 ----
-(none)
+10	true
 
-# 4c. ILIKE (case-insensitive) is NEVER pushed — not even the prefix form.
-#     The LIKE -> range rewrite only fires for case-SENSITIVE LIKE; a
-#     case-insensitive match can't be expressed as a single byte range
-#     (>= 'row' AND < 'rox' would miss 'ROW'/'Row'), so DuckDB keeps ILIKE as a
-#     residual expression above the scan. The selected semantic profile has no
-#     case-insensitive string-call contract, so nothing reaches the worker. This is a likely
-#     real-world cause of "my view's LIKE filter wasn't pushed down" when the
-#     predicate is actually a case-insensitive ILIKE. Results stay correct.
-
+# 4c. DuckDB 2.0 derives conservative case-insensitive prefix bounds.
+#     The residual ILIKE still checks the exact match above the scan.
 # ILIKE prefix — direct
 query T
 SELECT DISTINCT pushed_filters FROM example.data.filter_echo_table WHERE s ILIKE 'ROW%';
 ----
-(none)
+(s >= 'ROW' AND s < 'rox')
 
-# ILIKE prefix — through the plain view (same: not pushed)
+# ILIKE prefix — through the plain view
 query T
 SELECT DISTINCT pushed_filters FROM v_echo WHERE s ILIKE 'ROW%';
 ----
-(none)
+(s >= 'ROW' AND s < 'rox')
 
 # ILIKE contains — through the view
 query T
@@ -238,7 +233,7 @@ SELECT count(*) FROM v_echo WHERE s ILIKE '%ROW%';
 
 # 4d. Raw VARCHAR filters above use DuckDB's binary comparison semantics and are
 # safe under vgi.none.v1. A non-binary collation is represented as a function;
-# the 1.5 adapter cannot prove that function's protocol identity, so it declines
+# the adapter cannot prove that function's protocol identity, so it declines
 # pushdown and leaves the exact predicate in DuckDB.
 statement ok
 PRAGMA default_collation='NOCASE';

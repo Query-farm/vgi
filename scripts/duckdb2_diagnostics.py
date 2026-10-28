@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile the complete native VGI source list against the audited 2.0 pin.
 
-Run on the Linux/GCC build host in a separate source checkout. This is an
+Run on the Linux/Clang build host in a separate source checkout. This is an
 extension-only diagnostic lane, not an engine link or runtime qualification.
 The vendored nanoarrow bundle and existing OpenSSL/zstd/LZ4/SQLite installations
 are consumed without running vcpkg.
@@ -10,14 +10,15 @@ are consumed without running vcpkg.
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-ENGINE_REVISION = "289a784536fc28243f35ccf1b3de38cbf7f5d84d"
-ENGINE_VERSION = "v2.0.0-dev88800"
+ENGINE_REVISION = "54f8340a3ede48cfadb1ec3cef40c2136d08cb3d"
+ENGINE_VERSION = "v2.0.0-dev88801"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -40,7 +41,9 @@ def main():
     parser.add_argument("--engine-source", type=Path, required=True)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--dependency-prefix", type=Path, required=True)
-    parser.add_argument("--jobs", type=int, default=12)
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    parser.add_argument("--cc", default="clang")
+    parser.add_argument("--cxx", default="clang++")
     args = parser.parse_args()
     engine = args.engine_source.resolve()
     build = args.build_dir.resolve()
@@ -111,6 +114,8 @@ def main():
         record["dependency_status_sha256"] = hashlib.sha256(
             status.read_bytes()
         ).hexdigest()
+    compiler_version = subprocess.check_output([args.cxx, "--version"], text=True)
+    error_limit = "-ferror-limit=12" if "clang" in compiler_version.lower() else "-fmax-errors=12"
     command = [
         "cmake",
         "-S",
@@ -124,7 +129,9 @@ def main():
         "-DCMAKE_UNITY_BUILD=OFF",
         "-DCMAKE_BUILD_TYPE=Debug",
         "-DCMAKE_CXX_FLAGS_DEBUG=-O0 -g0",
-        "-DCMAKE_CXX_FLAGS=-fmax-errors=12 -fdiagnostics-color=never",
+        f"-DCMAKE_C_COMPILER={args.cc}",
+        f"-DCMAKE_CXX_COMPILER={args.cxx}",
+        f"-DCMAKE_CXX_FLAGS={error_limit} -fdiagnostics-color=never",
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         "-DDISABLE_UNITY=ON",
         "-DBUILD_EXTENSIONS_ONLY=ON",

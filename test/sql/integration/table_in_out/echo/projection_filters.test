@@ -310,13 +310,13 @@ SELECT n FROM example.echo((SELECT unnest(generate_series(1, 10)) AS n, 'label' 
 query II
 EXPLAIN SELECT b FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c));
 ----
-physical_plan	<!REGEX>:(?s).*PROJECTION.*INOUT_FUNCTION.*
+physical_plan	<!REGEX>:(?s).*Projection.*Inout Function.*
 
 # Two-column subset (verifies projection_ids handling, not just single-col)
 query II
 EXPLAIN SELECT a, c FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c));
 ----
-physical_plan	<!REGEX>:(?s).*PROJECTION.*INOUT_FUNCTION.*
+physical_plan	<!REGEX>:(?s).*Projection.*Inout Function.*
 
 # Projection + filter. NOTE (relaxed): when a FILTER is also present the
 # unused_columns optimizer no longer pushes the narrowing projection INTO the
@@ -329,14 +329,14 @@ physical_plan	<!REGEX>:(?s).*PROJECTION.*INOUT_FUNCTION.*
 query II
 EXPLAIN SELECT b FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c)) WHERE b > 0;
 ----
-physical_plan	<REGEX>:(?s).*INOUT_FUNCTION.*
+physical_plan	<REGEX>:(?s).*Inout Function.*
 
 # Same query — assert the FILTER node IS present above (positive match,
 # pins the current "filter runs above operator" planner behavior).
 query II
 EXPLAIN SELECT b FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c)) WHERE b > 0;
 ----
-physical_plan	<REGEX>:(?s).*FILTER.*INOUT_FUNCTION.*
+physical_plan	<REGEX>:(?s).*Filter.*Inout Function.*
 
 # ============================================================================
 # Cleanup

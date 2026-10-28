@@ -613,6 +613,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   # Standalone test worker — tiny AF_UNIX server that satisfies the launcher
   # contract.  Used by test_launcher_e2e.cpp; no Python required.
   add_executable(launcher_test_worker test/support/launcher_test_worker.cpp)
+  add_dependencies(vgi_unit_tests launcher_test_worker)
 
   # Inject the worker's absolute path into the test binary so the
   # integration tests can find it regardless of the cwd they're run from.

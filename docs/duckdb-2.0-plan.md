@@ -1,6 +1,6 @@
 # VGI migration plan for DuckDB 2.0
 
-**Status (October 27):** native DuckDB 2.0 implementation is now in progress on
+**Status (October 28):** native DuckDB 2.0 implementation is now in progress on
 `v2.0` in `~/Development/vgi`. It combines protocol preparation at `0592bf510d66`
 with the existing `nanoarrow-migration` work at `b3a65011`. The earlier 1.5.x
 preparation remains on `codex/duckdb-2.0-protocol` in `vgi-duckdb2`.
@@ -13,6 +13,12 @@ Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
 The native 2.0/nanoarrow build has its own subdirectory,
 `vgi-native2-nano-20261027-1i9LOE`, separate from the qualified 1.5 binaries.
+Qualification is moving to a fresh Clang build to match the DuckDB 2.0/Haybarn
+extension toolchain. The earlier native 2.0 results used GCC 14.2.1 on ARM64;
+an isolated HUGEINT comparison reproduction exposed the GCC early register
+allocation bug tracked as PR125795. Keep its SQL regression and diagnostic
+evidence, but do not add a GCC workaround to the implementation. The existing
+GCC build remains available for diagnosis and does not qualify the Clang lane.
 Synchronize by content and give changed remote inputs fresh timestamps so a
 local edit made during a remote build cannot leave stale objects undetected.
 The implementation goal is active. Preparing this remote workspace does not
@@ -23,22 +29,33 @@ October 23 combined review and remote checks cover every scope and field mapping
 P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation;
 the native 2.0 port has started and is not yet qualified.
 
-**Native 2.0 + nanoarrow implementation checkpoint (October 27):** the engine
+**Native 2.0 + nanoarrow implementation checkpoint (October 28):** the engine
 now builds from Haybarn `19e399c22f53` plus the committed minimal HTTP parameter
 clone patch, `831cdbed22ea`. The patch provides request-private cancellation
 contexts while retaining HTTPFS parameters; two regression cases with 17
-assertions pass. The current engine pin is `289a784536fc`; it also includes a
-missing test include and a DELETE RETURNING virtual-column hook. The build
+assertions pass. The current engine pin is `54f8340a3ede`; it also includes a
+missing test include, a DELETE RETURNING virtual-column hook, and a scanner
+capability for declining engine-local Bloom/prefix-range join filters while
+retaining IN/min-max pushdown. The build
 retains its explicitly configured `831cdbed22ea`/dev88798 version string;
 qualification records the actual source and shared-engine hashes separately. All 113 VGI production
 translation units now compile, and the static/loadable
 extensions and `v2.0.0-dev88798` shell link. Loading the new extension succeeds.
-The full native unit suite passes 178 cases / 2,716 assertions; the filter suite
-passes 15 cases / 221 assertions. Settings pass 8 / 137 and cancellation passes
+The Clang 15.0.7 build uses all 48 host CPUs. The full native unit suite passes
+178 cases / 2,716 assertions; the filter suite passes 17 cases / 243 assertions.
+Settings pass 8 / 137 and cancellation passes
 9 / 37, and the HTTP suite passes 9 cases / 276 assertions. The final catalog
 qualification covers all 88 cases, including every worker/corpus-backed case
-and both hidden tests. All 18 remote-query scenarios pass.
-The first complete eight-lane framework-language SQLLogic matrix finished with
+and both hidden tests, with zero skips. Five engine cases / 537 assertions cover
+HUGEINT comparisons and the unchanged local join-filter behavior. The complete
+C++ SQLLogic lane passes 341 files, with 38 existing allowed skips and no failures.
+The remaining seven language lanes are running concurrently against this Clang
+artifact. The final extension hash is
+`e66f6ff29d0268f7613be13f26183fdbdfda106d6cfba059dbc97f453d0996e0`;
+evidence is under `clang-qualification`, `catalog-clang-final` and
+`sql-matrix-clang` in the owned native lane.
+
+The first complete GCC eight-lane framework-language SQLLogic matrix finished with
 shared adapter failures: Python 326 passed / 30 failed / 33 skipped, Go 334/24/32,
 Rust 318/24/37, TypeScript 320/22/46 on each backend, Java 310/26/37,
 C# 318/24/37 and C++ 317/24/38. Dedicated crash/recovery cases passed.
@@ -47,15 +64,25 @@ under the native lane. These are diagnostic results, not a passing qualification
 Shared fixes are being stabilized against the C++ worker before repeating the
 language matrix, per the user's October 27 direction.
 
-Projection negotiation now passes its 12 scenarios in an isolated rebuilt
-extension. Parallel scanning works; DuckDB 2.0 rewrites the former mixed-DISTINCT
+Projection negotiation and query-scoped repeatability pass their reference
+scenarios. Parallel scanning works; DuckDB 2.0 rewrites the former mixed-DISTINCT
 test query through a serial CTE, so tests retain those result checks and verify
 multiple workers with a separate direct scan. Verified fixture updates are
-committed at `a7e41b2`. Remaining investigations include COPY worker lifetimes
-under DuckDB 2.0's per-batch local initialization and a numeric comparison
-failure reproducible without VGI. Native
+committed at `a7e41b2`. COPY now reuses workers across DuckDB 2.0's per-batch
+local initialization; ordered, parallel, failure and temporary-file cases pass
+in C++, Python and Java, including the formerly hanging cases. The numeric
+comparison regression passes under Clang without a compiler workaround. Native
 Iroh is disabled in this initial lane; these results do not establish optional
 Iroh or other-platform coverage.
+
+Python fixture commit `dd37d2601658` renders exact IN-set bounds for the split
+pushdown diagnostic; DuckDB 2.0 can omit redundant range predicates. The complete
+split regression passes without changing the SDK's public filter API. C# requires
+the scoped empty-STRUCT fix committed at `e4489a8212bd` in
+`vgi-rpc-csharp-empty-struct`: 14 focused tests and the native all-types echo pass.
+Its integration lane uses an explicitly recorded Arrow DLL overlay. This fix is
+committed but unpublished; the existing published Arrow package still has the
+empty-STRUCT limitation.
 
 Runtime qualification found and repaired a DELETE RETURNING shape mismatch:
 DuckDB 2.0 appended scan virtual columns, while provider responses contain only

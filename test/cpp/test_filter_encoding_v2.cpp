@@ -388,8 +388,11 @@ TEST_CASE("optional Top-N null ordering stays atomic before its dynamic bound ar
 		REQUIRE(VgiContainsDynamicFilter(*filter));
 		TableFilterSet filters;
 		filters.SetFilterByColumnIndex(ProjectionIndex(0), std::move(filter));
-		auto json = FilterSpec(
-		    ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"score"}, "test-worker").filter_bytes));
+		auto serialized = VgiSerializeFilters(*con.context, {0}, &filters, {"score"}, "test-worker");
+		REQUIRE(serialized.filter_bytes);
+		auto batch = ReadBatch(serialized.filter_bytes);
+		REQUIRE(batch->schema()->metadata().Get("vgi_evaluation_context") == "vgi.none.v1");
+		auto json = FilterSpec(batch);
 		REQUIRE(json.find("\"node\":\"is_null\"") == std::string::npos);
 		REQUIRE(json.find("\"mode\":\"advisory\"") == std::string::npos);
 		if (include_required) {
@@ -399,6 +402,46 @@ TEST_CASE("optional Top-N null ordering stays atomic before its dynamic bound ar
 			REQUIRE(json.find("\"predicates\":[]") != std::string::npos);
 		}
 	}
+}
+
+TEST_CASE("advisory join bounds survive an unsupported dynamic sibling", "[filter-v2]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(ExpressionFilter::CreateComparisonFilter(
+	    ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(5))->expr));
+	auto dynamic = make_shared_ptr<DynamicFilterData>(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(0));
+	children.push_back(CreateDynamicFilterExpression(dynamic, LogicalType::INTEGER));
+	TableFilterSet filters;
+	filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(CreateOptionalFilterExpression(
+	    BoundConjunctionExpression::Create(ExpressionType::CONJUNCTION_AND, std::move(children)), LogicalType::INTEGER)));
+	auto serialized = VgiSerializeFilters(*con.context, {0}, &filters, {"key"}, "test-worker");
+	REQUIRE(serialized.filter_bytes);
+	auto json = FilterSpec(ReadBatch(serialized.filter_bytes));
+	REQUIRE(json.find("\"op\":\"ge\"") != std::string::npos);
+	REQUIRE(json.find("\"mode\":\"advisory\"") != std::string::npos);
+	REQUIRE(json.find("\"id\":", json.find("\"id\":") + 1) == std::string::npos);
+}
+
+TEST_CASE("nested AND keeps mandatory filters separate from join bounds", "[filter-v2]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	TableFilterSet filters;
+	filters.PushFilter(ProjectionIndex(0),
+	    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_NOTEQUAL, Value::INTEGER(0)));
+	for (auto comparison : {ExpressionType::COMPARE_GREATERTHANOREQUALTO, ExpressionType::COMPARE_LESSTHANOREQUALTO}) {
+		auto bound = ExpressionFilter::CreateComparisonFilter(comparison, Value::INTEGER(5));
+		filters.PushFilter(ProjectionIndex(0), make_uniq<ExpressionFilter>(
+		    CreateOptionalFilterExpression(std::move(bound->expr), LogicalType::INTEGER)));
+	}
+	auto serialized = VgiSerializeFilters(*con.context, {0}, &filters, {"key"}, "test-worker");
+	REQUIRE(serialized.filter_bytes);
+	auto json = FilterSpec(ReadBatch(serialized.filter_bytes));
+	REQUIRE(json.find("\"op\":\"ne\"") != std::string::npos);
+	REQUIRE(json.find("\"op\":\"ge\"") != std::string::npos);
+	REQUIRE(json.find("\"op\":\"le\"") != std::string::npos);
+	REQUIRE(json.find("\"mode\":\"required\"") != std::string::npos);
+	REQUIRE(json.find("\"mode\":\"advisory\"") != std::string::npos);
 }
 
 TEST_CASE("required throwing AND remains one atomic predicate", "[filter-v2]") {

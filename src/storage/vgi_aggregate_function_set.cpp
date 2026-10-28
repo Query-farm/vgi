@@ -16,6 +16,7 @@
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_function_docs.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_global_functions.hpp"
@@ -152,6 +153,7 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 
 		agg_func.SetExtraFunctionInfo(agg_func_info);
 
+		vgi::SetVgiFunctionArgumentNames(agg_func, arg_types.positional_names);
 		func_set.AddFunction(agg_func);
 
 		// Create function description
