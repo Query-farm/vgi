@@ -64,13 +64,13 @@ SELECT m FROM example.echo((
 ----
 {'2024-01-01 00:00:00'=a}
 
-# BLOB keys
-query I
-SELECT m FROM example.echo((
+# BLOB keys: verify bytes and values independently of MAP display escaping.
+query TT
+SELECT hex(map_keys(m)[1]), map_values(m)[1] FROM example.echo((
     SELECT MAP {'\xDE\xAD'::BLOB: 'x'} AS m
 ));
 ----
-{\xDE\xAD=x}
+DEAD	x
 
 # ============================================================================
 # Map value types beyond scalars

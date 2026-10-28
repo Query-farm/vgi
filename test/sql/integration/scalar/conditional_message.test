@@ -188,7 +188,7 @@ SELECT LENGTH(example.conditional_message('5', 'X', true));
 statement error
 SELECT example.conditional_message('foo', 'X', true);
 ----
-cannot cast VARCHAR to BIGINT
+Could not convert string 'foo' to INT64
 
 # ============================================================================
 # Cleanup

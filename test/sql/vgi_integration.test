@@ -28,7 +28,7 @@ VARCHAR
 query II
 EXPLAIN SELECT * FROM vgi_catalogs('${VGI_TEST_WORKER}');
 ----
-physical_plan	<REGEX>:.*VGI_CATALOGS.*Worker:.*
+physical_plan	<REGEX>:.*Vgi Catalogs.*Worker:.*
 
 # ============================================================================
 # Test ATTACH with VGI catalog
@@ -94,6 +94,16 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%bat
 ----
 true
 
+# DuckDB 2.0 rewrites mixed DISTINCT aggregates through a sequential CTE.
+# Exercise the parallel source directly before checking its reader count.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT SUM(n) FROM vgi_test.main.partitioned_sequence(1000000);
+----
+499999500000
+
 # Verify multi-worker execution was attempted (at least one secondary worker spawned).
 # Asserting on init_local rather than batch_received avoids a timing race where the
 # primary can drain a small work queue before a freshly-spawned secondary picks up
@@ -115,9 +125,9 @@ true
 # ============================================================================
 
 # EXPLAIN should work without hanging and show Worker/Function in output. The
-# catalog scan names the operator after the function itself (SEQUENCE), unlike
+# catalog scan names the operator after the function itself (Sequence), unlike
 # the removed standalone call form which rendered as VGI_TABLE_FUNCTION.
 query II
 EXPLAIN SELECT * FROM vgi_test.main.sequence(10);
 ----
-physical_plan	<REGEX>:.*SEQUENCE.*Function: sequence.*
+physical_plan	<REGEX>:.*Sequence.*Function: sequence.*

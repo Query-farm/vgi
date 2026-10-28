@@ -360,6 +360,16 @@ FROM example.partitioned_sequence(100000);
 ----
 100000	100000	0	99999
 
+# DuckDB 2.0 rewrites mixed DISTINCT aggregates through a sequential CTE.
+# Exercise the parallel source directly before checking its reader count.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT SUM(n) FROM example.partitioned_sequence(100000);
+----
+4999950000
+
 # Verify multiple readers were created (at least 2 distinct conn= in
 # init_local logs). conn= is the transport-neutral per-connection id —
 # under subprocess each conn maps to a distinct worker pid; under HTTP each

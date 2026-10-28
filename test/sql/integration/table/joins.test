@@ -60,16 +60,20 @@ ORDER BY r.range;
 4	NULL
 
 # ============================================================================
-# POSITIONAL JOIN — async prefetch ON (reproduces the DuckDB TODO throw)
+# POSITIONAL JOIN — async prefetch ON
 # ============================================================================
 
 statement ok
 SET vgi_async_prefetch=true;
 
-statement error
-SELECT s1.n AS a, s2.n AS b FROM example.main.sequence(3) s1 POSITIONAL JOIN example.main.sequence(3) s2;
+query II
+SELECT s1.n AS a, s2.n AS b
+FROM example.main.sequence(3) s1 POSITIONAL JOIN example.main.sequence(3) s2
+ORDER BY a;
 ----
-Unexpected interrupt from table Source in PositionalTableScanner refill
+0	0
+1	1
+2	2
 
 statement ok
 SET vgi_async_prefetch=false;

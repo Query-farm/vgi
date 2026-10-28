@@ -51,19 +51,17 @@ SELECT count(*) FROM example.data.colors;
 query II
 EXPLAIN SELECT * FROM example.data.departments WHERE id > 100;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # id >= 1 is within [1, 10] — optimizer should NOT eliminate scan
 query II
 EXPLAIN SELECT * FROM example.data.departments WHERE id >= 1;
 ----
-physical_plan	<REGEX>:.*VGI_TABLE_SCAN.*
+physical_plan	<REGEX>:.*Vgi Table Scan.*
 
 # ============================================================================
 # Verify statistics on string columns (departments.name: min=Accounting, max=Sales)
-# DuckDB truncates string stats to 8 bytes, so filter elimination is conservative.
-# Short strings (< 8 bytes) can't reliably eliminate — the optimizer accounts for
-# the possibility that the full max string extends beyond the truncated prefix.
+# String statistics retain the provider's bounds for filter elimination.
 # But the statistics ARE being fetched and set (verified by numeric elimination above).
 # ============================================================================
 
@@ -81,19 +79,19 @@ SELECT count(*) FROM example.data.departments WHERE name > 'ZZZZZ';
 query II
 EXPLAIN SELECT * FROM example.data.departments WHERE budget > 1000000;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # budget < 10000 is outside [50000, 500000] — should also be eliminated
 query II
 EXPLAIN SELECT * FROM example.data.departments WHERE budget < 10000;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # budget >= 50000 is within range — should NOT be eliminated
 query II
 EXPLAIN SELECT * FROM example.data.departments WHERE budget >= 50000;
 ----
-physical_plan	<REGEX>:.*VGI_TABLE_SCAN.*
+physical_plan	<REGEX>:.*Vgi Table Scan.*
 
 # ============================================================================
 # Tables WITHOUT statistics should work normally (no elimination)
@@ -109,7 +107,7 @@ SELECT count(*) FROM example.data.versioned_data;
 query II
 EXPLAIN SELECT * FROM example.data.versioned_data WHERE id > 100;
 ----
-physical_plan	<REGEX>:.*VGI_TABLE_SCAN.*
+physical_plan	<REGEX>:.*Vgi Table Scan.*
 
 # ============================================================================
 # Nullable columns (products.quantity: has_null=true, has_not_null=true)
@@ -130,19 +128,19 @@ SELECT count(*) FROM example.data.products WHERE quantity IS NOT NULL;
 query II
 EXPLAIN SELECT * FROM example.data.products WHERE id > 200;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # price > 2000 is outside [0.99, 999.99] — should be eliminated
 query II
 EXPLAIN SELECT * FROM example.data.products WHERE price > 2000;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # quantity < -1 is outside [0, 10000] — should be eliminated
 query II
 EXPLAIN SELECT * FROM example.data.products WHERE quantity < -1;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # ============================================================================
 # DuckDB-extracted statistics: the 'numbers' table uses statistics_from_duckdb()
@@ -154,13 +152,13 @@ physical_plan	<REGEX>:.*EMPTY_RESULT.*
 query II
 EXPLAIN SELECT * FROM example.data.numbers WHERE value > 200;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # value < -1 is outside [0, 99] — should also be eliminated
 query II
 EXPLAIN SELECT * FROM example.data.numbers WHERE value < -1;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # ============================================================================
 # vgi_table_statistics() diagnostic function
@@ -238,12 +236,11 @@ SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'd
 budget	500000.0
 
 # String min/max (name: min=Accounting, max=Sales)
-# DuckDB truncates strings to 8 bytes for stats, so these may be truncated.
-# "Accounti" (8 chars) for min, "Sales" (5 chars) fits fully for max.
+# DuckDB 2.0 preserves these exact string bounds.
 query TT
 SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'name';
 ----
-name	Accounti
+name	Accounting
 
 query TT
 SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'name';
@@ -277,7 +274,7 @@ SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'p
 price	999.99
 
 # Products name: string column (min=Anvil, max=Zebra Tape)
-# "Anvil" (5 chars) fits fully, "Zebra Ta" (8 chars truncated)
+# Both string bounds remain exact in DuckDB 2.0.
 query TT
 SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'name';
 ----
@@ -286,7 +283,7 @@ name	Anvil
 query TT
 SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'name';
 ----
-name	Zebra Ta
+name	Zebra Tape
 
 # Products quantity: nullable integer (min=0, max=10000, has_null=true)
 query TT
@@ -429,7 +426,7 @@ color	true
 query II
 EXPLAIN SELECT * FROM example.data.colors WHERE id > 100;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # Verify data is readable
 query ITT
@@ -520,13 +517,13 @@ value	NULL
 query II
 EXPLAIN SELECT * FROM example.data.volatile_numbers WHERE value > 200;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # Second query — stats re-fetched (TTL=0), filter elimination still works
 query II
 EXPLAIN SELECT * FROM example.data.volatile_numbers WHERE value > 200;
 ----
-physical_plan	<REGEX>:.*EMPTY_RESULT.*
+physical_plan	<REGEX>:.*Empty Result.*
 
 # Verify data is actually readable
 query I

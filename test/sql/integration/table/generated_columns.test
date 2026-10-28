@@ -86,7 +86,7 @@ WHERE database_name = 'example' AND schema_name = 'data'
 ORDER BY column_name;
 ----
 doubled	CAST((n * 2) AS BIGINT)
-label	CAST(('item_' || CAST(n AS VARCHAR)) AS VARCHAR)
+label	CAST(('item_' || CAST(n AS "system".main.VARCHAR)) AS VARCHAR)
 n	NULL
 
 # ============================================================================

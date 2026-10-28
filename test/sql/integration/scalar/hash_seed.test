@@ -143,7 +143,7 @@ SELECT COUNT(DISTINCT example.hash_seed(7)) FROM (SELECT unnest(generate_series(
 # literal in a BIGINT-declared ConstParam slot reached the worker as a
 # string and crashed compute() with "can only concatenate str (not 'int') to
 # str". hash_seed declares seed: int via ConstParam — passing '5' must
-# cast to BIGINT 5, and 'foo' must surface a clean BinderException
+# cast to BIGINT 5, and 'foo' must surface a clean conversion error
 # instead of crashing the worker.
 # ============================================================================
 
@@ -160,7 +160,7 @@ SELECT example.hash_seed('42');
 statement error
 SELECT example.hash_seed('foo');
 ----
-cannot cast VARCHAR to BIGINT
+Could not convert string 'foo' to INT64
 
 # ----------------------------------------------------------------------------
 # Cleanup

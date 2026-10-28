@@ -45,7 +45,7 @@ query II
 EXPLAIN SELECT country, SUM(sales)
 FROM example.country_partitioned_sales(100) GROUP BY country;
 ----
-physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+physical_plan	<REGEX>:.*Partitioned Aggregate.*
 
 # ============================================================================
 # Aggregate correctness — country partitioned sales
@@ -76,11 +76,14 @@ FROM example.country_partitioned_sales(100);
 # Multi-column partitioning — (region, year)
 # ============================================================================
 
+# DuckDB 2.0's AVG implementation currently lacks the cluster-update callback
+# required for partitioned aggregation. SUM proves the multi-column partition
+# path; AVG correctness is still checked below.
 query II
-EXPLAIN SELECT region, year, AVG(value)
+EXPLAIN SELECT region, year, SUM(value)
 FROM example.region_year_partitioned(50) GROUP BY region, year;
 ----
-physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+physical_plan	<REGEX>:.*Partitioned Aggregate.*
 
 # Per-(region, year) average. base = partition_idx * 1000;
 # values = base + [0, 50), so avg = base + 24.5.
@@ -125,7 +128,7 @@ query II
 EXPLAIN SELECT category, SUM(revenue)
 FROM example.partitioned_with_explicit_override(20) GROUP BY category;
 ----
-physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+physical_plan	<REGEX>:.*Partitioned Aggregate.*
 
 # revenue = (category_idx + 1) * 100 + i for i in [0, 20)
 # per-category sum = (idx+1)*100*20 + sum(0..19) = (idx+1)*2000 + 190.
@@ -148,7 +151,7 @@ query II
 EXPLAIN SELECT key, SUM(value)
 FROM example.disjoint_range_partitioned(3) GROUP BY key;
 ----
-physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+physical_plan	<REGEX>:.*Hash Group By.*
 
 # Correctness still holds — the wire path carries (min, max) but DuckDB
 # ignores it; hash aggregation produces the right answer.
@@ -169,7 +172,7 @@ query II
 EXPLAIN SELECT key, SUM(value)
 FROM example.overlapping_range_partitioned(3) GROUP BY key;
 ----
-physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+physical_plan	<REGEX>:.*Hash Group By.*
 
 query I
 SELECT COUNT(*) FROM example.overlapping_range_partitioned(5);
@@ -248,7 +251,7 @@ query II
 EXPLAIN SELECT country, SUM(sales)
 FROM example.data.trailing_partition_sales GROUP BY country;
 ----
-physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+physical_plan	<REGEX>:.*Partitioned Aggregate.*
 
 query II rowsort
 SELECT country, SUM(sales)
@@ -265,7 +268,7 @@ query II
 EXPLAIN SELECT country, SUM(sales)
 FROM example.trailing_partition_sales(100) GROUP BY country;
 ----
-physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+physical_plan	<REGEX>:.*Partitioned Aggregate.*
 
 query II rowsort
 SELECT country, SUM(sales)
