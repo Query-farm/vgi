@@ -44,8 +44,8 @@
   "go": {
     "repository": "Query-farm/vgi-go",
     "commit": "00fd1234064a02c39c8c8e40ae33c40dec1194ae",
-    "branch": "fix/flatbuffers-vtable-object-size",
-    "package_published": false,
+    "branch": "main",
+    "package_published": true,
     "replacement": "github.com/rustyconover/flatbuffers v25.12.20-0.20261026151427-0acd09bcd1ff+incompatible",
     "replacement_commit": "0acd09bcd1ff70ff970e699e7a291119c156bfaa",
     "gates": [
@@ -58,7 +58,71 @@
     ],
     "consumer_requirement": "Application-level replace required; dependency-module replacements do not propagate.",
     "evidence": "qualification/go-flatbuffers-20261028",
-    "local_manifest_sha256": "a72915297bc019e6d0316ddd99ead0c26aa96f108cdd2b2ed3f8090a72b22a24"
+    "local_manifest_sha256": "a72915297bc019e6d0316ddd99ead0c26aa96f108cdd2b2ed3f8090a72b22a24",
+    "version": "v0.38.1",
+    "release_url": "https://github.com/Query-farm/vgi-go/releases/tag/v0.38.1",
+    "release_qualification": {
+      "source_commit": "00fd1234064a02c39c8c8e40ae33c40dec1194ae",
+      "tag_object": "7b6a815ef7f8b7f15a632ed9fb478e5e130f4d83",
+      "published_module_consumer": "Public Go proxy v0.38.1; no SDK replacement; upstream Arrow and SHM Arrow fork both pass with the documented FlatBuffers replacement.",
+      "module_sum": "h1:W/SrFWQikwfZ4put6H4BjJaxWXJZwAOiyS7YQEOImVM=",
+      "worker_archive": "vgi-go-v0.38.1-linux_arm64.tar.gz",
+      "worker_archive_sha256": "a93f633665df4653dc7e2d1fd64517e5710b2370a230a573c68984d0ec34ae28",
+      "worker_archive_bytes": 191669318,
+      "workers": {
+        "vgi-example-worker-go": {
+          "sha256": "30d88e04a48e6bab03de6dec335cb305a6a47c9e3e051fdf5bcd836c24bf5d75",
+          "bytes": 110090696
+        },
+        "vgi-example-versioned-worker-go": {
+          "sha256": "dacd42c2470f0c7a8fb156f9ce0efdcf6409854c65d12355338d3c6b687c861f",
+          "bytes": 103280528
+        },
+        "vgi-example-versioned-tables-worker-go": {
+          "sha256": "d3b0b511b892ce2a99026b2099bf62237eb31961b0e838df3127b5a11e0b6e82",
+          "bytes": 103378656
+        },
+        "vgi-example-attach-options-worker-go": {
+          "sha256": "cccbdab4cba3aaa61350b590851ea57993588978f17c3b4928a4e7bb8c9ab049",
+          "bytes": 103370168
+        },
+        "vgi-example-simple-writable-worker-go": {
+          "sha256": "1105339c2f81d66ce89a94664dfb65765b750c9f677d208420248ad0e7a4c3bb",
+          "bytes": 103562120
+        }
+      },
+      "platform": "Linux ARM64; dynamically linked; Amazon Linux 2023 build",
+      "runtime_symbols": {
+        "GLIBC": "GLIBC_2.34",
+        "GLIBCXX": "GLIBCXX_3.4.30",
+        "CXXABI": "CXXABI_1.3.13"
+      },
+      "native_smoke": {
+        "test_cases": 3,
+        "assertions": 151,
+        "skipped": 0,
+        "tests": [
+          "scalar/double.test",
+          "filter_pushdown/dictionary_varchar.test",
+          "reflection/vgi_v2_hash.test"
+        ]
+      },
+      "ci": [
+        {
+          "url": "https://github.com/Query-farm/vgi-go/actions/runs/40775444685",
+          "status": "success",
+          "checks": "Lint, race-enabled unit tests, hosted-protocol conformance"
+        },
+        {
+          "url": "https://github.com/Query-farm/vgi-go/actions/runs/40775444698",
+          "status": "success",
+          "checks": "Build five workers, HTTP, SHM, launcher, stdio and coverage merge"
+        }
+      ],
+      "evidence": "qualification/go-flatbuffers-release-0381-20261028",
+      "published_at": "2026-10-28T21:59:54Z",
+      "published_asset_verification": "Downloaded release archive and SHA256SUMS from GitHub; archive digest matches recorded local artifact and GitHub asset digest."
+    }
   },
   "wasm": {
     "triplet": "wasm32-emscripten-threads",

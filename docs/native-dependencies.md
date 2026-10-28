@@ -53,11 +53,21 @@ object boundary. Strict FlatCC rejects this with `table field out of range`.
 The producer correction is tracked in
 [FlatBuffers #9413](https://github.com/google/flatbuffers/issues/9413) and
 [PR #9414](https://github.com/google/flatbuffers/pull/9414). Until it is released
-upstream, Go workers need the fixed writer pinned by `vgi-go`. Go dependency
-`replace` directives do not propagate to applications: consumers must copy
-the documented replacement into their own top-level module and rebuild their
-workers. Existing affected worker binaries can still emit malformed schemas
-and must be updated before using this strict native adapter.
+upstream, Go workers need the fixed writer pinned by
+[`vgi-go v0.38.1`](https://github.com/Query-farm/vgi-go/releases/tag/v0.38.1).
+That release includes all five rebuilt example workers for Linux ARM64, with
+runtime requirements, checksums and provenance. Go dependency `replace`
+directives do not propagate to applications: consumers building their own
+workers must add this pin to their top-level `go.mod`, then rebuild:
+
+```go
+replace github.com/google/flatbuffers => github.com/rustyconover/flatbuffers v25.12.20-0.20261026151427-0acd09bcd1ff+incompatible
+```
+
+The separate Arrow fork replacement remains required for shared memory; see
+the [Go SDK instructions](https://github.com/Query-farm/vgi-go/blob/v0.38.1/README.md).
+Existing affected worker binaries can still emit malformed schemas and must be
+updated before using this strict native adapter.
 
 The native `[vgi-ipc-validation]` test contains actual before/after Go schema
 messages. It checks rejection of the malformed message and exact dictionary

@@ -78,10 +78,16 @@ native main has not been merged and engine distribution has not been released.
 53,860-line bundled nanoarrow/FlatCC tree with checksum-pinned vcpkg overlay
 ports. The Query-farm nanoarrow pin preserves the previous IPC implementation
 and adds package support; FlatCC's runtime and strict verifier are unmodified.
-The Go producer fix is committed and pushed at `vgi-go` `00fd123` on
-`fix/flatbuffers-vtable-object-size`; it has not been released as a package.
-Go applications must apply the documented top-level dependency replacement and
-rebuild affected workers before using the strict reader.
+The Go producer fix is merged into `vgi-go` main at `00fd123` and released as
+[`v0.38.1`](https://github.com/Query-farm/vgi-go/releases/tag/v0.38.1).
+All five example workers are rebuilt from that tag and available in the Linux
+ARM64 release bundle with checksums and provenance. Clean consumers of the
+published Go module pass with upstream Arrow and the SHM Arrow fork; the exact-tag
+worker smoke passes 151 assertions across three cases with zero skips. Main CI
+passes lint, race-enabled unit tests, hosted-protocol conformance and all four
+integration transports (HTTP, SHM, launcher and stdio). Go applications must
+still apply the documented top-level dependency replacement and rebuild their
+own affected workers before using the strict reader.
 
 The new native Clang build passes **179 unit cases / 2,719 assertions**,
 including actual malformed/corrected Go schema fixtures. The Go producer's
