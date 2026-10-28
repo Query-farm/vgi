@@ -83,17 +83,15 @@ SELECT count(*) FROM (SELECT rowid, payload FROM example.data.late_mat ORDER BY 
 # materializes payload and receives the rowid filter.
 # ============================================================================
 
-# Assert the IN-list count (= k) and that a rowid range is also present, but not
-# the exact min/max (those depend on which rowids the Top-N picks — deterministic
-# but version-coupled, so we don't hard-code them).
-query II
-SELECT
-    regexp_extract(pushed, 'in=([0-9]+)', 1)::INT AS in_count,
-    pushed NOT LIKE '%rng=none%' AS has_range
+# Assert the exact IN-list count (= k). DuckDB 2 need not send redundant
+# min/max bounds alongside an exact list; the large-set case below proves
+# range pushdown independently.
+query I
+SELECT regexp_extract(pushed, 'in=([0-9]+)', 1)::INT AS in_count
 FROM (SELECT pushed, payload FROM example.data.late_mat ORDER BY ord LIMIT 30)
 LIMIT 1;
 ----
-30	true
+30
 
 # ============================================================================
 # Behavioral: graceful degradation for large survivor sets (k > 50).
