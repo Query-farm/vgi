@@ -2,12 +2,12 @@
 +++ b/src/runtime/CMakeLists.txt
 @@ -8,8 +8,15 @@
  )
- 
+
  target_include_directories(flatccrt PUBLIC
 -    "${PROJECT_SOURCE_DIR}/include")
 +    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
 +    "$<INSTALL_INTERFACE:include>")
- 
+
  if (FLATCC_INSTALL)
 -    install(TARGETS flatccrt DESTINATION ${lib_dir})
 +    install(TARGETS flatccrt EXPORT flatcc-targets
