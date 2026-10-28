@@ -1,6 +1,10 @@
 # DuckDB 2.0 initial compile inventory — October 24, 2026
 
-The initial run below is preserved. The [main-integration refresh](#main-integration-refresh--october-24-2026) records the current merged source baseline.
+This is a historical compile inventory. The October 28 native port now compiles
+all 113 production units with Clang, links and loads, and has runtime test
+evidence recorded in the [current migration plan](duckdb-2.0-plan.md).
+The initial run and [main-integration refresh](#main-integration-refresh--october-24-2026)
+below are preserved as the pre-port baseline.
 
 The isolated diagnostic configuration succeeds. All **107 native VGI C++ source
 files** were attempted: **53 compiled and 54 failed**. The engine-generated

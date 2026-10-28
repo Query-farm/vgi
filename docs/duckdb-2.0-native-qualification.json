@@ -1,0 +1,285 @@
+{
+  "status": "passed_bounded_linux_arm64_development_qualification",
+  "date": "2026-10-28",
+  "branch": "v2.0",
+  "native_commit": "f1273b442014ae987ed17773b633dbf09f7886c2",
+  "engine_commit": "54f8340a3ede48cfadb1ec3cef40c2136d08cb3d",
+  "compiler": "Clang 15.0.7",
+  "compile_jobs": 48,
+  "production_translation_units_compiled": 113,
+  "version_metadata": {
+    "git_commit_hash": "831cdbed22ea76c9d52b348fd15643ea7787ccf5",
+    "version": "v2.0.0-dev88798",
+    "note": "Frozen binaries retain this earlier configured version stamp. Actual source snapshot and artifact hashes are recorded separately; release builds must stamp the final engine pin."
+  },
+  "remote_evidence_root": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/vgi-native2-nano-20261027-1i9LOE/evidence",
+  "remote_source_snapshot": {
+    "native_head": "0592bf510d66f19aeaddfad8505def189739a0ef",
+    "native_diff_sha256": "0d9c47db29c9667477341681017994f2d94ef8a642bcc23e48f3c4bc6ba7cc9b",
+    "engine_head": "289a784536fc28243f35ccf1b3de38cbf7f5d84d",
+    "engine_diff_sha256": "e28ed30333693fca3846ceceb7ca2a24b31dae2b9ec1ab1409aa957ee8f93f1b",
+    "note": "Exact frozen remote source snapshot; later local commits contain these edits. The amended late-materialization fixture is separately hashed in every targeted proof."
+  },
+  "artifact_hashes": {
+    "haybarn": "b0bd13abfe6be477f21b6f33f846bf4d6198baba24994cef6b4c4ffc2e59f19b",
+    "test/unittest": "dcda7560441eb28c9ecf04a4f0237c23c1607b5f5a709871b26c626e85bb1d83",
+    "src/libhaybarn.so": "675553bf2698e64ebcc1b39c5558abe4ab4728f5012778778407afc442646ece",
+    "extension/vgi/vgi.duckdb_extension": "e66f6ff29d0268f7613be13f26183fdbdfda106d6cfba059dbc97f453d0996e0",
+    "repository/831cdbed22/linux_arm64/vgi.duckdb_extension": "e66f6ff29d0268f7613be13f26183fdbdfda106d6cfba059dbc97f453d0996e0",
+    "extension/vgi/vgi_catalog_tests": "1695b873ca633e723ddd1205528d8752c6b40b8fc28f412eaf71538b641f7d49",
+    "extension/vgi/vgi_unit_tests": "ff3f69a5c47c02f5b911ac4ccc3688dd6dd204bbd53433996bde453f0e81d076",
+    "extension/vgi/vgi_filter_v2_tests": "56fb8f7c206dda7f5bd22502940ff09c422d85b30f2b3348f20d8c6c29cc950d",
+    "extension/vgi/vgi_settings_tests": "86dbcff9289e6e10b95146008cb80fd932ca3a22ea193468e52002369ac1de22",
+    "extension/vgi/vgi_cancel_dispatcher_tests": "10369bbb3bebeb173929131ce062854d016b76937e6a72ea85e3a6af19351ad5",
+    "extension/vgi/vgi_http_interrupt_tests": "aa27f3c6575cdd359cfb51593685dd106164f2d0f46f14aa85528b3e8cb7b0e0",
+    "extension/vgi/vgi_http_params_clone_tests": "be02627be8def189a0a4a09d819eb455b0bff7db5b44387d0726b7f94c94fe25"
+  },
+  "native_suites": [
+    {
+      "binary": "vgi_unit_tests",
+      "sha256": "ff3f69a5c47c02f5b911ac4ccc3688dd6dd204bbd53433996bde453f0e81d076",
+      "exit": 0,
+      "seconds": 6.175930026998685,
+      "assertions": 2716,
+      "cases": 178
+    },
+    {
+      "binary": "vgi_filter_v2_tests",
+      "sha256": "56fb8f7c206dda7f5bd22502940ff09c422d85b30f2b3348f20d8c6c29cc950d",
+      "exit": 0,
+      "seconds": 0.40479174999927636,
+      "assertions": 243,
+      "cases": 17
+    },
+    {
+      "binary": "vgi_settings_tests",
+      "sha256": "86dbcff9289e6e10b95146008cb80fd932ca3a22ea193468e52002369ac1de22",
+      "exit": 0,
+      "seconds": 0.28924728599668015,
+      "assertions": 137,
+      "cases": 8
+    },
+    {
+      "binary": "vgi_cancel_dispatcher_tests",
+      "sha256": "10369bbb3bebeb173929131ce062854d016b76937e6a72ea85e3a6af19351ad5",
+      "exit": 0,
+      "seconds": 0.3339519599976484,
+      "assertions": 37,
+      "cases": 9
+    },
+    {
+      "binary": "vgi_http_interrupt_tests",
+      "sha256": "aa27f3c6575cdd359cfb51593685dd106164f2d0f46f14aa85528b3e8cb7b0e0",
+      "exit": 0,
+      "seconds": 7.3193562570013455,
+      "assertions": 276,
+      "cases": 9
+    },
+    {
+      "binary": "vgi_http_params_clone_tests",
+      "sha256": "be02627be8def189a0a4a09d819eb455b0bff7db5b44387d0726b7f94c94fe25",
+      "exit": 0,
+      "seconds": 0.07628905000456143,
+      "assertions": 17,
+      "cases": 2
+    }
+  ],
+  "catalog": {
+    "status": "pass",
+    "cases": 88,
+    "skipped": 0
+  },
+  "engine_regressions": {
+    "cases": 5,
+    "assertions": 537
+  },
+  "reference_checks": {
+    "passed": 24,
+    "total": 24,
+    "explicit_query_scenarios": 18,
+    "default_schema_sql_exit": 0
+  },
+  "sql_matrix": {
+    "status": "passed",
+    "interpretation": "Initial failures remain in raw records; listed targeted proofs qualify fixture-only amendments and an interrupted-host launcher retry. No broad matrix rerun.",
+    "primary_passed_files": 2759,
+    "expected_skips": 306,
+    "dedicated_crash_passed_files": 10,
+    "unresolved_failures": 0,
+    "lanes": {
+      "python": {
+        "status": "passed",
+        "passed_files": 356,
+        "expected_skips": 33,
+        "dedicated_crash_files": 2,
+        "sdk_commit": "dd37d26016581a8f163c05a71244bc8ce83fae32",
+        "targeted_proofs": [
+          {
+            "path": "test/sql/integration/reflection/pre_reflection.test",
+            "original_exit": 1,
+            "proof": "late-materialization-final/python/pre_reflection.json",
+            "proof_sha256": "a5d417885787ed98dab9590b0ef7e0b26c236bb2a45b51228727c99ff77425f6",
+            "fixture_sha256": "a2161619645b5176e4b696623b0cada08b073bc5d10575f7500f43386881cb3f"
+          },
+          {
+            "path": "test/sql/integration/table/late_materialization.test",
+            "original_exit": 1,
+            "proof": "late-materialization-final/python/late_materialization.json",
+            "proof_sha256": "8fc0079ce2a66fbb6895a0128ba50aa07708948c8c6eca32491a5550b576ab54",
+            "fixture_sha256": "57fd6902c40f304472b3ce79679e53f161ce74e9ea87297bb9c6c50ececf6b50"
+          }
+        ]
+      },
+      "go": {
+        "status": "passed",
+        "passed_files": 358,
+        "expected_skips": 32,
+        "dedicated_crash_files": 0,
+        "sdk_commit": "ae8f35dc8324c7869648cb2ffd27bf0721397692",
+        "targeted_proofs": [
+          {
+            "path": "test/sql/integration/table/late_materialization.test",
+            "original_exit": 1,
+            "proof": "late-materialization-final/go/late_materialization.json",
+            "proof_sha256": "55b448f56d3bfcd3c4490defa515c82a1d1b8cc74623c1ddd7875b5522596753",
+            "fixture_sha256": "57fd6902c40f304472b3ce79679e53f161ce74e9ea87297bb9c6c50ececf6b50"
+          }
+        ]
+      },
+      "rust": {
+        "status": "passed",
+        "passed_files": 342,
+        "expected_skips": 37,
+        "dedicated_crash_files": 0,
+        "sdk_commit": "a14e7f9425d16575b29d469aa0cfa24f4fd20497",
+        "targeted_proofs": [
+          {
+            "path": "test/sql/integration/table/late_materialization.test",
+            "original_exit": 0,
+            "proof": "late-materialization-final/rust/late_materialization.json",
+            "proof_sha256": "78a3e4a759f35c846aee601a35b9374574964772e7b81a97b557cc22dba302e5",
+            "fixture_sha256": "57fd6902c40f304472b3ce79679e53f161ce74e9ea87297bb9c6c50ececf6b50"
+          }
+        ]
+      },
+      "typescript-arrowjs": {
+        "status": "passed",
+        "passed_files": 342,
+        "expected_skips": 46,
+        "dedicated_crash_files": 2,
+        "sdk_commit": "5ddfd82510db16f3d5a674ddcf8277d922bdfc82",
+        "targeted_proofs": [
+          {
+            "path": "test/sql/integration/table/late_materialization.test",
+            "original_exit": 1,
+            "proof": "late-materialization-final/typescript-arrowjs/late_materialization.json",
+            "proof_sha256": "950f5029517cd7081a61a88a8f98858ff52ace712df6ecd5641c1f50bb16a711",
+            "fixture_sha256": "57fd6902c40f304472b3ce79679e53f161ce74e9ea87297bb9c6c50ececf6b50"
+          }
+        ]
+      },
+      "typescript-flechette": {
+        "status": "passed",
+        "passed_files": 342,
+        "expected_skips": 46,
+        "dedicated_crash_files": 2,
+        "sdk_commit": "5ddfd82510db16f3d5a674ddcf8277d922bdfc82",
+        "targeted_proofs": [
+          {
+            "path": "test/sql/integration/table/late_materialization.test",
+            "original_exit": 1,
+            "proof": "late-materialization-final/typescript-flechette/late_materialization.json",
+            "proof_sha256": "3bcf953b8ab9890981df61640a0aaabfab5c196f10b35744c7a7f13201d357b7",
+            "fixture_sha256": "57fd6902c40f304472b3ce79679e53f161ce74e9ea87297bb9c6c50ececf6b50"
+          }
+        ]
+      },
+      "java": {
+        "status": "passed",
+        "passed_files": 336,
+        "expected_skips": 37,
+        "dedicated_crash_files": 2,
+        "sdk_commit": "0789d65560eaf4476dcc027e8c60e5af148b45e5",
+        "targeted_proofs": [
+          {
+            "path": "test/sql/integration/table/late_materialization.test",
+            "original_exit": 1,
+            "proof": "late-materialization-final/java/late_materialization.json",
+            "proof_sha256": "367894ccbb00023ea0c260ca3d0f53ced6456bbd5b14e5c97de7be896b239e22",
+            "fixture_sha256": "57fd6902c40f304472b3ce79679e53f161ce74e9ea87297bb9c6c50ececf6b50"
+          }
+        ]
+      },
+      "csharp": {
+        "status": "passed",
+        "passed_files": 342,
+        "expected_skips": 37,
+        "dedicated_crash_files": 2,
+        "sdk_commit": "ab8c3bfedd2ff6883b876b23fb8970239aadac25",
+        "targeted_proofs": [
+          {
+            "path": "test/sql/integration/table/late_materialization.test",
+            "original_exit": 1,
+            "proof": "late-materialization-final/csharp/late_materialization.json",
+            "proof_sha256": "8d47090e85f6cd9f25b9f38d7c6a3c93c80ce32fa755584a1e62a236579082d3",
+            "fixture_sha256": "57fd6902c40f304472b3ce79679e53f161ce74e9ea87297bb9c6c50ececf6b50"
+          }
+        ]
+      },
+      "cpp": {
+        "status": "passed",
+        "passed_files": 341,
+        "expected_skips": 38,
+        "dedicated_crash_files": 0,
+        "sdk_commit": "40eea1c662aec4cf679e38e34830ff5f921c6b5b",
+        "targeted_proofs": [
+          {
+            "path": "test/sql/integration/table/late_materialization.test",
+            "original_exit": 0,
+            "proof": "late-materialization-final/cpp/late_materialization.json",
+            "proof_sha256": "f3c7ac1c93e3f9adedb55f04e58692a0a703758caa01384ef1a8b9b2c5316c2f",
+            "fixture_sha256": "57fd6902c40f304472b3ce79679e53f161ce74e9ea87297bb9c6c50ececf6b50"
+          }
+        ]
+      }
+    },
+    "archived_attempts": [
+      {
+        "path": "attempt01-context-regression",
+        "reason": "Earlier extension lacked the now-fixed empty initial filter context; excluded from final candidate coverage."
+      },
+      {
+        "path": "attempt02-ts-launcher-collision",
+        "reason": "Shared runtime directory collided between TypeScript backends; all results excluded."
+      },
+      {
+        "path": "*/before-disconnect-resume",
+        "reason": "External SSH/job interruption; completed immutable per-file results retained, unfinished files resumed detached."
+      },
+      {
+        "path": "ts-disk-pressure",
+        "reason": "Unrelated disk-heavy host jobs stalled TypeScript fixture temp-state writes; owned workers stopped, six SIGKILL records archived, unfinished files resumed in private tmpfs."
+      }
+    ]
+  },
+  "evidence_manifests": {
+    "clang-qualification/artifacts-contextfix.json": "263f6c67408a63a59e7e3717195b1547721188738b4f2a4c4f672c0e4c4ce16d",
+    "clang-qualification/native-tests-final/summary.json": "e3ffa8a4a1ed96ed2b76e4be304d11053d8fa727cb6807cd999322b4eb462e92",
+    "catalog-clang-final/summary.json": "29047bd9acc9ecc566e8683c8933ec1c290ef946d2efb03fa668141040be881a",
+    "clang-qualification/reference-probes-final/summary.json": "32afee1ce0e0a9f284abf6d32e7117383d9654b79d78f8eab7120196cecf8948",
+    "sql-matrix-clang/qualification.json": "76ab33cfd7ea7759706c496603fd3d5a653afeeef443c5a85bf1f4f60dff587f",
+    "clang-qualification/frozen-hash-audit-final.json": "4cad1c4a11326fb1ba509d1bb41158db3e1a368f71b4350f5fe830a70cfaeac4"
+  },
+  "dependency_limits": [
+    "Java uses the qualified RPC 0.33.2 candidate; matched publication remains a release gate.",
+    "Rust SAB uses explicitly selected v3 candidate libraries; published SDK and registry lock updates remain a release gate.",
+    "C# uses only the Apache.Arrow.dll overlay from committed empty-STRUCT fix e4489a8212bddec01162f78ff14d632c5c95a4d8; the fix is unpublished."
+  ],
+  "csharp_arrow_overlay_sha256": "727e401ba1ffb9d8b6c4e26054bf3003177d8e9f12f8be65145bcb57fb59d7c1",
+  "outstanding_scope": [
+    "Automatic whole-query pushdown and nested-schema support.",
+    "Nested TUPLE/VARIANT value transport and broader DuckDB 2.0 grammar/feature qualification.",
+    "Iroh, optional companions, other platforms and browser qualification.",
+    "Pinned 2.0 CI/distribution, final engine ABI/version metadata and coordinated dependency publication."
+  ]
+}

@@ -1,7 +1,8 @@
 # VGI migration plan for DuckDB 2.0
 
-**Status (October 28):** native DuckDB 2.0 implementation is now in progress on
-`v2.0` in `~/Development/vgi`. It combines protocol preparation at `0592bf510d66`
+**Status (October 28):** the native DuckDB 2.0/nanoarrow port compiles and passes
+the configured Linux ARM64 development suites on `v2.0` in `~/Development/vgi`.
+It combines protocol preparation at `0592bf510d66`
 with the existing `nanoarrow-migration` work at `b3a65011`. The earlier 1.5.x
 preparation remains on `codex/duckdb-2.0-protocol` in `vgi-duckdb2`.
 
@@ -13,7 +14,7 @@ Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
 The native 2.0/nanoarrow build has its own subdirectory,
 `vgi-native2-nano-20261027-1i9LOE`, separate from the qualified 1.5 binaries.
-Qualification is moving to a fresh Clang build to match the DuckDB 2.0/Haybarn
+The native port has a complete Clang build matching the DuckDB 2.0/Haybarn
 extension toolchain. The earlier native 2.0 results used GCC 14.2.1 on ARM64;
 an isolated HUGEINT comparison reproduction exposed the GCC early register
 allocation bug tracked as PR125795. Keep its SQL regression and diagnostic
@@ -21,13 +22,19 @@ evidence, but do not add a GCC workaround to the implementation. The existing
 GCC build remains available for diagnosis and does not qualify the Clang lane.
 Synchronize by content and give changed remote inputs fresh timestamps so a
 local edit made during a remote build cannot leave stale objects undetected.
-The implementation goal is active. Preparing this remote workspace does not
-qualify any protocol/native migration gate.
+Interrupted SQLLogic runs retain completed per-file evidence and resume only
+unfinished checks under a detached supervisor. The final TypeScript continuation
+uses private, short `/dev/shm` temporary/runtime/state/cache directories to avoid
+contention with other disk-intensive work on the host; durable evidence stays in
+the owned lane. The build-and-test checkpoint is complete; the broader migration
+and release work remains open.
 
 **Overall completion: incomplete. P0 scope/inventory review is complete.** The
 October 23 combined review and remote checks cover every scope and field mapping.
-P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation;
-the native 2.0 port has started and is not yet qualified.
+P1–P3 and the full M0–M4 release gates remain open. The native 2.0/nanoarrow port
+builds and passes the bounded checks recorded below. Automatic whole-query
+pushdown, nested-schema support, broader 2.0 type/grammar coverage, and platform
+and dependency-release qualification remain separate work.
 
 **Native 2.0 + nanoarrow implementation checkpoint (October 28):** the engine
 now builds from Haybarn `19e399c22f53` plus the committed minimal HTTP parameter
@@ -49,11 +56,36 @@ qualification covers all 88 cases, including every worker/corpus-backed case
 and both hidden tests, with zero skips. Five engine cases / 537 assertions cover
 HUGEINT comparisons and the unchanged local join-filter behavior. The complete
 C++ SQLLogic lane passes 341 files, with 38 existing allowed skips and no failures.
-The remaining seven language lanes are running concurrently against this Clang
-artifact. The final extension hash is
+All eight configured language/backend lanes now pass against this Clang artifact,
+with the original coverage floors and skip allowlists:
+
+| Lane | SQLLogic files passed | Expected skips | Dedicated crash/recovery files |
+| --- | ---: | ---: | ---: |
+| Python | 356 | 33 | 2 |
+| Go | 358 | 32 | Included in primary lane |
+| Rust | 342 | 37 | Included in primary lane |
+| TypeScript ArrowJS | 342 | 46 | 2 |
+| TypeScript Flechette | 342 | 46 | 2 |
+| Java | 336 | 37 | 2 |
+| C# | 342 | 37 | 2 |
+| C++ | 341 | 38 | Included in primary lane |
+
+That is 2,759 primary passes, 10 dedicated crash/recovery passes and 306 existing
+skips, with zero unresolved failures. This is joined per-file qualification:
+completed results were retained after interruption, unfinished files resumed,
+and fixture-only corrections received whole-file targeted reruns. Initial
+failures and invalid attempts remain in the evidence. The late-materialization
+fixture passes 53 assertions on every worker without requiring redundant range
+bounds alongside an exact IN set; its separate large-set min/max checks remain.
+Python's interrupted launcher/reflection case passes 15 assertions on retry.
+
+The final extension hash is
 `e66f6ff29d0268f7613be13f26183fdbdfda106d6cfba059dbc97f453d0996e0`;
 evidence is under `clang-qualification`, `catalog-clang-final` and
-`sql-matrix-clang` in the owned native lane.
+`sql-matrix-clang` in the owned native lane. The committed
+[qualification summary](duckdb-2.0-native-qualification.json) records source
+commits, frozen artifact hashes, test counts, targeted proofs and the exact
+evidence-manifest hashes. The final audit confirms the binaries stayed unchanged.
 
 The first complete GCC eight-lane framework-language SQLLogic matrix finished with
 shared adapter failures: Python 326 passed / 30 failed / 33 skipped, Go 334/24/32,
@@ -61,7 +93,7 @@ Rust 318/24/37, TypeScript 320/22/46 on each backend, Java 310/26/37,
 C# 318/24/37 and C++ 317/24/38. Dedicated crash/recovery cases passed.
 Per-file results and artifact hashes are in `evidence/sql-matrix/summary.json`
 under the native lane. These are diagnostic results, not a passing qualification.
-Shared fixes are being stabilized against the C++ worker before repeating the
+Shared fixes were stabilized against the C++ worker before repeating the
 language matrix, per the user's October 27 direction.
 
 Projection negotiation and query-scoped repeatability pass their reference
@@ -120,7 +152,9 @@ with nanoarrow. Python generator commit `81a182bc08e4` adds an explicit
 available. Its 37 focused tests, lint/format checks, all-SDK default generation
 check and native nanoarrow generation check pass on EC2. Native contracts,
 query parameters, strict IPC framing and metadata validation have been ported
-to nanoarrow; their execution checks are being completed against the new binary.
+to nanoarrow. All 24 final reference checks pass, covering all 18 explicit-query
+scenarios, projection and repeatability, catalog contracts and truncated IPC
+over subprocess and HTTP. Default-schema SQL also passes 19 assertions.
 
 DuckDB 2.0 adaptation includes bound function signatures, raw `Identifier`
 conversion at catalog boundaries, nullable default schemas, active
@@ -128,8 +162,8 @@ conversion at catalog boundaries, nullable default schemas, active
 optimizer remaps pushed filter indices through `LogicalGet::column_ids`;
 retaining the 1.5 mapping would target incorrect columns after pruning.
 Existing required-filter, nested-struct, buffered-filter and native-delegation
-SQL tests must qualify that change. Automatic whole-query pushdown remains
-separate outstanding adapter work. Java/Rust publication below is still a
+SQL tests are part of the language-matrix qualification. Automatic whole-query
+pushdown remains separate outstanding adapter work. Java/Rust publication below is still a
 release gate, and is not a prerequisite for this isolated native development.
 
 **Dependency fix preparation (October 27):** the minimal Java RPC dictionary
@@ -2153,11 +2187,14 @@ strings remain unpublished placeholders until the complete contract is frozen.
 | Gate | Current status | Work still required |
 | --- | --- | --- |
 | P0 | Complete: combined source review and remote inventory/tests passed October 23 | Reopen mappings if scope changes; remaining contract/proof work belongs to P1. |
-| P1 | In progress; catalog groundwork and typed read-query preparation/execution have bounded reference behavior | Complete operation/lifecycle specifications and reference implementations, then choose the combined version. |
-| P2 | Shared records and schema/table/column surfaces generated across SDKs; snapshot remains open | Freeze all included records, port all operations/adapters, and produce migration and version matrices. |
-| P3 | Not qualified or released | Full capability conformance, transport tests, coordinated deployment/rollback proof, and matched publication. |
-| M0 | Haybarn refresh and source audit prepared | Establish the pinned VGI 2.0 build/CI lane and complete native diagnostics. |
-| M1–M4 | Native port remains | Binding, execution/write semantics, nested identities, platform/browser qualification, and distribution. |
+| P1 | Combined breaking protocol selected as `vgi.v3`; bounded operation/lifecycle reference checks pass | Finish the contract freeze and provider acceptance inventory for every advertised feature. |
+| P2 | Shared records generated across SDKs; nanoarrow native generation and parity checks pass | Finalize the migration/version matrix and qualify published dependency artifacts. |
+| P3 | Candidate language matrix has bounded evidence; matched publication remains open | Complete transport/platform conformance, deployment/rollback proof, and coordinated publication. |
+| M0 | Pinned Clang engine and all 113 native production units compile; static/loadable artifacts and native tests pass | Publish the engine patches and establish the pinned 2.0 CI/distribution configuration. |
+| M1 | Basic catalog binding, scalar/aggregate execution, scans and explicit remote queries pass | Keep the supported feature inventory aligned with the bounded native evidence. |
+| M2 | Existing optimizer/write/COPY paths ported with native and language-matrix evidence | Complete broader differential/failure qualification and the separate automatic whole-query pushdown work. |
+| M3 | Nested schema support remains open | Preserve full schema identities through discovery, cache keys, reads, writes and DDL. |
+| M4 | Linux ARM64 Clang development qualification only | Published dependencies, optional transports/companions, platform/browser matrix and distribution. |
 
 ## Baselines and existing work
 
