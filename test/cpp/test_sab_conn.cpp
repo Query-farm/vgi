@@ -12,6 +12,8 @@
 #include "vgi_catalog_metadata.hpp"  // VgiSecretRequirement (complete type for the ctor default)
 #include "vgi_sab_abi.hpp"
 #include "vgi_webworker_function_connection.hpp"
+#include "../../src/generated/vgi_protocol_names.hpp"
+#include "../../src/generated/vgi_protocol_version.hpp"
 
 #include "duckdb.hpp"
 
@@ -29,8 +31,21 @@ using duckdb::vgi::WebWorkerFunctionConnection;
 
 // Rust table-function worker (sabtable staticlib): serve count_to on a slot.
 extern "C" void vgi_rust_serve_table_sab_slot(int slot);
+extern "C" bool vgi_rust_table_protocol_matches(const char *name, size_t name_len,
+                                                const char *version, size_t version_len);
+
+namespace {
+void RequireMatchingRustProtocol() {
+	const auto name = duckdb::vgi::generated::VGI_PROTOCOL_NAME;
+	const auto version = duckdb::vgi::generated::VGI_PROTOCOL_VERSION;
+	INFO("The linked sabtable SDK must match " << name << " / " << version
+	     << "; update the Rust fixture dependencies and rebuild both libraries");
+	REQUIRE(vgi_rust_table_protocol_matches(name.data(), name.size(), version.data(), version.size()));
+}
+} // namespace
 
 TEST_CASE("WebWorkerFunctionConnection drives count_to(5) over the ring", "[sab-conn]") {
+	RequireMatchingRustProtocol();
 	DuckDB db(nullptr);
 	Connection con(db);
 	ClientContext &context = *con.context;
@@ -75,6 +90,7 @@ TEST_CASE("WebWorkerFunctionConnection drives count_to(5) over the ring", "[sab-
 }
 
 TEST_CASE("WebWorkerFunctionConnection streams a multi-batch producer", "[sab-conn]") {
+	RequireMatchingRustProtocol();
 	DuckDB db(nullptr);
 	Connection con(db);
 	ClientContext &context = *con.context;
@@ -119,6 +135,7 @@ TEST_CASE("WebWorkerFunctionConnection streams a multi-batch producer", "[sab-co
 }
 
 TEST_CASE("WebWorkerFunctionConnection surfaces a worker produce error", "[sab-conn]") {
+	RequireMatchingRustProtocol();
 	DuckDB db(nullptr);
 	Connection con(db);
 	ClientContext &context = *con.context;
@@ -188,6 +205,7 @@ TEST_CASE("WebWorkerFunctionConnection surfaces a worker produce error", "[sab-c
 
 TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained split",
           "[sab-conn][sab-split]") {
+	RequireMatchingRustProtocol();
 	DuckDB db(nullptr);
 	Connection con(db);
 	ClientContext &context = *con.context;
@@ -236,6 +254,7 @@ TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained sp
 
 TEST_CASE("WebWorkerFunctionConnection re-inits after a split whose output was never read",
           "[sab-conn][sab-split]") {
+	RequireMatchingRustProtocol();
 	DuckDB db(nullptr);
 	Connection con(db);
 	ClientContext &context = *con.context;

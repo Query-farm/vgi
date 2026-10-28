@@ -29,6 +29,23 @@ use vgi::table_in_out::{project_batch, TableInOutFunction};
 use vgi::vgi_rpc::OutputCollector;
 use vgi::{Result, RpcError};
 
+/// The native harness checks the linked SDK's identity before starting a worker
+/// thread, so an outdated registry fixture fails clearly instead of aborting
+/// while an unjoined worker waits on the ring.
+///
+/// # Safety
+/// Each pointer must reference its stated number of readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn vgi_rust_table_protocol_matches(
+    name: *const u8,
+    name_len: usize,
+    version: *const u8,
+    version_len: usize,
+) -> bool {
+    std::slice::from_raw_parts(name, name_len) == vgi::VGI_PROTOCOL_NAME.as_bytes()
+        && std::slice::from_raw_parts(version, version_len) == vgi::VGI_PROTOCOL_VERSION.as_bytes()
+}
+
 // Worker-side ring ops, implemented in C++ (test/support/vgi_sab_native_ring.cpp)
 // natively, or in the browser worker module's --js-library (vgi_worker_lib.js).
 extern "C" {

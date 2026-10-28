@@ -9,7 +9,7 @@
 # bump sabtable's `vgi` to an SDK minor that moved vgi-rpc and sabffi keeps
 # building against the old one. This check is what keeps them in step.
 #
-# It also refuses a path/git source for vgi or vgi-rpc. Those used to point at
+# It also refuses a path/git source for vgi, vgi-protocol, vgi-rpc or Arrow. Those used to point at
 # sibling checkouts (../vgi-rust, ../vgi-rpc-rust), which made the build depend
 # on whatever branch each sibling was on and silently rewrote the lockfiles
 # whenever a sibling's version differed.
@@ -74,6 +74,26 @@ sole_registry_version "$SABTABLE_LOCK" vgi-rpc
 sabtable_rpc="$REPLY"
 sole_registry_version "$SABTABLE_LOCK" vgi
 sabtable_vgi="$REPLY"
+sole_registry_version "$SABTABLE_LOCK" vgi-protocol
+sabtable_protocol="$REPLY"
+
+if [ -n "$sabtable_vgi" ] && [ -n "$sabtable_protocol" ] && [ "$sabtable_vgi" != "$sabtable_protocol" ]; then
+	fail "$SABTABLE_LOCK resolves vgi $sabtable_vgi with vgi-protocol $sabtable_protocol;" \
+		"use the matching SDK and protocol packages from one release."
+fi
+
+arrow_version=""
+for lock in "$SABFFI_LOCK" "$SABTABLE_LOCK"; do
+	for crate in arrow-array arrow-schema; do
+		sole_registry_version "$lock" "$crate"
+		if [ -n "$REPLY" ]; then
+			if [ -n "$arrow_version" ] && [ "$REPLY" != "$arrow_version" ]; then
+				fail "$lock resolves $crate $REPLY, expected Arrow $arrow_version across both fixtures."
+			fi
+			arrow_version="$REPLY"
+		fi
+	done
+done
 
 if [ -n "$sabffi_rpc" ] && [ -n "$sabtable_rpc" ] && [ "$sabffi_rpc" != "$sabtable_rpc" ]; then
 	fail "the two fixtures resolve different vgi-rpcs:" \
@@ -85,4 +105,4 @@ fi
 if [ "$failed" -ne 0 ]; then
 	exit 1
 fi
-echo "check_rust_fixture_locks: sabffi and sabtable both resolve vgi-rpc $sabffi_rpc from crates.io (sabtable via vgi $sabtable_vgi)"
+echo "check_rust_fixture_locks: both fixtures resolve registry vgi-rpc $sabffi_rpc and Arrow $arrow_version (sabtable via vgi/vgi-protocol $sabtable_vgi)"
