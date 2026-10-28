@@ -496,8 +496,7 @@ void VgiIpcWriter::Write(const VgiBatch &batch, const VgiMetadata *metadata) {
 	if (closed_) {
 		throw InternalException("Cannot write to a closed IPC writer");
 	}
-	if (batch.schema().get() != schema_.get() &&
-	    !TypesEqual(batch.schema()->c_schema(), schema_->c_schema(), /*check_names=*/true)) {
+	if (batch.schema().get() != schema_.get() && !batch.schema()->Equals(*schema_)) {
 		throw InvalidInputException("Tried to write record batch with different schema:\n%s\nexpected:\n%s",
 		                            batch.schema()->ToString(), schema_->ToString());
 	}

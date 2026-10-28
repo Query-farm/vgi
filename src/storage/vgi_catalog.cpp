@@ -225,6 +225,11 @@ PhysicalOperator &VgiCatalog::PlanDelete(ClientContext &context, PhysicalPlanGen
 
 PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                          PhysicalOperator &plan) {
+	// Trigger OLD capture adds a second row image to the engine output. VGI
+	// does not support triggers and its UPDATE response contains only NEW rows.
+	if (op.capture_old_rows) {
+		throw NotImplementedException("VGI UPDATE does not support returning the OLD row image");
+	}
 	auto &table = op.table.Cast<VgiTableEntry>();
 	RequireWriteResultMode(table, "update", op.return_chunk);
 	auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk);

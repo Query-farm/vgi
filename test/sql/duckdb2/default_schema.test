@@ -1,5 +1,5 @@
 # name: test/sql/duckdb2/default_schema.test
-# description: Nullable default schema is rejected before native 1.5 attachment publication
+# description: DuckDB 2 preserves catalogs without an implicit default schema
 # group: [vgi_duckdb2_protocol]
 
 require-env VGI_DEFAULT_SCHEMA_NONE_WORKER
@@ -10,27 +10,38 @@ require-env VGI_DEFAULT_SCHEMA_DOTTED_WORKER
 
 require vgi
 
-statement error
+statement ok
 ATTACH 'default_schema_probe' AS probe (TYPE vgi, LOCATION '${VGI_DEFAULT_SCHEMA_NONE_WORKER}');
-----
-catalogs with no implicit default are unsupported
 
 query I
 SELECT count(*) FROM duckdb_databases() WHERE database_name = 'probe';
 ----
-0
+1
 
 query I
 SELECT count(*) FROM duckdb_settings() WHERE name = 'vgi_default_schema_probe_setting';
 ----
-0
+1
+
+# A missing implicit default does not prevent explicitly qualified access.
+query I
+SELECT value FROM probe.main.marker;
+----
+11
 
 query I
-SELECT 42;
+SELECT value FROM probe."root.with.dot".marker;
 ----
-42
+22
 
-# The rejected alias can be reused, and the ordinary main default still works.
+statement error
+SELECT value FROM probe.marker;
+----
+
+statement ok
+DETACH probe;
+
+# The detached alias can be reused, and the ordinary main default still works.
 statement ok
 ATTACH 'default_schema_probe' AS probe (TYPE vgi, LOCATION '${VGI_DEFAULT_SCHEMA_MAIN_WORKER}');
 

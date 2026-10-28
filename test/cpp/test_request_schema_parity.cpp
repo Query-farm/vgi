@@ -227,7 +227,7 @@ TEST_CASE("BuildBindRequest carries resolved argument names", "[schema-parity]")
 	REQUIRE(values.GetString(begin + 2) == "named_tail");
 }
 
-TEST_CASE("DuckDB 1.5 schema paths preserve one component and reject nesting", "[schema-path]") {
+TEST_CASE("Native schema paths preserve one component and reject unqualified nesting", "[schema-path]") {
 	REQUIRE(SingleSchemaPath("analytics") == std::vector<std::string> {"analytics"});
 	REQUIRE(SchemaNameFromPath({"analytics"}, "test.path") == "analytics");
 	REQUIRE(OptionalSchemaNameFromPath(std::nullopt, "test.path").empty());

@@ -112,7 +112,10 @@ class Runner:
             if error:
                 assert error.casefold() in stderr.casefold(), diagnostic
         if not cancel:
-            assert rows(stdout) == list(expected), diagnostic
+            # DuckDB 2 starts streaming its JSON array before execution. On an
+            # execution error, a lone opening bracket contains no result rows.
+            actual_rows = [] if error is not None and stdout.strip() == "[" else rows(stdout)
+            assert actual_rows == list(expected), diagnostic
         audit = events(database)
         attempts = [event for event in audit if event["event"] == "start_attempt"]
         with sqlite3.connect(database) as connection:

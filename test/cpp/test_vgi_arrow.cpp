@@ -121,6 +121,43 @@ TEST_CASE("VgiSchema describes and compares types", "[vgi-arrow]") {
 	CHECK(schema->WithMetadata(VgiMetadata()).get()->metadata().empty());
 }
 
+TEST_CASE("Schema edits preserve IPC identity without relaxing field contracts", "[vgi-arrow]") {
+	auto original = MakeSchema({type::Int32().Named("n").WithMetadata(VgiMetadata({{"raw", "source"}}))},
+	                           VgiMetadata({{"table", "metadata"}}));
+	auto result = MakeSchema({type::Int64().Named("wide")});
+	auto expanded = original->AddField(1, result->field(0));
+	auto bytes = SerializeSchema(*expanded);
+	auto decoded = ReadSchemaBytes(bytes->data(), bytes->size());
+	CHECK(expanded->Equals(*decoded, true));
+
+	ArrowSchema root;
+	expanded->ExportTo(&root);
+	root.flags |= ARROW_FLAG_NULLABLE;
+	REQUIRE(ArrowSchemaSetName(&root, "C interface wrapper") == NANOARROW_OK);
+	auto wrapper = VgiSchema::Adopt(&root);
+	CHECK(expanded->Equals(*wrapper, true));
+	auto sink = std::make_shared<VgiBufferOutputStream>();
+	auto writer = VgiIpcWriter::Open(sink, expanded);
+	CHECK_NOTHROW(writer->Write(*VgiBatch::MakeEmpty(wrapper)));
+
+	auto nonnull = MakeSchema({type::Int64().Named("wide", false)});
+	auto renamed = MakeSchema({type::Int64().Named("renamed")});
+	auto plain = MakeSchema({type::Int32().Named("n")});
+	CHECK_FALSE(expanded->Equals(*expanded->SetField(1, nonnull->field(0)), true));
+	CHECK_FALSE(expanded->Equals(*expanded->SetField(1, renamed->field(0)), true));
+	CHECK_FALSE(expanded->Equals(*expanded->SetField(0, plain->field(0)), true));
+	CHECK_FALSE(expanded->Equals(*expanded->WithMetadata(VgiMetadata()), true));
+	CHECK(expanded->Equals(*expanded->WithMetadata(VgiMetadata()), false));
+	CHECK_THROWS(writer->Write(*VgiBatch::MakeEmpty(expanded->SetField(1, nonnull->field(0)))));
+	writer->Close();
+	auto encoded = sink->Finish();
+	auto reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(encoded));
+	auto empty = reader->ReadNext();
+	REQUIRE(empty);
+	CHECK(empty->num_rows() == 0);
+	CHECK_FALSE(reader->ReadNext());
+}
+
 TEST_CASE("VgiBatch builds, reads, slices and exports", "[vgi-arrow]") {
 	auto batch = SampleBatch(10);
 	REQUIRE(batch->num_rows() == 10);

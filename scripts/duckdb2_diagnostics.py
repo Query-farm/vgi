@@ -16,8 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-ENGINE_REVISION = "5afbe7302db8e2a9b42c98640373eb594b27e1b0"
-ENGINE_VERSION = "v2.0.0-dev88799"
+ENGINE_REVISION = "289a784536fc28243f35ccf1b3de38cbf7f5d84d"
+ENGINE_VERSION = "v2.0.0-dev88800"
 ROOT = Path(__file__).resolve().parents[1]
 
 

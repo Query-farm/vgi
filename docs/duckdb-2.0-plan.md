@@ -27,17 +27,45 @@ the native 2.0 port has started and is not yet qualified.
 now builds from Haybarn `19e399c22f53` plus the committed minimal HTTP parameter
 clone patch, `831cdbed22ea`. The patch provides request-private cancellation
 contexts while retaining HTTPFS parameters; two regression cases with 17
-assertions pass. The final engine pin, `5afbe7302db8`, also adds a missing
-include in an upstream test; production artifacts retain the tested
-`831cdbed22ea`/dev88798 version configuration. All 113 VGI production
+assertions pass. The current engine pin is `289a784536fc`; it also includes a
+missing test include and a DELETE RETURNING virtual-column hook. The build
+retains its explicitly configured `831cdbed22ea`/dev88798 version string;
+qualification records the actual source and shared-engine hashes separately. All 113 VGI production
 translation units now compile, and the static/loadable
 extensions and `v2.0.0-dev88798` shell link. Loading the new extension succeeds.
-The full native unit suite passes 177 cases / 2,703 assertions; the filter suite
+The full native unit suite passes 178 cases / 2,716 assertions; the filter suite
 passes 15 cases / 221 assertions. Settings pass 8 / 137 and cancellation passes
-9 / 37, and the HTTP suite passes 9 cases / 276 assertions. Focused catalog/query
-contracts pass 48 cases / 716 assertions. Fixture-backed contracts and the full
-framework-language SQLLogic matrix are still being qualified. Native Iroh is disabled in this initial lane; these
-results do not establish optional Iroh or other-platform coverage.
+9 / 37, and the HTTP suite passes 9 cases / 276 assertions. The final catalog
+qualification covers all 88 cases, including every worker/corpus-backed case
+and both hidden tests. All 18 remote-query scenarios pass.
+The eight-lane framework-language SQLLogic matrix is running concurrently.
+Projection negotiation and parallel-worker activation remain under investigation;
+the current results do not establish a fully passing integration suite. Native
+Iroh is disabled in this initial lane; these results do not establish optional
+Iroh or other-platform coverage.
+
+Runtime qualification found and repaired a DELETE RETURNING shape mismatch:
+DuckDB 2.0 appended scan virtual columns, while provider responses contain only
+user columns. Haybarn now exposes `GetDeleteReturningVirtualColumns()` with the
+existing behavior as its default; VGI returns no virtual columns for this
+operation. Ordinary RETURNING works, and requesting virtual `rowid` fails during
+binding before effects, with the optimizer both enabled and disabled. Three
+engine DELETE suites pass 312 assertions; the VGI regression passes 33. No
+placeholder row identifiers or wire-contract changes were introduced.
+
+The nanoarrow schema comparison and IPC writer now compare Arrow schema fields
+without treating the C Data Interface's root struct name/nullability as schema
+properties. Field types, names, nullability and requested metadata checks remain
+strict. Positional query parameters accept DuckDB 2.0's `row(...)` TUPLE container
+and use the existing flat parameter-batch contract. This does not qualify nested
+TUPLE or VARIANT value transport.
+
+SQLLogic skips now parse from stderr as well as stdout, and display as skips.
+Build the official `duckdb_local_extension_repo` target before SQLLogic tests;
+building selected binaries alone does not populate the extensions used by
+`require`. The initial missing-extension matrix attempts are recorded as invalid
+coverage. The previously disabled Boolean-in-UNION fixture now checks correct
+results and is enabled after passing on the new native artifact.
 
 On DuckDB 2, VGI follows the engine's conservative HTTP retry policy: the HTTP
 transport does not automatically retry POSTs, including read-only RPCs. Cached retry settings are

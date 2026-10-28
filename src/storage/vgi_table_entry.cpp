@@ -1168,6 +1168,13 @@ virtual_column_map_t VgiTableEntry::GetVirtualColumns() const {
 	return result;
 }
 
+virtual_column_map_t VgiTableEntry::GetDeleteReturningVirtualColumns() const {
+	// The provider returns user columns for DELETE. Its transport row identifier
+	// is available to scans but is absent from the returned row schema; response
+	// order is not an identity mapping back to the input identifiers.
+	return {};
+}
+
 vector<column_t> VgiTableEntry::GetRowIdColumns() const {
 	if (rowid_type_ != LogicalType::INVALID) {
 		return {COLUMN_IDENTIFIER_ROW_ID};

@@ -79,6 +79,8 @@ if [ "$CPP_ONLY" -eq 0 ]; then
         run_leg "Arrow reference for cross-language schema checks" \
             uv run --project "$VGI_PYTHON_DIR" python "$VGI_PYTHON_DIR/scripts/regen_generated.py" \
                 --only vgi --root "vgi=$ARROW_REFERENCE_ROOT" --require-all
+        run_leg "native runtime registry reference" \
+            cp "$VGI_DIR/src/vgi_schema_registry.cpp" "$ARROW_REFERENCE_ROOT/src/vgi_schema_registry.cpp"
         export VGI_GENERATED_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_protocol_schemas.hpp"
         export VGI_REQUEST_BUILDERS_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_request_builders.hpp"
         export VGI_GENERATED_CONSTANTS_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_protocol_constants.hpp"

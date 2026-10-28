@@ -146,7 +146,9 @@ def main():
                 else "before Arrow EOS"
             )
             checks.extend(
-                [not completed.stdout.strip(), expected_error in completed.stderr]
+                # DuckDB 2 may emit the JSON array opener before a fetch fails.
+                # No row or aggregate result may have been emitted.
+                [completed.stdout.strip() in ("", "["), expected_error in completed.stderr]
             )
         else:
             rows = json.loads(completed.stdout) if completed.stdout.strip() else None

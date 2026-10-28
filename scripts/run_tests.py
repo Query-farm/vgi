@@ -319,7 +319,7 @@ def _run_unittest(
         "stderr": stderr,
         "duration": time.monotonic() - t0,
         "error": error,
-        "skip_reasons": _parse_skips(stdout),
+        "skip_reasons": _parse_skips(stdout, stderr),
     }
 
 
@@ -330,7 +330,7 @@ _SKIP_BANNER = "Skipped tests for the following reasons:"
 _SKIP_LINE = re.compile(r"^(.+): (\d+)$")
 
 
-def _parse_skips(stdout: str) -> dict[str, int]:
+def _parse_skips(stdout: str, stderr: str = "") -> dict[str, int]:
     """Skip reasons and counts from one file's Catch2 output.
 
     A skipped .test file EXITS 0, so classifying purely on exit code reports it
@@ -340,25 +340,31 @@ def _parse_skips(stdout: str) -> dict[str, int]:
     from a suite without anyone noticing. The runner has the output already —
     the only thing missing was reading it.
     """
-    if _SKIP_BANNER not in stdout:
-        return {}
     reasons: dict[str, int] = {}
-    for line in stdout.split(_SKIP_BANNER, 1)[1].splitlines():
-        line = line.strip()
-        if not line:
+    # DuckDB 2 reports skip reasons on stderr; older runners use stdout.
+    # Read both so a missing extension cannot satisfy a coverage floor.
+    for output in (stdout, stderr):
+        if _SKIP_BANNER not in output:
             continue
-        m = _SKIP_LINE.match(line)
-        if not m:
-            break  # past the banner block
-        reasons[m.group(1)] = reasons.get(m.group(1), 0) + int(m.group(2))
+        for line in output.split(_SKIP_BANNER, 1)[1].splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = _SKIP_LINE.match(line)
+            if not m:
+                break  # past the banner block
+            reasons[m.group(1)] = reasons.get(m.group(1), 0) + int(m.group(2))
     return reasons
 
 
 def _format_result_line(idx: int, total: int, result: dict) -> str:
     """One-line live progress message."""
-    status = (
-        GREEN("PASS") if result["exit"] == 0 else RED("FAIL")
-    )
+    if result["exit"] != 0:
+        status = RED("FAIL")
+    elif result["skip_reasons"]:
+        status = YELLOW("SKIP")
+    else:
+        status = GREEN("PASS")
     dur = f"{result['duration']:6.2f}s"
     return f"[{idx:>3}/{total}] {status} {result['path']} {DIM(f'({dur})')}"
 

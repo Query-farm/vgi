@@ -177,8 +177,10 @@ VgiBatchPtr BuildQueryParameters(ClientContext &context, TableFunctionBindInput 
 	auto parameters_it = input.named_parameters.find("parameters");
 	if (parameters_it != input.named_parameters.end()) {
 		auto &parameters = parameters_it->second;
-		if (parameters.IsNull() || parameters.type().id() != LogicalTypeId::STRUCT) {
-			throw BinderException("vgi_query parameters must be a non-NULL STRUCT (use row(...) for positional mode)");
+		const auto type_id = parameters.type().id();
+		if (parameters.IsNull() ||
+		    (type_id != LogicalTypeId::STRUCT && !(mode == "positional" && type_id == LogicalTypeId::TUPLE))) {
+			throw BinderException("vgi_query parameters must be a non-NULL STRUCT, or row(...) in positional mode");
 		}
 		values = StructValue::GetChildren(parameters);
 		if (values.size() > MAX_PARAMETERS) {
@@ -347,7 +349,8 @@ void RegisterVgiQueryFunction(ExtensionLoader &loader) {
 	CreateTableFunctionInfo info(function);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "Execute explicitly selected remote read-only SQL through an attached VGI catalog. Parameters are typed "
-	    "STRUCT values; parameter_mode is named (default) or positional. Requires vgi_query_enabled before ATTACH.",
+	    "STRUCT values for named parameters (default), or row(...) with parameter_mode := positional. "
+	    "Requires vgi_query_enabled before ATTACH.",
 	    {"catalog", "sql"}, {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	    {"SELECT * FROM vgi_query('remote', 'SELECT $value', parameters := {'value': 7::INTEGER});"}));
 	loader.RegisterFunction(std::move(info));

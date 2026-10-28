@@ -34,7 +34,7 @@ def main() -> int:
             str(build / "test/unittest"),
             "--test-config",
             "test/configs/no_error_skip.json",
-            "test/sql/duckdb2/default_schema.test",
+            str(native / "test/sql/duckdb2/default_schema.test"),
         ],
         cwd=native,
         env=env,

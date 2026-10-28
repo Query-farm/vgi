@@ -12,6 +12,30 @@ ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}
 statement ok
 INSERT INTO w.main.items VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40);
 
+# Transport row identifiers are usable by scans, but provider RETURNING rows
+# contain user columns only. Reject a virtual rowid before executing DELETE,
+# including when the optimizer is disabled.
+statement error
+DELETE FROM w.main.items WHERE id = 1 RETURNING rowid;
+----
+Referenced column "rowid" not found
+
+statement ok
+PRAGMA disable_optimizer;
+
+statement error
+DELETE FROM w.main.items WHERE id = 1 RETURNING rowid;
+----
+Referenced column "rowid" not found
+
+statement ok
+PRAGMA enable_optimizer;
+
+query I
+SELECT COUNT(*) FROM w.main.items;
+----
+4
+
 # ============================================================================
 # DELETE without RETURNING
 # ============================================================================

@@ -89,6 +89,7 @@ public:
 
 	// Virtual columns: return rowid if table has a row_id column
 	virtual_column_map_t GetVirtualColumns() const override;
+	virtual_column_map_t GetDeleteReturningVirtualColumns() const override;
 
 	// Row ID columns: return COLUMN_IDENTIFIER_ROW_ID if table has a row_id column
 	vector<column_t> GetRowIdColumns() const override;

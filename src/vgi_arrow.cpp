@@ -441,7 +441,19 @@ std::string VgiSchema::ToString() const {
 }
 
 bool VgiSchema::Equals(const VgiSchema &other, bool check_metadata) const {
-	return TypesEqual(schema_, other.schema_, /*check_names=*/true, check_metadata);
+	// The C Data Interface represents a record schema as a struct. Its root
+	// name/nullability are not Arrow Schema properties and are not carried by
+	// IPC. Field names, nullability, dictionary flags and metadata remain exact.
+	if (num_fields() != other.num_fields() ||
+	    (check_metadata && !MetadataEq(schema_.metadata, other.schema_.metadata))) {
+		return false;
+	}
+	for (int i = 0; i < num_fields(); ++i) {
+		if (!TypesEqual(field(i), other.field(i), /*check_names=*/true, check_metadata)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 void VgiSchema::ExportTo(ArrowSchema *out) const {
@@ -462,6 +474,7 @@ VgiSchemaPtr StructOf(const std::vector<const ArrowSchema *> &fields, const std:
 	ArrowSchema out;
 	ArrowSchemaInit(&out);
 	ArrowErrorCode code = ArrowSchemaSetTypeStruct(&out, static_cast<int64_t>(fields.size()));
+	out.flags &= ~ARROW_FLAG_NULLABLE; // Match MakeSchema: batch roots are not nullable fields.
 	if (code == NANOARROW_OK && !metadata.empty()) {
 		code = ArrowSchemaSetMetadata(&out, metadata.data());
 	}
