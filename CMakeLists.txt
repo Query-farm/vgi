@@ -533,8 +533,6 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_sab_e2e.cpp
     test/cpp/test_sab_conn.cpp
     test/support/vgi_sab_native_ring.cpp
-    test/support/vgi_sab_test_stubs.cpp
-    test/support/vgi_database_worker_test_stubs.cpp
     src/vgi_sab_stream.cpp
     src/vgi_webworker_function_connection.cpp
     src/vgi_rpc_client.cpp
@@ -581,13 +579,20 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   # for convenience.
   # Rust FFI worker staticlib for the cross-language SAB e2e (test_sab_e2e.cpp).
   # Built out-of-band by `make unit_test_rust_libs` (cargo --locked, crates.io).
+  # Explicit test-only overrides allow qualification of an unpublished SDK
+  # candidate without changing the registry fixture manifests or lockfiles.
   set(SABFFI_LIB
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabffi/target/release/libsabffi.a)
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabffi/target/release/libsabffi.a
+    CACHE FILEPATH "Rust RPC SAB fixture static library for vgi_unit_tests")
   # Table-function worker staticlib (vgi crate) for the WebWorkerFunctionConnection
   # runtime e2e. Built by `make unit_test_rust_libs`, alongside sabffi.
   set(SABTABLE_LIB
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabtable/target/release/libsabtable.a)
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabtable/target/release/libsabtable.a
+    CACHE FILEPATH "Rust VGI SAB fixture static library for vgi_unit_tests")
   target_link_libraries(vgi_unit_tests
+    # Shared protocol helpers (catalog constraints, macros and column metadata)
+    # follow the production archive instead of a second incomplete source list.
+    ${EXTENSION_NAME}
     duckdb_static
     dummy_static_extension_loader
     duckdb_mbedtls

@@ -164,6 +164,10 @@ class Runner:
         result = {
             "version": graph.catalog_version,
             "graph": base64.b64encode(graph.serialize_to_bytes()).decode(),
+            "column_dependency_count": sum(
+                edge.dependent_column_path is not None or edge.subject_column_paths is not None
+                for edge in graph.edges()
+            ),
             "tables": {
                 info.name: base64.b64encode(info.serialize_to_bytes()).decode()
                 for info in tables
@@ -174,6 +178,10 @@ class Runner:
             },
             "columns": {
                 info.name: pa.ipc.read_schema(pa.BufferReader(info.columns)).names
+                for info in tables
+            },
+            "column_types": {
+                info.name: [str(field.type) for field in pa.ipc.read_schema(pa.BufferReader(info.columns))]
                 for info in tables
             },
             "comments": {info.name: info.comment for info in tables},
@@ -360,9 +368,10 @@ COMMIT;
             flush=True,
         )
 
-    if wanted("reject_native_type_conversion"):
-        database = runner.seed("reject_native_type_conversion")
-        before = runner.state(database, "reject_native_type_conversion_before")
+    if wanted("native_type_conversion"):
+        # Canonical DEFAULT/USING support now admits ordinary casts and the
+        # equivalent explicit CAST. This metadata-only provider still declines
+        # computed USING expressions. Read back the authoritative schema.
         for suffix, statement in [
             ("implicit", "ALTER TABLE items ALTER COLUMN id TYPE INTEGER;"),
             (
@@ -370,35 +379,58 @@ COMMIT;
                 "ALTER TABLE items ALTER COLUMN id TYPE INTEGER USING CAST(id AS INTEGER);",
             ),
         ]:
+            name = "native_type_" + suffix
+            database = runner.seed(name)
+            before = runner.state(database, name + "_before")
+            assert before["column_types"]["items"] == ["int64", "string", "int64"]
+            runner.execute(name, database, statement)
+            after = runner.state(database, name + "_after")
+            assert after["version"] > before["version"]
+            assert after["columns"] == before["columns"]
+            assert after["column_types"]["items"] == ["int32", "string", "int64"]
             runner.execute(
-                "reject_native_type_" + suffix,
+                name + "_computed",
                 database,
-                statement,
-                error="USING conversions",
+                "ALTER TABLE items ALTER COLUMN id TYPE BIGINT USING id + 1;",
+                error="metadata-only reference does not execute USING conversions",
             )
-            assert (
-                runner.state(database, "reject_native_type_" + suffix + "_after")
-                == before
+            assert runner.state(database, name + "_computed_after") == after
+            runner.execute(
+                name + "_unsupported",
+                database,
+                "ALTER TABLE items ALTER COLUMN id TYPE BIGINT USING random();",
+                error="unsupported",
             )
+            assert runner.state(database, name + "_unsupported_after") == after
         print(
-            "PASS reject_native_type_conversion: implicit parser CAST and explicit USING preserve metadata",
+            "PASS native_type_conversion: ordinary implicit/explicit CAST updates durable types; declined expressions have no effects",
             flush=True,
         )
 
-    if wanted("reject_native_generated_materialization"):
-        database = runner.seed(
-            "reject_native_generated_materialization", generated=True
-        )
-        before = runner.state(database, "reject_native_generated_before")
+    if wanted("generated_dependency_cascade"):
+        database = runner.seed("generated_dependency_cascade", generated=True)
+        before = runner.state(database, "generated_dependency_before")
+        assert before["columns"]["items"] == ["id", "label", "keep", "derived"]
+        assert before["column_dependency_count"] > 0
         runner.execute(
-            "reject_native_generated_materialization",
+            "generated_dependency_restrict",
+            database,
+            "ALTER TABLE items DROP COLUMN id;",
+            error="depend",
+        )
+        assert runner.state(database, "generated_dependency_restrict_after") == before
+        runner.execute(
+            "generated_dependency_cascade",
             database,
             "ALTER TABLE items DROP COLUMN id CASCADE;",
-            error=("qualified native adapter", "vgi.expression.duckdb.scalar.v1"),
         )
-        assert runner.state(database, "reject_native_generated_after") == before
+        after = runner.state(database, "generated_dependency_cascade_after")
+        assert after["version"] > before["version"]
+        assert after["columns"]["items"] == ["label", "keep"]
+        assert after["column_types"]["items"] == ["string", "int64"]
+        assert after["column_dependency_count"] == 0
         print(
-            "PASS reject_native_generated_materialization: unqualified native expression path has no effects",
+            "PASS generated_dependency_cascade: RESTRICT preserves state; CASCADE removes the dependent column and graph edge",
             flush=True,
         )
 

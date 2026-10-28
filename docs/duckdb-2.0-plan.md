@@ -20,6 +20,38 @@ October 23 combined review and remote checks cover every scope and field mapping
 P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
 not a frozen protocol or a native DuckDB 2.0 port.
 
+**Full v3 candidate matrix (October 27):** all configured SQLLogic lanes match
+the October 24 coverage with the original floors and skip allowlists: Python
+356/33, Go 358/32, Rust 342/37, TypeScript 342/46 on each Arrow backend, Java
+336/37, C# 342/37 and C++ 341/38 (passes/expected skips). Dedicated crash/recovery
+lanes pass where those tests are excluded from shared-worker lanes. Full SDK
+unit suites pass with the qualified dependencies, including Go race testing.
+
+The dependency audit found a Java release blocker: Maven RPC 0.33.1 ignores
+scalar dictionary annotations and fails 16 SDK tests plus catalog readback.
+The independently qualified minimal two-file fix (`ec578e1` on
+`codex/vgi-v3-record-dictionaries`) passes five RPC regressions, all 803 Java SDK
+tests and the complete Java SQL/crash lanes. It is committed locally; release
+and pinning remain outstanding. Native SAB fixtures also still
+pin a published v2 Rust SDK. Their v3 candidate qualification uses explicitly
+selected static libraries from an immutable Rust candidate archive; the default
+fixture requirements/locks must move to the matching published SDK during the
+coordinated release. No public dependency gate is waived by either override.
+The independent C++ RPC checkout has the exact tree of published 0.11.0.
+
+Native reference tests cover canonical contracts, metadata, macros, constraints,
+indexes, generated columns, projections, repeatability, all 18 query scenarios,
+transaction cleanup and stored-data rollback. The full native unit target passes 171 cases/1,395 assertions after its missing
+production-helper link was corrected. Filter, settings and cancellation suites
+also pass, and the catalog contract suite passes 81 cases/1,864 assertions. The
+semantic ALTER diagnostic now tests the already supported ordinary casts and
+generated-column cascade instead of older blanket-rejection expectations.
+Evidence, exact revisions, hashes and dependency limits are recorded in
+`full_candidate_checkpoint_2026_10_27` in the companion manifest and
+`qualification/protocol-v3-full-20261027-BwGMpF` on the owned EC2 workspace.
+This checkpoint does not claim optional external-service/platform coverage or
+a native DuckDB 2 port, and the release blockers remain before merge.
+
 **Successor protocol identity (October 27):** the combined breaking protocol now
 uses `vgi.v3` / `3.0.0` across the extension and all seven SDKs. Generated routing,
 versions, registries and catalog contract fingerprints move together. Reflection

@@ -133,6 +133,27 @@ must resolve **one** vgi-rpc version; `scripts/check_rust_fixture_locks.sh` (run
 `make unit_test_rust_libs`) fails on drift, so bumping sabtable's `vgi` across a vgi-rpc move
 means bumping sabffi's `vgi-rpc` in the same change.
 
+For an unpublished protocol candidate, build separate copies of both fixtures
+against the exact candidate SDK revision, with one matching published vgi-rpc
+version and Arrow major. Keep the repository manifests, locks and registry-built
+libraries intact; record the copied manifests/locks, SDK revision and library
+hashes, then build the copies with `--locked`. Select their outputs explicitly:
+
+```bash
+cmake -S duckdb -B build/release -DBUILD_VGI_UNIT_TESTS=ON \
+  -DSABFFI_LIB=/absolute/candidate/target/release/libsabffi.a \
+  -DSABTABLE_LIB=/absolute/candidate/target/release/libsabtable.a
+cmake --build build/release --target vgi_unit_tests
+./build/release/extension/vgi/vgi_unit_tests
+```
+
+These cache paths affect only `vgi_unit_tests`. The committed `sabtable` 0.35.1
+dependency still speaks `vgi.v2` / `2.0.0`; it cannot qualify the prepared v3
+client. Candidate-library results prove candidate interoperability, not a
+published-dependency release. Once the matching Rust SDK is published, update
+both fixture requirements/locks and rerun without overrides. Unset the two
+cache entries (`cmake -U SABFFI_LIB -U SABTABLE_LIB ...`) to restore the defaults.
+
 The `[flock]` parity cases pass as skipped unless `python3` can `import filelock`; put e.g.
 vgi-python's `.venv/bin` first on `PATH`.
 
