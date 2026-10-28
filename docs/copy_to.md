@@ -47,9 +47,11 @@ worker's existing `table_buffering_process` / `table_buffering_combine` RPCs:
 | DuckDB callback | maps to |
 |---|---|
 | `copy_to_initialize_global` (once) | acquire one worker, `PerformInit` → mint `execution_id` (retained as the combine worker) |
-| `copy_to_sink` (per chunk, parallel) | per-thread worker → `table_buffering_process(batch)` → shard `state_id` |
-| `copy_to_combine` (per thread) | hand the worker + `state_id` to the global state (no RPC) |
+| `copy_to_sink` (per chunk, parallel) | acquire an idle execution worker → `table_buffering_process(batch)` → shard `state_id` |
+| `copy_to_combine` (per local batch state) | return the worker + `state_id` to the execution pool for reuse (no RPC) |
 | `copy_to_finalize` (once) | `table_buffering_combine(all state_ids)` on the retained worker → worker's `combine()` does the terminal merge + write + close |
+
+DuckDB 2.0 can create local COPY state for each flushed batch. Completed workers are reused within the execution, keeping worker count bounded by concurrent sinks. Each reused worker retains its accumulated shard state until the final combine.
 
 `initialize_global` runs once before any sink, so the `execution_id` is published
 race-free — no init handshake is needed. Empty-input COPY still calls combine (with an

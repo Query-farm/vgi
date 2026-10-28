@@ -1,7 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
 // COPY ... TO backed by a VGI worker. DuckDB's PhysicalCopyToFile drives the
-// copy_to_* callbacks below; we forward DataChunks to per-thread workers using
+// copy_to_* callbacks below; we forward DataChunks to reusable sink workers using
 // the buffered-table Sink+Combine RPCs (table_buffering_process /
 // table_buffering_combine) and let the worker's combine() perform the terminal
 // destination write. There is no Source phase. See docs/copy_to.md.
@@ -108,7 +108,9 @@ public:
 	// exists, even for empty input). Cleared on the happy path after release.
 	std::unique_ptr<IFunctionConnection> init_worker;
 
-	// Per-thread sink workers handed off in Combine.
+	// Completed sink workers available to the next batch. DuckDB2's legacy
+	// COPY adapter creates local state per batch rather than per thread, so
+	// retaining every connection until finalize would grow without bound.
 	std::mutex workers_mutex;
 	std::vector<std::unique_ptr<IFunctionConnection>> workers;
 	std::vector<std::vector<uint8_t>> state_ids;
@@ -186,7 +188,7 @@ VgiCopyToGlobalState::~VgiCopyToGlobalState() {
 class VgiCopyToLocalState : public LocalFunctionData {
 public:
 	~VgiCopyToLocalState() override {
-		// Error path: this thread still owns a connection (Combine never ran — it
+		// Error path: this batch still owns a connection (Combine never ran — it
 		// moves the connection into gstate.workers[], nulling this one). Cancel-
 		// dispatch it so a blocking RPC unblocks; otherwise drop.
 		if (!connection) {
@@ -278,7 +280,8 @@ unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindI
 		}
 		auto spec_it = specs.find(key_lower);
 		if (spec_it == specs.end()) {
-			throw BinderException("Unsupported option '%s' for COPY ... TO (FORMAT %s)", key, carrier.format_name);
+			throw BinderException("Unsupported option '%s' for COPY ... TO (FORMAT %s)", key.GetIdentifierName(),
+			                      carrier.format_name);
 		}
 		Value raw = values.empty() ? Value(LogicalType::BOOLEAN) : (values.size() == 1 ? values[0] : Value::LIST(values));
 		string cast_error;
@@ -406,14 +409,25 @@ void VgiCopyToSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalF
 	auto &gstate = gstate_p.Cast<VgiCopyToGlobalState>();
 	auto &lstate = lstate_p.Cast<VgiCopyToLocalState>();
 
-	// Lazy per-thread worker acquire (secondary init with the published id).
+	// DuckDB may create a new local state for each flushed batch. Reuse a
+	// completed sink worker and its accumulated state before creating another;
+	// workers remain private to one concurrent sink at a time.
 	if (!lstate.connection) {
 		lstate.db = gstate.db;
+		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
+		if (!gstate.workers.empty()) {
+			lstate.connection = std::move(gstate.workers.back());
+			gstate.workers.pop_back();
+			lstate.state_id = std::move(gstate.state_ids.back());
+			gstate.state_ids.pop_back();
+		}
+	}
+	if (!lstate.connection) {
 		auto params = BuildCopyToAcquireParams(bd, gstate.execution_id);
 		auto acquired = AcquireConnectionForInit(context.client, params);
 		lstate.connection = std::move(acquired.connection);
-		lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{}, /*pushdown_filters=*/nullptr,
-		                               /*join_keys=*/{}, /*phase=*/"TABLE_BUFFERING");
+		lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/ {}, /*pushdown_filters=*/nullptr,
+		                               /*join_keys=*/ {}, /*phase=*/"TABLE_BUFFERING");
 		DrainInitStream(*lstate.connection);
 	}
 
@@ -485,8 +499,8 @@ void VgiCopyToInitializeOperator(GlobalFunctionData & /*gstate*/, const Physical
 }
 
 CopyFunctionExecutionMode VgiCopyToExecutionMode(bool /*preserve_insertion_order*/, bool /*supports_batch_index*/) {
-	// Parallel sink: copy_to_sink runs concurrently; each thread fans out to its
-	// own worker (shard), combine merges. Order is not preserved (the sink has
+	// Parallel sink: copy_to_sink runs concurrently; each active sink owns a
+	// worker (shard), combine merges. Order is not preserved (the sink has
 	// no batch_index); order-sensitive writers opt into the ordered mode below.
 	return CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
 }
