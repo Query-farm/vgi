@@ -22,13 +22,13 @@ path = "src/lib.rs"
 #
 # From crates.io, not a path to a sibling vgi-rust checkout: a path dependency
 # builds against whatever branch that checkout is on, and rewrites Cargo.lock
-# whenever its version differs from the one recorded here. To try an unreleased
-# SDK change, add an uncommitted `[patch.crates-io] vgi = { path = ... }`, the
-# same convention vgi-rust uses for vgi-rpc.
+# whenever its version differs from the one recorded here. For an unpublished
+# SDK candidate, build isolated fixture copies and select their libraries using
+# the explicit SABFFI_LIB/SABTABLE_LIB test options described in CLAUDE.md.
 #
-# Bumping this moves the vgi-rpc sabtable resolves; sabffi's direct vgi-rpc
-# requirement must move with it (see scripts/check_rust_fixture_locks.sh).
-vgi = { version = "0.35.1", default-features = false }
+# VGI 0.48 carries vgi.v3 / 3.0.0. Bumping this moves the vgi-rpc sabtable
+# resolves; sabffi's direct vgi-rpc requirement must move with it (see scripts/check_rust_fixture_locks.sh).
+vgi = { version = "0.48.0", default-features = false }
 # No direct `vgi-rpc` dependency: the trait signatures name vgi-rpc's
 # `Result`/`RpcError`/`OutputCollector`, and `vgi` re-exports that crate
 # (`vgi::vgi_rpc`, `vgi::{Result, RpcError}`) so a worker never names its
@@ -36,8 +36,8 @@ vgi = { version = "0.35.1", default-features = false }
 # lagged the SDK's vgi-rpc minor (0.x minors never unify), Cargo resolved a
 # SECOND vgi-rpc beside vgi's and every trait impl failed with E0053
 # (`expected vgi::RpcError, found vgi_rpc::RpcError`).
-arrow-array = "59"
-arrow-schema = "59"
+arrow-array = "60"
+arrow-schema = "60"
 serde = { version = "1", features = ["derive"] }
 
 [profile.release]

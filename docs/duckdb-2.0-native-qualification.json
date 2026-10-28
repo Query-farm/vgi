@@ -276,7 +276,6 @@
   },
   "dependency_limits": [
     "Java uses the qualified RPC 0.33.2 candidate; matched publication remains a release gate.",
-    "Rust SAB uses explicitly selected v3 candidate libraries; published SDK and registry lock updates remain a release gate.",
     "C# uses only the Apache.Arrow.dll overlay from committed empty-STRUCT fix e4489a8212bddec01162f78ff14d632c5c95a4d8; the fix is unpublished."
   ],
   "csharp_arrow_overlay_sha256": "727e401ba1ffb9d8b6c4e26054bf3003177d8e9f12f8be65145bcb57fb59d7c1",
@@ -296,5 +295,37 @@
     "sdk_expected_skips": 252,
     "unresolved_failures": 0,
     "note": "Counts overlap across modes. Scope, candidate limits and preserved attempts are in the HTTP summary."
+  },
+  "registry_sab_checkpoint_2026_10_28": {
+    "status": "passed",
+    "vgi": "0.48.0",
+    "vgi-protocol": "0.48.0",
+    "vgi-rpc": "0.32.0",
+    "arrow": "60.1.0",
+    "source": "crates.io only; no path/git patches",
+    "lock_sha256": {
+      "test/support/sabffi/Cargo.lock": "7f188433def2c6cc30fa9e06841f251c8ecfce2876735bc12a9fc57f08bd5e4c",
+      "test/support/sabtable/Cargo.lock": "e4a48c1feb499b3068f851afc1f9a8833eb4ea5c9a87c83c488878f0570b7d3d"
+    },
+    "build": "make unit_test_rust_libs (cargo --release --locked); cmake default SABFFI_LIB/SABTABLE_LIB paths",
+    "lock_guard_tests": 6,
+    "native_unit_cases": 178,
+    "native_unit_assertions": 2721,
+    "exit": 0,
+    "unit_sha256": "7ba35b1f85cc90dc292bb76e7b925c5e0afc519feee0861a28b681ccfd5b9207",
+    "static_library_sha256": {
+      "sabffi": "add1a48f6d8ae4b427138169f07336a34a8e12e8ae593c2c6440153bb301b5a4",
+      "sabtable": "e06429304064762bfc21487dc5cf1144cbdb5c412bf745a624aa2f17cb76b9f6"
+    },
+    "evidence_root": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/qualification/sdk-releases-20261028-root",
+    "evidence_files": [
+      "rust-fixtures.log",
+      "native-registry-fixtures.log",
+      "native-registry-configure.log",
+      "native-registry-unit-build.log",
+      "native-registry-units.log",
+      "native-registry-units.exit"
+    ],
+    "note": "Supersedes the candidate-library dependency limitation. Earlier matrix artifacts and hashes above remain the historical evidence; this checkpoint rebuilds and qualifies the native unit executable with registry dependencies."
   }
 }

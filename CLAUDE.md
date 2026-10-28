@@ -147,12 +147,14 @@ cmake --build build/release --target vgi_unit_tests
 ./build/release/extension/vgi/vgi_unit_tests
 ```
 
-These cache paths affect only `vgi_unit_tests`. The committed `sabtable` 0.35.1
-dependency still speaks `vgi.v2` / `2.0.0`; it cannot qualify the prepared v3
-client. Candidate-library results prove candidate interoperability, not a
-published-dependency release. Once the matching Rust SDK is published, update
-both fixture requirements/locks and rerun without overrides. Unset the two
-cache entries (`cmake -U SABFFI_LIB -U SABTABLE_LIB ...`) to restore the defaults.
+These cache paths affect only `vgi_unit_tests`. The default fixtures use the
+registry VGI 0.48 SDK (`vgi.v3` / `3.0.0`), vgi-rpc 0.32 and Arrow 60, pinned by
+both lockfiles. The lock guard also checks the matching `vgi-protocol` package
+and Arrow versions. Before a SAB worker thread starts, its linked SDK identity
+must match the native generated protocol name/version. Candidate-library
+results prove candidate interoperability, not a published-dependency release.
+Unset both cache entries (`cmake -U SABFFI_LIB -U SABTABLE_LIB ...`) and rerun the
+full unit suite to qualify the registry defaults.
 
 The `[flock]` parity cases pass as skipped unless `python3` can `import filelock`; put e.g.
 vgi-python's `.venv/bin` first on `PATH`.

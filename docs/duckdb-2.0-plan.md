@@ -40,6 +40,16 @@ builds and passes the bounded checks recorded below. Automatic whole-query
 pushdown, nested-schema support, broader 2.0 type/grammar coverage, and platform
 and dependency-release qualification remain separate work.
 
+**Published Rust fixture checkpoint (October 28):** `vgi`, `vgi-protocol`,
+and `vgi-client` 0.48.0 are published on crates.io. Native SAB fixtures now use
+real registry locks for VGI 0.48.0, RPC 0.32.0 and Arrow 60.1.0. Both fixtures
+build with the existing `make unit_test_rust_libs` target and `--locked`; all six
+lock-guard regressions pass. With candidate-library overrides removed and the
+CMake default paths restored, the native unit suite passes **178 cases / 2,721
+assertions**. This closes the earlier Rust publication/static-library gate.
+Exact locks, binary hashes and evidence paths are recorded in the native
+qualification manifest's `registry_sab_checkpoint_2026_10_28` entry.
+
 **Native 2.0 + nanoarrow implementation checkpoint (October 28):** the engine
 now builds from Haybarn `19e399c22f53` plus the committed minimal HTTP parameter
 clone patch, `831cdbed22ea`. The patch provides request-private cancellation
