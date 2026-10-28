@@ -2,6 +2,7 @@
 #include "catch.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "core_functions_extension.hpp"
 #include "vgi_extension.hpp"
 #include "vgi_projection_pushdown.hpp"
@@ -216,11 +217,22 @@ TEST_CASE("Accepted projections survive bind copies and table scan serialization
 	CHECK_FALSE(cloned_scan->function.filter_pushdown);
 	// A serialized proposal may not reuse provider state from a different bind.
 	auto proposal = vgi::DeserializeVgiQueryRecord(data.projection_request_bytes);
-	auto original_bytes =
-	    proposal->GetColumnByName("bind_result").GetView(0);
+	auto original_bytes = proposal->GetColumnByName("bind_result").GetView(0);
 	auto original = vgi::DeserializeVgiQueryRecord(Bytes(original_bytes.begin(), original_bytes.end()));
 	auto changed = Replace(original, "opaque_data", vgi::BuildBinaryScalarRequired({9, 9}));
 	data.projection_request_bytes = vgi::SerializeToIpcBytes(
 	    Replace(proposal, "bind_result", vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(changed))));
 	CHECK_THROWS_WITH(plan->Copy(*con.context), Catch::Contains("source bind state changed"));
+
+	// Registered conversions remain local even when their executable happens
+	// to equal the built-in cast. Registration itself may change semantics.
+	auto &cast_functions = CastFunctionSet::Get(*con.context);
+	GetCastFunctionInput cast_input(*con.context);
+	auto registered_cast = cast_functions.GetCastFunction(LogicalType::INTEGER, LogicalType::BIGINT, cast_input);
+	cast_functions.RegisterCastFunction(LogicalType::INTEGER, LogicalType::BIGINT, std::move(registered_cast));
+	auto custom_plan = con.ExtractPlan(common ? "SELECT CAST(n AS BIGINT) FROM w.main.projection_rows"
+	                                          : "SELECT CAST(n AS BIGINT) FROM w.main.accepted");
+	auto custom_scan = FindScan(*custom_plan);
+	REQUIRE(custom_scan);
+	CHECK(custom_scan->bind_data->Cast<vgi::VgiTableFunctionBindData>().projection_response_bytes.empty());
 }

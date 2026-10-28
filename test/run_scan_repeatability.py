@@ -84,9 +84,11 @@ def main():
             "ORDER BY n NULLS LAST;"
         )
         if recursive:
+            # Keep the provider scan on the probe side so each recursive
+            # iteration rescans it instead of materializing it once as a build side.
             body = (
                 "WITH RECURSIVE r(i) AS (SELECT 0 UNION ALL "
-                "SELECT r.i+1 FROM r CROSS JOIN w.main.stable_unoffered s "
+                "SELECT r.i+1 FROM w.main.stable_unoffered s CROSS JOIN r "
                 "WHERE r.i<2 AND s.n=1) SELECT i FROM r ORDER BY i;\n"
             )
             expected = [{"i": 0}, {"i": 1}, {"i": 2}]

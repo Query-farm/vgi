@@ -12,6 +12,7 @@
 #include "generated/vgi_protocol_schemas.hpp"
 #include "generated/vgi_request_builders.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -20,9 +21,12 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "vgi_ipc.hpp"
 #include "nanoarrow/nanoarrow.h"
 #include <set>
+#include <limits>
 
 namespace duckdb {
 namespace vgi {
@@ -193,13 +197,37 @@ private:
 			if (cast_child.GetReturnType() != LogicalType::INTEGER ||
 			    cast_child.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF)
 				continue;
-			auto builtin = BoundCastExpression::AddDefaultCastToType(cast_child.Copy(), LogicalType::BIGINT);
+			auto &cast_functions = CastFunctionSet::Get(input.context);
+			if (cast_functions.CanOverrideDefaultCast(LogicalType::INTEGER, LogicalType::BIGINT))
+				continue;
+			// Bind through the host registry after excluding custom casts. A
+			// statically linked loadable owns another copy of DuckDB's built-ins,
+			// whose function addresses cannot identify casts bound by the host.
+			GetCastFunctionInput cast_input(input.context);
+			auto default_cast = cast_functions.GetCastFunction(LogicalType::INTEGER, LogicalType::BIGINT, cast_input);
 			const auto &bound_cast = BoundCastExpression::GetBoundCast(cast);
-			const auto &default_cast = BoundCastExpression::GetBoundCast(builtin->Cast<BoundFunctionExpression>());
-			if (!default_cast.Equals(bound_cast) || bound_cast.GetCastData() || bound_cast.HasInitLocalState()) {
+			// DuckDB may replace the built-in widening cast with its unchecked
+			// numeric implementation after statistics propagation. Derive that
+			// implementation from the default cast over the entire INTEGER domain;
+			// both implementations have identical semantics for this proposal.
+			auto optimized_default = default_cast.Copy();
+			auto domain = BaseStatistics::CreateUnknown(LogicalType::INTEGER);
+			NumericStats::SetMin(domain, Value::INTEGER(std::numeric_limits<int32_t>::lowest()));
+			NumericStats::SetMax(domain, Value::INTEGER(std::numeric_limits<int32_t>::max()));
+			optimized_default.PropagateStatistics(LogicalType::INTEGER, LogicalType::BIGINT, domain);
+			// Statistics callbacks can differ after optimization without changing
+			// the executable conversion. Compare implementation identity on copies.
+			auto bound_implementation = bound_cast.Copy();
+			auto default_implementation = default_cast.Copy();
+			bound_implementation.SetStatisticsCallback(nullptr);
+			default_implementation.SetStatisticsCallback(nullptr);
+			optimized_default.SetStatisticsCallback(nullptr);
+			const bool same_implementation =
+			    default_implementation.Equals(bound_implementation) || optimized_default.Equals(bound_implementation);
+			if (!same_implementation || bound_cast.GetCastData() || bound_cast.HasInitLocalState()) {
 				VGI_LOG(input.context, "projection.decline",
 				        {{"reason", "cast_implementation"},
-				         {"same_implementation", default_cast.Equals(bound_cast) ? "true" : "false"},
+				         {"same_implementation", same_implementation ? "true" : "false"},
 				         {"cast_data", bound_cast.GetCastData() ? "true" : "false"},
 				         {"local_state", bound_cast.HasInitLocalState() ? "true" : "false"}});
 				continue;
@@ -254,8 +282,9 @@ private:
 			auto slot = slots[accepted.indices[i]];
 			auto index = get.GetColumnIds().size();
 			get.AddColumnId(source->num_fields() + i);
-			projection.expressions[slot] = make_uniq<BoundColumnRefExpression>(
-			    projection.expressions[slot]->GetAlias(), LogicalType::BIGINT, ColumnBinding(get.table_index, ProjectionIndex(index)));
+			projection.expressions[slot] =
+			    make_uniq<BoundColumnRefExpression>(projection.expressions[slot]->GetAlias(), LogicalType::BIGINT,
+			                                        ColumnBinding(get.table_index, ProjectionIndex(index)));
 		}
 		get.returned_types = data.all_column_types;
 		get.names.clear();
