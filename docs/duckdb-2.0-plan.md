@@ -20,6 +20,32 @@ October 23 combined review and remote checks cover every scope and field mapping
 P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
 not a frozen protocol or a native DuckDB 2.0 port.
 
+**Dependency fix preparation (October 27):** the minimal Java RPC dictionary
+fix is committed, with a 0.33.2 release candidate. Its full core suite passes
+on Java 21 and 25 (680 tests each), and its FFM suite passes on Java 22 and 25
+(21 tests each). The VGI Java SDK pins 0.33.2 and passes all 803 unit tests
+(two expected skips) against the packaged candidate in an isolated Maven
+repository with composite source substitution disabled. All 336 SQLLogic files
+and both crash/recovery files pass; the 37 expected skips remain unchanged.
+
+Rust SDK 0.48.0 release preparation is committed. The release workflow's
+format, Clippy, workspace/all-feature build and doctest gates pass; the
+`vgi-protocol` package dry run also passes. Native SAB tests now check the
+linked Rust protocol identity before starting worker threads, so the old v2
+fixture fails clearly instead of aborting or hanging. The lock checker also
+requires matching registry SDK/protocol, RPC and Arrow dependencies. Its six
+regressions pass, and all 171 native unit cases/1,400 assertions pass with the
+isolated v3 candidate fixture.
+
+Publication remains outstanding: these commits do not publish Java RPC or the
+v3 Rust SDK. The native fixture manifests and registry locks remain together
+at their old versions until the Rust release exists; the prepared update to
+VGI 0.48.0, RPC 0.32 and Arrow 60 is retained as a qualification artifact.
+After publication, regenerate the real registry locks and verify Java and
+native SAB without candidate repositories or static-library overrides before
+merge. Evidence is in `qualification/v3-dependency-fixes-20261027-vgttOv` and
+the companion manifest's dependency-fix checkpoint.
+
 **Full v3 candidate matrix (October 27):** all configured SQLLogic lanes match
 the October 24 coverage with the original floors and skip allowlists: Python
 356/33, Go 358/32, Rust 342/37, TypeScript 342/46 on each Arrow backend, Java
