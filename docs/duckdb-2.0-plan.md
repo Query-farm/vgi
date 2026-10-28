@@ -6,6 +6,10 @@ It combines protocol preparation at `0592bf510d66`
 with the existing `nanoarrow-migration` work at `b3a65011`. The earlier 1.5.x
 preparation remains on `codex/duckdb-2.0-protocol` in `vgi-duckdb2`.
 
+`~/Development/vgi` is the primary checkout for ongoing nanoarrow development
+and builds. The migration from `~/Development/vgi-nano` is incorporated here;
+the native extension links the vendored nanoarrow library from this repository.
+
 **Build/test workflow:** edit locally, then synchronize
 source changes to `ec2-user@54.224.166.207` and build/test there (same instance, resumed October 27;
 previous addresses `18.234.89.245`, `3.82.45.233`, `98.81.121.120`, `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
@@ -51,7 +55,12 @@ extensions and `v2.0.0-dev88798` shell link. Loading the new extension succeeds.
 The Clang 15.0.7 build uses all 48 host CPUs. The full native unit suite passes
 178 cases / 2,716 assertions; the filter suite passes 17 cases / 243 assertions.
 Settings pass 8 / 137 and cancellation passes
-9 / 37, and the HTTP suite passes 9 cases / 276 assertions. The final catalog
+9 / 37, and the HTTP suite passes 9 cases / 276 assertions. This is targeted
+HTTP coverage for cancellation, retry policy and secret isolation, with the
+separate parameter-clone tests above. The eight-language/backend matrix below
+does not establish full HTTP qualification: its HTTP-specific integration,
+authentication, compression and optional HTTP versioning cases are skipped.
+The final catalog
 qualification covers all 88 cases, including every worker/corpus-backed case
 and both hidden tests, with zero skips. Five engine cases / 537 assertions cover
 HUGEINT comparisons and the unchanged local join-filter behavior. The complete
@@ -152,9 +161,12 @@ with nanoarrow. Python generator commit `81a182bc08e4` adds an explicit
 available. Its 37 focused tests, lint/format checks, all-SDK default generation
 check and native nanoarrow generation check pass on EC2. Native contracts,
 query parameters, strict IPC framing and metadata validation have been ported
-to nanoarrow. All 24 final reference checks pass, covering all 18 explicit-query
-scenarios, projection and repeatability, catalog contracts and truncated IPC
-over subprocess and HTTP. Default-schema SQL also passes 19 assertions.
+to nanoarrow. All 24 final reference checks pass; together with the catalog
+interrupt test they cover all 18 explicit-query scenarios. Projection,
+repeatability and catalog contracts also pass. The truncated IPC probes run
+over launcher and subprocess transports, not HTTP. Default-schema SQL also
+passes 19 assertions. Full HTTP worker integration remains to be run against
+this DuckDB 2.0/nanoarrow artifact.
 
 DuckDB 2.0 adaptation includes bound function signatures, raw `Identifier`
 conversion at catalog boundaries, nullable default schemas, active
