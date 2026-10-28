@@ -24,7 +24,10 @@ REF="${VGI_FIXTURES_REF:-main}"
 
 if [ ! -d "$DEST/.git" ]; then
     echo "==> cloning vgi-python fixtures into $DEST"
-    git clone --depth 1 --branch "$REF" https://github.com/Query-farm/vgi-python.git "$DEST"
+    git init "$DEST"
+    git -C "$DEST" remote add origin https://github.com/Query-farm/vgi-python.git
+    git -C "$DEST" fetch --depth 1 origin "$REF"
+    git -C "$DEST" checkout --detach FETCH_HEAD
 fi
 
 if ! command -v uv >/dev/null 2>&1; then
