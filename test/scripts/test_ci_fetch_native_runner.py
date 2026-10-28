@@ -46,14 +46,14 @@ class NativeArtifactTests(unittest.TestCase):
             (staging / "unittest").write_bytes(b"corrupt executable")
         return ""
 
-    def fetch(self):
+    def fetch(self, branch="main"):
         with (
             patch.object(runner, "api", side_effect=self.api),
             patch.object(runner, "command", side_effect=self.download),
             patch.object(runner, "platform_name", return_value="linux_amd64"),
             patch.dict(os.environ, {"GITHUB_ENV": str(self.root / "environment")}),
         ):
-            runner.fetch(self.revision, self.root / "output", timeout=0)
+            runner.fetch(self.revision, self.root / "output", timeout=0, branch=branch)
 
     def test_matching_build_exports_executable_paths(self):
         self.fetch()
@@ -81,6 +81,16 @@ class NativeArtifactTests(unittest.TestCase):
 
     def test_pull_request_build_is_not_used(self):
         self.run["event"] = "pull_request"
+        with self.assertRaisesRegex(RuntimeError, "no vgi-native-runner"):
+            self.fetch()
+
+    def test_explicit_branch_dispatch_is_accepted(self):
+        self.run.update(head_branch="release/vgi-v3-ci", event="workflow_dispatch")
+        self.fetch(branch="release/vgi-v3-ci")
+        self.assertTrue((self.root / "output/unittest").is_file())
+
+    def test_other_branch_never_falls_back(self):
+        self.run["head_branch"] = "release/vgi-v3-ci"
         with self.assertRaisesRegex(RuntimeError, "no vgi-native-runner"):
             self.fetch()
 

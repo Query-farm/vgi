@@ -135,14 +135,14 @@ jobs:
       # before that revision is published to the signed community channel.
       # Both executables statically link VGI and its core dependencies.
       - name: Package native SDK CI executables
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
           python3 scripts/ci_fetch_native_runner.py --pack \
             --source "$GITHUB_WORKSPACE" --build build/release \
             --output "$RUNNER_TEMP/vgi-native-runner"
 
       - name: Upload native SDK CI executables
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: vgi-native-runner-linux_amd64

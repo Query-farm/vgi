@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package or fetch the native CI executables for an exact VGI main revision.
+"""Package or fetch the native CI executables for an exact VGI revision.
 
 SDK development CI must use a client with the same wire contract as its workers.
 The signed community extension is released separately and can still implement
@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from urllib.parse import urlencode
 
 
 REPOSITORY = "Query-farm/vgi"
@@ -74,18 +75,18 @@ def api(path: str) -> dict:
     return json.loads(command("gh", "api", path))
 
 
-def fetch(revision: str, output: Path, timeout: int) -> None:
+def fetch(revision: str, output: Path, timeout: int, branch: str = "main") -> None:
     artifact_name = "vgi-native-runner-" + platform_name()
     deadline = time.monotonic() + timeout
     run_id = None
     while True:
         runs = api(
             f"repos/{REPOSITORY}/actions/workflows/integration.yml/runs"
-            f"?branch=main&head_sha={revision}&per_page=10"
+            "?" + urlencode({"branch": branch, "head_sha": revision, "per_page": 10})
         )["workflow_runs"]
         for run in runs:
             # Never consume a pull-request merge build or a different revision.
-            if run["head_sha"] != revision or run["head_branch"] != "main":
+            if run["head_sha"] != revision or run["head_branch"] != branch:
                 continue
             if run["event"] not in ("push", "workflow_dispatch"):
                 continue
@@ -145,6 +146,10 @@ def main() -> None:
     parser.add_argument("--pack", action="store_true")
     parser.add_argument("--build", type=Path, default=Path("build/release"))
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument(
+        "--branch", default=os.environ.get("VGI_NATIVE_RUNNER_BRANCH", "main"),
+        help="Branch that built the exact requested revision (default: main)",
+    )
     args = parser.parse_args()
     source = args.source.resolve()
     output = args.output.resolve()
@@ -153,7 +158,7 @@ def main() -> None:
         build = args.build if args.build.is_absolute() else source / args.build
         package(source, build, output, revision)
     else:
-        fetch(revision, output, args.timeout)
+        fetch(revision, output, args.timeout, args.branch)
 
 
 if __name__ == "__main__":
