@@ -1,6 +1,6 @@
 {
   "date": "2026-10-28",
-  "status": "native_and_producer_qualified_transport_followup_interrupted",
+  "status": "passed_bounded_native_and_producer_and_transport_qualification",
   "branch": "v2.0",
   "base_native_commit": "4623aa387d943d20941823c344ccd22d2752855e",
   "dependencies": {
@@ -72,12 +72,50 @@
     "native-build.log",
     "native-units.log",
     "python-http.log",
-    "python-http-invalid-system-python.log"
+    "python-http-invalid-system-python.log",
+    "python-http-preflight.log",
+    "python-http-final.log",
+    "python-http-final.exit"
   ],
   "transport_followup": {
-    "python_http": "Existing make test_http started but fixture servers failed startup; SSH connectivity failed before those server logs could be inspected. Not qualified.",
-    "go": "Canonical launch and HTTP supervisor started; completion unconfirmed after SSH timeout. Results at qualification/go-flatbuffers-20261028/transports/{launch,http}/result.json.",
-    "host": "54.224.166.207:22 timed out; no replacement host assumed."
+    "status": "passed",
+    "python_http": {
+      "command": "make test_http VGI_RPC_PYTHON_DIR=",
+      "passed": 330,
+      "skipped": 49,
+      "failed": 0,
+      "seconds": 186.78,
+      "jobs": 24,
+      "exit": 0,
+      "preflight": "scalar/double.test passed before full suite",
+      "log": "python-http-final.log",
+      "log_sha256": "e571f184b19926d7c8f1d68a3d4c350f2c32e4d78f86c99fadec9a08d1c41c5d",
+      "environment": "Python source venv with vgi-rpc[http]==0.52.3; UV_NO_SYNC=1"
+    },
+    "go": {
+      "source_commit": "00fd1234064a02c39c8c8e40ae33c40dec1194ae",
+      "command": "ci/run-integration.sh",
+      "launch": {
+        "passed": 328,
+        "skipped": 45,
+        "assertions": 12432,
+        "seconds": 101.63,
+        "exit": 0
+      },
+      "http": {
+        "passed": 318,
+        "skipped": 54,
+        "assertions": 12109,
+        "seconds": 158.25,
+        "exit": 0
+      },
+      "artifact_hashes_unchanged": true,
+      "evidence": "qualification/go-flatbuffers-20261028/transports",
+      "results_sha256": "159c24ecf695b888932b91f73109596b37583d32dd5c11e3ad4d0a6cd6691f1b",
+      "artifacts_sha256": "603f48fbcfe86be13e6c251730842294b9ee03a0b31411d9c0fc5877ec482055"
+    },
+    "earlier_attempts": "Preserved as invalid/incomplete evidence. First Python invocation selected the old system Python; the next lacked the HTTP extra and failed worker startup. After SSH recovered, installed the exact RPC HTTP extra, checked server startup, and completed the existing full suite. The first Go supervisor never produced results; the final supervisor used streaming artifact hashes and completed both lanes.",
+    "host": "54.224.166.207; connectivity recovered; no host restart or other workloads modified."
   },
   "limits": [
     "No full WASM, Windows or macOS build in this checkpoint.",

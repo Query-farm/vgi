@@ -87,9 +87,13 @@ The new native Clang build passes **179 unit cases / 2,719 assertions**,
 including actual malformed/corrected Go schema fixtures. The Go producer's
 full unit suite, vet, independent consumers and worker builds pass. Eight Make
 dry-run cases verify selection of the separate pthread-enabled WASM triplet;
-no WASM runtime build is claimed. Python HTTP fixture startup failed and EC2
-SSH subsequently timed out, leaving that run and the Go launch/HTTP completion
-checks unresolved. See the [dependency qualification record](duckdb-2.0-dependency-qualification.json)
+no WASM runtime build is claimed. The existing `make test_http` suite passes
+330 files with 49 explicit skips in 187 seconds. The canonical Go launcher and
+HTTP lanes pass 328 and 318 cases respectively, with 45 and 54 allowed skips,
+in 102 and 158 seconds. No failures remain in these configured lanes. Earlier
+failed startup attempts are retained; the Python environment needed the RPC
+HTTP extra before the startup preflight and final suite could pass.
+See the [dependency qualification record](duckdb-2.0-dependency-qualification.json)
 for exact artifacts, evidence paths and limits; earlier broad matrices below
 remain historical results for the preceding build.
 
