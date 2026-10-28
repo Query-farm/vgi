@@ -545,6 +545,11 @@ private:
 	bool split_reset_failed_ = false;
 
 #if VGI_SHM_TRANSPORT
+	// A worker retains its SHM attachment for the transport session. Once we
+	// advertise a segment, generic pooled readers cannot safely take ownership
+	// of that session: they cannot resolve its response pointers. Sticky across
+	// failed init/reset paths, even if local segment setup later falls back.
+	bool shm_session_advertised_ = false;
 	std::shared_ptr<class VgiShmSegment> shm_segment_;
 	// One lease per slot the worker filled and we resolved, shared with the
 	// resolved batch's buffers. A slot goes back to the worker only when ours is

@@ -1,0 +1,41 @@
+# name: test/sql/integration/table_in_out/shm_pool_metadata.test
+# description: A completed function must not lend its SHM session to generic
+#   catalog/bind readers when its subprocess returns to the worker pool. Those
+#   readers cannot resolve pointers into the function-owned segment. This also
+#   exercises ordinary subprocess pooling when SHM is disabled.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+# With SHM enabled, the first execution advertises the segment, drains its
+# result, and releases its worker.
+query I
+SELECT count(*) FROM example.buffer_input((SELECT * FROM range(100) AS t(v)));
+----
+100
+
+# This function needs a fresh catalog lookup before binding. Reusing the previous
+# function's SHM session used to return an undecodable zero-row pointer batch.
+query I
+SELECT * FROM example.sum_all_columns((SELECT * FROM range(10) AS t(v)));
+----
+45
+
+# The next completed execution must leave subsequent metadata/bind requests safe.
+query I
+SELECT count(*) FROM example.buffer_input((SELECT * FROM range(7) AS t(v)));
+----
+7
+
+statement ok
+DETACH example;

@@ -15,22 +15,28 @@ to enable.
 attaches read-write and writes batches into the segment via its bump-pointer
 allocator. Each emitted batch becomes a 0-row "pointer batch" carrying
 `SHM_OFFSET_KEY` / `SHM_LENGTH_KEY`. The C++ side's `ReadDataBatch` detects
-the pointer batch, frees the *prior* batch's slot (lockstep guarantees DuckDB
-has finished consuming it), and parses the IPC bytes from the segment in
-place via a `ChainedBufferInputStream` that splices `[schema_msg | mmap_slice
-| EOS]` for dictionary-encoded batches without copying the slice.
+the pointer batch and parses its IPC bytes from the segment in place. A
+resolved batch retains its slot lease until every consumer has released it,
+including caches that keep batches beyond the current RPC.
 
 **Header byte layout** must match `vgi-rpc/vgi_rpc/shm.py` byte-for-byte:
 fixed 64 KiB header (magic `"VGIS"` + version + data_size + num_allocs +
 up-to-4094 `(offset, length)` entries, all LE).
 
-**Lifecycle.** The C++ extension owns the segment per `FunctionConnection`
-(`shm_open` + `ftruncate` + `mmap` at first `PerformInit`; `munmap` +
-`shm_unlink` at destruction). `ResetAllocator` is called at every
-`PerformInit` so each scan starts with a clean header. `FreeAllocation`
-releases the prior batch's slot when the next `ReadDataBatch` is invoked.
-Without that free, the allocator monotonically fills and the worker silently
-falls back to inline transport once full.
+**Lifecycle.** The extension creates a segment per `FunctionConnection` at
+first `PerformInit`. Each resolved batch retains a lease on its slot; a slot
+is released only after its final consumer is done. Later init requests keep
+leased slots allocated. Connection destruction unlinks the segment name;
+retained batches keep the mapping alive until their leases are released.
+
+A private subprocess that has received a SHM advertisement stays owned by that
+function connection and is closed when the connection ends. It does not return
+to the generic worker pool, whose catalog and bind readers cannot resolve that
+session's SHM response pointers. This costs a process restart between completed
+standalone SHM function executions. Within an execution, SHM remains enabled;
+ordinary subprocess pooling and shared launcher workers keep their existing
+lifecycles. The guard stays set after failed init/reset attempts because the
+peer may already have attached the segment.
 
 **Naming.** Posix shm names start with `/`; Python's `multiprocessing.shared_memory.SharedMemory` *prepends one itself*, so we strip the leading slash when advertising the name to the worker.
 

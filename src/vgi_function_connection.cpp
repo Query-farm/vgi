@@ -871,6 +871,12 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 	}
 #endif // VGI_POSIX_TRANSPORT (shm)
 	try {
+#if VGI_SHM_TRANSPORT
+		// Set before writing: a lost reply does not undo the peer's attachment.
+		if (shm_metadata) {
+			shm_session_advertised_ = true;
+		}
+#endif
 		WriteTransportRpc("init", rpc_params, shm_metadata);
 	} catch (const IOException &e) {
 		if (proc_) {
@@ -1954,6 +1960,14 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 		// the next caller.
 		return nullptr;
 	}
+#if VGI_SHM_TRANSPORT
+	if (shm_session_advertised_) {
+		// The pool also lends processes to catalog/bind readers that have no
+		// SHM resolver. Keep this private process with its session owner;
+		// destruction closes it while retained batches keep their own leases.
+		return nullptr;
+	}
+#endif
 	bool streaming_in_flight = init_done_ && !data_finished_;
 	if (streaming_in_flight) {
 		return nullptr;
