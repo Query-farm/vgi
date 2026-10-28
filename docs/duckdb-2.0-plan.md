@@ -38,9 +38,22 @@ passes 15 cases / 221 assertions. Settings pass 8 / 137 and cancellation passes
 9 / 37, and the HTTP suite passes 9 cases / 276 assertions. The final catalog
 qualification covers all 88 cases, including every worker/corpus-backed case
 and both hidden tests. All 18 remote-query scenarios pass.
-The eight-lane framework-language SQLLogic matrix is running concurrently.
-Projection negotiation and parallel-worker activation remain under investigation;
-the current results do not establish a fully passing integration suite. Native
+The first complete eight-lane framework-language SQLLogic matrix finished with
+shared adapter failures: Python 326 passed / 30 failed / 33 skipped, Go 334/24/32,
+Rust 318/24/37, TypeScript 320/22/46 on each backend, Java 310/26/37,
+C# 318/24/37 and C++ 317/24/38. Dedicated crash/recovery cases passed.
+Per-file results and artifact hashes are in `evidence/sql-matrix/summary.json`
+under the native lane. These are diagnostic results, not a passing qualification.
+Shared fixes are being stabilized against the C++ worker before repeating the
+language matrix, per the user's October 27 direction.
+
+Projection negotiation now passes its 12 scenarios in an isolated rebuilt
+extension. Parallel scanning works; DuckDB 2.0 rewrites the former mixed-DISTINCT
+test query through a serial CTE, so tests retain those result checks and verify
+multiple workers with a separate direct scan. Verified fixture updates are
+committed at `a7e41b2`. Remaining investigations include COPY worker lifetimes
+under DuckDB 2.0's per-batch local initialization and a numeric comparison
+failure reproducible without VGI. Native
 Iroh is disabled in this initial lane; these results do not establish optional
 Iroh or other-platform coverage.
 
