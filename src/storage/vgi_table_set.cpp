@@ -24,8 +24,7 @@ namespace duckdb {
 VgiTableSet::VgiTableSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
-void VgiTableSet::LoadEntries(ClientContext &context,
-                               const std::lock_guard<std::mutex> &/*_load_lock*/) {
+void VgiTableSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> & /*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -37,16 +36,17 @@ void VgiTableSet::LoadEntries(ClientContext &context,
 	// Call catalog_schema_contents_tables via RPC — entry_lock_ is NOT held
 	// here. load_lock_ (held by caller) serializes concurrent loaders.
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 	auto tables = schema_.TakeTables(rpc_ctx, context);
 
 	// Publish each entry under entry_lock_ briefly (per-entry, not whole loop).
 	// Mirrors UnityCatalog UCTableSet::LoadEntries.
 	for (auto &table_info : tables) {
 		vgi::RequireNativeConstraintRead(*attach_result, table_info);
-		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
+		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name.GetIdentifierName());
 		auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 		{
 			std::lock_guard<std::mutex> entry_lk(entry_lock_);
@@ -66,7 +66,7 @@ void VgiTableSet::LoadEntries(ClientContext &context,
 optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const std::string &name) {
 	auto rpc_start = std::chrono::steady_clock::now();
 	uint64_t pre_gen;
-	std::string qualifier = schema_.name + "." + name;
+	std::string qualifier = schema_.name.GetIdentifierName() + "." + name;
 	bool eager_path = false;
 	// Pre-read settings OUTSIDE entry_lock_ — DuckDB's setting registry +
 	// log manager both have their own mutexes; holding entry_lock_ across
@@ -124,9 +124,10 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 		auto &attach_result = vgi_catalog.attach_result();
 		if (attach_params && attach_result) {
 			auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-			vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+			vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+			                                vgi_tx.GetTransactionOpaqueData()};
 			rpc_ctx.entity_kind = "schema";
-			rpc_ctx.entity_qualifier = schema_.name;
+			rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 			auto tables = schema_.TakeTables(rpc_ctx, context);
 
 			// Build entries OUTSIDE entry_lock_ (CreateTableInfoFromVgiTable
@@ -136,7 +137,8 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 			built_entries.reserve(tables.size());
 			for (auto &table_info : tables) {
 				vgi::RequireNativeConstraintRead(*attach_result, table_info);
-				auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
+				auto create_info =
+				    vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name.GetIdentifierName());
 				built_entries.push_back(make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info));
 			}
 			{
@@ -180,18 +182,16 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 
 	if (!attach_params || !attach_result) {
 		VGI_LOG(context, "catalog.entry_cache",
-		        {{"set_kind", CacheKindName()},
-		         {"name", name},
-		         {"qualifier", qualifier},
-		         {"outcome", "not_attached"}});
+		        {{"set_kind", CacheKindName()}, {"name", name}, {"qualifier", qualifier}, {"outcome", "not_attached"}});
 		return nullptr;
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "table";
 	rpc_ctx.entity_qualifier = qualifier;
-	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, name, context);
+	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name.GetIdentifierName(), name, context);
 
 	auto rpc_end = std::chrono::steady_clock::now();
 	double rpc_ms = std::chrono::duration<double, std::milli>(rpc_end - rpc_start).count();
@@ -212,7 +212,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 
 	auto &table_info = *table_info_opt;
 	vgi::RequireNativeConstraintRead(*catalog_.Cast<VgiCatalog>().attach_result(), table_info);
-	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
+	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name.GetIdentifierName());
 	auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 
 	// Publish under entry_lock_ briefly; log AFTER releasing.
@@ -266,7 +266,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 		return nullptr;
 	}
 
-	auto at_unit = at->Unit();
+	auto at_unit = at->Unit().GetIdentifierName();
 	auto at_raw = at->GetValue();
 	if (at_raw.IsNull()) {
 		// AT (... => NULL) cannot reach the worker as a meaningful version
@@ -280,11 +280,12 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	// Call catalog_table_get with AT params via RPC
 	auto rpc_start = std::chrono::steady_clock::now();
 	auto &vgi_tx_at = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_at.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx_at.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "table";
-	rpc_ctx.entity_qualifier = schema_.name + "." + entry_name;
-	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, entry_name, context,
-	                                                  at_unit, at_value);
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName() + "." + entry_name;
+	auto table_info_opt =
+	    vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name.GetIdentifierName(), entry_name, context, at_unit, at_value);
 	auto rpc_end = std::chrono::steady_clock::now();
 	double rpc_ms = std::chrono::duration<double, std::milli>(rpc_end - rpc_start).count();
 
@@ -302,7 +303,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 
 	auto &table_info = *table_info_opt;
 	vgi::RequireNativeConstraintRead(*catalog_.Cast<VgiCatalog>().attach_result(), table_info);
-	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
+	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name.GetIdentifierName());
 	auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 
 	// Store on the transaction so it stays alive for the query lifetime

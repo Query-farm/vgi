@@ -11,8 +11,9 @@
 #include "vgi_httpi.hpp"
 #include "vgi_rpc_client.hpp"
 
-#include <arrow/io/memory.h>
-#include <arrow/ipc/writer.h>
+#include "vgi_ipc.hpp"
+
+#include "duckdb/common/exception.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -50,42 +51,32 @@ namespace {
 // Models a transport that delivered a valid batch and then failed before the
 // Arrow EOS marker. Physical EOF is deliberately an I/O error, matching an
 // Iroh idle timeout/reset rather than a clean half-close.
-class ErrorAtEofInputStream final : public arrow::io::InputStream {
+class ErrorAtEofInputStream final : public duckdb::vgi::VgiInputStream {
 public:
-	explicit ErrorAtEofInputStream(std::shared_ptr<arrow::Buffer> bytes) : bytes_(std::move(bytes)) {
+	explicit ErrorAtEofInputStream(duckdb::vgi::VgiBufferPtr bytes) : bytes_(std::move(bytes)) {
 	}
 
-	arrow::Status Close() override {
+	void Close() override {
 		closed_ = true;
-		return arrow::Status::OK();
 	}
 	bool closed() const override {
 		return closed_;
 	}
-	arrow::Result<int64_t> Tell() const override {
-		return position_;
-	}
-	arrow::Result<int64_t> Read(int64_t nbytes, void *out) override {
+	int64_t Read(int64_t nbytes, void *out) override {
 		if (closed_) {
-			return arrow::Status::Invalid("test stream is closed");
+			throw duckdb::IOException("test stream is closed");
 		}
 		if (position_ >= bytes_->size()) {
-			return arrow::Status::IOError("injected transport reset before EOS");
+			throw duckdb::IOException("injected transport reset before EOS");
 		}
 		auto count = std::min(nbytes, bytes_->size() - position_);
 		std::memcpy(out, bytes_->data() + position_, static_cast<size_t>(count));
 		position_ += count;
 		return count;
 	}
-	arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override {
-		ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(nbytes));
-		ARROW_ASSIGN_OR_RAISE(auto count, Read(nbytes, buffer->mutable_data()));
-		ARROW_RETURN_NOT_OK(buffer->Resize(count, false));
-		return std::shared_ptr<arrow::Buffer>(std::move(buffer));
-	}
 
 private:
-	std::shared_ptr<arrow::Buffer> bytes_;
+	duckdb::vgi::VgiBufferPtr bytes_;
 	int64_t position_ = 0;
 	bool closed_ = false;
 };
@@ -153,29 +144,22 @@ TEST_CASE("httpi response heads distinguish HTTP from pre-response terminal evid
 }
 
 TEST_CASE("stream drain rejects a transport failure before Arrow EOS", "[transport]") {
-	auto schema = arrow::schema({arrow::field("result", arrow::int32())});
-	arrow::Int32Builder builder;
-	REQUIRE(builder.Append(42).ok());
-	std::shared_ptr<arrow::Array> values;
-	REQUIRE(builder.Finish(&values).ok());
-	auto batch = arrow::RecordBatch::Make(schema, 1, {values});
+	using namespace duckdb::vgi;
+	VgiBatchBuilder builder(MakeSchema({type::Int32().Named("result")}));
+	append::Int(builder.column(0), 42);
+	builder.FinishRow();
+	auto batch = builder.Finish();
 
-	auto sink_result = arrow::io::BufferOutputStream::Create();
-	REQUIRE(sink_result.ok());
-	auto sink = sink_result.ValueUnsafe();
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
-	REQUIRE(writer_result.ok());
-	auto writer = writer_result.ValueUnsafe();
-	REQUIRE(writer->WriteRecordBatch(*batch).ok());
-	REQUIRE(writer->Close().ok());
-	auto bytes_result = sink->Finish();
-	REQUIRE(bytes_result.ok());
-	auto bytes = bytes_result.ValueUnsafe();
+	auto sink = std::make_shared<VgiBufferOutputStream>();
+	auto writer = VgiIpcWriter::Open(sink, batch->schema());
+	writer->Write(*batch);
+	writer->Close();
+	auto bytes = sink->Finish();
 	REQUIRE(bytes->size() > 8);
 
 	// Arrow stream EOS is an 8-byte continuation + zero-length marker. Remove
 	// it so the next drain read reaches the transport error instead.
-	auto truncated = arrow::SliceBuffer(bytes, 0, bytes->size() - 8);
+	auto truncated = bytes->Slice(0, bytes->size() - 8);
 	auto input = std::make_shared<ErrorAtEofInputStream>(std::move(truncated));
 	CHECK_THROWS(duckdb::vgi::ReadUnaryResponse(input, nullptr, "iroh://test"));
 }

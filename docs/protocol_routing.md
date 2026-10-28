@@ -45,6 +45,14 @@ technically distinguish co-hosted versions, but this release does not provide
 a legacy encoder, a version-aware router or live token/transaction migration.
 The secret and reflection protocols retain their independent names and versions.
 
+The application wire revision is checked separately: peers must agree on its
+major and minor components. A coordinated incompatible revision can therefore
+increment the minor version while retaining the routing name. Catalog metadata
+collections use this mechanism for `2.1` → `2.2` under `vgi.v2`; old and new
+clients fail the version gate before exchanging catalog data. Patch revisions
+must remain wire compatible. This is distinct from protocols that promise
+backward-compatible minor additions or choose a new major routing namespace.
+
 Reserved server-level methods (`__transport_options__`, `__upload_url__`) belong
 to no protocol: the server resolves them from a built-in table *before* routing
 and mounts them flat at `{base}/{method}`. `IsReservedRpcMethod()` gates both the

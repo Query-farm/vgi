@@ -13,8 +13,8 @@
 #include "vgi_sab_abi.hpp"
 #include "vgi_sab_stream.hpp"
 
-#include <arrow/api.h>
-#include <arrow/ipc/api.h>
+#include "vgi_arrow.hpp"
+#include "vgi_ipc.hpp"
 
 #include <memory>
 #include <thread>
@@ -24,6 +24,7 @@ using duckdb::vgi::SabInputStream;
 using duckdb::vgi::SabOutputStream;
 using duckdb::vgi::SerializeRpcRequest;
 using duckdb::vgi::VgiProtocolId;
+using namespace duckdb::vgi;
 
 // Rust FFI worker (sabffi staticlib): serve one slot to completion.
 extern "C" void vgi_rust_serve_sab_slot(int slot);
@@ -86,18 +87,30 @@ private:
 // batch whose custom metadata carries vgi_rpc.log_level=EXCEPTION; fail with the
 // worker's message rather than reading column(0) of an envelope, which for an
 // error with an empty schema is a segfault that names nothing.
-static std::shared_ptr<arrow::RecordBatch> NextBatch(arrow::ipc::RecordBatchStreamReader &reader) {
+static VgiBatchPtr NextBatch(VgiIpcReader &reader) {
 	auto next = reader.ReadNext();
-	REQUIRE(next.ok());
-	const auto &md = next->custom_metadata;
-	if (md) {
-		auto level = md->Get(duckdb::vgi::RPC_LOG_LEVEL_KEY);
-		if (level.ok() && *level == "EXCEPTION") {
-			auto message = md->Get(duckdb::vgi::RPC_LOG_MESSAGE_KEY);
-			FAIL("worker answered with an error: " << (message.ok() ? *message : std::string("<no message>")));
+	if (next) {
+		const auto &md = *next->metadata();
+		auto level = md.Get(duckdb::vgi::RPC_LOG_LEVEL_KEY);
+		if (level && *level == "EXCEPTION") {
+			auto message = md.Get(duckdb::vgi::RPC_LOG_MESSAGE_KEY);
+			FAIL("worker answered with an error: " << (message ? *message : std::string("<no message>")));
 		}
 	}
-	return next->batch;
+	return next;
+}
+
+// A one-row, one-column NON-nullable int64 params batch {name: value}.
+static VgiBatchPtr Int64Params(const char *name, int64_t value) {
+	VgiBatchBuilder b(MakeSchema({type::Int64().Named(name, /*is_nullable=*/false)}));
+	append::Int(b.column(0), value);
+	b.FinishRow();
+	return b.Finish();
+}
+
+// The zero-column, zero-row tick batch.
+static VgiBatchPtr EmptyTick() {
+	return VgiBatch::MakeEmpty(VgiSchema::Empty());
 }
 
 TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[sab-e2e]") {
@@ -110,51 +123,42 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 
 	// --- C++ producer client ------------------------------------------------
 	// 1. Invocation request: params batch {total: 3}.
-	arrow::Int64Builder tb;
-	REQUIRE(tb.Append(3).ok());
-	std::shared_ptr<arrow::Array> ta;
-	REQUIRE(tb.Finish(&ta).ok());
 	// The nullable flag is load-bearing on an RPC params batch: vgi-rpc
-	// validates it field-by-field before dispatch, and Arrow's two-argument
-	// arrow::field() defaults to NULLABLE while the Rust #[service]-derived
-	// schema declares <i64 as VgiArrow>::nullable() == false. A mismatch is
-	// answered with an exception envelope, which NextBatch reports.
-	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64(), /*nullable=*/false)}), 1, {ta});
+	// validates it field-by-field before dispatch, and VgiField::Named()
+	// defaults to NULLABLE while the Rust #[service]-derived schema declares
+	// <i64 as VgiArrow>::nullable() == false. A mismatch is answered with an
+	// exception envelope, which NextBatch reports.
+	auto params = Int64Params("total", 3);
 	std::vector<uint8_t> req = SerializeRpcRequest("count_to", params, SVC_PROTOCOL);
 
 	auto out = std::make_shared<SabOutputStream>(region, slot);
-	REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
+	REQUIRE_NOTHROW(out->Write(req.data(), static_cast<int64_t>(req.size())));
 
 	// 2. Tick stream (empty schema) on the same c2w + tick #1 (bootstrap).
-	auto empty_schema = arrow::schema({});
-	auto tick = arrow::RecordBatch::Make(empty_schema, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-	auto tick_writer_res = arrow::ipc::MakeStreamWriter(out, empty_schema);
-	REQUIRE(tick_writer_res.ok());
-	auto tick_writer = *tick_writer_res;
-	REQUIRE(tick_writer->WriteRecordBatch(*tick).ok());
+	auto tick = EmptyTick();
+	auto tick_writer = VgiIpcWriter::Open(out, tick->schema());
+	REQUIRE_NOTHROW(tick_writer->Write(*tick));
 
 	// 3. Data reader on the server's output stream (w2c).
 	auto in = std::make_shared<SabInputStream>(region, slot);
-	auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(in);
-	REQUIRE(reader_res.ok());
-	auto reader = *reader_res;
+	auto reader = VgiIpcReader::Open(in);
 
 	// 4. One-ahead loop: read a batch, then send the next tick.
 	std::vector<int64_t> got;
-	std::shared_ptr<arrow::RecordBatch> batch;
+	VgiBatchPtr batch;
 	for (;;) {
 		batch = NextBatch(*reader);
 		if (!batch) {
 			break; // EOS
 		}
-		auto col = std::static_pointer_cast<arrow::Int64Array>(batch->column(0));
-		for (int64_t i = 0; i < col->length(); i++) {
-			got.push_back(col->Value(i));
+		auto col = batch->column(0);
+		for (int64_t i = 0; i < col.length(); i++) {
+			got.push_back(col.GetInt(i));
 		}
-		REQUIRE(tick_writer->WriteRecordBatch(*tick).ok());
+		REQUIRE_NOTHROW(tick_writer->Write(*tick));
 	}
 	// 5. Close the tick stream (Arrow EOS) + the c2w ring (EOF) so serve() returns.
-	REQUIRE(tick_writer->Close().ok());
+	REQUIRE_NOTHROW(tick_writer->Close());
 	vgi_wasm_slot_write_eos(region, slot);
 
 	rust_worker.Join();
@@ -174,58 +178,48 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 
 	// --- Phase 1: unary add_one(41) -> 42 (the "bind" analog) ---
 	{
-		arrow::Int64Builder xb;
-		REQUIRE(xb.Append(41).ok());
-		std::shared_ptr<arrow::Array> xa;
-		REQUIRE(xb.Finish(&xa).ok());
-		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64(), /*nullable=*/false)}), 1, {xa});
+		auto params = Int64Params("x", 41);
 		auto req = SerializeRpcRequest("add_one", params, SVC_PROTOCOL);
 
 		auto out = std::make_shared<SabOutputStream>(region, slot);
-		REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
+		REQUIRE_NOTHROW(out->Write(req.data(), static_cast<int64_t>(req.size())));
 
 		auto in = std::make_shared<SabInputStream>(region, slot);
-		auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
+		auto reader = VgiIpcReader::Open(in);
 		auto resp = NextBatch(*reader);
 		REQUIRE(resp != nullptr);
-		auto rcol = std::static_pointer_cast<arrow::Int64Array>(resp->column(0));
-		CHECK(rcol->Value(0) == 42);
+		CHECK(resp->column(0).GetInt(0) == 42);
 		CHECK(NextBatch(*reader) == nullptr); // drain the response's EOS
 	}
 
 	// --- Phase 2: producer count_to(3) -> [0,1,2] on the SAME slot (the "init" analog) ---
 	std::vector<int64_t> got;
 	{
-		arrow::Int64Builder tb;
-		REQUIRE(tb.Append(3).ok());
-		std::shared_ptr<arrow::Array> ta;
-		REQUIRE(tb.Finish(&ta).ok());
-		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64(), /*nullable=*/false)}), 1, {ta});
+		auto params = Int64Params("total", 3);
 		auto req = SerializeRpcRequest("count_to", params, SVC_PROTOCOL);
 
 		auto out = std::make_shared<SabOutputStream>(region, slot); // fresh stream, same slot
-		REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
+		REQUIRE_NOTHROW(out->Write(req.data(), static_cast<int64_t>(req.size())));
 
-		auto empty_schema = arrow::schema({});
-		auto tick = arrow::RecordBatch::Make(empty_schema, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-		auto tick_writer = *arrow::ipc::MakeStreamWriter(out, empty_schema);
-		REQUIRE(tick_writer->WriteRecordBatch(*tick).ok());
+		auto tick = EmptyTick();
+		auto tick_writer = VgiIpcWriter::Open(out, tick->schema());
+		REQUIRE_NOTHROW(tick_writer->Write(*tick));
 
 		auto in = std::make_shared<SabInputStream>(region, slot); // fresh reader, same slot
-		auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
-		std::shared_ptr<arrow::RecordBatch> batch;
+		auto reader = VgiIpcReader::Open(in);
+		VgiBatchPtr batch;
 		for (;;) {
 			batch = NextBatch(*reader);
 			if (!batch) {
 				break;
 			}
-			auto col = std::static_pointer_cast<arrow::Int64Array>(batch->column(0));
-			for (int64_t i = 0; i < col->length(); i++) {
-				got.push_back(col->Value(i));
+			auto col = batch->column(0);
+			for (int64_t i = 0; i < col.length(); i++) {
+				got.push_back(col.GetInt(i));
 			}
-			REQUIRE(tick_writer->WriteRecordBatch(*tick).ok());
+			REQUIRE_NOTHROW(tick_writer->Write(*tick));
 		}
-		REQUIRE(tick_writer->Close().ok());
+		REQUIRE_NOTHROW(tick_writer->Close());
 		vgi_wasm_slot_write_eos(region, slot);
 	}
 
@@ -244,40 +238,40 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	RustSlotWorker rust_worker(region, slot);
 
 	// 1. request scale(factor = 10.0).
-	arrow::DoubleBuilder fb;
-	REQUIRE(fb.Append(10.0).ok());
-	std::shared_ptr<arrow::Array> fa;
-	REQUIRE(fb.Finish(&fa).ok());
-	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("factor", arrow::float64(), /*nullable=*/false)}), 1, {fa});
+	VgiBatchBuilder fb(MakeSchema({type::Float64().Named("factor", /*is_nullable=*/false)}));
+	append::Double(fb.column(0), 10.0);
+	fb.FinishRow();
+	auto params = fb.Finish();
 	auto req = SerializeRpcRequest("scale", params, SVC_PROTOCOL);
 
 	auto out = std::make_shared<SabOutputStream>(region, slot);
-	REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
+	REQUIRE_NOTHROW(out->Write(req.data(), static_cast<int64_t>(req.size())));
 
 	// 2. input stream (single "value" f64 column) + one input batch [1,2,3].
-	auto input_schema = arrow::schema({arrow::field("value", arrow::float64())});
-	arrow::DoubleBuilder ib;
-	REQUIRE(ib.AppendValues({1.0, 2.0, 3.0}).ok());
-	std::shared_ptr<arrow::Array> ia;
-	REQUIRE(ib.Finish(&ia).ok());
-	auto input_batch = arrow::RecordBatch::Make(input_schema, 3, {ia});
-	auto input_writer = *arrow::ipc::MakeStreamWriter(out, input_schema);
-	REQUIRE(input_writer->WriteRecordBatch(*input_batch).ok());
+	auto input_schema = MakeSchema({type::Float64().Named("value")});
+	VgiBatchBuilder ib(input_schema);
+	for (double v : {1.0, 2.0, 3.0}) {
+		append::Double(ib.column(0), v);
+		ib.FinishRow();
+	}
+	auto input_batch = ib.Finish();
+	auto input_writer = VgiIpcWriter::Open(out, input_schema);
+	REQUIRE_NOTHROW(input_writer->Write(*input_batch));
 
 	// 3. read the 1:1 scaled output batch.
 	auto in = std::make_shared<SabInputStream>(region, slot);
-	auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
+	auto reader = VgiIpcReader::Open(in);
 	auto outb = NextBatch(*reader);
 	REQUIRE(outb != nullptr);
-	auto ocol = std::static_pointer_cast<arrow::DoubleArray>(outb->column(0));
+	auto ocol = outb->column(0);
 	std::vector<double> got;
-	for (int64_t i = 0; i < ocol->length(); i++) {
-		got.push_back(ocol->Value(i));
+	for (int64_t i = 0; i < ocol.length(); i++) {
+		got.push_back(ocol.GetDouble(i));
 	}
 	CHECK(got == std::vector<double>({10.0, 20.0, 30.0}));
 
 	// 4. close input (Arrow EOS + ring EOF), drain output EOS.
-	REQUIRE(input_writer->Close().ok());
+	REQUIRE_NOTHROW(input_writer->Close());
 	vgi_wasm_slot_write_eos(region, slot);
 	CHECK(NextBatch(*reader) == nullptr);
 

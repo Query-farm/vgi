@@ -2,8 +2,6 @@
 #include "vgi_streaming_window_operator.hpp"
 #include "vgi_batch_validation.hpp"
 
-#include <arrow/c/bridge.h>
-
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -33,13 +31,13 @@ namespace vgi {
 vector<ColumnBinding> LogicalVgiStreamingWindow::GetColumnBindings() {
 	auto child_bindings = children[0]->GetColumnBindings();
 	for (idx_t i = 0; i < expressions.size(); i++) {
-		child_bindings.emplace_back(window_index, i);
+		child_bindings.emplace_back(window_index, ProjectionIndex(i));
 	}
 	return child_bindings;
 }
 
-vector<idx_t> LogicalVgiStreamingWindow::GetTableIndex() const {
-	return vector<idx_t> {window_index};
+vector<TableIndex> LogicalVgiStreamingWindow::GetTableIndex() const {
+	return vector<TableIndex> {window_index};
 }
 
 string LogicalVgiStreamingWindow::GetName() const {
@@ -53,7 +51,7 @@ string LogicalVgiStreamingWindow::GetExtensionName() const {
 void LogicalVgiStreamingWindow::ResolveTypes() {
 	types.insert(types.end(), children[0]->types.begin(), children[0]->types.end());
 	for (auto &expr : expressions) {
-		types.push_back(expr->return_type);
+		types.push_back(expr->GetReturnType());
 	}
 }
 
@@ -115,7 +113,7 @@ struct VgiStreamingWindowOperatorState : public OperatorState {
 	// All expressions in the same operator share the same partition/order
 	// keys (DuckDB's planner separates by partition equivalence into different
 	// LogicalWindow nodes), but value-col types differ per expression.
-	vector<std::shared_ptr<arrow::Schema>> chunk_input_schema_per_expr;
+	vector<VgiSchemaPtr> chunk_input_schema_per_expr;
 	idx_t partition_key_count = 0;
 	idx_t order_key_count = 0;
 	// DatabaseInstance pointer captured at OpenSessions time so the
@@ -190,13 +188,13 @@ static void OpenSessions(ClientContext &context, const PhysicalVgiStreamingWindo
 	try {
 		for (idx_t expr_idx = 0; expr_idx < op.select_list.size(); expr_idx++) {
 			auto &wexpr = op.select_list[expr_idx]->Cast<BoundWindowExpression>();
-			if (!wexpr.bind_info) {
+			if (!wexpr.BindInfo()) {
 				throw IOException("VGI streaming window: window expression has no bind_info");
 			}
-			auto &bind_data = wexpr.bind_info->Cast<VgiAggregateBindData>();
+			auto &bind_data = wexpr.BindInfo()->Cast<VgiAggregateBindData>();
 
-			const idx_t pkc = wexpr.partitions.size();
-			const idx_t okc = wexpr.orders.size();
+			const idx_t pkc = wexpr.Partitions().size();
+			const idx_t okc = wexpr.OrderBy().size();
 			// Planner groups expressions sharing partition/order keys into
 			// the same LogicalWindow node, so all expressions in one operator
 			// see the same (pkc, okc). Assert defensively.
@@ -218,19 +216,19 @@ static void OpenSessions(ClientContext &context, const PhysicalVgiStreamingWindo
 			// THIS expression: partition keys, order keys, this expr's value cols.
 			vector<LogicalType> col_types;
 			vector<string> col_names;
-			col_types.reserve(pkc + okc + wexpr.children.size());
-			col_names.reserve(pkc + okc + wexpr.children.size());
+			col_types.reserve(pkc + okc + wexpr.GetChildren().size());
+			col_names.reserve(pkc + okc + wexpr.GetChildren().size());
 
 			for (idx_t i = 0; i < pkc; i++) {
-				col_types.push_back(wexpr.partitions[i]->return_type);
+				col_types.push_back(wexpr.Partitions()[i]->GetReturnType());
 				col_names.push_back(StringUtil::Format("__pk_%llu", static_cast<unsigned long long>(i)));
 			}
 			for (idx_t i = 0; i < okc; i++) {
-				col_types.push_back(wexpr.orders[i].expression->return_type);
+				col_types.push_back(wexpr.OrderBy()[i].expression->GetReturnType());
 				col_names.push_back(StringUtil::Format("__ok_%llu", static_cast<unsigned long long>(i)));
 			}
-			for (idx_t i = 0; i < wexpr.children.size(); i++) {
-				col_types.push_back(wexpr.children[i]->return_type);
+			for (idx_t i = 0; i < wexpr.GetChildren().size(); i++) {
+				col_types.push_back(wexpr.GetChildren()[i]->GetReturnType());
 				col_names.push_back(StringUtil::Format("__val_%llu", static_cast<unsigned long long>(i)));
 			}
 
@@ -282,13 +280,13 @@ static void ProjectInputInto(ClientContext &context, const BoundWindowExpression
 		ExpressionExecutor exec(context, expr);
 		exec.ExecuteExpression(input, projected.data[out_idx++]);
 	};
-	for (auto &p : wexpr.partitions) {
+	for (auto &p : wexpr.Partitions()) {
 		eval(*p);
 	}
-	for (auto &o : wexpr.orders) {
+	for (auto &o : wexpr.OrderBy()) {
 		eval(*o.expression);
 	}
-	for (auto &c : wexpr.children) {
+	for (auto &c : wexpr.GetChildren()) {
 		eval(*c);
 	}
 	projected.SetCardinality(input.size());
@@ -331,15 +329,15 @@ OperatorResultType PhysicalVgiStreamingWindow::Execute(ExecutionContext &context
 		auto &bind_data = *state.bind_datas[expr_idx];
 
 		vector<LogicalType> col_types;
-		col_types.reserve(wexpr.partitions.size() + wexpr.orders.size() + wexpr.children.size());
-		for (auto &p : wexpr.partitions) {
-			col_types.push_back(p->return_type);
+		col_types.reserve(wexpr.Partitions().size() + wexpr.OrderBy().size() + wexpr.GetChildren().size());
+		for (auto &p : wexpr.Partitions()) {
+			col_types.push_back(p->GetReturnType());
 		}
-		for (auto &o : wexpr.orders) {
-			col_types.push_back(o.expression->return_type);
+		for (auto &o : wexpr.OrderBy()) {
+			col_types.push_back(o.expression->GetReturnType());
 		}
-		for (auto &c : wexpr.children) {
-			col_types.push_back(c->return_type);
+		for (auto &c : wexpr.GetChildren()) {
+			col_types.push_back(c->GetReturnType());
 		}
 
 		DataChunk projected;
@@ -368,7 +366,7 @@ OperatorResultType PhysicalVgiStreamingWindow::Execute(ExecutionContext &context
 		ArrowScanLocalState scan_state(std::move(chunk_wrapper), client_context);
 
 		DataChunk result_chunk;
-		result_chunk.Initialize(client_context, {wexpr.return_type});
+		result_chunk.Initialize(client_context, {wexpr.GetReturnType()});
 		result_chunk.SetCardinality(input.size());
 		ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), result_chunk, false);
 

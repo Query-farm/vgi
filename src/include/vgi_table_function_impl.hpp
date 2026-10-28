@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include "vgi_settings_defaults.hpp"
 #include <atomic>
 #include <future>
@@ -525,7 +527,7 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// after the batch has been sliced to STANDARD_VECTOR_SIZE; these count the
 	// RecordBatches as they came off the wire. Workers vary wildly here — one
 	// 2M-row batch versus two thousand 1k-row batches are indistinguishable in
-	// the profile box otherwise — so ``VgiTableFunctionDynamicToString`` surfaces
+	// the profile box otherwise — so ``VgiTableFunctionGetMetrics`` surfaces
 	// the distribution. Must live on the gstate, not the lstate: DuckDB calls
 	// dynamic_to_string once per source thread and *overrides* duplicate keys
 	// (see OperatorProfiler::FinalizeSourceProfiling), so a per-thread counter
@@ -586,7 +588,7 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	vector<VgiDynamicFilterInfo> dynamic_filters;
 
 	// Cached static filter bytes (serialized once, reused on every tick)
-	std::shared_ptr<arrow::Buffer> static_filter_bytes;
+	VgiBufferPtr static_filter_bytes;
 
 	// Shared tick filter state (updated by scan, read by connection for tick metadata)
 	shared_ptr<TickFilterState> tick_filter_state;
@@ -598,7 +600,7 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// (which assumes projected layout when projection_pushdown=true) reads
 	// the wrong column position.
 	std::vector<int32_t> projection_ids;
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	std::vector<VgiBufferPtr> join_keys_buffers;
 	std::optional<OrderByHint> order_by_hint;
 	std::optional<TableSampleHint> table_sample_hint;
 
@@ -703,7 +705,7 @@ struct VgiPrefetchSlot {
 	// Prefetch state machine (see ``PrefetchState`` above).
 	std::atomic<PrefetchState> state {PrefetchState::IDLE};
 	// The batch produced by the prefetch (valid when state == READY).
-	std::shared_ptr<arrow::RecordBatch> batch;
+	VgiBatchPtr batch;
 	// Any exception thrown by the prefetch (valid when state == ERROR).
 	std::exception_ptr exception;
 	// Set by the local-state destructor. A task that sees this flag must not
@@ -849,19 +851,21 @@ private:
 //! This function creates a temporary connection, performs bind, and stores the results.
 //! Returns the output schema from the worker.
 void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindData &bind_data,
-                                 vector<LogicalType> &return_types, vector<string> &names);
+                                 vector<LogicalType> &return_types, vector<Identifier> &names);
 
 //! Serialize filters to Arrow IPC bytes for worker.
 //! Returns nullptr if filters is empty/null.
 //! Throws InvalidInputException if a required filter cannot be encoded exactly.
 //! Result of filter serialization — contains the filter batch and optional join keys batch.
 struct SerializedFilters {
-	std::shared_ptr<arrow::Buffer> filter_bytes;                    //! Arrow IPC bytes of the filter RecordBatch (or nullptr)
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;  //! Arrow IPC bytes per join key column (one single-column batch each)
+	VgiBufferPtr filter_bytes;                    //! Arrow IPC bytes of the filter RecordBatch (or nullptr)
+	std::vector<VgiBufferPtr> join_keys_buffers;  //! Arrow IPC bytes per join key column (one single-column batch each)
 };
 
 enum class VgiFilterColumnIndexDomain : uint8_t {
+	//! DuckDB filters are keyed by projection positions, mapped through column_ids.
 	PROJECTED,
+	//! Synthetic filters explicitly keyed by the original bind-schema column index.
 	BIND_SCHEMA,
 };
 
@@ -877,8 +881,8 @@ enum class VgiFilterColumnIndexDomain : uint8_t {
 //! ``rowid_column_name`` and ``rowid_worker_col_index`` identify the field that
 //! DuckDB hides from ``column_names``. They restore worker-schema indexes for
 //! rowid and for ordinary fields shifted by the erased field.
-//! ``exclude_filter_keys`` (default null): projected filter-map keys (``filters->filters``
-//! entry keys, i.e. the projected col_idx) to SKIP. Used by the per-partition result
+//! ``exclude_filter_keys`` (default null): projected filter-map entry indexes to
+//! SKIP. Used by the per-partition result
 //! cache to serialize the RESIDUAL filter — everything except the partition-column
 //! predicate — so a per-partition entry keys on the non-partition filter shape only.
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
@@ -902,7 +906,7 @@ struct VgiDynamicFilterDeltaUpdate {
 };
 
 //! Serialize the advisory Top-N mutations sent in tick metadata.
-std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
+VgiBufferPtr VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
                                                               const vector<VgiDynamicFilterDeltaUpdate> &updates);
 
 //! Returns true if any descendant of ``filter`` is a DynamicFilter (Top-N
@@ -942,10 +946,11 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 //! the function can return diagnostics it persisted during process(). Always also surfaces
 //! intrinsic keys (Worker, Function, Rows Read, Threads). Best-effort: any RPC failure is
 //! logged and degrades to just the intrinsic keys.
-InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctionDynamicToStringInput &input);
+void VgiTableFunctionGetMetrics(TableFunctionGetMetricsInput &input);
 
 //! Get bind info callback for returning table entry reference
-BindInfo VgiTableScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p);
+BindInfo VgiTableScanGetBindInfo(TableFunctionGetBindInfoInput &input);
+optional_ptr<TableCatalogEntry> VgiTableScanGetTableEntry(optional_ptr<const FunctionData> bind_data_p);
 
 //! Virtual column callback for row_id support on scan functions
 virtual_column_map_t VgiTableScanGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p);

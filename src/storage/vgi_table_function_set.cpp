@@ -1,3 +1,4 @@
+#include "vgi_function_docs.hpp"
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "storage/vgi_table_function_set.hpp"
 
@@ -47,18 +48,16 @@ bool VgiSplitScansEnabled(ClientContext &context) {
 
 } // namespace
 
-
 namespace {
 
 // Extract settings from client context given a list of setting names
 // This is used for catalog-bound functions where we know which settings the catalog registered
-std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
-                                                const std::vector<std::string> &setting_names) {
+std::map<std::string, Value> ExtractVgiSettings(ClientContext &context, const std::vector<std::string> &setting_names) {
 	std::map<std::string, Value> settings;
 
 	for (const auto &name : setting_names) {
 		Value value;
-		if (context.TryGetCurrentSetting(name, value)) {
+		if (context.TryGetCurrentSetting(Identifier(name), value)) {
 			settings[name] = value;
 		}
 	}
@@ -96,7 +95,8 @@ VgiTableFunctionSet::VgiTableFunctionSet(Catalog &catalog, VgiSchemaEntry &schem
 // ============================================================================
 
 static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                                            vector<LogicalType> &return_types,
+                                                            vector<Identifier> &names) {
 	// Access the VgiTableFunctionInfo attached to this function
 	auto &vgi_info = input.info->Cast<vgi::VgiTableFunctionInfo>();
 
@@ -105,7 +105,8 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// Copy connection information from the catalog function info. A function
 	// published into system.main outlives DETACH, so its live state is resolved
 	// from the attached catalog here (see ResolveVgiFunctionBinding).
-	auto binding = vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.name);
+	auto binding =
+	    vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.GetName().GetIdentifierName());
 	bind_data->attach_params = binding.attach_params;
 	bind_data->attach_opaque_data = binding.attach_opaque_data;
 	auto &vgi_tx = VgiTransaction::Get(context, *binding.catalog);
@@ -141,8 +142,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 		bind_data->fixed_order = false;
 	} else {
 		bind_data->fixed_order =
-		    MapOrderPreservation(vgi_info.function_info().order_preservation) ==
-		    OrderPreservationType::FIXED_ORDER;
+		    MapOrderPreservation(vgi_info.function_info().order_preservation) == OrderPreservationType::FIXED_ORDER;
 	}
 
 	// PartitionColumns mode: carry the wire ``partition_kind`` flag onto
@@ -161,7 +161,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// Extract named arguments from input.named_parameters
 	vector<std::pair<string, Value>> named_args;
 	for (auto &[name, value] : input.named_parameters) {
-		named_args.emplace_back(name, value);
+		named_args.emplace_back(name.GetIdentifierName(), value);
 	}
 
 	// Build Arrow arguments struct from both positional and named args
@@ -190,13 +190,12 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 				}
 				missing_list += missing_settings[i];
 			}
-			throw BinderException(
-			    vgi::ErrorInfo(vgi::error_subtype::kMissingSettings)
-			        .Set(vgi::error_key::kFunctionName, bind_data->function_name)
-			        .Set(vgi::error_key::kMissingSettings, missing_list),
-			    StringUtil::Format("Function '%s' requires the following settings to be set: %s. "
-			                       "Use SET <setting_name> = <value> before calling this function.",
-			                       bind_data->function_name, missing_list));
+			throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kMissingSettings)
+			                          .Set(vgi::error_key::kFunctionName, bind_data->function_name)
+			                          .Set(vgi::error_key::kMissingSettings, missing_list),
+			                      StringUtil::Format("Function '%s' requires the following settings to be set: %s. "
+			                                         "Use SET <setting_name> = <value> before calling this function.",
+			                                         bind_data->function_name, missing_list));
 		}
 	}
 
@@ -206,7 +205,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// Resolve partition_column_indices by walking the bind output schema
 	// for fields whose metadata carries ``vgi.partition_column = "true"``.
 	// Per-field Arrow metadata round-trips losslessly through
-	// ``pa.Schema.serialize() -> arrow::ipc::ReadSchema``, which is what
+	// ``pa.Schema.serialize()`` -> the IPC schema reader, which is what
 	// the bind RPC uses today. Doing this once at bind keeps
 	// ``VgiGetPartitionInfo`` cheap (O(P) membership check per planner
 	// call, no schema walk).
@@ -214,13 +213,10 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 		const auto &out_schema = bind_data->bind_result.output_schema;
 		if (out_schema) {
 			for (int i = 0; i < out_schema->num_fields(); ++i) {
-				const auto &field = out_schema->field(i);
-				const auto &meta = field->metadata();
-				if (meta) {
-					int idx = meta->FindKey("vgi.partition_column");
-					if (idx >= 0 && meta->value(idx) == "true") {
-						bind_data->partition_column_indices.push_back(static_cast<idx_t>(i));
-					}
+				const auto meta = out_schema->field_metadata(i);
+				const auto idx = meta.FindKey("vgi.partition_column");
+				if (idx >= 0 && meta.value(idx) == "true") {
+					bind_data->partition_column_indices.push_back(static_cast<idx_t>(i));
 				}
 			}
 		}
@@ -229,11 +225,10 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 		// enforces this at resolve_metadata; we check here as defense in
 		// depth (catches partial-deployment / version-skew bugs).
 		if (bind_data->partition_column_indices.empty()) {
-			throw BinderException(
-			    "VGI function '%s' declares partition_kind but no bind-schema "
-			    "field carries vgi.partition_column metadata; mark partition "
-			    "columns with vgi.schema_utils.partition_field()",
-			    bind_data->function_name);
+			throw BinderException("VGI function '%s' declares partition_kind but no bind-schema "
+			                      "field carries vgi.partition_column metadata; mark partition "
+			                      "columns with vgi.schema_utils.partition_field()",
+			                      bind_data->function_name);
 		}
 	}
 
@@ -248,7 +243,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 
 static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                                  vector<LogicalType> &return_types,
-                                                                 vector<string> &names) {
+                                                                 vector<Identifier> &names) {
 	// Access the VgiTableFunctionInfo attached to this function
 	auto &vgi_info = input.info->Cast<vgi::VgiTableFunctionInfo>();
 
@@ -256,7 +251,8 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	vgi::VgiTableInOutBindParams params;
 	// A function published into system.main outlives DETACH, so its live state
 	// is resolved from the attached catalog here (see ResolveVgiFunctionBinding).
-	auto binding = vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.name);
+	auto binding =
+	    vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.GetName().GetIdentifierName());
 	params.attach_params = binding.attach_params;
 	params.function_name = vgi_info.function_info().name;
 	params.schema_name = vgi_info.function_info().schema_name;
@@ -265,8 +261,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.transaction_opaque_data = tio_tx.GetTransactionOpaqueData();
 	params.settings = ExtractVgiSettings(context, binding.setting_names);
 	params.required_secrets = vgi_info.function_info().required_secrets;
-	params.table_buffering =
-	    vgi_info.function_info().function_type == vgi::VgiFunctionType::TableBuffering;
+	params.table_buffering = vgi_info.function_info().function_type == vgi::VgiFunctionType::TableBuffering;
 	params.source_order_dependent = vgi_info.function_info().source_order_dependent;
 	params.sink_order_dependent = vgi_info.function_info().sink_order_dependent;
 	params.requires_input_batch_index = vgi_info.function_info().requires_input_batch_index;
@@ -282,8 +277,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.input_rows_per_call = vgi_info.function_info().input_rows_per_call;
 	params.stability = vgi_info.function_info().stability; // for the map-operator dedup gate
 	if (params.input_from_args && vgi_info.function_info().arguments_schema) {
-		auto blended_args =
-		    vgi::ParseFunctionArgumentSchema(context, vgi_info.function_info().arguments_schema);
+		auto blended_args = vgi::ParseFunctionArgumentSchema(context, vgi_info.function_info().arguments_schema);
 		params.positional_input_names = blended_args.positional_names;
 		params.positional_input_types = blended_args.positional_types;
 		params.varargs_input_type = blended_args.varargs_type;
@@ -307,13 +301,12 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 				}
 				missing_list += missing_settings[i];
 			}
-			throw BinderException(
-			    vgi::ErrorInfo(vgi::error_subtype::kMissingSettings)
-			        .Set(vgi::error_key::kFunctionName, params.function_name)
-			        .Set(vgi::error_key::kMissingSettings, missing_list),
-			    StringUtil::Format("Function '%s' requires the following settings to be set: %s. "
-			                       "Use SET <setting_name> = <value> before calling this function.",
-			                       params.function_name, missing_list));
+			throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kMissingSettings)
+			                          .Set(vgi::error_key::kFunctionName, params.function_name)
+			                          .Set(vgi::error_key::kMissingSettings, missing_list),
+			                      StringUtil::Format("Function '%s' requires the following settings to be set: %s. "
+			                                         "Use SET <setting_name> = <value> before calling this function.",
+			                                         params.function_name, missing_list));
 		}
 	}
 
@@ -327,7 +320,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
                                           const std::vector<vgi::VgiFunctionInfo> &overloads,
                                           const VgiFunctionRegistrationTarget &target,
                                           vector<FunctionDescription> &descriptions) {
-	TableFunctionSet func_set(registered_name);
+	TableFunctionSet func_set {Identifier(registered_name)};
 
 	for (const auto &func_info : overloads) {
 		// Parse argument types, distinguishing positional from named arguments
@@ -350,7 +343,8 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			if (func_info.input_from_args && func_info.has_finalize) {
 				throw InvalidInputException(
 				    "Function '%s' advertises input_from_args (blended) AND has_finalize; a blended "
-				    "RowTransformFunction is map-shaped and cannot have a finalize.", func_info.name);
+				    "RowTransformFunction is map-shaped and cannot have a finalize.",
+				    func_info.name);
 			}
 			// Create a table-in-out function
 			// Table-in-out functions use LogicalType::TABLE in args and have an in_out_function
@@ -374,8 +368,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// rewrite is somehow missed, the operator falls back to
 			// VgiTableInOutFunction, which asserts loudly on bind_data
 			// with table_buffering=true.
-			const bool is_buffering =
-			    func_info.function_type == vgi::VgiFunctionType::TableBuffering;
+			const bool is_buffering = func_info.function_type == vgi::VgiFunctionType::TableBuffering;
 			if (func_info.has_finalize && !is_buffering) {
 				table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
 			}
@@ -414,14 +407,17 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 
 			// Register named parameters
-			table_func.named_parameters = arg_types.named_parameters;
 
 			// Register varargs so DuckDB accepts a blended VARARGS call
 			// (row_sum(1,2,3) -> N input columns of varargs_type). Without this
 			// the signature would carry only the named params and DuckDB would
 			// reject any positional args.
 			if (arg_types.has_varargs) {
-				table_func.varargs = arg_types.varargs_type;
+				table_func.GetSignature().AddArgs("args", arg_types.varargs_type);
+			}
+
+			for (const auto &option : arg_types.named_parameters) {
+				vgi::AddVgiFunctionOption(table_func, Identifier(option.first), option.second);
 			}
 
 			// Attach function info
@@ -431,9 +427,8 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 		} else {
 			// Create a regular table function
 			// Only positional arguments go in the function signature
-			TableFunction table_func(arg_types.positional_types, vgi::VgiTableFunctionScan,
-			                         VgiCatalogTableFunctionBind, vgi::VgiTableFunctionInitGlobal,
-			                         vgi::VgiTableFunctionInitLocal);
+			TableFunction table_func(arg_types.positional_types, vgi::VgiTableFunctionScan, VgiCatalogTableFunctionBind,
+			                         vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 			table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
 			table_func.sampling_pushdown = func_info.sampling_pushdown.value_or(false);
@@ -445,7 +440,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			table_func.statistics = vgi::VgiTableFunctionStatistics;
 			table_func.table_scan_progress = vgi::VgiTableFunctionProgress;
 			table_func.to_string = vgi::VgiTableFunctionToString;
-			table_func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
+			table_func.get_metrics = vgi::VgiTableFunctionGetMetrics;
 			table_func.set_scan_order = vgi::VgiSetScanOrder;
 			// batch_index opt-in: install the partition-data callback so
 			// ordered sinks (BatchCollector, BatchInsert,
@@ -502,11 +497,14 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// INITIALIZE_ON_SCHEDULE without sacrificing join pushdown.
 
 			// Register named parameters so DuckDB knows how to handle them
-			table_func.named_parameters = arg_types.named_parameters;
 
 			// Register varargs support if the function accepts additional positional arguments
 			if (arg_types.has_varargs) {
-				table_func.varargs = arg_types.varargs_type;
+				table_func.GetSignature().AddArgs("args", arg_types.varargs_type);
+			}
+
+			for (const auto &option : arg_types.named_parameters) {
+				vgi::AddVgiFunctionOption(table_func, Identifier(option.first), option.second);
 			}
 
 			// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
@@ -541,7 +539,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 
 } // namespace vgi
 
-void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
+void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> & /*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -559,9 +557,10 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	// Call catalog_schema_contents_functions via RPC for table functions
 	auto worker_path = attach_params->worker_path();
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::TABLE_FUNCTION_ENTRY, context);
 
@@ -592,11 +591,11 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	// Registration target: this catalog's own schema.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
-	target.catalog_name = catalog_.GetName();
+	target.catalog_name = catalog_.GetName().GetIdentifierName();
 	target.attach_params = attach_params;
 	target.attach_opaque_data = attach_result->attach_opaque_data;
 	target.setting_names = setting_names;
-	target.schema_name = schema_.name;
+	target.schema_name = schema_.name.GetIdentifierName();
 
 	// Create function entries
 	for (const auto &pair : functions_by_name) {
@@ -606,7 +605,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 
 		// Create function info and entry
 		CreateTableFunctionInfo info(func_set);
-		info.schema = schema_.name;
+		info.SetQualifiedName(schema_.GetQualifiedName(info.GetFunctionName()));
 		info.internal = true;
 		info.descriptions = std::move(descriptions);
 
@@ -628,7 +627,10 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 			}
 		}
 
-		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(function_entry)); }
+		{
+			std::lock_guard<std::mutex> __entry_lk(entry_lock_);
+			CreateEntryLocked(std::move(function_entry));
+		}
 	}
 }
 

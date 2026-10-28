@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 // Typed catalog RPC surface: every InvokeCatalog*/InvokeTableFunction* call,
 // the DDL operations, statistics, and the SecretManager / CreateTableInfo
 // helpers. Split out of vgi_catalog_api.hpp so that editing an RPC signature
@@ -109,16 +111,16 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 // HostsProtocol / InvokeListProtocols in vgi_reflection.hpp. A worker that
 // does not host reflection throws (VgiRpcException protocol_not_supported, or
 // method_not_implemented from a server that predates routing keys).
-std::shared_ptr<arrow::RecordBatch> InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
+VgiBatchPtr InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
                                                                   ClientContext &context);
 
 // One unary call to a non-vgi.v3 protocol through the catalog's connection and
 // auth (routing key and, when non-empty, version from `protocol`). Returns the
 // decoded one-row payload of the binary `result` envelope; decode it by name.
 // Worker errors surface as VgiRpcException carrying error_kind / error_code.
-std::shared_ptr<arrow::RecordBatch> InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
+VgiBatchPtr InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
                                                         const VgiProtocolId &protocol, const std::string &method_name,
-                                                        const std::shared_ptr<arrow::RecordBatch> &params);
+                                                        const VgiBatchPtr &params);
 
 // Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);
@@ -131,7 +133,7 @@ VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientCon
                                          const std::optional<std::string> &if_none_match = std::nullopt);
 
 // Validate and index every row/batch of the six embedded metadata streams.
-VgiCatalogContents ParseCatalogContents(const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiCatalogContents ParseCatalogContents(const VgiBatchPtr &batch,
                                        const std::string &worker_path,
                                        const std::optional<std::string> &if_none_match = std::nullopt);
 
@@ -230,7 +232,7 @@ VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
 // Loud-rejects empty branches lists and surfaces parse errors on
 // branch_filter expressions as BinderException.
 VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
-                                                const std::shared_ptr<arrow::RecordBatch> &batch,
+                                                const VgiBatchPtr &batch,
                                                 const std::string &worker_path);
 
 // Write function discovery uses the same result type as scan function discovery.
@@ -284,7 +286,7 @@ void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContex
 void InvokeCatalogTableCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
-    const std::shared_ptr<arrow::Schema> &columns_schema,
+    const VgiSchemaPtr &columns_schema,
     const std::string &on_conflict,
     const std::vector<std::vector<uint8_t>> &constraint_definitions,
     ClientContext &context);
@@ -310,7 +312,7 @@ void InvokeCatalogTableRename(
 void InvokeCatalogTableColumnAdd(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
-    const std::shared_ptr<arrow::Schema> &column_definition,
+    const VgiSchemaPtr &column_definition,
     bool if_column_not_exists,
     ClientContext &context);
 
@@ -348,7 +350,7 @@ void InvokeCatalogTableColumnCommentSet(
 // Invoke catalog_table_column_type_change: change a column's type in a table.
 void InvokeCatalogTableColumnTypeChange(const CatalogRpcContext &ctx, const std::string &schema_name,
                                         const std::string &table_name,
-                                        const std::shared_ptr<arrow::Schema> &column_definition,
+                                        const VgiSchemaPtr &column_definition,
                                         const std::optional<std::vector<uint8_t>> &expression, ClientContext &context);
 
 // Invoke catalog_table_column_default_set: set a column's default expression.
@@ -461,7 +463,7 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 // Throws on malformed input; callers wrap in try/catch when fail-soft is
 // desired (the inline-blob path leaves the cache empty + marks fetched).
 std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
-    const std::shared_ptr<arrow::RecordBatch> &result_batch,
+    const VgiBatchPtr &result_batch,
     const std::vector<LogicalType> &column_types,
     const std::vector<std::string> &column_names,
     const std::string &worker_path, const std::string &log_source_key,
@@ -485,7 +487,7 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx, const std::vec
                                     ClientContext &context);
 
 //! Parse one PlanResponse batch into a page.
-VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch, const std::string &worker_path);
 
 TableFunctionCardinalityResult InvokeTableFunctionCardinality(
     const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,

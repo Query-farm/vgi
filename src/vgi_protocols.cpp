@@ -57,7 +57,7 @@ struct VgiProtocolsGlobalState : public GlobalTableFunctionState {
 
 // The attached VGI catalog named `alias`, or a BinderException.
 VgiCatalog &ResolveVgiCatalog(ClientContext &context, const std::string &alias) {
-	auto catalog = Catalog::GetCatalogEntry(context, alias);
+	auto catalog = Catalog::GetCatalogEntry(context, Identifier(alias));
 	if (!catalog) {
 		throw BinderException("vgi_protocols: no attached catalog named '%s'", alias);
 	}
@@ -69,12 +69,12 @@ VgiCatalog &ResolveVgiCatalog(ClientContext &context, const std::string &alias) 
 }
 
 unique_ptr<FunctionData> VgiProtocolsBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<VgiProtocolsBindData>();
 
 	Value catalog_value;
 	for (auto &kv : input.named_parameters) {
-		if (StringUtil::Lower(kv.first) == kCatalogParam) {
+		if (StringUtil::Lower(kv.first.GetIdentifierName()) == kCatalogParam) {
 			catalog_value = kv.second;
 		}
 	}
@@ -105,7 +105,7 @@ unique_ptr<FunctionData> VgiProtocolsBind(ClientContext &context, TableFunctionB
 		// The attached catalog's own connection and auth are used; options that
 		// configure a connection belong to the location form only.
 		for (auto &kv : input.named_parameters) {
-			if (StringUtil::Lower(kv.first) != kCatalogParam) {
+			if (StringUtil::Lower(kv.first.GetIdentifierName()) != kCatalogParam) {
 				throw BinderException("vgi_protocols: %s is only valid with a worker location; catalog "
 				                      ":= uses "
 				                      "the attached catalog's connection and authentication",
@@ -196,7 +196,7 @@ InsertionOrderPreservingMap<string> VgiProtocolsToString(TableFunctionToStringIn
 TableFunction MakeVgiProtocolsFunction(vector<LogicalType> arguments) {
 	TableFunction func("vgi_protocols", std::move(arguments), VgiProtocolsScan, VgiProtocolsBind,
 	                   VgiProtocolsInitGlobal);
-	func.named_parameters[kCatalogParam] = LogicalType::VARCHAR;
+	vgi::AddVgiFunctionOption(func, Identifier(kCatalogParam), LogicalType::VARCHAR);
 	vgi::AddDiscoveryNamedParameters(func);
 	func.to_string = VgiProtocolsToString;
 	return func;

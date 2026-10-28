@@ -19,7 +19,8 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder/check_binder.hpp"
-#include <arrow/util/byte_size.h>
+#include "vgi_ipc.hpp"
+#include "nanoarrow/nanoarrow.hpp"
 #include <set>
 #include <algorithm>
 #include "duckdb/common/string_util.hpp"
@@ -32,65 +33,54 @@ void Require(bool value, const std::string &message) {
 	if (!value)
 		throw InvalidInputException("VGI constraint protocol: %s", message);
 }
-void CheckStatus(const arrow::Status &status, const char *operation) {
-	Require(status.ok(), std::string(operation) + ": " + status.ToString());
-}
 void Identifier(const std::string &value) {
 	Require(!value.empty() && value.size() <= 4096 && value.find('\0') == std::string::npos, "invalid identifier");
 }
 void Token(const std::vector<uint8_t> &value) {
 	Require(!value.empty() && value.size() <= 65536, "missing or oversized definition revision");
 }
-void NoListNulls(const std::shared_ptr<arrow::Array> &array, int64_t begin, int64_t end) {
-	if (array->type_id() != arrow::Type::LIST)
+void NoListNulls(const VgiColumn &array, int64_t begin, int64_t end) {
+	if (array.type().type != NANOARROW_TYPE_LIST)
 		return;
-	auto list = std::static_pointer_cast<arrow::ListArray>(array);
+	auto values = array.child(0);
 	for (int64_t i = begin; i < end; ++i) {
-		if (list->IsNull(i))
+		if (array.IsNull(i))
 			continue;
-		auto first = list->value_offset(i), last = list->value_offset(i + 1);
-		for (auto child = first; child < last; ++child) {
-			Require(!list->values()->IsNull(child), "NULL list elements are not permitted");
-		}
-		NoListNulls(list->values(), first, last);
+		int64_t first = 0, last = 0;
+		array.ListRange(i, first, last);
+		for (auto child = first; child < last; ++child)
+			Require(!values.IsNull(child), "NULL list elements are not permitted");
+		NoListNulls(values, first, last);
 	}
 }
-void Strict(const std::shared_ptr<arrow::RecordBatch> &batch, const std::shared_ptr<arrow::Schema> &schema) {
+void Strict(const VgiBatchPtr &batch, const VgiSchemaPtr &schema) {
 	Require(batch && batch->num_rows() == 1, "record must contain exactly one row");
-	Require(arrow::util::TotalBufferSize(*batch) <= MAX_BYTES, "record exceeds size limit");
+	Require(batch->TotalBufferSize() <= MAX_BYTES, "record exceeds size limit");
 	ValidateVgiQueryResultBatch(batch, schema);
-	for (const auto &column : batch->columns())
-		NoListNulls(column, 0, 1);
+	for (int i = 0; i < batch->num_columns(); ++i)
+		NoListNulls(batch->column(i), 0, 1);
 }
-std::shared_ptr<arrow::RecordBatch> Decode(const std::vector<uint8_t> &bytes,
-                                           const std::shared_ptr<arrow::Schema> &schema) {
+VgiBatchPtr Decode(const std::vector<uint8_t> &bytes, const VgiSchemaPtr &schema) {
 	Require(!bytes.empty() && bytes.size() <= MAX_BYTES, "invalid record size");
 	// Returned Arrow arrays may retain slices of the IPC buffer. Nested callers
 	// pass temporary vectors, so the reader must own its storage beyond this call.
-	auto input = std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromVector(bytes));
-	auto opened = arrow::ipc::RecordBatchStreamReader::Open(input);
-	Require(opened.ok(), "invalid IPC stream");
-	auto reader = opened.ValueOrDie();
-	std::shared_ptr<arrow::RecordBatch> batch, extra;
-	Require(reader->ReadNext(&batch).ok(), "invalid IPC batch");
+	auto input = std::make_shared<VgiBufferReader>(VgiBuffer::FromVector(bytes));
+	auto reader = VgiIpcReader::Open(input);
+	auto batch = reader->ReadNext();
 	Strict(batch, schema);
-	Require(reader->ReadNext(&extra).ok() && !extra, "unexpected extra batch");
-	auto consumed = input->Tell();
-	Require(consumed.ok() && consumed.ValueOrDie() == static_cast<int64_t>(bytes.size()), "trailing IPC bytes");
+	Require(!reader->ReadNext(), "unexpected extra batch");
+	Require(input->remaining() == 0, "trailing IPC bytes");
 	return batch;
 }
-std::vector<uint8_t> Encode(const std::shared_ptr<arrow::Schema> &schema,
-                            std::vector<std::shared_ptr<arrow::Array>> columns) {
-	return SerializeToIpcBytes(arrow::RecordBatch::Make(schema, 1, std::move(columns)));
-}
-std::shared_ptr<arrow::Array> Null(const std::shared_ptr<arrow::DataType> &type) {
-	return arrow::MakeArrayOfNull(type, 1).ValueOrDie();
+std::vector<uint8_t> Encode(const VgiSchemaPtr &schema, std::vector<ArrowArray> columns) {
+	return SerializeToIpcBytes(VgiBatch::FromColumns(schema, 1, std::move(columns)));
 }
 std::vector<uint8_t> Ref(const std::string &schema, const std::string &table) {
 	Identifier(schema);
 	Identifier(table);
-	return Encode(generated::CatalogObjectRefSchema(), {BuildStringScalar("table"), BuildStringListScalar({schema}),
-	                                                    BuildStringScalar(table), Null(arrow::utf8())});
+	return Encode(generated::CatalogObjectRefSchema(),
+	              {BuildStringScalar("table"), BuildStringListScalar({schema}), BuildStringScalar(table),
+	               BuildOptionalStringScalar(std::nullopt)});
 }
 struct Reference {
 	std::string name, schema, owner;
@@ -100,11 +90,11 @@ Reference ReadRef(const std::vector<uint8_t> &bytes, const std::string &kind) {
 	RecordBatchSingleRow row(batch, 0, "CatalogObjectRef", "constraint");
 	Require(row["kind"].value_not_null<std::string>() == kind, "wrong object kind");
 	auto path = row["schema_path"].value_not_null<std::vector<std::string>>();
-	Require(path.size() == 1, "native 1.5 requires one-component schema paths");
+	Require(path.size() == 1, "native adapter requires one-component schema paths");
 	Reference result {row["name"].value_not_null<std::string>(), path[0], row["owner_table"].value_or(std::string())};
 	Identifier(result.name);
 	Identifier(result.schema);
-	Require(kind == "constraint" ? !result.owner.empty() : batch->GetColumnByName("owner_table")->IsNull(0),
+	Require(kind == "constraint" ? !result.owner.empty() : batch->GetColumnByName("owner_table").IsNull(0),
 	        "invalid constraint owner");
 	if (!result.owner.empty())
 		Identifier(result.owner);
@@ -126,68 +116,81 @@ std::vector<ColumnPath> ReadPaths(RecordBatchSingleRow &row, const char *field) 
 std::vector<std::string> TopLevelNames(const std::vector<ColumnPath> &paths) {
 	std::vector<std::string> names;
 	for (const auto &path : paths) {
-		Require(path.size() == 1, "native 1.5 supports nested constraint paths only for NOT_NULL facts");
+		Require(path.size() == 1, "native adapter supports nested constraint paths only for NOT_NULL facts");
 		names.push_back(path[0]);
 	}
 	return names;
 }
-bool OrdinaryStruct(const arrow::Field &field) {
-	if (field.type()->id() != arrow::Type::STRUCT)
+bool OrdinaryStruct(const ArrowSchema &field) {
+	if (DescribeType(field).type != NANOARROW_TYPE_STRUCT)
 		return false;
-	if (field.metadata()) {
-		for (const auto &key : field.metadata()->keys()) {
-			if (key == "ARROW:extension:name" || key.compare(0, 17, "vgi.logical_type.") == 0)
-				return false;
-		}
+	auto metadata = VgiMetadata::FromC(field.metadata);
+	for (const auto &entry : metadata.pairs()) {
+		if (entry.first == "ARROW:extension:name" || entry.first.compare(0, 17, "vgi.logical_type.") == 0)
+			return false;
 	}
 	return true;
+}
+int ChildIndex(const ArrowSchema &parent, const std::string &name) {
+	int index = -1;
+	for (int64_t i = 0; i < parent.n_children; ++i) {
+		if (name == parent.children[i]->name) {
+			if (index >= 0)
+				return -1;
+			index = static_cast<int>(i);
+		}
+	}
+	return index;
 }
 void ResolveNotNullPath(const VgiTableInfo &info, const ColumnPath &path) {
 	auto index = info.arrow_schema->GetFieldIndex(path[0]);
 	Require(index >= 0 && index != info.row_id_column,
 	        "constraint references a missing, ambiguous, or synthetic column");
-	auto field = info.arrow_schema->field(index);
+	auto field = &info.arrow_schema->field(index);
 	for (size_t depth = 1; depth < path.size(); ++depth) {
 		Require(OrdinaryStruct(*field), "constraint path must traverse ordinary STRUCT fields, not storage members");
-		auto &type = static_cast<const arrow::StructType &>(*field->type());
-		index = type.GetFieldIndex(path[depth]);
+		index = ChildIndex(*field, path[depth]);
 		Require(index >= 0, "constraint references a missing or ambiguous nested field");
-		field = type.field(index);
+		field = field->children[index];
 	}
 }
-void ValidateNullability(const arrow::FieldVector &fields, const ColumnPath &prefix,
-                         const std::set<ColumnPath> &required, int row_id_column) {
-	for (size_t i = 0; i < fields.size(); ++i) {
-		if (prefix.empty() && static_cast<int>(i) == row_id_column)
+void ValidateNullability(const ArrowSchema &parent, const ColumnPath &prefix, const std::set<ColumnPath> &required,
+                         int row_id_column) {
+	for (int64_t i = 0; i < parent.n_children; ++i) {
+		if (prefix.empty() && i == row_id_column)
 			continue;
-		const auto &field = fields[i];
+		const auto &field = *parent.children[i];
 		auto path = prefix;
-		path.push_back(field->name());
-		Require(field->nullable() == !required.count(path),
+		path.push_back(field.name);
+		Require(((field.flags & ARROW_FLAG_NULLABLE) != 0) == !required.count(path),
 		        "Arrow nullability disagrees with canonical NOT_NULL/PRIMARY_KEY");
-		// Collection and logical-type storage children are not table column paths.
-		if (OrdinaryStruct(*field))
-			ValidateNullability(field->type()->fields(), path, required, row_id_column);
+		if (OrdinaryStruct(field))
+			ValidateNullability(field, path, required, row_id_column);
 	}
 }
-std::shared_ptr<arrow::Array> PathArray(const std::vector<std::string> &names) {
-	auto text = std::make_shared<arrow::StringBuilder>();
-	auto paths = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), text);
-	arrow::ListBuilder list(arrow::default_memory_pool(), paths);
-	CheckStatus(list.Append(), "constraint paths");
+ArrowArray PathArray(const std::vector<std::string> &names) {
+	VgiBatchBuilder builder(MakeSchema({type::List(type::List(type::Utf8()))}));
+	auto list = builder.column(0);
 	for (const auto &name : names) {
 		Identifier(name);
-		CheckStatus(paths->Append(), "constraint path");
-		CheckStatus(text->Append(name), "constraint column");
+		append::String(list->children[0]->children[0], name);
+		append::FinishElement(list->children[0]);
 	}
-	return list.Finish().ValueOrDie();
+	append::FinishElement(list);
+	builder.FinishRow();
+	nanoarrow::UniqueArray array;
+	builder.Finish()->ExportTo(array.get());
+	ArrowArray result;
+	ArrowArrayMove(array->children[0], &result);
+	return result;
 }
 const std::vector<std::string> KINDS {"NOT_NULL", "UNIQUE", "PRIMARY_KEY", "CHECK", "FOREIGN_KEY"};
 std::vector<uint8_t> Definition(const std::string &kind, const std::vector<std::string> &names,
                                 const std::vector<uint8_t> &foreign = {}) {
 	return Encode(generated::ConstraintDefinitionSchema(),
-	              {BuildEnumArray(kind, KINDS), PathArray(names), Null(arrow::utf8()), Null(arrow::binary()),
-	               (foreign.empty() ? Null(arrow::binary()) : BuildBinaryScalarRequired(foreign))});
+	              {BuildEnumArray(kind, KINDS), PathArray(names), BuildOptionalStringScalar(std::nullopt),
+	               BuildOptionalBinaryScalar(std::nullopt),
+	               (foreign.empty() ? BuildOptionalBinaryScalar(std::nullopt) : BuildBinaryScalarRequired(foreign))});
 }
 void Records(const std::vector<std::vector<uint8_t>> &records) {
 	Require(records.size() <= 1024, "too many constraints");
@@ -205,32 +208,32 @@ void Records(const std::vector<std::vector<uint8_t>> &records) {
 void NumericOperand(const ParsedExpression &expression, const VgiTableInfo &info) {
 	Require(!expression.HasAlias(), "CHECK expressions cannot have aliases");
 	if (expression.GetExpressionClass() == ExpressionClass::CONSTANT) {
-		const auto &value = expression.Cast<ConstantExpression>().value;
+		const auto &value = expression.Cast<ConstantExpression>().GetLiteral().ToValue();
 		Require(!value.IsNull() && value.type().IsNumeric(), "CHECK requires numeric operands");
 		return;
 	}
 	Require(expression.GetExpressionClass() == ExpressionClass::COLUMN_REF,
 	        "native CHECK read supports only numeric column/constant comparisons");
-	const auto &names = expression.Cast<ColumnRefExpression>().column_names;
+	const auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
 	Require(names.size() == 1, "CHECK requires unqualified column references");
 	int index = -1;
 	for (int i = 0; i < info.arrow_schema->num_fields(); ++i) {
-		if (StringUtil::CIEquals(info.arrow_schema->field(i)->name(), names[0])) {
+		if (StringUtil::CIEquals(info.arrow_schema->field(i).name, names[0].GetIdentifierName())) {
 			Require(index < 0, "ambiguous CHECK column reference");
 			index = i;
 		}
 	}
 	Require(index >= 0 && index != info.row_id_column, "CHECK references a missing or synthetic column");
 	const auto &field = info.arrow_schema->field(index);
-	Require(!field->metadata() || !field->metadata()->Contains("ARROW:extension:name"),
+	Require(!VgiMetadata::FromC(field.metadata).Contains("ARROW:extension:name"),
 	        "CHECK extension-typed operands are unsupported");
-	switch (field->type()->id()) {
-	case arrow::Type::INT8:
-	case arrow::Type::INT16:
-	case arrow::Type::INT32:
-	case arrow::Type::INT64:
-	case arrow::Type::FLOAT:
-	case arrow::Type::DOUBLE:
+	switch (DescribeType(field).type) {
+	case NANOARROW_TYPE_INT8:
+	case NANOARROW_TYPE_INT16:
+	case NANOARROW_TYPE_INT32:
+	case NANOARROW_TYPE_INT64:
+	case NANOARROW_TYPE_FLOAT:
+	case NANOARROW_TYPE_DOUBLE:
 		return;
 	default:
 		throw InvalidInputException("VGI constraint protocol: CHECK requires primitive signed numeric columns");
@@ -239,7 +242,7 @@ void NumericOperand(const ParsedExpression &expression, const VgiTableInfo &info
 unique_ptr<ParsedExpression> ParseNumericCheck(const std::string &sql, const VgiTableInfo &info) {
 	Require(!sql.empty() && sql.size() <= 1024 * 1024 && sql.find('\0') == std::string::npos,
 	        "invalid CHECK SQL size or text");
-	Parser parser;
+	Parser parser {ParserOptions::Builtin()};
 	parser.ParseQuery("SELECT " + sql);
 	Require(parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT,
 	        "CHECK requires exactly one scalar expression");
@@ -266,8 +269,8 @@ unique_ptr<ParsedExpression> ParseNumericCheck(const std::string &sql, const Vgi
 		throw InvalidInputException("VGI constraint protocol: unsupported CHECK comparison");
 	}
 	auto &comparison = expression->Cast<ComparisonExpression>();
-	NumericOperand(*comparison.left, info);
-	NumericOperand(*comparison.right, info);
+	NumericOperand(comparison.Left(), info);
+	NumericOperand(comparison.Right(), info);
 	return expression;
 }
 std::string ReadCheck(const std::vector<uint8_t> &bytes, const VgiTableInfo &info) {
@@ -276,11 +279,15 @@ std::string ReadCheck(const std::vector<uint8_t> &bytes, const VgiTableInfo &inf
 	Require(row["profile"].value_not_null<std::string>() == VGI_CONSTRAINT_SCALAR_READ,
 	        "unsupported CHECK expression profile");
 	Require(row["schema_path"].value_not_null<std::vector<std::string>>() ==
-	            std::vector<std::string> {info.schema_name}, "CHECK expression belongs to another schema");
-	auto context = std::static_pointer_cast<arrow::StructArray>(expression->GetColumnByName("evaluation_context"));
-	Require(!context->IsNull(0), "CHECK requires an evaluation context");
-	auto batch = arrow::RecordBatch::Make(generated::QueryEvaluationContextSchema(), 1, context->fields());
-	Strict(batch, generated::QueryEvaluationContextSchema());
+	            std::vector<std::string> {info.schema_name},
+	        "CHECK expression belongs to another schema");
+	auto context = expression->GetColumnByName("evaluation_context");
+	Require(!context.IsNull(0), "missing evaluation context");
+	VgiBatchBuilder builder(generated::QueryEvaluationContextSchema());
+	for (int i = 0; i < builder.num_columns(); ++i)
+		AppendElement(builder.column(i), context.child(i), 0);
+	builder.FinishRow();
+	auto batch = builder.Finish();
 	RecordBatchSingleRow settings(batch, 0, "QueryEvaluationContext", "constraint");
 	Require(settings["timezone"].value_not_null<std::string>() == "UTC" &&
 	            settings["collation"].value_not_null<std::string>() == "binary" &&
@@ -295,20 +302,22 @@ std::string ReadCheck(const std::vector<uint8_t> &bytes, const VgiTableInfo &inf
 } // namespace
 
 std::vector<uint8_t> BuildNativeConstraintCapabilities() {
-	return Encode(generated::CatalogCapabilitiesSchema(),
-	              {BuildStringListScalar({VGI_CONSTRAINT_READ, VGI_CONSTRAINT_SCALAR_READ, VGI_INDEX_READ}),
-	               BuildStringListScalar({VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE, VGI_INDEX_CREATE, VGI_INDEX_DROP}),
-	               BuildStringListScalar({VGI_CONSTRAINT_ENFORCE}), BuildStringListScalar({"vgi.transaction.ddl.v1"})});
+	return Encode(
+	    generated::CatalogCapabilitiesSchema(),
+	    {BuildStringListScalar({VGI_CONSTRAINT_READ, VGI_CONSTRAINT_SCALAR_READ, VGI_INDEX_READ}),
+	     BuildStringListScalar({VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE, VGI_INDEX_CREATE, VGI_INDEX_DROP}),
+	     BuildStringListScalar({VGI_CONSTRAINT_ENFORCE}), BuildStringListScalar({"vgi.transaction.ddl.v1"})});
 }
 void ParseNativeConstraintCapabilities(CatalogAttachResult &result, const std::vector<uint8_t> &bytes) {
 	if (bytes.empty())
 		return;
 	auto batch = Decode(bytes, generated::CatalogCapabilitiesSchema());
 	RecordBatchSingleRow row(batch, 0, "CatalogCapabilities", "constraint");
-	std::map<std::string, std::set<std::string>> offered {{"read", {VGI_CONSTRAINT_READ, VGI_CONSTRAINT_SCALAR_READ, VGI_INDEX_READ}},
-	                                                      {"ddl", {VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE, VGI_INDEX_CREATE, VGI_INDEX_DROP}},
-	                                                      {"write", {VGI_CONSTRAINT_ENFORCE}},
-	                                                      {"transaction", {"vgi.transaction.ddl.v1"}}};
+	std::map<std::string, std::set<std::string>> offered {
+	    {"read", {VGI_CONSTRAINT_READ, VGI_CONSTRAINT_SCALAR_READ, VGI_INDEX_READ}},
+	    {"ddl", {VGI_CONSTRAINT_CREATE, VGI_CONSTRAINT_MUTATE, VGI_INDEX_CREATE, VGI_INDEX_DROP}},
+	    {"write", {VGI_CONSTRAINT_ENFORCE}},
+	    {"transaction", {"vgi.transaction.ddl.v1"}}};
 	for (const auto &category : offered) {
 		std::set<std::string> seen;
 		for (const auto &profile : row[category.first].value_not_null<std::vector<std::string>>()) {
@@ -318,7 +327,8 @@ void ParseNativeConstraintCapabilities(CatalogAttachResult &result, const std::v
 		}
 	}
 	Require(!(result.constraint_profiles.count(VGI_INDEX_CREATE) || result.constraint_profiles.count(VGI_INDEX_DROP)) ||
-	            result.constraint_profiles.count(VGI_INDEX_READ), "index DDL requires typed index read support");
+	            result.constraint_profiles.count(VGI_INDEX_READ),
+	        "index DDL requires typed index read support");
 	Require(!result.constraint_profiles.count("vgi.transaction.ddl.v1") || result.supports_transactions,
 	        "DDL transaction profile requires transaction support");
 	if (result.constraint_profiles.count(VGI_CONSTRAINT_CREATE) ||
@@ -348,11 +358,21 @@ void RequireNativeConstraintWrite(const CatalogAttachResult &result, const VgiTa
 		RequireNativeConstraintCapabilities(result, VGI_CONSTRAINT_ENFORCE);
 }
 
-void ValidateNativeConstraintList(const std::shared_ptr<arrow::Array> &array, int64_t row) {
-	Require(array && array->type()->Equals(arrow::list(arrow::binary())) && row >= 0 && row < array->length() &&
-	            !array->IsNull(row),
+void ValidateNativeConstraintList(const VgiColumn &array, int64_t row) {
+	Require(array && array.type().type == NANOARROW_TYPE_LIST && array.child(0).type().type == NANOARROW_TYPE_BINARY &&
+	            row >= 0 && row < array.length() && !array.IsNull(row),
 	        "constraints must be a non-NULL binary list");
-	Require(array->ValidateFull().ok(), "invalid constraint list buffers");
+	ArrowError error;
+	ArrowErrorInit(&error);
+	// Validation may fill inferred sizes: use local views rather than mutating
+	// the immutable batch shared with other catalog readers. This shape has
+	// exactly one binary child and no further descendants.
+	auto view = array.view();
+	auto values = array.child(0).view();
+	ArrowArrayView *children[] = {&values};
+	view.children = children;
+	Require(ArrowArrayViewValidate(&view, NANOARROW_VALIDATION_LEVEL_FULL, &error) == NANOARROW_OK,
+	        "invalid constraint list buffers");
 	NoListNulls(array, row, row + 1);
 }
 
@@ -384,23 +404,25 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 		RecordBatchSingleRow def(definition, 0, "ConstraintDefinition", "constraint");
 		auto kind = def["kind"].value_not_null<std::string>();
 		auto paths = ReadPaths(def, "column_paths");
-		if (!definition->GetColumnByName("declared_name")->IsNull(0)) {
+		if (!definition->GetColumnByName("declared_name").IsNull(0)) {
 			auto label = def["declared_name"].value_not_null<std::string>();
 			Identifier(label);
 			Require(labels.insert(StringUtil::Lower(label)).second, "duplicate SQL constraint label");
 		}
 		auto foreign = def["foreign_key"].value_or(std::vector<uint8_t>());
 		auto target_bytes = row["referenced_constraint"].value_or(std::vector<uint8_t>());
-		Require((kind == "CHECK") == !definition->GetColumnByName("check_expression")->IsNull(0),
+		Require((kind == "CHECK") == !definition->GetColumnByName("check_expression").IsNull(0),
 		        "inconsistent CHECK payload");
 		Require(kind == "CHECK" ? paths.empty() : !paths.empty(), "invalid constraint column paths");
-		Require(kind == "NOT_NULL" || kind == "UNIQUE" || kind == "PRIMARY_KEY" || kind == "FOREIGN_KEY" || kind == "CHECK",
+		Require(kind == "NOT_NULL" || kind == "UNIQUE" || kind == "PRIMARY_KEY" || kind == "FOREIGN_KEY" ||
+		            kind == "CHECK",
 		        "unknown constraint kind");
-		Require((kind == "FOREIGN_KEY") == !definition->GetColumnByName("foreign_key")->IsNull(0) &&
-		            (kind == "FOREIGN_KEY") == !batch->GetColumnByName("referenced_constraint")->IsNull(0),
+		Require((kind == "FOREIGN_KEY") == !definition->GetColumnByName("foreign_key").IsNull(0) &&
+		            (kind == "FOREIGN_KEY") == !batch->GetColumnByName("referenced_constraint").IsNull(0),
 		        "inconsistent FK payload");
 		if (kind == "CHECK") {
-			info.check_constraints.push_back(ReadCheck(def["check_expression"].value_not_null<std::vector<uint8_t>>(), info));
+			info.check_constraints.push_back(
+			    ReadCheck(def["check_expression"].value_not_null<std::vector<uint8_t>>(), info));
 			continue;
 		}
 		if (kind == "NOT_NULL") {
@@ -441,17 +463,17 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 			        "FK must reference an identified key in the same schema");
 			auto pk_names = TopLevelNames(ReadPaths(fk, "referenced_column_paths"));
 			Require(pk_names.size() == names.size(), "FK arity mismatch");
-			Require(fk["match"].value_not_null<std::string>() == "SIMPLE", "native 1.5 requires MATCH SIMPLE");
+			Require(fk["match"].value_not_null<std::string>() == "SIMPLE", "native adapter requires MATCH SIMPLE");
 			for (const char *action : {"on_update", "on_delete"}) {
 				auto value = fk[action].value_not_null<std::string>();
 				Require(value == "NO_ACTION" || value == "RESTRICT",
-				        "native 1.5 does not support this referential action");
+				        "native adapter does not support this referential action");
 			}
 			info.foreign_key_constraints.push_back({names, pk_names, table.name, table.schema});
 		}
 	}
 	if (check_nullability) {
-		ValidateNullability(info.arrow_schema->fields(), {}, required, info.row_id_column);
+		ValidateNullability(info.arrow_schema->c_schema(), {}, required, info.row_id_column);
 	}
 }
 
@@ -461,32 +483,31 @@ void AppendNativeCheckConstraints(ClientContext &context, const VgiTableInfo &in
 		// Bind only against this table's physical primitive columns. No generated
 		// expression expansion or session/catalog function lookup is qualified.
 		auto &comparison = expression->Cast<ComparisonExpression>();
-		for (const auto *operand : {comparison.left.get(), comparison.right.get()}) {
+		for (const auto *operand : {&comparison.Left(), &comparison.Right()}) {
 			if (operand->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-				const auto &name = operand->Cast<ColumnRefExpression>().column_names[0];
+				const auto &name = operand->Cast<ColumnRefExpression>().ColumnNames()[0];
 				const auto &column = create.columns.GetColumn(name);
 				Require(!column.Generated() && column.Type().IsNumeric(), "unsupported bound CHECK column type");
 			}
 		}
 		auto binder = Binder::CreateBinder(context);
 		physical_index_set_t columns;
-		CheckBinder check_binder(*binder, context, create.table, create.columns, columns);
+		CheckBinder check_binder(*binder, context, create.GetTableName(), create.columns, columns);
 		// DuckDB's CHECK binder normally casts to INTEGER; require an actual Boolean.
 		check_binder.target_type = LogicalType::INVALID;
 		auto copy = expression->Copy();
 		auto bound = check_binder.Bind(copy);
-		Require(bound->return_type == LogicalType::BOOLEAN, "CHECK must bind to BOOLEAN");
+		Require(bound->GetReturnType() == LogicalType::BOOLEAN, "CHECK must bind to BOOLEAN");
 		create.constraints.push_back(make_uniq<CheckConstraint>(std::move(expression)));
 	}
 }
 
-std::vector<std::vector<uint8_t>> EncodeNativeConstraints(const CreateTableInfo &info,
-                                                          std::shared_ptr<arrow::Schema> &schema) {
+std::vector<std::vector<uint8_t>> EncodeNativeConstraints(const CreateTableInfo &info, VgiSchemaPtr &schema) {
 	std::vector<std::vector<uint8_t>> result;
 	std::set<int> required;
 	auto column = [&](idx_t index) {
 		Require(index < static_cast<idx_t>(schema->num_fields()), "logical column index out of range");
-		return schema->field(index)->name();
+		return schema->field(index).name;
 	};
 	for (const auto &constraint : info.constraints) {
 		std::vector<std::string> names;
@@ -516,21 +537,21 @@ std::vector<std::vector<uint8_t>> EncodeNativeConstraints(const CreateTableInfo 
 			Require(fk.info.type == ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE ||
 			            fk.info.type == ForeignKeyType::FK_TYPE_SELF_REFERENCE_TABLE,
 			        "cannot create an engine-internal FK counterpart");
-			auto target_schema = fk.info.schema.empty() ? info.schema : fk.info.schema;
-			Require(target_schema == info.schema, "native FK must reference the same schema");
-			std::vector<std::string> pk(fk.pk_columns.begin(), fk.pk_columns.end());
+			auto target_schema = fk.info.schema.empty() ? info.GetQualifiedName().Schema() : fk.info.schema;
+			Require(target_schema == info.GetQualifiedName().Schema(), "native FK must reference the same schema");
+			auto pk = IdentifiersToStrings(fk.pk_columns);
 			std::vector<std::string> local;
 			for (const auto &name : fk.fk_columns) {
 				auto spelling = name;
 				local.push_back(column(info.columns.GetColumnIndex(spelling).index));
 			}
 			Require(!local.empty() && local.size() == pk.size(), "unresolved FK columns");
-			auto foreign =
-			    Encode(generated::ForeignKeyDefinitionSchema(),
-			           {BuildBinaryScalarRequired(Ref(target_schema, fk.info.table)), PathArray(pk),
-			            BuildEnumArray("SIMPLE", {"SIMPLE", "FULL"}),
-			            BuildEnumArray("NO_ACTION", {"NO_ACTION", "RESTRICT", "CASCADE", "SET_NULL", "SET_DEFAULT"}),
-			            BuildEnumArray("NO_ACTION", {"NO_ACTION", "RESTRICT", "CASCADE", "SET_NULL", "SET_DEFAULT"})});
+			auto foreign = Encode(
+			    generated::ForeignKeyDefinitionSchema(),
+			    {BuildBinaryScalarRequired(Ref(target_schema.GetIdentifierName(), fk.info.table.GetIdentifierName())),
+			     PathArray(pk), BuildEnumArray("SIMPLE", {"SIMPLE", "FULL"}),
+			     BuildEnumArray("NO_ACTION", {"NO_ACTION", "RESTRICT", "CASCADE", "SET_NULL", "SET_DEFAULT"}),
+			     BuildEnumArray("NO_ACTION", {"NO_ACTION", "RESTRICT", "CASCADE", "SET_NULL", "SET_DEFAULT"})});
 			result.push_back(Definition("FOREIGN_KEY", local, foreign));
 		} else {
 			throw NotImplementedException(
@@ -538,23 +559,28 @@ std::vector<std::vector<uint8_t>> EncodeNativeConstraints(const CreateTableInfo 
 		}
 	}
 	Records(result);
-	auto fields = schema->fields();
-	for (size_t i = 0; i < fields.size(); ++i)
-		fields[i] = fields[i]->WithNullable(!required.count(i));
-	schema = arrow::schema(fields, schema->metadata());
+	nanoarrow::UniqueSchema output;
+	schema->ExportTo(output.get());
+	for (int64_t i = 0; i < output->n_children; ++i) {
+		if (required.count(i))
+			output->children[i]->flags &= ~ARROW_FLAG_NULLABLE;
+		else
+			output->children[i]->flags |= ARROW_FLAG_NULLABLE;
+	}
+	schema = VgiSchema::Adopt(output.get());
 	return result;
 }
 
 std::vector<uint8_t> BuildNativeNotNullChange(const VgiTableInfo &info, const std::string &column, bool add) {
 	int index = -1;
 	for (int i = 0; i < info.arrow_schema->num_fields(); ++i) {
-		if (StringUtil::CIEquals(info.arrow_schema->field(i)->name(), column)) {
+		if (StringUtil::CIEquals(info.arrow_schema->field(i).name, column)) {
 			Require(index < 0, "ambiguous SQL column spelling");
 			index = i;
 		}
 	}
 	Require(index >= 0 && index != info.row_id_column, "missing or synthetic NOT NULL column");
-	const auto &raw_name = info.arrow_schema->field(index)->name();
+	const auto &raw_name = info.arrow_schema->field(index).name;
 	for (const auto &key : info.primary_key_constraints) {
 		if (std::find(key.begin(), key.end(), index) != key.end()) {
 			Require(add, "cannot drop PRIMARY KEY implied NOT NULL");
@@ -568,25 +594,28 @@ std::vector<uint8_t> BuildNativeNotNullChange(const VgiTableInfo &info, const st
 		return {};
 	if (!add)
 		Require(existing->second.size() == 1, "multiple NOT_NULL identities require an explicit constraint operation");
-	return Encode(generated::ConstraintChangeSchema(),
-	              {BuildEnumArray(add ? "ADD" : "DROP", {"ADD", "DROP", "RENAME", "REPLACE"}),
-	               add ? Null(arrow::binary()) : BuildBinaryScalarRequired(existing->second[0]),
-	               add ? BuildBinaryScalarRequired(Definition("NOT_NULL", {raw_name})) : Null(arrow::binary()),
-	               BuildOptionalEnumArray(add ? std::optional<std::string>("ENFORCED") : std::nullopt,
-	                                      {"ENFORCED", "METADATA_ONLY"}),
-	               BuildOptionalEnumArray(add ? std::optional<std::string>("ALL_ROWS") : std::nullopt,
-	                                      {"ALL_ROWS", "FUTURE_WRITES", "UNVALIDATED"}),
-	               add ? Null(arrow::boolean()) : BuildBoolScalar(false), Null(arrow::utf8())});
+	return Encode(
+	    generated::ConstraintChangeSchema(),
+	    {BuildEnumArray(add ? "ADD" : "DROP", {"ADD", "DROP", "RENAME", "REPLACE"}),
+	     add ? BuildOptionalBinaryScalar(std::nullopt) : BuildBinaryScalarRequired(existing->second[0]),
+	     add ? BuildBinaryScalarRequired(Definition("NOT_NULL", {raw_name})) : BuildOptionalBinaryScalar(std::nullopt),
+	     BuildOptionalEnumArray(add ? std::optional<std::string>("ENFORCED") : std::nullopt,
+	                            {"ENFORCED", "METADATA_ONLY"}),
+	     BuildOptionalEnumArray(add ? std::optional<std::string>("ALL_ROWS") : std::nullopt,
+	                            {"ALL_ROWS", "FUTURE_WRITES", "UNVALIDATED"}),
+	     add ? BuildOptionalBoolScalar(std::nullopt) : BuildBoolScalar(false),
+	     BuildOptionalStringScalar(std::nullopt)});
 }
 std::vector<uint8_t> BuildNativeConstraintsApply(const std::vector<uint8_t> &attachment,
                                                  const std::vector<uint8_t> &transaction, const VgiTableInfo &info,
                                                  const std::vector<uint8_t> &change) {
 	Token(info.definition_revision);
 	Require(!change.empty(), "empty mutation");
-	return Encode(generated::ConstraintsApplyRequestSchema(),
-	              {BuildBinaryScalarRequired(attachment), BuildBinaryScalarRequired(Ref(info.schema_name, info.name)),
-	               BuildBinaryScalarRequired(info.definition_revision), BuildBinaryListScalar({change}),
-	               (transaction.empty() ? Null(arrow::binary()) : BuildBinaryScalarRequired(transaction))});
+	return Encode(
+	    generated::ConstraintsApplyRequestSchema(),
+	    {BuildBinaryScalarRequired(attachment), BuildBinaryScalarRequired(Ref(info.schema_name, info.name)),
+	     BuildBinaryScalarRequired(info.definition_revision), BuildBinaryListScalar({change}),
+	     (transaction.empty() ? BuildOptionalBinaryScalar(std::nullopt) : BuildBinaryScalarRequired(transaction))});
 }
 void ValidateNativeConstraintSnapshot(const std::vector<uint8_t> &bytes, const VgiTableInfo &before) {
 	auto batch = Decode(bytes, generated::ConstraintSnapshotSchema());

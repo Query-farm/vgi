@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 // Validation of Arrow batches received from a worker.
 //
 // Arrow's IPC reader verifies only the message framing: the flatbuffer
@@ -15,12 +17,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-
-namespace arrow {
-class RecordBatch;
-class DataType;
-class Schema;
-}
 
 namespace duckdb {
 
@@ -49,7 +45,7 @@ WorkerBatchValidation GetWorkerBatchValidation(ClientContext *context);
 
 // Validate `batch` at `level`; throw IOException naming `worker` if it is
 // malformed. A null batch is ignored.
-void ValidateWorkerBatch(const arrow::RecordBatch *batch, WorkerBatchValidation level, const std::string &worker);
+void ValidateWorkerBatch(const VgiBatch *batch, WorkerBatchValidation level, const std::string &worker);
 
 // Throw IOException if `batch`'s column types do not match `expected` (one entry
 // per wire column; type structure only -- nullability and field metadata are
@@ -58,8 +54,8 @@ void ValidateWorkerBatch(const arrow::RecordBatch *batch, WorkerBatchValidation 
 // with the type it declared at bind: ArrowToDuckDB reads each buffer using the
 // BIND-TIME type (arrow_conversion.cpp), so a mismatch is a type-confusion
 // misread, not a clean cast. Cheap (O(columns), no data scan).
-void ValidateWireBatchTypes(const arrow::RecordBatch &batch,
-                            const std::vector<std::shared_ptr<arrow::DataType>> &expected,
+void ValidateWireBatchTypes(const VgiBatch &batch,
+                            const std::vector<const ArrowSchema *> &expected,
                             const std::string &worker, const std::string &function);
 
 // Validate a worker OUTPUT batch against a declared output schema projected by
@@ -69,13 +65,13 @@ void ValidateWireBatchTypes(const arrow::RecordBatch &batch,
 // `declared` is null. This is the shared form for every path whose wire batch
 // is the worker's (possibly projection-narrowed) output: the producer table
 // scan and the exchange table-in-out / buffered / lateral operators.
-void ValidateProjectedWireBatch(ClientContext *context, const arrow::RecordBatch &batch,
-                                const std::shared_ptr<arrow::Schema> &declared,
+void ValidateProjectedWireBatch(ClientContext *context, const VgiBatch &batch,
+                                const VgiSchemaPtr &declared,
                                 const std::vector<int32_t> &projection_ids, const std::string &worker,
                                 const std::string &function);
 
 // Convenience: validate at the level configured for `context`.
-inline void ValidateWorkerBatch(ClientContext *context, const arrow::RecordBatch *batch, const std::string &worker) {
+inline void ValidateWorkerBatch(ClientContext *context, const VgiBatch *batch, const std::string &worker) {
 	ValidateWorkerBatch(batch, GetWorkerBatchValidation(context), worker);
 }
 

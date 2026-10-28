@@ -3,7 +3,8 @@
 
 Run on the Linux/GCC build host in a separate source checkout. This is an
 extension-only diagnostic lane, not an engine link or runtime qualification.
-Existing Arrow/OpenSSL/SQLite installations are consumed without running vcpkg.
+The vendored nanoarrow bundle and existing OpenSSL/zstd/LZ4/SQLite installations
+are consumed without running vcpkg.
 """
 
 import argparse
@@ -15,8 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-ENGINE_REVISION = "e1784fa4231072d7152b8aaa20977bdb8ff4ace3"
-ENGINE_VERSION = "v2.0.0-dev87872"
+ENGINE_REVISION = "5afbe7302db8e2a9b42c98640373eb594b27e1b0"
+ENGINE_VERSION = "v2.0.0-dev88799"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -86,9 +87,13 @@ def main():
             ["git", "-C", str(ROOT), "status", "--porcelain", "--ignore-submodules=all"], text=True
         ).splitlines(),
     }
-    source_files = sorted(p for p in (ROOT / "src").rglob("*") if p.is_file())
+    source_files = sorted(
+        p for source_dir in (ROOT / "src", ROOT / "third_party/nanoarrow")
+        for p in source_dir.rglob("*") if p.is_file()
+    )
     source_files += [
         ROOT / "CMakeLists.txt",
+        ROOT / "vcpkg.json",
         ROOT / "extension_config_duckdb2_diagnostics.cmake",
         Path(__file__),
     ]

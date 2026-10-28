@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #define DUCKDB_EXTENSION_MAIN
 
+#include "vgi_arrow.hpp"
 #include "vgi_settings_defaults.hpp"
 #include "vgi_extension.hpp"
 #include "vgi_settings.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/logging/log_manager.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/planner/extension_callback.hpp"
@@ -36,18 +38,15 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/function/scalar/struct_utils.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
-#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
@@ -155,10 +154,10 @@ public:
 
 private:
 	static bool IsCumulativeFrame(const BoundWindowExpression &wexpr) {
-		if (wexpr.start != WindowBoundary::UNBOUNDED_PRECEDING) {
+		if (wexpr.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING) {
 			return false;
 		}
-		switch (wexpr.end) {
+		switch (wexpr.WindowEnd()) {
 		case WindowBoundary::CURRENT_ROW_RANGE:
 		case WindowBoundary::CURRENT_ROW_ROWS:
 		case WindowBoundary::CURRENT_ROW_GROUPS:
@@ -173,10 +172,10 @@ private:
 			return false;
 		}
 		auto &wexpr = expr.Cast<BoundWindowExpression>();
-		if (!wexpr.aggregate) {
+		if (!wexpr.AggregateFunction()) {
 			return false;
 		}
-		auto info = wexpr.aggregate->function_info.get();
+		auto info = wexpr.AggregateFunction()->GetFunctionInfo().get();
 		if (!info) {
 			return false;
 		}
@@ -197,12 +196,12 @@ private:
 			return false;
 		}
 		// EXCLUDE clauses produce multiple subframes per row — punt for v1.
-		if (wexpr.exclude_clause != WindowExcludeMode::NO_OTHER) {
+		if (wexpr.WindowExclude() != WindowExcludeMode::NO_OTHER) {
 			return false;
 		}
 		// DISTINCT, FILTER, ORDER BY in args — punt for v1, fall through to
 		// PhysicalWindow which handles them.
-		if (wexpr.distinct || wexpr.filter_expr || !wexpr.arg_orders.empty()) {
+		if (wexpr.Distinct() || wexpr.Filter() || !wexpr.ArgOrders().empty()) {
 			return false;
 		}
 		return true;
@@ -244,15 +243,15 @@ private:
 		// eligibility + the streaming operator's OpenSessions asserts), so
 		// expressions[0] is representative.
 		auto &wexpr = streaming_op->expressions[0]->Cast<BoundWindowExpression>();
-		if (!wexpr.partitions.empty() || !wexpr.orders.empty()) {
+		if (!wexpr.Partitions().empty() || !wexpr.OrderBy().empty()) {
 			vector<BoundOrderByNode> sort_orders;
 			// Group partitions first (any total order over the key suffices to make
 			// each partition contiguous); then the within-partition window order,
 			// copied verbatim so ASC/DESC + NULLS placement match the frame.
-			for (auto &p : wexpr.partitions) {
+			for (auto &p : wexpr.Partitions()) {
 				sort_orders.emplace_back(OrderType::ASCENDING, OrderByNullType::ORDER_DEFAULT, p->Copy());
 			}
-			for (auto &o : wexpr.orders) {
+			for (auto &o : wexpr.OrderBy()) {
 				sort_orders.push_back(o.Copy());
 			}
 			auto order = make_uniq<LogicalOrder>(std::move(sort_orders));
@@ -265,7 +264,7 @@ private:
 
 		VGI_STDERR_DEBUG("[VGI] LogicalWindow rewritten -> LogicalVgiStreamingWindow "
 		                 "(window_index=%llu, %zu expression(s))\n",
-		                 static_cast<unsigned long long>(window.window_index),
+		                 static_cast<unsigned long long>(window.window_index.index),
 		                 streaming_op->expressions.size());
 
 		op = std::move(streaming_op);
@@ -335,18 +334,18 @@ private:
 		if (!get.projection_ids.empty()) {
 			post_proj_names.reserve(get.projection_ids.size());
 			for (auto proj_id : get.projection_ids) {
-				const auto &idx = all_col_ids[proj_id];
+				const auto &idx = all_col_ids[proj_id.GetIndex()];
 				post_proj_names.push_back(idx.IsVirtualColumn() ? string("__virtual__")
-				                                                : get.names[idx.GetPrimaryIndex()]);
+				                                                : get.names[idx.GetPrimaryIndex()].GetIdentifierName());
 			}
 		} else if (!all_col_ids.empty()) {
 			post_proj_names.reserve(all_col_ids.size());
 			for (const auto &idx : all_col_ids) {
 				post_proj_names.push_back(idx.IsVirtualColumn() ? string("__virtual__")
-				                                                : get.names[idx.GetPrimaryIndex()]);
+				                                                : get.names[idx.GetPrimaryIndex()].GetIdentifierName());
 			}
 		} else {
-			post_proj_names = get.names;
+			post_proj_names = IdentifiersToStrings(get.names);
 		}
 		D_ASSERT(post_proj_types.size() == post_proj_names.size());
 
@@ -360,7 +359,7 @@ private:
 		// path goes through a custom PhysicalOperator with no InitInput, so the
 		// rewriter is the analogous capture point.
 		rewritten->all_column_types = get.returned_types;
-		rewritten->all_column_names = get.names;
+		rewritten->all_column_names = IdentifiersToStrings(get.names);
 
 		// Read pushdown capabilities from bind_data (echoed from Meta at
 		// catalog-load time). The catalog set's HasTableInput branch already
@@ -391,7 +390,7 @@ private:
 			} else {
 				rewritten->projection_ids.reserve(get.projection_ids.size());
 				for (auto proj_id : get.projection_ids) {
-					const auto &idx = all_col_ids[proj_id];
+					const auto &idx = all_col_ids[proj_id.GetIndex()];
 					rewritten->projection_ids.push_back(static_cast<int32_t>(
 					    idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID
 					                          : idx.GetPrimaryIndex()));
@@ -399,8 +398,8 @@ private:
 			}
 		}
 		// column_ids is the projected output-to-worker mapping used later by
-		// ArrowToDuckDB. At this post-optimizer point table_filters keys are
-		// already bind-schema indexes and do not index this vector.
+		// ArrowToDuckDB. DuckDB 2.0 also keys table_filters by positions
+		// in this vector, after projection pruning.
 		rewritten->column_ids.reserve(all_col_ids.size());
 		for (const auto &idx : all_col_ids) {
 			rewritten->column_ids.push_back(static_cast<int32_t>(
@@ -409,17 +408,18 @@ private:
 
 		// Serialize filters via the shared utility. FilterPushdown has already
 		// delegated required predicates to this scan, so failures must abort.
-		if (!get.table_filters.filters.empty()) {
+		if (get.table_filters.HasFilters()) {
 			auto bd_typed = static_cast<vgi::VgiTableInOutBindData *>(rewritten->bind_data.get());
 			auto worker_path = bd_typed && bd_typed->attach_params
 			                       ? bd_typed->attach_params->worker_path()
 			                       : std::string{};
-			// LogicalGet::table_filters keys are already bind-schema indexes at
-			// this post-optimizer rewrite point. They must not be mapped through
-			// the projected output list a second time.
+			vector<column_t> filter_column_ids;
+			for (const auto &index : all_col_ids) {
+				filter_column_ids.push_back(index.GetPrimaryIndex());
+			}
 			auto serialized = vgi::VgiSerializeFilters(
-			    context, {}, &get.table_filters, rewritten->all_column_names, worker_path, "", -1, nullptr,
-			    vgi::VgiFilterColumnIndexDomain::BIND_SCHEMA);
+			    context, filter_column_ids, &get.table_filters, rewritten->all_column_names, worker_path, "", -1,
+			    nullptr, vgi::VgiFilterColumnIndexDomain::PROJECTED);
 			rewritten->pushdown_filters = std::move(serialized.filter_bytes);
 			rewritten->join_keys_buffers = std::move(serialized.join_keys_buffers);
 		}
@@ -428,7 +428,7 @@ private:
 		// TableFilter objects in scope (the wire-serialized form is opaque
 		// to the C++ side). Reused later by PhysicalVgiTableBufferingFunction
 		// ::ParamsToString.
-		if (rewritten->projection_pushdown || !get.table_filters.filters.empty()) {
+		if (rewritten->projection_pushdown || get.table_filters.HasFilters()) {
 			std::string summary;
 			if (rewritten->projection_pushdown) {
 				summary += "Projections: [";
@@ -445,23 +445,26 @@ private:
 				}
 				summary += "]";
 			}
-			if (!get.table_filters.filters.empty()) {
+			if (get.table_filters.HasFilters()) {
 				if (!summary.empty()) {
 					summary += " | ";
 				}
 				summary += "Filters: ";
 				bool first = true;
-				// table_filters keys are bind-schema indexes at this rewrite point.
-				for (auto &kv : get.table_filters.filters) {
+				// Resolve filter projection positions back to worker columns.
+				for (auto &kv : get.table_filters) {
 					if (!first) {
 						summary += " AND ";
 					}
 					first = false;
 					std::string name = "<unknown>";
-					if (kv.first < rewritten->all_column_names.size()) {
-						name = rewritten->all_column_names[kv.first];
+					if (kv.GetIndex().GetIndex() < all_col_ids.size()) {
+						const auto &column = all_col_ids[kv.GetIndex().GetIndex()];
+						if (!column.IsVirtualColumn() && column.GetPrimaryIndex() < rewritten->all_column_names.size()) {
+							name = rewritten->all_column_names[column.GetPrimaryIndex()];
+						}
 					}
-					summary += kv.second->ToString(name);
+					summary += ExpressionFilter::GetExpressionFilter(kv.Filter(), "VGI buffered EXPLAIN").ToString(name);
 				}
 			}
 			rewritten->explain_summary = std::move(summary);
@@ -473,7 +476,7 @@ private:
 		    "[VGI] LogicalGet rewritten -> LogicalVgiTableBufferingFunction "
 		    "(table_index=%llu, %zu output column(s), projection_pushdown=%d, "
 		    "filter_bytes=%s)\n",
-		    static_cast<unsigned long long>(get.table_index), rewritten->return_types.size(),
+		    static_cast<unsigned long long>(get.table_index.index), rewritten->return_types.size(),
 		    rewritten->projection_pushdown ? 1 : 0,
 		    rewritten->pushdown_filters ? "yes" : "no");
 
@@ -523,79 +526,56 @@ private:
 	using PresentPaths = std::set<ColumnPath>;
 	using RequiredGroups = std::vector<std::vector<ColumnPath>>;
 
-	// Preserve components through every struct extraction.
-	static void WalkTableFilter(const TableFilter &filter, const ColumnPath &path, PresentPaths &out) {
-		switch (filter.filter_type) {
-		case TableFilterType::CONSTANT_COMPARISON:
-		case TableFilterType::IS_NULL:
-		case TableFilterType::IS_NOT_NULL:
-		case TableFilterType::IN_FILTER:
-		case TableFilterType::EXPRESSION_FILTER:
-			out.insert(path);
-			return;
+	// ExpressionFilter subjects are bound references. Resolve nested struct
+	// extracts before traversing children so a child predicate does not count
+	// as a predicate on every sibling through its parent struct.
+	static bool ResolveFilterPath(const Expression &expr, const vector<ColumnPath> &roots, ColumnPath &path) {
+		if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+			auto index = expr.Cast<BoundReferenceExpression>().Index();
+			if (index >= roots.size() || roots[index].empty()) {
+				return false;
+			}
+			path = roots[index];
+			return true;
+		}
+		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return false;
+		}
+		const auto &function = expr.Cast<BoundFunctionExpression>();
+		idx_t child_index;
+		if (!TryGetStructExtractChildIndex(function, child_index) || function.GetChildren().empty() ||
+		    !ResolveFilterPath(*function.GetChildren()[0], roots, path)) {
+			return false;
+		}
+		const auto &children = StructType::GetChildTypes(function.GetChildren()[0]->GetReturnType());
+		if (child_index >= children.size()) {
+			return false;
+		}
+		path.push_back(children[child_index].first.GetIdentifierName());
+		return true;
+	}
 
-		case TableFilterType::CONJUNCTION_AND: {
-			auto &conj = filter.Cast<ConjunctionAndFilter>();
-			for (auto &child : conj.child_filters) {
-				WalkTableFilter(*child, path, out);
-			}
-			return;
-		}
-		case TableFilterType::CONJUNCTION_OR: {
-			auto &conj = filter.Cast<ConjunctionOrFilter>();
-			for (auto &child : conj.child_filters) {
-				WalkTableFilter(*child, path, out);
-			}
-			return;
-		}
-		case TableFilterType::STRUCT_EXTRACT: {
-			auto &sf = filter.Cast<StructFilter>();
-			auto deeper = path;
-			deeper.push_back(sf.child_name);
-			if (sf.child_filter) {
-				WalkTableFilter(*sf.child_filter, deeper, out);
-			} else {
-				out.insert(deeper);
-			}
-			return;
-		}
-		case TableFilterType::OPTIONAL_FILTER: {
-			auto &opt = filter.Cast<OptionalFilter>();
-			// A null child_filter is a placeholder/sentinel — typically a Top-N
-			// OptionalFilter still waiting for a DynamicFilter value that never
-			// materialised. It is NOT a constraint, so we emit nothing. Mirrors
-			// the serializer at vgi_table_function_impl.cpp:699-703 which skips
-			// the OptionalFilter entirely in this case (returns false).
-			if (!opt.child_filter) {
+	static void WalkFilterExpression(const Expression &expr, const vector<ColumnPath> &roots, PresentPaths &out) {
+		if (auto child = ExpressionFilter::GetOptionalFilterChild(expr)) {
+			// Runtime Top-N bounds are optimizer machinery, not a predicate
+			// supplied by the caller. Do not let a partial optional subtree
+			// satisfy the provider's required-filter contract.
+			if (ExpressionFilter::ContainsInternalFunction(*child, DynamicFilterScalarFun::NAME) ||
+			    ExpressionFilter::ContainsInternalFunction(*child, BloomFilterScalarFun::NAME) ||
+			    ExpressionFilter::ContainsInternalFunction(*child, PrefixRangeScalarFun::NAME)) {
 				return;
 			}
-			// Skip the entire OptionalFilter when its subtree contains a
-			// DynamicFilter — mirrors the serializer at
-			// vgi_table_function_impl.cpp:714-716. The static portion of a
-			// Top-N OptionalFilter (e.g. OR(IsNull, DynamicFilter)) is
-			// machinery, not user intent: emitting presence here would let a
-			// Top-N artifact spuriously satisfy a required_filters
-			// requirement the user never wrote in their WHERE clause.
-			if (vgi::VgiContainsDynamicFilter(*opt.child_filter)) {
-				return;
-			}
-			WalkTableFilter(*opt.child_filter, path, out);
+			WalkFilterExpression(*child, roots, out);
 			return;
 		}
-		case TableFilterType::DYNAMIC_FILTER:
-		case TableFilterType::BLOOM_FILTER: {
-			// Values aren't known at optimize time, but the column reference
-			// is — count it as presence so that join-derived filters satisfy
-			// requirements as the user intends.
-			out.insert(path);
+		ColumnPath path;
+		if (ResolveFilterPath(expr, roots, path)) {
+			out.insert(std::move(path));
 			return;
 		}
-		default:
-			// Unknown future filter type — treat as presence so we don't
-			// over-reject the user.
-			out.insert(path);
-			return;
-		}
+		ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+			WalkFilterExpression(child, roots, out);
+		});
 	}
 
 	// Resolve a BoundColumnRefExpression's binding.column_index (which is
@@ -622,42 +602,42 @@ private:
 	// Resolve a chain to the engine's canonical field names. Using bound
 	// indexes handles nested extracts and SQL case resolution without changing
 	// the raw, case-preserving wire identity. Do not also emit its parent path.
-	static bool ResolveExpressionPath(const Expression &expr, idx_t target_table_index,
+	static bool ResolveExpressionPath(const Expression &expr, TableIndex target_table_index,
 	                                  const vector<ColumnIndex> &col_ids,
-	                                  const vector<std::string> &names, ColumnPath &path) {
+	                                  const vector<Identifier> &names, ColumnPath &path) {
 		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			auto &cref = expr.Cast<BoundColumnRefExpression>();
-			if (cref.binding.table_index != target_table_index) {
+			if (cref.Binding().table_index != target_table_index) {
 				return false;
 			}
-			auto orig = ResolveOrigIndex(cref.binding.column_index, col_ids, names.size());
+			auto orig = ResolveOrigIndex(cref.Binding().column_index.GetIndex(), col_ids, names.size());
 			if (orig < 0) {
 				return false;
 			}
-			path.push_back(names[orig]);
+			path.push_back(names[orig].GetIdentifierName());
 			return true;
 		}
 		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 			return false;
 		}
 		auto &fn = expr.Cast<BoundFunctionExpression>();
-		if ((fn.function.name != "struct_extract" && fn.function.name != "struct_extract_at") ||
-		    fn.children.empty() || !fn.bind_info || fn.children[0]->return_type.id() != LogicalTypeId::STRUCT) {
+		if ((fn.Function().GetName() != "struct_extract" && fn.Function().GetName() != "struct_extract_at") ||
+		    fn.GetChildren().empty() || !fn.BindInfo() || fn.GetChildren()[0]->GetReturnType().id() != LogicalTypeId::STRUCT) {
 			return false;
 		}
-		auto &bound = fn.bind_info->Cast<StructExtractBindData>();
-		auto &children = StructType::GetChildTypes(fn.children[0]->return_type);
+		auto &bound = fn.BindInfo()->Cast<StructExtractBindData>();
+		auto &children = StructType::GetChildTypes(fn.GetChildren()[0]->GetReturnType());
 		if (bound.index >= children.size() ||
-		    !ResolveExpressionPath(*fn.children[0], target_table_index, col_ids, names, path)) {
+		    !ResolveExpressionPath(*fn.GetChildren()[0], target_table_index, col_ids, names, path)) {
 			return false;
 		}
-		path.push_back(children[bound.index].first);
+		path.push_back(children[bound.index].first.GetIdentifierName());
 		return true;
 	}
 
-	static void WalkExpression(const Expression &expr, idx_t target_table_index,
+	static void WalkExpression(const Expression &expr, TableIndex target_table_index,
 	                           const vector<ColumnIndex> &col_ids,
-	                           const vector<std::string> &names, PresentPaths &out) {
+	                           const vector<Identifier> &names, PresentPaths &out) {
 		ColumnPath path;
 		if (ResolveExpressionPath(expr, target_table_index, col_ids, names, path)) {
 			out.insert(std::move(path));
@@ -746,25 +726,24 @@ private:
 
 		PresentPaths present;
 
-		// Source 1: filters pushed into the LogicalGet itself.
-		// At post-optimize time a TableFilterSet is keyed by the *original*
-		// table-schema column index (the ColumnIndex primary index) — see
-		// TableFilterSet::PushFilter (duckdb/src/planner/table_filter.cpp),
-		// which stores col_idx.GetPrimaryIndex() as the key, and
-		// remove_unused_columns.cpp which reads it back as a primary index.
-		// (The remap to a column_ids *position* happens later, at physical
-		// planning in CreateTableFilterSet.) So the key indexes directly into
-		// `get.names` (the full schema-ordered column list); do NOT route it
-		// through column_ids — for native multi-file/Hive scans column_ids is
-		// a non-identity permutation and the indirection lands on the wrong
-		// column.
+		// DuckDB 2.0 keys filters by the scan projection, remapping them as
+		// unused columns are removed. Resolve each position through column_ids.
 		const auto &col_ids = get.GetColumnIds();
-		for (auto &kv : get.table_filters.filters) {
-			if (kv.first >= get.names.size()) {
-				// Virtual column (rowid etc.) — never a required path.
-				continue;
+		auto root_path = [&](ProjectionIndex index) -> ColumnPath {
+			auto original = ResolveOrigIndex(index.GetIndex(), col_ids, get.names.size());
+			return original < 0 ? ColumnPath {} : ColumnPath {get.names[original].GetIdentifierName()};
+		};
+		for (const auto &entry : get.table_filters) {
+			const auto &filter = ExpressionFilter::GetExpressionFilter(entry.Filter(), "VGI required filters");
+			WalkFilterExpression(*filter.expr, {root_path(entry.GetIndex())}, present);
+		}
+		for (const auto &item : get.table_filters.GetMultiColumnFilters()) {
+			const auto &filter = ExpressionFilter::GetExpressionFilter(*item, "VGI required multi-column filters");
+			vector<ColumnPath> roots;
+			for (const auto &index : filter.column_indexes) {
+				roots.push_back(root_path(index));
 			}
-			WalkTableFilter(*kv.second, {get.names[kv.first]}, present);
+			WalkFilterExpression(*filter.expr, roots, present);
 		}
 
 		// Source 2: dynamic_filters (Top-N / runtime). The public API doesn't
@@ -830,7 +809,7 @@ private:
 		auto native_return_names = std::move(mark->native_return_names);
 		auto native_virtual_columns = std::move(mark->native_virtual_columns);
 		auto function_name_log = mark->scan_result.function_name;
-		auto table_name_log = mark->table.get().name;
+		auto table_name_log = mark->table.get().name.GetIdentifierName();
 
 		get.function = std::move(native_tf);
 		get.bind_data = std::move(native_bind);
@@ -851,9 +830,9 @@ private:
 	                                     const LogicalProjection &proj) {
 		ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
 		    expr, [&](BoundColumnRefExpression &cref, unique_ptr<Expression> &slot) {
-			    if (cref.binding.table_index == proj.table_index &&
-			        cref.binding.column_index < proj.expressions.size()) {
-				    slot = proj.expressions[cref.binding.column_index]->Copy();
+			    if (cref.Binding().table_index == proj.table_index &&
+			        cref.Binding().column_index.GetIndex() < proj.expressions.size()) {
+				    slot = proj.expressions[cref.Binding().column_index.GetIndex()]->Copy();
 			    }
 		    });
 	}
@@ -1143,7 +1122,7 @@ public:
 				// If a user detached it out-of-band, the registry is stale; drop
 				// the stale record and fall through to a fresh attach so branches
 				// can still resolve it.
-				if (db_manager.GetDatabase(alias)) {
+				if (db_manager.GetDatabase(Identifier(alias))) {
 					it->second.refcount++;
 					return CompanionOutcome::SHARED;
 				}
@@ -1153,7 +1132,7 @@ public:
 				return CompanionOutcome::CONFLICT;
 			}
 		}
-		if (db_manager.GetDatabase(alias)) {
+		if (db_manager.GetDatabase(Identifier(alias))) {
 			conflict_target_out = "(existing non-companion catalog)";
 			return CompanionOutcome::CONFLICT;
 		}
@@ -1283,8 +1262,8 @@ static void InjectCompanionSecret(ClientContext &context, const std::string &sec
 	}
 	// Don't overwrite an option the worker set explicitly.
 	for (const auto &e : kv->secret_map) {
-		if (options.options.find(e.first) == options.options.end()) {
-			options.options[e.first] = e.second;
+		if (options.options.find(e.first.GetIdentifierName()) == options.options.end()) {
+			options.options[e.first.GetIdentifierName()] = e.second;
 		}
 	}
 }
@@ -1305,7 +1284,7 @@ static bool SystemFunctionNameTaken(ClientContext &context, Catalog &system_cata
 	for (auto type : kFunctionTypes) {
 		try {
 			CatalogEntryRetriever retriever {context};
-			if (system_catalog.GetEntry(retriever, DEFAULT_SCHEMA, {type, name}, OnEntryNotFound::RETURN_NULL)) {
+			if (system_catalog.GetEntry(retriever, DEFAULT_SCHEMA, {type, QualifiedName(Identifier(name))}, OnEntryNotFound::RETURN_NULL)) {
 				return true;
 			}
 		} catch (const std::exception &) {
@@ -1427,7 +1406,7 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 				auto func_set =
 				    vgi::BuildVgiScalarFunctionSet(context, global_name, group.overloads, target, descriptions);
 				CreateScalarFunctionInfo info(func_set);
-				info.schema = DEFAULT_SCHEMA;
+				info.SetSchema(DEFAULT_SCHEMA);
 				info.internal = true;
 				info.descriptions = std::move(descriptions);
 				system_catalog.CreateFunction(sys_txn, info);
@@ -1437,7 +1416,7 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 				auto func_set =
 				    vgi::BuildVgiAggregateFunctionSet(context, global_name, group.overloads, target, descriptions);
 				CreateAggregateFunctionInfo info(func_set);
-				info.schema = DEFAULT_SCHEMA;
+				info.SetSchema(DEFAULT_SCHEMA);
 				info.internal = true;
 				info.descriptions = std::move(descriptions);
 				system_catalog.CreateFunction(sys_txn, info);
@@ -1447,7 +1426,7 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 				auto func_set =
 				    vgi::BuildVgiTableFunctionSet(context, global_name, group.overloads, target, descriptions);
 				CreateTableFunctionInfo info(func_set);
-				info.schema = DEFAULT_SCHEMA;
+				info.SetSchema(DEFAULT_SCHEMA);
 				info.internal = true;
 				info.descriptions = std::move(descriptions);
 				system_catalog.CreateFunction(sys_txn, info);
@@ -1497,7 +1476,7 @@ void ReleaseCompanionCatalogs(ClientContext &context, const std::vector<std::str
 		// (`USE companion; DETACH vgi_catalog`) — a rare edge case that must not
 		// abort the parent detach or leak the exception out of OnDetach.
 		try {
-			db_manager.DetachDatabase(context, alias, OnEntryNotFound::RETURN_NULL);
+			db_manager.DetachDatabase(context, Identifier(alias), OnEntryNotFound::RETURN_NULL);
 			VGI_LOG(context, "vgi.companion_detach", {{"alias", alias}});
 		} catch (const std::exception &e) {
 			VGI_LOG(context, "vgi.companion_detach.failed", {{"alias", alias}, {"error", e.what()}});
@@ -1518,12 +1497,14 @@ static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecr
 	auto vgi_ext = StorageExtension::Find(config, "vgi");
 	if (vgi_ext) {
 		auto &vgi_storage = static_cast<VgiStorageExtension &>(*vgi_ext);
-		secret->redact_keys = vgi_storage.GetRedactKeys(input.type);
+		for (const auto &key : vgi_storage.GetRedactKeys(input.type.GetIdentifierName())) {
+			secret->redact_keys.insert(Identifier(key));
+		}
 	}
 
 	// Copy all user-provided options into the secret map
 	for (const auto &entry : input.options) {
-		secret->secret_map[entry.first] = entry.second;
+		secret->secret_map[Identifier(entry.first)] = entry.second;
 	}
 
 	return secret;
@@ -1535,7 +1516,7 @@ static unique_ptr<BaseSecret> IrohCreateSecret(ClientContext &, CreateSecretInpu
 	auto secret = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
 	secret->redact_keys.insert("secret_key");
 	for (const auto &entry : input.options) {
-		secret->secret_map[entry.first] = entry.second;
+		secret->secret_map[Identifier(entry.first)] = entry.second;
 	}
 	return secret;
 }
@@ -1591,7 +1572,7 @@ static ParsedContainerOptions ParseContainerLocationStruct(const Value &loc) {
 	auto &child_types = StructType::GetChildTypes(loc.type());
 	auto &children = StructValue::GetChildren(loc);
 	for (idx_t i = 0; i < children.size(); i++) {
-		auto key = StringUtil::Lower(child_types[i].first);
+		auto key = StringUtil::Lower(child_types[i].first.GetIdentifierName());
 		const Value &cv = children[i];
 		if (key == "image" || key == "location" || key == "path") {
 			out.image = cv.IsNull() ? "" : cv.ToString();
@@ -2255,7 +2236,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			// from the path basename) is left untouched.
 			auto &fs = FileSystem::GetFileSystem(context);
 			if (name == AttachedDatabase::ExtractDatabaseName(info.path, fs)) {
-				db.SetName(catalog_name);
+				db.SetName(Identifier(catalog_name));
 			}
 		}
 
@@ -2320,9 +2301,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					                                         opt.first, catalog_name, build_accepted_list()));
 				}
 
-				Value casted;
 				std::string cast_error;
-				if (!opt.second.DefaultTryCastAs(matching_spec->type, casted, &cast_error)) {
+				auto cast_result = opt.second.DefaultTryCastAs(matching_spec->type, &cast_error);
+				if (!cast_result) {
 					if (matching_spec->secret) {
 						// The cast error quotes the value; a credential's must not surface.
 						throw BinderException(
@@ -2339,6 +2320,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					    StringUtil::Format("Cannot cast ATTACH option '%s' to declared type %s: %s",
 					                       matching_spec->name, matching_spec->type.ToString(), cast_error));
 				}
+				auto casted = std::move(*cast_result);
 				if (matching_spec->secret) {
 					secret_option_names.insert(opt.first);
 					key_options[opt.first] = hashed_key(opt.first, casted);
@@ -2457,10 +2439,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto &config = DBConfig::GetConfig(db.GetDatabase());
 
 	for (const auto &setting : attach_result.settings) {
-		if (config.HasExtensionOption(setting.name)) {
+		if (config.HasExtensionOption(Identifier(setting.name))) {
 			// Setting already exists - verify types match
 			ExtensionOption existing_option;
-			if (!config.TryGetExtensionOption(setting.name, existing_option)) {
+			if (!config.TryGetExtensionOption(Identifier(setting.name), existing_option)) {
 				throw BinderException("Failed to retrieve existing VGI setting '%s'", setting.name);
 			}
 			if (existing_option.type != setting.type) {
@@ -2476,7 +2458,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			// Types match - setting is already registered, no need to add again
 		} else {
 			// New setting - register it
-			config.AddExtensionOption(setting.name, setting.description, setting.type, setting.default_value);
+			config.AddExtensionOption(Identifier(setting.name), setting.description, setting.type, setting.default_value);
 		}
 	}
 
@@ -2501,7 +2483,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 		// Register the secret type with DuckDB
 		SecretType secret_type;
-		secret_type.name = st.name;
+		secret_type.name = Identifier(st.name);
 		secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
 		secret_type.default_provider = "config";
 		secret_type.extension = "vgi";
@@ -2526,7 +2508,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		create_func.provider = "config";
 		create_func.function = VgiCreateSecret;
 		for (const auto &param : st.parameters) {
-			create_func.named_parameters[param.name] = param.type;
+			create_func.named_parameters[Identifier(param.name)] = param.type;
 		}
 		secret_manager.RegisterSecretFunction(create_func, OnCreateConflict::IGNORE_ON_CONFLICT);
 	}
@@ -2753,7 +2735,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				// the system catalog (shouldn't happen for alias-scoped names).
 				CatalogEntryRetriever retriever {context};
 				auto clash = system_catalog.GetEntry(retriever, DEFAULT_SCHEMA,
-				                                     {CatalogType::COPY_FUNCTION_ENTRY, registered_name},
+				                                     {CatalogType::COPY_FUNCTION_ENTRY, QualifiedName(Identifier(registered_name))},
 				                                     OnEntryNotFound::RETURN_NULL);
 				if (clash) {
 					throw BinderException(
@@ -2770,7 +2752,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				const bool wants_from = (dir != "to"); // "from", "both", or unset → reader
 				const bool wants_to = (dir == "to" || dir == "both");
 
-				CopyFunction cf(registered_name);
+				CopyFunction cf {Identifier(registered_name)};
 				if (wants_from) {
 					// Per-format reader context rides on the copy_from_function's
 					// TableFunctionInfo carrier (self-contained, outlives DETACH).
@@ -2935,7 +2917,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					    c.alias, c.target, scheme, c.hidden, db_manager,
 					    [&]() {
 						    AttachInfo cinfo;
-						    cinfo.name = c.alias;
+						    cinfo.name = Identifier(c.alias);
 						    cinfo.path = c.target;
 						    cinfo.on_conflict = OnCreateConflict::ERROR_ON_CONFLICT; // never clobber
 						    AttachOptions coptions(cfg.options);
@@ -3030,7 +3012,7 @@ struct OAuthLogoutState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> OAuthLogoutBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<OAuthLogoutBindData>();
 	if (input.inputs.size() > 1) {
 		throw BinderException("vgi_oauth_logout expects 0 or 1 arguments (catalog name), got %d", input.inputs.size());
@@ -3057,7 +3039,7 @@ static unique_ptr<GlobalTableFunctionState> OAuthLogoutInit(ClientContext &conte
 		if (catalog.GetCatalogType() != "vgi") {
 			continue;
 		}
-		auto catalog_name = catalog.GetName();
+		auto catalog_name = catalog.GetName().GetIdentifierName();
 		if (!bind_data.logout_all && catalog_name != bind_data.target_catalog) {
 			continue;
 		}
@@ -3112,7 +3094,7 @@ static LogicalType OAuthStatusEnumType() {
 }
 
 static unique_ptr<FunctionData> OAuthTokensBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("catalog_name");
 	return_types.push_back(LogicalType::VARCHAR);
@@ -3142,7 +3124,7 @@ static unique_ptr<GlobalTableFunctionState> OAuthTokensInit(ClientContext &conte
 		}
 
 		OAuthTokensState::TokenRow row;
-		row.catalog_name = catalog.GetName();
+		row.catalog_name = catalog.GetName().GetIdentifierName();
 		row.origin = vgi::ExtractOrigin(params->worker_path());
 
 		auto &auth = params->auth();
@@ -3222,7 +3204,7 @@ struct OAuthIdentityState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> OAuthIdentityBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("catalog_name");
 	return_types.push_back(LogicalType::VARCHAR);
@@ -3260,7 +3242,7 @@ static unique_ptr<GlobalTableFunctionState> OAuthIdentityInit(ClientContext &con
 		}
 
 		OAuthIdentityState::IdentityRow row;
-		row.catalog_name = catalog.GetName();
+		row.catalog_name = catalog.GetName().GetIdentifierName();
 		row.origin = vgi::ExtractOrigin(params->worker_path());
 
 		// Get identity from per-catalog auth state
@@ -3317,7 +3299,7 @@ struct VgiSecretProvidersData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiSecretProvidersBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"catalog_name", "endpoint", "tie_break_offset", "active", "cached_secrets", "ttl_seconds"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
 	                LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::BIGINT};
@@ -3359,7 +3341,7 @@ struct VgiCompanionsData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiCompanionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"catalog_name", "target", "db_type", "hidden", "refcount"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
 	                LogicalType::BIGINT};
@@ -3397,7 +3379,7 @@ struct VgiSecretFlushData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiSecretFlushBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"flushed"};
 	return_types = {LogicalType::BIGINT};
 	auto data = make_uniq<VgiSecretFlushData>();
@@ -3470,7 +3452,7 @@ static Value TagsToMapValue(const std::map<std::string, std::string> &tags) {
 }
 
 static unique_ptr<FunctionData> VgiCopyFormatsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"catalog_name", "format_name",  "direction",   "ordered",     "format_description", "format_comment",
 	         "format_tags",  "handler",      "option_name", "option_type", "option_description"};
 	return_types = {LogicalType::VARCHAR,
@@ -3517,17 +3499,15 @@ static unique_ptr<FunctionData> VgiCopyFormatsBind(ClientContext &context, Table
 			vector<string> opt_names;
 			vgi::ArrowSchemaToDuckDBTypes(context, info.options_schema, c_schema, arrow_table, types, opt_names);
 			for (idx_t i = 0; i < opt_names.size(); i++) {
-				auto field = info.options_schema->field(static_cast<int>(i));
+				auto field_metadata = info.options_schema->field_metadata(static_cast<int>(i));
 				auto row = base_row();
 				row.has_option = true;
 				row.option_name = opt_names[i];
 				row.option_type = (i < types.size() ? types[i] : LogicalType::ANY).ToString();
-				if (field->HasMetadata()) {
-					auto doc = field->metadata()->Get(vgi::VGI_DOC_METADATA_KEY);
-					if (doc.ok() && !doc.ValueUnsafe().empty()) {
-						row.has_option_desc = true;
-						row.option_desc = doc.ValueUnsafe();
-					}
+				auto doc = field_metadata.Get(vgi::VGI_DOC_METADATA_KEY);
+				if (doc && !doc->empty()) {
+					row.has_option_desc = true;
+					row.option_desc = *doc;
 				}
 				data->rows.push_back(std::move(row));
 			}
@@ -3585,7 +3565,7 @@ struct VgiGlobalFunctionsData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiGlobalFunctionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"global_name", "catalog_name", "function_name", "schema_name", "function_type", "worker_path", "live"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
@@ -3604,7 +3584,7 @@ static unique_ptr<FunctionData> VgiGlobalFunctionsBind(ClientContext &context, T
 		row.schema_name = entry.schema_name;
 		row.function_type = entry.function_type;
 		row.worker_path = entry.worker_path;
-		auto db = db_manager.GetDatabase(context, entry.catalog_name);
+		auto db = db_manager.GetDatabase(context, Identifier(entry.catalog_name));
 		row.live = db && dynamic_cast<VgiCatalog *>(&db->GetCatalog()) != nullptr;
 		data->rows.push_back(std::move(row));
 	}
@@ -3630,6 +3610,7 @@ static void VgiGlobalFunctionsScan(ClientContext &context, TableFunctionInput &d
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	vgi::CheckArrowRuntime();
 #if defined(__EMSCRIPTEN__) && VGI_ASYNC_INIT_ENABLED
 	// Pre-spawn a bounded pool of background workers at extension load. Required
 	// under MAIN_MODULE=1 + pthreads: pthread_create after side-modules are
@@ -3722,15 +3703,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 				auto &cast_set = CastFunctionSet::Get(context);
 				GetCastFunctionInput cast_input(context);
 				auto info = cast_set.GetCastFunction(source.GetType(), result.GetType(), cast_input);
-				CastParameters params(info.cast_data.get(), false, nullptr, nullptr);
-				info.function(source, result, count, params);
+				CastParameters params(info.GetCastData(), false, nullptr, nullptr);
+				info.Cast(source, result, count, params);
 			}
 		};
 
 		// DuckToArrow closures per geometry storage type
 		// Each lambda captures the storage type for ToVectorizedFormat
 #define VGI_GEOARROW_DUCK_TO_ARROW(STORAGE_TYPE)                                                                       \
-	[](ClientContext &, Vector &source, Vector &result, idx_t count) {                                                 \
+	[](ClientContext &, const Vector &source, Vector &result, idx_t count) {                                                 \
 		Geometry::ToVectorizedFormat(source, result, count, STORAGE_TYPE);                                              \
 	}
 
@@ -3829,7 +3810,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// VgiRequiredFiltersOptimizer didn't fire when it should have.
 	{
 		TableFunction marker_func = MakeNativeDelegationMarkerFunction();
-		marker_func.deserialize = [](Deserializer &, TableFunction &) -> unique_ptr<FunctionData> {
+		marker_func.deserialize = [](Deserializer &, BoundTableFunction &) -> unique_ptr<FunctionData> {
 			throw SerializationException(
 			    "VGI native-delegation marker function 'vgi_native_delegation_marker' "
 			    "is being deserialized — VgiRequiredFiltersOptimizer must run BEFORE "
@@ -3907,7 +3888,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(std::move(companions_info));
 
 		TableFunction flush_func("vgi_secret_provider_flush", {}, VgiSecretFlushScan, VgiSecretFlushBind);
-		flush_func.named_parameters["catalog"] = LogicalType::VARCHAR;
+		vgi::AddVgiFunctionOption(flush_func, "catalog", LogicalType::VARCHAR);
 		CreateTableFunctionInfo flush_info(flush_func);
 		flush_info.descriptions.push_back(vgi::MakeFunctionDescription(
 		    "Clear the TTL cache of one Orchard remote secret provider, or all providers when 'catalog' is "
@@ -3930,7 +3911,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	{
 		// vgi_oauth_logout([origin])
 		TableFunction logout_func("vgi_oauth_logout", {}, OAuthLogoutFunction, OAuthLogoutBind, OAuthLogoutInit);
-		logout_func.varargs = LogicalType::VARCHAR;
+		logout_func.GetSignature().AddArgs("origins", LogicalType::VARCHAR);
 		CreateTableFunctionInfo logout_info(logout_func);
 		logout_info.descriptions.push_back(vgi::MakeFunctionDescription(
 		    "Forget cached OAuth tokens. With no arguments, clears every stored token; pass one or more OAuth "

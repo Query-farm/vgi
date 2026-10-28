@@ -112,7 +112,7 @@ static std::string EncodeNamedArgsAsJson(const std::map<std::string, Value> &nam
 }
 
 static unique_ptr<FunctionData> VgiTableBranchesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {
 	    LogicalType::VARCHAR,                          // catalog_name
 	    LogicalType::VARCHAR,                          // schema_name
@@ -173,18 +173,18 @@ static unique_ptr<FunctionData> VgiTableBranchesBind(ClientContext &context, Tab
 					// via duckdb_logs so a hidden bad entry doesn't go
 					// unnoticed.
 					VGI_LOG(context, "vgi.table_branches.skip_failed_table",
-					        {{"catalog", catalog_name},
-					         {"schema", schema_name},
-					         {"table", table_entry->name},
+					        {{"catalog", catalog_name.GetIdentifierName()},
+					         {"schema", schema_name.GetIdentifierName()},
+					         {"table", table_entry->name.GetIdentifierName()},
 					         {"error", e.what()}});
 					return;
 				}
 				for (size_t i = 0; i < result.branches.size(); i++) {
 					const auto &branch = result.branches[i];
 					BranchesRow row;
-					row.catalog_name = catalog_name;
-					row.schema_name = schema_name;
-					row.table_name = table_entry->name;
+					row.catalog_name = catalog_name.GetIdentifierName();
+					row.schema_name = schema_name.GetIdentifierName();
+					row.table_name = table_entry->name.GetIdentifierName();
 					row.branch_index = static_cast<int64_t>(i);
 					row.function_name = branch.function_name;
 					row.positional_arguments_json = EncodeValuesAsJsonArray(branch.positional_arguments);

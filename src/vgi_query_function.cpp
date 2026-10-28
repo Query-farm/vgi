@@ -16,6 +16,8 @@
 #include "vgi_query_rpc.hpp"
 #include "vgi_table_function_impl.hpp"
 
+#include "nanoarrow/nanoarrow.h"
+
 #include <chrono>
 #include <atomic>
 #include <set>
@@ -79,63 +81,41 @@ constexpr idx_t MAX_PARAMETERS = 1024;
 
 // Arrow ValidateFull checks buffers, but not field nullability. Walk only
 // visible children: a required child beneath a NULL parent is not a value.
-void ValidateRequiredValues(const std::shared_ptr<arrow::Field> &field,
-	                        const std::shared_ptr<arrow::Array> &array, int64_t begin, int64_t end) {
-	if (array->type_id() != arrow::Type::DICTIONARY && field->type()->num_fields() == 0 &&
-	    (field->nullable() || array->null_count() == 0)) {
-		return;
-	}
-	for (int64_t row = begin; row < end; row++) {
-		if (array->IsNull(row)) {
-			if (!field->nullable()) {
-				throw IOException("vgi_query result contains NULL in required field '%s'", field->name());
-			}
+void ValidateRequiredValues(const ArrowSchema &field, const VgiColumn &column, int64_t begin, int64_t end,
+                            std::optional<bool> nullable_override = std::nullopt) {
+	const bool nullable = nullable_override.value_or((field.flags & ARROW_FLAG_NULLABLE) != 0);
+	if (!column.is_dictionary() && field.n_children == 0 && (nullable || column.null_count() == 0)) return;
+	for (int64_t row = begin; row < end; ++row) {
+		if (column.IsNull(row)) {
+			if (!nullable) throw IOException("vgi_query result contains NULL in required field '%s'", field.name ? field.name : "");
 			continue;
 		}
-		switch (array->type_id()) {
-		case arrow::Type::DICTIONARY: {
-			auto values = std::static_pointer_cast<arrow::DictionaryArray>(array);
-			auto index = values->GetValueIndex(row);
-			ValidateRequiredValues(field->WithType(values->dictionary()->type()), values->dictionary(), index, index + 1);
-			break;
+		if (column.is_dictionary()) {
+			auto index = column.GetInt(row);
+			ValidateRequiredValues(*field.dictionary, column.dictionary(), index, index + 1, nullable);
+			continue;
 		}
-		case arrow::Type::STRUCT: {
-			auto values = std::static_pointer_cast<arrow::StructArray>(array);
-			for (int child = 0; child < field->type()->num_fields(); child++) {
-				ValidateRequiredValues(field->type()->field(child), values->field(child), row, row + 1);
+		switch (column.storage_type()) {
+		case NANOARROW_TYPE_STRUCT:
+			for (int64_t child = 0; child < field.n_children; ++child) {
+				ValidateRequiredValues(*field.children[child], column.child(child), row, row + 1);
 			}
 			break;
-		}
-		case arrow::Type::LIST:
-		case arrow::Type::MAP: {
-			auto values = std::static_pointer_cast<arrow::ListArray>(array);
-			auto start = values->value_offset(row);
-			ValidateRequiredValues(field->type()->field(0), values->values(), start, start + values->value_length(row));
+		case NANOARROW_TYPE_LIST:
+		case NANOARROW_TYPE_MAP:
+		case NANOARROW_TYPE_LARGE_LIST:
+		case NANOARROW_TYPE_FIXED_SIZE_LIST: {
+			int64_t child_begin, child_end;
+			column.ListRange(row, child_begin, child_end);
+			ValidateRequiredValues(*field.children[0], column.child(0), child_begin, child_end);
 			break;
 		}
-		case arrow::Type::LARGE_LIST: {
-			auto values = std::static_pointer_cast<arrow::LargeListArray>(array);
-			auto start = values->value_offset(row);
-			ValidateRequiredValues(field->type()->field(0), values->values(), start, start + values->value_length(row));
-			break;
-		}
-		case arrow::Type::FIXED_SIZE_LIST: {
-			auto values = std::static_pointer_cast<arrow::FixedSizeListArray>(array);
-			auto start = values->value_offset(row);
-			ValidateRequiredValues(field->type()->field(0), values->values(), start, start + values->value_length());
-			break;
-		}
-		case arrow::Type::SPARSE_UNION: {
-			auto values = std::static_pointer_cast<arrow::SparseUnionArray>(array);
-			auto child = values->child_id(row);
-			ValidateRequiredValues(field->type()->field(child), values->field(child), row, row + 1);
-			break;
-		}
-		case arrow::Type::DENSE_UNION: {
-			auto values = std::static_pointer_cast<arrow::DenseUnionArray>(array);
-			auto child = values->child_id(row);
-			auto offset = values->value_offset(row);
-			ValidateRequiredValues(field->type()->field(child), values->field(child), offset, offset + 1);
+		case NANOARROW_TYPE_SPARSE_UNION:
+		case NANOARROW_TYPE_DENSE_UNION: {
+			auto index = row + column.shift();
+			auto child = ArrowArrayViewUnionChildIndex(&column.view(), index);
+			auto offset = ArrowArrayViewUnionChildOffset(&column.view(), index);
+			ValidateRequiredValues(*field.children[child], column.child(child), offset, offset + 1);
 			break;
 		}
 		default:
@@ -180,7 +160,7 @@ FunctionConnectionParams QueryConnectionParams(const VgiTableFunctionBindData &d
 	return params;
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildQueryParameters(ClientContext &context, TableFunctionBindInput &input) {
+VgiBatchPtr BuildQueryParameters(ClientContext &context, TableFunctionBindInput &input) {
 	std::string mode = "named";
 	auto mode_it = input.named_parameters.find("parameter_mode");
 	if (mode_it != input.named_parameters.end()) {
@@ -209,7 +189,7 @@ std::shared_ptr<arrow::RecordBatch> BuildQueryParameters(ClientContext &context,
 			if (values[i].type().id() == LogicalTypeId::SQLNULL) {
 				throw BinderException("vgi_query NULL parameters require an explicit SQL type cast");
 			}
-			auto name = mode == "positional" ? std::to_string(i + 1) : StructType::GetChildName(parameters.type(), i);
+			auto name = mode == "positional" ? std::to_string(i + 1) : StructType::GetChildName(parameters.type(), i).GetIdentifierName();
 			if (mode == "named") {
 				bool numeric = !name.empty() && name.find_first_not_of("0123456789") == string::npos;
 				if (name.empty() || numeric || string("$:@?").find(name[0]) != string::npos ||
@@ -221,25 +201,32 @@ std::shared_ptr<arrow::RecordBatch> BuildQueryParameters(ClientContext &context,
 		}
 	}
 	auto arguments = BuildArgumentsFromValues(context, values);
-	auto struct_array = std::static_pointer_cast<arrow::StructArray>(arguments.array);
-	auto struct_type = std::static_pointer_cast<arrow::StructType>(arguments.type);
-	std::vector<std::shared_ptr<arrow::Field>> fields;
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-	for (idx_t i = 0; i < values.size(); i++) {
-		fields.push_back(struct_type->field(static_cast<int>(i))->WithName(names[i]));
-		arrays.push_back(struct_array->field(static_cast<int>(i)));
+	auto argument_column = arguments.batch->column(0);
+	ArrowSchemaWrapper parameter_schema;
+	if (ArrowSchemaDeepCopy(&argument_column.schema(), &parameter_schema.arrow_schema) != NANOARROW_OK) {
+		throw InternalException("VGI failed to copy parameter schema");
 	}
-	auto metadata = arrow::KeyValueMetadata::Make({"vgi.query.parameters.v1"}, {mode});
-	auto batch = arrow::RecordBatch::Make(arrow::schema(fields, metadata), 1, arrays);
-	auto status = batch->ValidateFull();
-	if (!status.ok()) {
-		throw BinderException("vgi_query parameters could not be encoded as Arrow: %s", status.ToString());
+	ArrowSchemaSetName(&parameter_schema.arrow_schema, "");
+	parameter_schema.arrow_schema.flags = 0;
+	for (idx_t i = 0; i < values.size(); ++i) {
+		if (ArrowSchemaSetName(parameter_schema.arrow_schema.children[i], names[i].c_str()) != NANOARROW_OK) {
+			throw InternalException("VGI failed to name parameter field");
+		}
 	}
+	const auto metadata = VgiMetadata({{"vgi.query.parameters.v1", mode}}).ToC();
+	if (ArrowSchemaSetMetadata(&parameter_schema.arrow_schema, metadata.data()) != NANOARROW_OK) {
+		throw InternalException("VGI failed to set parameter metadata");
+	}
+	VgiBatchBuilder builder(VgiSchema::Adopt(&parameter_schema.arrow_schema));
+	for (idx_t i = 0; i < values.size(); ++i) AppendElement(builder.column(i), argument_column.child(i), 0);
+	builder.FinishRow();
+	auto batch = builder.Finish();
+	ValidateBatch(*batch, VgiValidation::FULL);
 	return batch;
 }
 
 unique_ptr<FunctionData> VgiQueryBind(ClientContext &context, TableFunctionBindInput &input,
-	                                vector<LogicalType> &return_types, vector<string> &names) {
+	                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (!IsVgiQueryEnabled(context)) {
 		throw BinderException("vgi_query is disabled; SET vgi_query_enabled=true before attaching the catalog");
 	}
@@ -247,7 +234,7 @@ unique_ptr<FunctionData> VgiQueryBind(ClientContext &context, TableFunctionBindI
 		throw BinderException("vgi_query catalog and SQL must not be NULL");
 	}
 	auto catalog_name = input.inputs[0].GetValue<string>();
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 	if (catalog.GetCatalogType() != "vgi") {
 		throw BinderException("vgi_query catalog '%s' is not a VGI catalog", catalog_name);
 	}
@@ -292,7 +279,7 @@ unique_ptr<FunctionData> VgiQueryBind(ClientContext &context, TableFunctionBindI
 		}
 		ArrowSchemaToDuckDBTypes(context, data->bind_result.output_schema, data->c_schema,
 		                         data->arrow_table, return_types, names);
-		data->all_column_names = names;
+		data->all_column_names = IdentifiersToStrings(names);
 		data->all_column_types = return_types;
 	} catch (...) {
 		data->query_preparation->ReleaseNoThrow(context);
@@ -334,18 +321,15 @@ unique_ptr<GlobalTableFunctionState> VgiQueryInitGlobal(ClientContext &context, 
 
 } // namespace
 
-void ValidateVgiQueryResultBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                 const std::shared_ptr<arrow::Schema> &expected) {
+void ValidateVgiQueryResultBatch(const VgiBatchPtr &batch,
+                                 const VgiSchemaPtr &expected) {
 	if (!batch) {
 		return;
 	}
 	if (!batch->schema()->Equals(*expected, true)) {
 		throw IOException("vgi_query result schema differs from the prepared schema (including metadata)");
 	}
-	auto status = batch->ValidateFull();
-	if (!status.ok()) {
-		throw IOException("vgi_query received an invalid Arrow result batch: %s", status.ToString());
-	}
+	ValidateBatch(*batch, VgiValidation::FULL);
 	for (int column = 0; column < batch->num_columns(); column++) {
 		ValidateRequiredValues(expected->field(column), batch->column(column), 0, batch->num_rows());
 	}
@@ -354,8 +338,8 @@ void ValidateVgiQueryResultBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 void RegisterVgiQueryFunction(ExtensionLoader &loader) {
 	TableFunction function("vgi_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, VgiTableFunctionScan,
 	                       VgiQueryBind, VgiQueryInitGlobal, VgiTableFunctionInitLocal);
-	function.named_parameters["parameters"] = LogicalType::ANY;
-	function.named_parameters["parameter_mode"] = LogicalType::VARCHAR;
+	vgi::AddVgiFunctionOption(function, Identifier("parameters"), LogicalType::ANY);
+	vgi::AddVgiFunctionOption(function, Identifier("parameter_mode"), LogicalType::VARCHAR);
 	function.projection_pushdown = false;
 	function.filter_pushdown = false;
 	function.sampling_pushdown = false;

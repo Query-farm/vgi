@@ -40,29 +40,26 @@ struct VgiNativeDelegationMarkerBindData : public duckdb::TableFunctionData {
 	// eagerly (so we can populate the LogicalGet's returned_types/names
 	// faithfully), and the rewriter just transfers ownership of these into
 	// the LogicalGet during the in-place swap. No re-binding in the optimizer.
-	TableFunction native_tf;
+	BoundTableFunction native_tf;
 	mutable unique_ptr<duckdb::FunctionData> native_bind;
 	std::vector<LogicalType> native_return_types;
-	std::vector<std::string> native_return_names;
+	vector<Identifier> native_return_names;
 	virtual_column_map_t native_virtual_columns;
 
 	// Originating ScanFunctionResult — kept for diagnostics + logging.
 	vgi::VgiScanFunctionResult scan_result;
 	std::string worker_path;
 
-	VgiNativeDelegationMarkerBindData(VgiTableEntry &table_p, TableFunction native_tf_p,
-	                                   unique_ptr<duckdb::FunctionData> native_bind_p,
-	                                   std::vector<LogicalType> native_return_types_p,
-	                                   std::vector<std::string> native_return_names_p,
-	                                   virtual_column_map_t native_virtual_columns_p,
-	                                   vgi::VgiScanFunctionResult scan_result_p,
-	                                   std::string worker_path_p)
-	    : table(table_p), native_tf(std::move(native_tf_p)),
-	      native_bind(std::move(native_bind_p)),
-	      native_return_types(std::move(native_return_types_p)),
-	      native_return_names(std::move(native_return_names_p)),
-	      native_virtual_columns(std::move(native_virtual_columns_p)),
-	      scan_result(std::move(scan_result_p)), worker_path(std::move(worker_path_p)) {
+	VgiNativeDelegationMarkerBindData(VgiTableEntry &table_p, BoundTableFunction native_tf_p,
+	                                  unique_ptr<duckdb::FunctionData> native_bind_p,
+	                                  std::vector<LogicalType> native_return_types_p,
+	                                  vector<Identifier> native_return_names_p,
+	                                  virtual_column_map_t native_virtual_columns_p,
+	                                  vgi::VgiScanFunctionResult scan_result_p, std::string worker_path_p)
+	    : table(table_p), native_tf(std::move(native_tf_p)), native_bind(std::move(native_bind_p)),
+	      native_return_types(std::move(native_return_types_p)), native_return_names(std::move(native_return_names_p)),
+	      native_virtual_columns(std::move(native_virtual_columns_p)), scan_result(std::move(scan_result_p)),
+	      worker_path(std::move(worker_path_p)) {
 	}
 };
 
@@ -78,10 +75,15 @@ public:
 	~VgiTableEntry() override;
 
 public:
+	const ColumnList &GetColumns() const override {
+		return columns_;
+	}
+
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
-	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data, const EntryLookupInfo &lookup) override;
+	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+	                              const EntryLookupInfo &lookup) override;
 
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
@@ -105,7 +107,7 @@ public:
 	// versions (see test/sql/integration/table/time_travel.test).
 	// at_unit/at_value are empty strings for non-time-travel binds.
 	vgi::VgiScanBranchesResult FetchScanBranches(ClientContext &context, const std::string &at_unit,
-	                                              const std::string &at_value);
+	                                             const std::string &at_value);
 
 	// Cheap pre-RPC check for "is this table multi-branch under the no-AT
 	// view?" Returns true only when we know cheaply that the table is
@@ -135,8 +137,8 @@ public:
 	// a fully-configured TableFunction + bind data by re-running the bind
 	// against the looked-up VgiTableEntry.
 	static void VgiTableScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-	                                  const TableFunction &function);
-	static unique_ptr<FunctionData> VgiTableScanDeserialize(Deserializer &deserializer, TableFunction &function);
+	                                  const BoundTableFunction &function);
+	static unique_ptr<FunctionData> VgiTableScanDeserialize(Deserializer &deserializer, BoundTableFunction &function);
 
 private:
 	TableFunction GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
@@ -151,6 +153,7 @@ private:
 	// catalog_schema_contents_tables, eliminating the per-table RPC.
 	void PopulateStatsCacheFromInline(ClientContext &context) const;
 
+	ColumnList columns_;
 	vgi::VgiTableInfo table_info_;
 	Catalog &catalog_;
 	LogicalType rowid_type_ = LogicalType::INVALID;
@@ -166,7 +169,7 @@ private:
 	//    1 = known multi-branch
 	// Lifetime is tied to the VgiTableEntry; vgi_clear_cache() or
 	// catalog-version invalidation creates a fresh entry with hint reset.
-	mutable std::atomic<int> multi_branch_hint_no_at_{-1};
+	mutable std::atomic<int> multi_branch_hint_no_at_ {-1};
 
 	// Column statistics cache: lazy-fetched via RPC, TTL-based expiry, thread-safe.
 	// Mutable because GetStatistics() is const in the DuckDB interface but we

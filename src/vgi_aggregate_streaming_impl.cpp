@@ -3,9 +3,6 @@
 
 #include <cstring>
 
-#include <arrow/builder.h>
-#include <arrow/ipc/api.h>
-
 #include "duckdb/common/exception.hpp"
 
 #include "vgi_aggregate_function_impl.hpp"
@@ -20,49 +17,38 @@ namespace vgi {
 
 namespace {
 
-// Use vgi::ThrowOnArrowError (vgi_arrow_utils.hpp) for status checks. We
-// don't redeclare it here — that creates an ambiguous overload set when
-// arrow::Result<T>::status() is passed.
-
-std::vector<uint8_t> SerializeSchemaBytes(const std::shared_ptr<arrow::Schema> &schema) {
-	auto buf = arrow::ipc::SerializeSchema(*schema);
-	ThrowOnArrowError(buf.status());
-	auto &b = buf.ValueUnsafe();
-	return std::vector<uint8_t>(b->data(), b->data() + b->size());
-}
-
 // Build aggregate_streaming_open request batch matching
 // vgi.protocol.AggregateStreamingOpenRequest field-for-field.
 //
 // arguments: bytes (Arguments.serialize_to_bytes() — empty for the v1
 // streaming operator until we wire const-arg passing through the operator).
-std::shared_ptr<arrow::RecordBatch> BuildStreamingOpenRequest(
+VgiBatchPtr BuildStreamingOpenRequest(
     const std::string &function_name,
     const std::string &schema_name,
     const std::vector<uint8_t> &arguments,
-    const std::shared_ptr<arrow::Schema> &input_schema,
+    const VgiSchemaPtr &input_schema,
     int64_t partition_key_count,
     int64_t order_key_count,
-    const std::shared_ptr<arrow::Schema> &output_schema,
+    const VgiSchemaPtr &output_schema,
     const std::vector<uint8_t> &attach_opaque_data) {
 	generated::AggregateStreamingOpenRequest request;
 	request.function_name = function_name;
 	request.arguments = arguments;
-	request.input_schema = SerializeSchemaBytes(input_schema);
+	request.input_schema = SerializeSchemaToIpcBytes(input_schema);
 	request.partition_key_count = partition_key_count;
 	request.order_key_count = order_key_count;
-	request.output_schema = SerializeSchemaBytes(output_schema);
+	request.output_schema = SerializeSchemaToIpcBytes(output_schema);
 	// settings / secrets are not wired through the streaming operator yet.
 	request.attach_opaque_data = BytesOrNull(attach_opaque_data);
 	request.schema_path = OptionalSingleSchemaPath(schema_name);
 	return generated::BuildAggregateStreamingOpenParams(SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
+VgiBatchPtr BuildStreamingChunkRequest(
     const std::string &function_name,
     const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
-    const std::shared_ptr<arrow::RecordBatch> &input_batch,
+    const VgiBatchPtr &input_batch,
     const std::vector<uint8_t> &attach_opaque_data) {
 	generated::AggregateStreamingChunkRequest request;
 	request.function_name = function_name;
@@ -73,7 +59,7 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
 	return generated::BuildAggregateStreamingChunkParams(SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
+VgiBatchPtr BuildStreamingCloseRequest(
     const std::string &function_name,
     const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
@@ -95,7 +81,7 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
 VgiStreamingSession VgiAggregateStreamingOpen(
     ClientContext &context,
     const VgiAggregateBindData &bind_data,
-    const std::shared_ptr<arrow::Schema> &input_schema,
+    const VgiSchemaPtr &input_schema,
     int64_t partition_key_count,
     int64_t order_key_count) {
 
@@ -113,14 +99,11 @@ VgiStreamingSession VgiAggregateStreamingOpen(
 	// it, hence the explicit 1-row construction here.)
 	std::vector<uint8_t> arguments_bytes;
 	{
-		auto empty_struct_type = arrow::struct_({});
-		// Length-1 StructArray with no child fields.
-		std::vector<std::shared_ptr<arrow::Array>> child_arrays;
-		auto struct_array = std::make_shared<arrow::StructArray>(empty_struct_type, /*length=*/1,
-		                                                          child_arrays);
-		auto args_schema = arrow::schema({arrow::field("args", empty_struct_type)});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, 1, {struct_array});
-		arguments_bytes = SerializeToIpcBytes(args_batch);
+		// Length-1 struct<> column (one valid, empty row) with no child fields.
+		VgiBatchBuilder builder(MakeSchema({type::Struct({}).Named("args")}));
+		append::FinishElement(builder.column(0));
+		builder.FinishRow();
+		arguments_bytes = SerializeToIpcBytes(builder.Finish());
 	}
 
 	auto request = BuildStreamingOpenRequest(
@@ -140,11 +123,11 @@ VgiStreamingSession VgiAggregateStreamingOpen(
 	return session;
 }
 
-std::shared_ptr<arrow::RecordBatch> VgiAggregateStreamingChunk(
+VgiBatchPtr VgiAggregateStreamingChunk(
     ClientContext &context,
     const VgiAggregateBindData &bind_data,
     const VgiStreamingSession &session,
-    const std::shared_ptr<arrow::RecordBatch> &input_batch) {
+    const VgiBatchPtr &input_batch) {
 
 	auto request = BuildStreamingChunkRequest(
 	    session.function_name, session.schema_name, session.execution_id, input_batch,

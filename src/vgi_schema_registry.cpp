@@ -38,12 +38,12 @@ struct DynamicMethod {
 
 struct ItemsMethod {
 	const char *name;
-	const std::shared_ptr<arrow::Schema> &(*item)();
+	const VgiSchemaPtr &(*item)();
 };
 
 struct BlobMethod {
 	const char *name;
-	const std::shared_ptr<arrow::Schema> &(*result)();
+	const VgiSchemaPtr &(*result)();
 };
 
 const std::unordered_map<std::string, ResponseSchema> &Registry() {
@@ -137,13 +137,14 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 // Diff rendering
 // ============================================================================
 
-std::string DescribeField(const arrow::Field &f) {
+std::string DescribeField(const VgiSchema &schema, int i) {
 	std::ostringstream s;
-	s << f.name() << ": " << f.type()->ToString() << (f.nullable() ? " nullable" : " not null");
+	s << schema.field_name(i) << ": " << TypeToString(schema.field(i))
+	  << (schema.field_nullable(i) ? " nullable" : " not null");
 	return s.str();
 }
 
-std::string DiffSchemas(const arrow::Schema &expected, const arrow::Schema &actual) {
+std::string DiffSchemas(const VgiSchema &expected, const VgiSchema &actual) {
 	std::ostringstream out;
 	const auto nE = expected.num_fields();
 	const auto nA = actual.num_fields();
@@ -156,13 +157,12 @@ std::string DiffSchemas(const arrow::Schema &expected, const arrow::Schema &actu
 		return out.str();
 	}
 	for (int i = 0; i < nE; i++) {
-		const auto &e = *expected.field(i);
-		const auto &a = *actual.field(i);
-		if (e.Equals(a, /*check_metadata=*/false)) {
+		// Field equality: name, nullability and type, metadata ignored.
+		if (TypesEqual(expected.field(i), actual.field(i), /*check_names=*/true, /*check_metadata=*/false)) {
 			continue;
 		}
-		out << "  [" << i << "] expected: " << DescribeField(e) << "\n"
-		    << "      actual:   " << DescribeField(a) << "\n";
+		out << "  [" << i << "] expected: " << DescribeField(expected, i) << "\n"
+		    << "      actual:   " << DescribeField(actual, i) << "\n";
 	}
 	return out.str();
 }
@@ -175,7 +175,7 @@ const ResponseSchema *LookupResponseSchema(const std::string &method_name) {
 	return it == reg.end() ? nullptr : &it->second;
 }
 
-void ValidateResponseSchema(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &method_name,
+void ValidateResponseSchema(const VgiBatchPtr &batch, const std::string &method_name,
                             const std::string &worker_path) {
 	const auto *entry = LookupResponseSchema(method_name);
 	if (!entry) {
@@ -206,7 +206,7 @@ void ValidateResponseSchema(const std::shared_ptr<arrow::RecordBatch> &batch, co
 	}
 }
 
-void ValidateRequestSchema(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &method_name,
+void ValidateRequestSchema(const VgiBatchPtr &batch, const std::string &method_name,
                            const std::string &worker_path) {
 	const auto *entry = LookupResponseSchema(method_name);
 	if (!entry) {
@@ -245,7 +245,7 @@ void ValidateRequestSchema(const std::shared_ptr<arrow::RecordBatch> &batch, con
 	}
 }
 
-void ValidateItemSchema(const std::shared_ptr<arrow::RecordBatch> &item_batch, const std::string &method_name,
+void ValidateItemSchema(const VgiBatchPtr &item_batch, const std::string &method_name,
                         const std::string &worker_path, size_t item_index) {
 	const auto *entry = LookupResponseSchema(method_name);
 	if (!entry || !entry->item_schema) {

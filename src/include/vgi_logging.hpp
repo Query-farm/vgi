@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -11,11 +13,6 @@
 // declarations suffice here. Pulling in the full <arrow/api.h> umbrella from
 // this header is expensive because vgi_logging.hpp is included by ~34 TUs; the
 // definitions are only needed in vgi_logging.cpp.
-namespace arrow {
-class RecordBatch;
-class KeyValueMetadata;
-} // namespace arrow
-
 #include "duckdb/logging/logging.hpp"
 #include "duckdb/logging/log_type.hpp"
 #include "duckdb/logging/logger.hpp"
@@ -154,8 +151,8 @@ inline LogLevel ParseLogLevel(const string &level_str) {
 //! If it's an EXCEPTION, throws IOException with the message, traceback, and worker context.
 //! For other log levels, logs to DuckDB if context is provided.
 //! Returns true if the batch was a log message, false otherwise.
-bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
-                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
+bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch,
+                           const vgi::VgiMetadataPtr &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid = -1,
                            const std::string &execution_id_hex = "", const std::string &attach_opaque_data_digest = "",
                            const std::string &transaction_opaque_data_digest = "", const std::string &conn_id_hex = "",

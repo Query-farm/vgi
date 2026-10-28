@@ -3,9 +3,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "yyjson.hpp"
-#include <arrow/api.h>
-#include <arrow/extension_type.h>
-#include <arrow/util/utf8.h>
+#include "utf8proc_wrapper.hpp"
 #include <set>
 
 namespace duckdb {
@@ -14,15 +12,7 @@ namespace {
 using namespace duckdb_yyjson; // NOLINT
 
 void Utf8(const std::string &text, const char *label) {
-	// Arrow's UTF-8 DFA tables must be initialized even when this validation
-	// is the process's first Arrow text operation. Local static initialization
-	// serializes concurrent callers before they can read the tables.
-	static const bool initialized = [] {
-		arrow::util::InitializeUTF8();
-		return true;
-	}();
-	(void)initialized;
-	if (!arrow::util::ValidateUTF8(reinterpret_cast<const uint8_t *>(text.data()), text.size())) {
+	if (Utf8Proc::Analyze(text.data(), text.size()) == UnicodeType::INVALID) {
 		throw InvalidInputException("VGI column metadata: %s must be valid UTF-8", label);
 	}
 }
@@ -54,39 +44,38 @@ std::map<std::string, std::string> Tags(const std::string &text) {
 }
 } // namespace
 
-NativeColumnMetadata ReadNativeColumnMetadata(const std::shared_ptr<arrow::Field> &field) {
+NativeColumnMetadata ReadNativeColumnMetadata(const ArrowSchema &field) {
 	NativeColumnMetadata result;
-	if (auto metadata = field->metadata()) {
+	if (field.metadata) {
+		auto metadata = VgiMetadata::FromC(field.metadata);
 		std::set<std::string> keys;
-		for (int64_t index = 0; index < metadata->size(); ++index) {
-			const auto &key = metadata->key(index);
+		for (int64_t index = 0; index < metadata.size(); ++index) {
+			const auto &key = metadata.key(index);
 			if (!keys.insert(key).second)
 				throw InvalidInputException("VGI column metadata: duplicate metadata key");
 			if (key == "comment") {
-				Utf8(metadata->value(index), "comment");
-				result.comment = metadata->value(index);
+				Utf8(metadata.value(index), "comment");
+				result.comment = metadata.value(index);
 			} else if (key == "tags") {
-				result.tags = Tags(metadata->value(index));
+				result.tags = Tags(metadata.value(index));
 			}
 		}
 	}
 	return result;
 }
 
-void ValidateNativeColumnMetadata(const std::shared_ptr<arrow::Schema> &schema) {
-	std::vector<std::shared_ptr<arrow::Field>> pending = schema->fields();
+void ValidateNativeColumnMetadata(const VgiSchemaPtr &schema) {
+	std::vector<const ArrowSchema *> pending;
+	for (int i = 0; i < schema->num_fields(); ++i)
+		pending.push_back(&schema->field(i));
 	while (!pending.empty()) {
 		auto field = pending.back();
 		pending.pop_back();
-		ReadNativeColumnMetadata(field);
-		auto type = field->type();
-		while (type->id() == arrow::Type::DICTIONARY || type->id() == arrow::Type::EXTENSION) {
-			type = type->id() == arrow::Type::DICTIONARY
-			           ? std::static_pointer_cast<arrow::DictionaryType>(type)->value_type()
-			           : std::static_pointer_cast<arrow::ExtensionType>(type)->storage_type();
-		}
-		for (const auto &child : type->fields())
-			pending.push_back(child);
+		ReadNativeColumnMetadata(*field);
+		if (field->dictionary)
+			pending.push_back(field->dictionary);
+		for (int64_t i = 0; i < field->n_children; ++i)
+			pending.push_back(field->children[i]);
 	}
 }
 } // namespace vgi

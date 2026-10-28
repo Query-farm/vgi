@@ -21,6 +21,8 @@
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
+#include <cstring>
+
 namespace duckdb {
 
 // Resolve a write-function discovery result, preferring the inlined value on
@@ -60,19 +62,21 @@ using namespace vgi;
 // so we try the table's schema first, then the catalog's default schema.
 // Returns false if not found or if the function isn't a VGI function —
 // preserving the legacy close-and-drain behavior for workers that don't opt in.
-static bool WriteFunctionHasFinalize(ClientContext &context, Catalog &catalog,
-                                      const string &table_schema, const string &function_name) {
-	auto entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, table_schema, function_name,
-	                              OnEntryNotFound::RETURN_NULL);
+static bool WriteFunctionHasFinalize(ClientContext &context, Catalog &catalog, const string &table_schema,
+                                     const string &function_name) {
+	auto entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, Identifier(table_schema),
+	                              Identifier(function_name), OnEntryNotFound::RETURN_NULL);
 	if (!entry) {
-		entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, catalog.GetDefaultSchema(),
-		                         function_name, OnEntryNotFound::RETURN_NULL);
+		if (auto schema = catalog.GetDefaultSchema()) {
+			entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, *schema, Identifier(function_name),
+			                         OnEntryNotFound::RETURN_NULL);
+		}
 	}
 	if (!entry) {
 		return false;
 	}
 	for (auto &overload : entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
-		if (auto info = dynamic_cast<vgi::VgiTableFunctionInfo *>(overload.function_info.get())) {
+		if (auto info = dynamic_cast<vgi::VgiTableFunctionInfo *>(overload->function_info.get())) {
 			return info->function_info().has_finalize;
 		}
 	}
@@ -84,15 +88,15 @@ static bool WriteFunctionHasFinalize(ClientContext &context, Catalog &catalog,
 // the function was actually found in. Mirrors WriteFunctionHasFinalize's
 // table-schema-then-default-schema order. Empty when not found.
 static string ResolveWriteFunctionSchema(ClientContext &context, Catalog &catalog, const string &table_schema,
-                                          const string &function_name) {
-	if (catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, table_schema, function_name,
-	                     OnEntryNotFound::RETURN_NULL)) {
+                                         const string &function_name) {
+	if (catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, Identifier(table_schema),
+	                     Identifier(function_name), OnEntryNotFound::RETURN_NULL)) {
 		return table_schema;
 	}
 	auto default_schema = catalog.GetDefaultSchema();
-	if (catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, default_schema, function_name,
-	                     OnEntryNotFound::RETURN_NULL)) {
-		return default_schema;
+	if (default_schema && catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, *default_schema,
+	                                       Identifier(function_name), OnEntryNotFound::RETURN_NULL)) {
+		return default_schema->GetIdentifierName();
 	}
 	return string();
 }
@@ -103,12 +107,8 @@ static string ResolveWriteFunctionSchema(ClientContext &context, Catalog &catalo
 
 // Build a one-row Arrow RecordBatch of write options to pass to the worker.
 // The batch is self-describing and extensible — new options are just new fields.
-static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
-                                                              OnConflictAction action_type,
-                                                              const vector<string> &conflict_columns) {
-	auto result_mode_arr =
-	    arrow::MakeArrayFromScalar(*arrow::MakeScalar(return_chunk ? "rows" : "count"), 1).ValueOrDie();
-
+static VgiBatchPtr BuildWriteOptions(bool return_chunk, OnConflictAction action_type,
+                                     const vector<string> &conflict_columns) {
 	string action_str;
 	switch (action_type) {
 	case OnConflictAction::THROW:
@@ -120,24 +120,25 @@ static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
 	default:
 		throw InternalException("Unsupported OnConflictAction for VGI tables");
 	}
-	auto action_arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(action_str), 1).ValueOrDie();
 
-	// Build conflict columns as list<string>
-	arrow::StringBuilder col_builder;
-	auto list_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), std::make_shared<arrow::StringBuilder>());
-	auto &col_value_builder = dynamic_cast<arrow::StringBuilder &>(*list_builder->value_builder());
-	(void)list_builder->Append();
-	for (auto &col : conflict_columns) {
-		(void)col_value_builder.Append(col);
-	}
-	auto conflict_cols_arr = list_builder->Finish().ValueOrDie();
-
-	auto schema = arrow::schema({
-	    arrow::field("result_mode", arrow::utf8(), false),
-	    arrow::field("on_conflict", arrow::utf8()),
-	    arrow::field("on_conflict_columns", arrow::list(arrow::utf8())),
+	// The wire shape the worker expects: result_mode: utf8 not null, on_conflict: utf8,
+	// on_conflict_columns: list<item: utf8> (nullable fields, nullable items).
+	static const VgiSchemaPtr schema = MakeSchema({
+	    type::Utf8().Named("result_mode", /*is_nullable=*/false),
+	    type::Utf8().Named("on_conflict"),
+	    type::List(type::Utf8()).Named("on_conflict_columns"),
 	});
-	return arrow::RecordBatch::Make(schema, 1, {result_mode_arr, action_arr, conflict_cols_arr});
+	VgiBatchBuilder builder(schema);
+	append::String(builder.column(0), return_chunk ? "rows" : "count");
+	append::String(builder.column(1), action_str);
+	// Build conflict columns as list<string>
+	auto *conflict_cols = builder.column(2);
+	for (auto &col : conflict_columns) {
+		append::String(conflict_cols->children[0], col);
+	}
+	append::FinishElement(conflict_cols);
+	builder.FinishRow();
+	return builder.Finish();
 }
 
 struct SetupWriteResult {
@@ -146,10 +147,9 @@ struct SetupWriteResult {
 };
 
 static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEntry &table,
-                                              const VgiWriteFunctionResult &write_func,
-                                              const std::shared_ptr<arrow::Schema> &input_schema,
-                                              const std::shared_ptr<arrow::RecordBatch> &write_options,
-                                              const std::vector<uint8_t> &transaction_opaque_data) {
+                                             const VgiWriteFunctionResult &write_func, const VgiSchemaPtr &input_schema,
+                                             const VgiBatchPtr &write_options,
+                                             const std::vector<uint8_t> &transaction_opaque_data) {
 	auto &catalog = table.GetCatalog().Cast<VgiCatalog>();
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
@@ -173,24 +173,24 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
 		if (pooled) {
 			connection = CreateFunctionConnectionFromPool(std::move(pooled), write_func.function_name, arguments,
-			                                              attach_result->attach_opaque_data, transaction_opaque_data, context,
-			                                              "TABLE", {}, params->worker_debug());
+			                                              attach_result->attach_opaque_data, transaction_opaque_data,
+			                                              context, "TABLE", {}, params->worker_debug());
 		}
 	}
 	if (!connection) {
 		connection = CreateFunctionConnection(params->worker_path(), write_func.function_name, arguments,
-		                                      attach_result->attach_opaque_data, transaction_opaque_data, context, "TABLE", {},
-		                                      params->worker_debug(), {}, {}, params);
+		                                      attach_result->attach_opaque_data, transaction_opaque_data, context,
+		                                      "TABLE", {}, params->worker_debug(), {}, {}, params);
 	}
 
 	connection->SetInputSchema(input_schema);
-	connection->SetSchemaName(ResolveWriteFunctionSchema(context, catalog, table.GetTableInfo().schema_name,
-	                                                     write_func.function_name));
+	connection->SetSchemaName(
+	    ResolveWriteFunctionSchema(context, catalog, table.GetTableInfo().schema_name, write_func.function_name));
 	auto bind_result = connection->PerformBindRpc();
 	connection->PerformInit(bind_result, {}, nullptr, {}, "INPUT");
 	connection->OpenInputWriter();
 
-	return SetupWriteResult{std::move(connection), std::move(bind_result)};
+	return SetupWriteResult {std::move(connection), std::move(bind_result)};
 }
 
 // Helper: Validate that a worker-emitted RETURNING batch matches the table's
@@ -202,12 +202,32 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
 //
 // We compare field count + per-field name + type. Nullability is intentionally
 // ignored because DuckDB's Arrow exporter forces nullable=true on every field.
-static void ValidateReturningSchema(const std::shared_ptr<arrow::Schema> &expected,
-                                     const std::shared_ptr<arrow::Schema> &actual,
-                                     const string &op_name, const string &table_name) {
+//! Type equality with Arrow C++ ``DataType::Equals`` semantics: a node's own
+//! nullability belongs to its field, not its type, so only nested children compare it.
+static bool SameDataType(const ArrowSchema &a, const ArrowSchema &b) {
+	if (std::strcmp(a.format, b.format) != 0 || a.n_children != b.n_children) {
+		return false;
+	}
+	const int64_t type_flags = ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED;
+	if ((a.flags & type_flags) != (b.flags & type_flags)) {
+		return false;
+	}
+	for (int64_t c = 0; c < a.n_children; c++) {
+		if (!TypesEqual(*a.children[c], *b.children[c])) {
+			return false;
+		}
+	}
+	if ((a.dictionary == nullptr) != (b.dictionary == nullptr)) {
+		return false;
+	}
+	return !a.dictionary || SameDataType(*a.dictionary, *b.dictionary);
+}
+
+static void ValidateReturningSchema(const VgiSchemaPtr &expected, const VgiSchemaPtr &actual, const string &op_name,
+                                    const string &table_name) {
 	if (!expected) {
-		throw InternalException("ValidateReturningSchema called without expected schema (op=%s table=%s)",
-		                        op_name, table_name);
+		throw InternalException("ValidateReturningSchema called without expected schema (op=%s table=%s)", op_name,
+		                        table_name);
 	}
 	auto fail = [&](const string &reason) {
 		throw IOException(ErrorInfo(error_subtype::kProtocolViolation)
@@ -226,26 +246,29 @@ static void ValidateReturningSchema(const std::shared_ptr<arrow::Schema> &expect
 		fail(StringUtil::Format("expected %d field(s), got %d", expected->num_fields(), actual->num_fields()));
 	}
 	for (int i = 0; i < expected->num_fields(); i++) {
-		auto &ef = expected->field(i);
-		auto &af = actual->field(i);
-		if (ef->name() != af->name()) {
-			fail(StringUtil::Format("field %d name mismatch (expected '%s', got '%s')", i, ef->name(), af->name()));
+		const auto &ef = expected->field(i);
+		const auto &af = actual->field(i);
+		const string ef_name = expected->field_name(i);
+		const string af_name = actual->field_name(i);
+		if (ef_name != af_name) {
+			fail(StringUtil::Format("field %d name mismatch (expected '%s', got '%s')", i, ef_name, af_name));
 		}
-		if (!ef->type()->Equals(*af->type())) {
-			fail(StringUtil::Format("field '%s' type mismatch (expected %s, got %s)", ef->name(),
-			                        ef->type()->ToString(), af->type()->ToString()));
+		if (!SameDataType(ef, af)) {
+			fail(StringUtil::Format("field '%s' type mismatch (expected %s, got %s)", ef_name, TypeToString(ef),
+			                        TypeToString(af)));
 		}
 	}
 }
 
 // Helper: Read the count from a response batch (count column)
-static idx_t ReadCountFromBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
+static idx_t ReadCountFromBatch(const VgiBatchPtr &batch) {
 	if (!batch || batch->num_rows() == 0) {
 		return 0;
 	}
-	auto schema = batch->schema();
-	if (!schema || schema->num_fields() != 1 || schema->field(0)->name() != "count" ||
-	    schema->field(0)->type()->id() != arrow::Type::INT64 || schema->field(0)->nullable()) {
+	const auto &schema = batch->schema();
+	if (!schema || schema->num_fields() != 1 || schema->field_name(0) != "count" ||
+	    std::strcmp(schema->field(0).format, "l") != 0 || schema->field(0).dictionary != nullptr ||
+	    schema->field_nullable(0)) {
 		throw IOException(
 		    ErrorInfo(error_subtype::kProtocolViolation)
 		        .Set(error_key::kField, "count")
@@ -253,18 +276,19 @@ static idx_t ReadCountFromBatch(const std::shared_ptr<arrow::RecordBatch> &batch
 		    "VGI worker emitted an incompatible count result: expected exactly 'count: int64 not null', got %s",
 		    schema ? schema->ToString() : "<null>");
 	}
-	auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(batch->column(0));
-	if (!int_array) {
+	auto count_col = batch->column(0);
+	if (!count_col) {
 		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kField, "count"),
 		                  "VGI worker emitted an incompatible count result array");
 	}
 	idx_t total = 0;
-	for (int64_t i = 0; i < int_array->length(); i++) {
-		if (int_array->IsNull(i)) {
+	const int64_t n = count_col.length();
+	for (int64_t i = 0; i < n; i++) {
+		if (count_col.IsNull(i)) {
 			throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Set(error_key::kField, "count"),
 			                  "VGI worker emitted a null count result");
 		}
-		total += NumericCast<idx_t>(int_array->Value(i));
+		total += NumericCast<idx_t>(count_col.GetInt(i));
 	}
 	return total;
 }
@@ -305,8 +329,7 @@ static idx_t FinalizeWriteConnection(VgiWriteGlobalState &gstate) {
 
 // Helper: Load an Arrow RecordBatch into an ArrowScanLocalState.
 // Same pattern as LoadBatchIntoScanState in vgi_table_in_out_impl.cpp.
-static void LoadResponseBatch(ArrowScanLocalState &scan_state,
-                               const std::shared_ptr<arrow::RecordBatch> &batch) {
+static void LoadResponseBatch(ArrowScanLocalState &scan_state, const VgiBatchPtr &batch) {
 	auto chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(batch, *chunk);
 	scan_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
@@ -318,7 +341,7 @@ static void LoadResponseBatch(ArrowScanLocalState &scan_state,
 
 // Helper: Produce count or RETURNING rows from source
 static SourceResultType WriteGetDataInternal(VgiWriteGlobalState &gstate, VgiWriteSourceState &source_state,
-                                              DataChunk &chunk, bool return_chunk) {
+                                             DataChunk &chunk, bool return_chunk) {
 	if (!return_chunk) {
 		if (source_state.returned) {
 			return SourceResultType::FINISHED;
@@ -340,38 +363,49 @@ static SourceResultType WriteGetDataInternal(VgiWriteGlobalState &gstate, VgiWri
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 
+// DuckDB appends merge_action to a MERGE RETURNING result; the enclosing
+// PhysicalMergeInto supplies that value after each action returns table rows.
+static vector<LogicalType> WriteOutputTypes(const LogicalOperator &op, bool returning) {
+	auto types = op.types;
+	if (returning && op.type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
+		D_ASSERT(!types.empty());
+		types.pop_back();
+	}
+	return types;
+}
+
 // ============================================================================
 // INSERT Implementation
 // ============================================================================
 
-VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalInsert &op, VgiTableEntry &table_p,
-                                     bool return_chunk_p, OnConflictAction action_type_p,
-                                     unordered_set<column_t> on_conflict_filter_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality),
-      insert_table(&table_p),
-      return_chunk(return_chunk_p), action_type(action_type_p), on_conflict_filter(std::move(on_conflict_filter_p)) {
+VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalInsert &op, VgiTableEntry &table_p, bool return_chunk_p,
+                                     OnConflictAction action_type_p, unordered_set<column_t> on_conflict_filter_p)
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
+                       op.estimated_cardinality),
+      insert_table(&table_p), return_chunk(return_chunk_p), action_type(action_type_p),
+      on_conflict_filter(std::move(on_conflict_filter_p)) {
 }
 
 VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
                                      bool return_chunk_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality),
-      insert_table(&table_p),
-      return_chunk(return_chunk_p), action_type(OnConflictAction::THROW) {
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
+                       op.estimated_cardinality),
+      insert_table(&table_p), return_chunk(return_chunk_p), action_type(OnConflictAction::THROW) {
 }
 
 VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, SchemaCatalogEntry &schema_p,
                                      unique_ptr<BoundCreateTableInfo> create_info_p)
     : PhysicalOperator(plan, PhysicalOperatorType::CREATE_TABLE_AS, op.types, op.estimated_cardinality),
-      schema(&schema_p), create_info(std::move(create_info_p)),
-      return_chunk(false), action_type(OnConflictAction::THROW) {
+      schema(&schema_p), create_info(std::move(create_info_p)), return_chunk(false),
+      action_type(OnConflictAction::THROW) {
 }
 
 InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
 	if (insert_table) {
-		result["Table"] = insert_table->name;
+		result["Table"] = insert_table->name.GetIdentifierName();
 	} else if (create_info) {
-		result["Table"] = create_info->base->Cast<CreateTableInfo>().table;
+		result["Table"] = create_info->base->Cast<CreateTableInfo>().GetTableName().GetIdentifierName();
 	}
 	return result;
 }
@@ -403,7 +437,7 @@ InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
 // dispatch the INSERT against a verified key, instead of re-resolving the
 // writable arm internally and hoping the C++ side and the worker agree.
 static std::optional<std::string> RefuseInsertIfMultiBranchUnwritable(ClientContext &context,
-                                                                       VgiTableEntry &table_entry) {
+                                                                      VgiTableEntry &table_entry) {
 	if (table_entry.IsKnownSingleBranchNoAT()) {
 		return std::nullopt; // cheap path: no RPC, no multi-branch refusal applies
 	}
@@ -418,12 +452,13 @@ static std::optional<std::string> RefuseInsertIfMultiBranchUnwritable(ClientCont
 	}
 	throw BinderException(
 	    ErrorInfo(error_subtype::kUnsupported)
-	        .Set(error_key::kTable, table_entry.ParentSchema().name + "." + table_entry.name)
+	        .Set(error_key::kTable,
+	             table_entry.ParentSchema().name.GetIdentifierName() + "." + table_entry.name.GetIdentifierName())
 	        .Set(error_key::kOperation, "INSERT"),
 	    StringUtil::Format("Multi-branch VGI table '%s.%s' is read-only — no branch declared writable=true. "
 	                       "INSERT is not supported. (Set writable=true on exactly one branch in the worker's "
 	                       "ScanBranchesResult to enable INSERT routing to that arm.)",
-	                       table_entry.ParentSchema().name, table_entry.name));
+	                       table_entry.ParentSchema().name.GetIdentifierName(), table_entry.name.GetIdentifierName()));
 }
 
 // UPDATE/DELETE/MERGE always refuse on multi-branch tables, regardless of
@@ -432,8 +467,7 @@ static std::optional<std::string> RefuseInsertIfMultiBranchUnwritable(ClientCont
 // conservative answer until concrete customer requirements arrive.
 // Short-circuits on the cheap multi-branch hint to avoid an RPC on every
 // write to a single-branch VGI table.
-static void RefuseUpdateDeleteIfMultiBranch(ClientContext &context, VgiTableEntry &table_entry,
-                                             const char *operation) {
+static void RefuseUpdateDeleteIfMultiBranch(ClientContext &context, VgiTableEntry &table_entry, const char *operation) {
 	if (table_entry.IsKnownSingleBranchNoAT()) {
 		return; // cheap path: no RPC, no multi-branch refusal applies
 	}
@@ -441,18 +475,19 @@ static void RefuseUpdateDeleteIfMultiBranch(ClientContext &context, VgiTableEntr
 	if (branches_result.branches.size() <= 1) {
 		return; // single-branch path, unchanged (hint now populated)
 	}
-	throw BinderException(
-	    ErrorInfo(error_subtype::kUnsupported)
-	        .Set(error_key::kTable, table_entry.ParentSchema().name + "." + table_entry.name)
-	        .Set(error_key::kOperation, operation),
-	    StringUtil::Format("%s is not supported on multi-branch VGI table '%s.%s' (%d branches). "
-	                       "Issue the %s directly against the writable arm's underlying VGI table "
-	                       "(declare it as a single-branch VGI table for write access). "
-	                       "(UPDATE/DELETE/MERGE on multi-branch tables is not supported pending "
-	                       "concrete customer requirements for cross-arm semantics — see "
-	                       "docs/multi_branch.md.)",
-	                       operation, table_entry.ParentSchema().name, table_entry.name,
-	                       static_cast<int>(branches_result.branches.size()), operation));
+	throw BinderException(ErrorInfo(error_subtype::kUnsupported)
+	                          .Set(error_key::kTable, table_entry.ParentSchema().name.GetIdentifierName() + "." +
+	                                                      table_entry.name.GetIdentifierName())
+	                          .Set(error_key::kOperation, operation),
+	                      StringUtil::Format("%s is not supported on multi-branch VGI table '%s.%s' (%d branches). "
+	                                         "Issue the %s directly against the writable arm's underlying VGI table "
+	                                         "(declare it as a single-branch VGI table for write access). "
+	                                         "(UPDATE/DELETE/MERGE on multi-branch tables is not supported pending "
+	                                         "concrete customer requirements for cross-arm semantics — see "
+	                                         "docs/multi_branch.md.)",
+	                                         operation, table_entry.ParentSchema().name.GetIdentifierName(),
+	                                         table_entry.name.GetIdentifierName(),
+	                                         static_cast<int>(branches_result.branches.size()), operation));
 }
 
 unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext &context) const {
@@ -480,14 +515,11 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	auto writable_branch_function_name = RefuseInsertIfMultiBranchUnwritable(context, *table);
 
 	auto &vgi_tx = VgiTransaction::Get(context, table->GetCatalog());
-	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
-	auto write_func = ResolveWriteFunction(
-	    context, *table, "insert", table->GetTableInfo().insert_function,
-	    [&]() {
-		    return InvokeCatalogTableInsertFunctionGet(rpc_ctx, table->GetTableInfo().schema_name,
-		                                                table->GetTableInfo().name, context,
-		                                                writable_branch_function_name);
-	    });
+	CatalogRpcContext rpc_ctx {params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	auto write_func = ResolveWriteFunction(context, *table, "insert", table->GetTableInfo().insert_function, [&]() {
+		return InvokeCatalogTableInsertFunctionGet(rpc_ctx, table->GetTableInfo().schema_name,
+		                                           table->GetTableInfo().name, context, writable_branch_function_name);
+	});
 
 	// Build input schema (table columns minus row_id)
 	auto &table_info = table->GetTableInfo();
@@ -495,15 +527,14 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	// adapter. Value streams carry their physical types, not SQL definitions.
 	auto input_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 	if (table_info.row_id_column >= 0) {
-		auto fields = input_schema->fields();
-		fields.erase(fields.begin() + table_info.row_id_column);
-		input_schema = arrow::schema(fields);
+		// A fresh schema of the remaining fields (no schema-level metadata).
+		input_schema = input_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 	}
 
 	// Build conflict target column names from column IDs
 	vector<string> conflict_columns;
 	for (auto col_id : on_conflict_filter) {
-		conflict_columns.push_back(table->GetColumns().GetColumn(PhysicalIndex(col_id)).Name());
+		conflict_columns.push_back(table->GetColumns().GetColumn(PhysicalIndex(col_id)).Name().GetIdentifierName());
 	}
 
 	auto write_options = BuildWriteOptions(return_chunk, action_type, conflict_columns);
@@ -515,12 +546,11 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 		// user-column schema (sans rowid). Same shape used by GetLocalSinkState.
 		gstate->expected_returning_schema = input_schema;
 	}
-	gstate->has_finalize =
-	    WriteFunctionHasFinalize(context, table->GetCatalog(), table->GetTableInfo().schema_name,
-	                             write_func.function_name);
+	gstate->has_finalize = WriteFunctionHasFinalize(context, table->GetCatalog(), table->GetTableInfo().schema_name,
+	                                                write_func.function_name);
 	{
 		auto setup = SetupWriteConnection(context, *table, write_func, input_schema, write_options,
-		                                   vgi_tx.GetTransactionOpaqueData());
+		                                  vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
 	}
@@ -536,14 +566,12 @@ unique_ptr<LocalSinkState> VgiPhysicalInsert::GetLocalSinkState(ExecutionContext
 		auto &table_info = insert_table->GetTableInfo();
 		auto response_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 		if (table_info.row_id_column >= 0) {
-			auto fields = response_schema->fields();
-			fields.erase(fields.begin() + table_info.row_id_column);
-			response_schema = arrow::schema(fields);
+			response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 		}
 		return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 	}
 	// CTAS: use a minimal schema — RETURNING is never used for CTAS
-	auto empty_schema = arrow::schema({});
+	auto empty_schema = VgiSchema::Empty();
 	return make_uniq<VgiWriteLocalSinkState>(context.client, empty_schema, GetTypes());
 }
 
@@ -569,8 +597,10 @@ SinkResultType VgiPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chu
 				D_ASSERT(NumericCast<idx_t>(response->num_rows()) <= chunk.size());
 				D_ASSERT(NumericCast<idx_t>(response->num_rows()) <= STANDARD_VECTOR_SIZE);
 
-				ValidateReturningSchema(gstate.expected_returning_schema, response->schema(), "INSERT",
-				                         insert_table ? insert_table->name : create_info->base->Cast<CreateTableInfo>().table);
+				ValidateReturningSchema(
+				    gstate.expected_returning_schema, response->schema(), "INSERT",
+				    insert_table ? insert_table->name.GetIdentifierName()
+				                 : create_info->base->Cast<CreateTableInfo>().GetTableName().GetIdentifierName());
 
 				auto &lstate = input.local_state.Cast<VgiWriteLocalSinkState>();
 
@@ -593,7 +623,7 @@ SinkResultType VgiPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chu
 }
 
 SinkFinalizeType VgiPhysicalInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-                                              OperatorSinkFinalizeInput &input) const {
+                                             OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
 	if (gstate.connection) {
 		auto finalize_count = FinalizeWriteConnection(gstate);
@@ -608,7 +638,7 @@ unique_ptr<GlobalSourceState> VgiPhysicalInsert::GetGlobalSourceState(ClientCont
 }
 
 SourceResultType VgiPhysicalInsert::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-                                                     OperatorSourceInput &input) const {
+                                                    OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<VgiWriteGlobalState>();
 	auto &source_state = input.global_state.Cast<VgiWriteSourceState>();
 	return WriteGetDataInternal(gstate, source_state, chunk, return_chunk);
@@ -618,21 +648,23 @@ SourceResultType VgiPhysicalInsert::GetDataInternal(ExecutionContext &context, D
 // DELETE Implementation
 // ============================================================================
 
-VgiPhysicalDelete::VgiPhysicalDelete(PhysicalPlan &plan, LogicalDelete &op, VgiTableEntry &table_p,
-                                     bool return_chunk_p, idx_t rowid_index_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
-      return_chunk(return_chunk_p), rowid_index(rowid_index_p) {
+VgiPhysicalDelete::VgiPhysicalDelete(PhysicalPlan &plan, LogicalDelete &op, VgiTableEntry &table_p, bool return_chunk_p,
+                                     idx_t rowid_index_p)
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
+                       op.estimated_cardinality),
+      table(table_p), return_chunk(return_chunk_p), rowid_index(rowid_index_p) {
 }
 
 VgiPhysicalDelete::VgiPhysicalDelete(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
                                      bool return_chunk_p, idx_t rowid_index_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
-      return_chunk(return_chunk_p), rowid_index(rowid_index_p) {
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
+                       op.estimated_cardinality),
+      table(table_p), return_chunk(return_chunk_p), rowid_index(rowid_index_p) {
 }
 
 InsertionOrderPreservingMap<string> VgiPhysicalDelete::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Table"] = table.name;
+	result["Table"] = table.name.GetIdentifierName();
 	return result;
 }
 
@@ -644,18 +676,15 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	RefuseUpdateDeleteIfMultiBranch(context, const_cast<VgiTableEntry &>(table), "DELETE");
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
-	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
-	auto write_func = ResolveWriteFunction(
-	    context, table, "delete", table.GetTableInfo().delete_function,
-	    [&]() {
-		    return InvokeCatalogTableDeleteFunctionGet(rpc_ctx, table.GetTableInfo().schema_name,
-		                                                table.GetTableInfo().name, context);
-	    });
+	CatalogRpcContext rpc_ctx {params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	auto write_func = ResolveWriteFunction(context, table, "delete", table.GetTableInfo().delete_function, [&]() {
+		return InvokeCatalogTableDeleteFunctionGet(rpc_ctx, table.GetTableInfo().schema_name, table.GetTableInfo().name,
+		                                           context);
+	});
 
 	auto &table_info = table.GetTableInfo();
 	auto value_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
-	auto rowid_field = value_schema->field(table_info.row_id_column);
-	auto input_schema = arrow::schema({rowid_field});
+	auto input_schema = value_schema->Select({table_info.row_id_column})->WithMetadata(VgiMetadata());
 
 	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
 
@@ -666,18 +695,15 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 		// schema (sans rowid). Same shape used by GetLocalSinkState below.
 		auto response_schema = value_schema;
 		if (table_info.row_id_column >= 0) {
-			auto fields = response_schema->fields();
-			fields.erase(fields.begin() + table_info.row_id_column);
-			response_schema = arrow::schema(fields);
+			response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 		}
 		gstate->expected_returning_schema = response_schema;
 	}
-	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(),
-	                                                 table.GetTableInfo().schema_name,
-	                                                 write_func.function_name);
+	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(), table.GetTableInfo().schema_name,
+	                                                write_func.function_name);
 	{
 		auto setup = SetupWriteConnection(context, table, write_func, input_schema, write_options,
-		                                   vgi_tx.GetTransactionOpaqueData());
+		                                  vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
 	}
@@ -689,9 +715,7 @@ unique_ptr<LocalSinkState> VgiPhysicalDelete::GetLocalSinkState(ExecutionContext
 	auto &table_info = table.GetTableInfo();
 	auto response_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 	if (table_info.row_id_column >= 0) {
-		auto fields = response_schema->fields();
-		fields.erase(fields.begin() + table_info.row_id_column);
-		response_schema = arrow::schema(fields);
+		response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 	}
 	return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 }
@@ -713,7 +737,8 @@ SinkResultType VgiPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chu
 		auto response = gstate.connection->ReadDataBatch();
 		if (response && response->num_rows() > 0) {
 			if (gstate.return_chunk) {
-				ValidateReturningSchema(gstate.expected_returning_schema, response->schema(), "DELETE", table.name);
+				ValidateReturningSchema(gstate.expected_returning_schema, response->schema(), "DELETE",
+				                        table.name.GetIdentifierName());
 				auto &lstate = input.local_state.Cast<VgiWriteLocalSinkState>();
 				LoadResponseBatch(lstate.arrow_state, response);
 				lstate.returning_chunk.Reset();
@@ -732,7 +757,7 @@ SinkResultType VgiPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chu
 }
 
 SinkFinalizeType VgiPhysicalDelete::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-                                              OperatorSinkFinalizeInput &input) const {
+                                             OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
 	auto finalize_count = FinalizeWriteConnection(gstate);
 	D_ASSERT(!gstate.return_chunk || finalize_count == 0);
@@ -745,7 +770,7 @@ unique_ptr<GlobalSourceState> VgiPhysicalDelete::GetGlobalSourceState(ClientCont
 }
 
 SourceResultType VgiPhysicalDelete::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-                                                     OperatorSourceInput &input) const {
+                                                    OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<VgiWriteGlobalState>();
 	auto &source_state = input.global_state.Cast<VgiWriteSourceState>();
 	return WriteGetDataInternal(gstate, source_state, chunk, return_chunk);
@@ -755,10 +780,10 @@ SourceResultType VgiPhysicalDelete::GetDataInternal(ExecutionContext &context, D
 // UPDATE Implementation
 // ============================================================================
 
-VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalUpdate &op, VgiTableEntry &table_p,
-                                     bool return_chunk_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
-      return_chunk(return_chunk_p), columns(op.columns) {
+VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalUpdate &op, VgiTableEntry &table_p, bool return_chunk_p)
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
+                       op.estimated_cardinality),
+      table(table_p), return_chunk(return_chunk_p), columns(op.columns) {
 	for (auto &expr : op.expressions) {
 		expressions.push_back(expr->Copy());
 	}
@@ -767,13 +792,15 @@ VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalUpdate &op, VgiT
 VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
                                      bool return_chunk_p, vector<PhysicalIndex> columns_p,
                                      vector<unique_ptr<Expression>> expressions_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
-      return_chunk(return_chunk_p), columns(std::move(columns_p)), expressions(std::move(expressions_p)) {
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
+                       op.estimated_cardinality),
+      table(table_p), return_chunk(return_chunk_p), columns(std::move(columns_p)),
+      expressions(std::move(expressions_p)) {
 }
 
 InsertionOrderPreservingMap<string> VgiPhysicalUpdate::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Table"] = table.name;
+	result["Table"] = table.name.GetIdentifierName();
 	return result;
 }
 
@@ -785,13 +812,11 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	RefuseUpdateDeleteIfMultiBranch(context, const_cast<VgiTableEntry &>(table), "UPDATE");
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
-	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
-	auto write_func = ResolveWriteFunction(
-	    context, table, "update", table.GetTableInfo().update_function,
-	    [&]() {
-		    return InvokeCatalogTableUpdateFunctionGet(rpc_ctx, table.GetTableInfo().schema_name,
-		                                                table.GetTableInfo().name, context);
-	    });
+	CatalogRpcContext rpc_ctx {params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	auto write_func = ResolveWriteFunction(context, table, "update", table.GetTableInfo().update_function, [&]() {
+		return InvokeCatalogTableUpdateFunctionGet(rpc_ctx, table.GetTableInfo().schema_name, table.GetTableInfo().name,
+		                                           context);
+	});
 
 	auto &table_info = table.GetTableInfo();
 	auto &table_columns = table.GetColumns();
@@ -803,21 +828,18 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	// silently widen the worker's contract. The C++
 	// ReconcileBatchToSchema helper reshapes incoming batches to match
 	// this declared schema before they hit the IPC writer.
-	std::vector<std::shared_ptr<arrow::Field>> send_fields;
+	VgiSchemaPtr input_schema = VgiSchema::Empty();
 	for (auto &col_idx : columns) {
 		auto &col = table_columns.GetColumn(col_idx);
-		auto declared_idx = value_schema->GetFieldIndex(col.Name());
+		auto declared_idx = value_schema->GetFieldIndex(col.Name().GetIdentifierName());
 		if (declared_idx >= 0) {
-			send_fields.push_back(value_schema->field(declared_idx));
+			input_schema = input_schema->AddField(input_schema->num_fields(), value_schema->field(declared_idx));
 		} else {
 			auto arrow_type = BuildArrowSchemaFromDuckDB(context, {col.Type()}, {col.Name()});
-			send_fields.push_back(arrow_type->field(0));
+			input_schema = input_schema->AddField(input_schema->num_fields(), arrow_type->field(0));
 		}
 	}
-	auto rowid_field = value_schema->field(table_info.row_id_column);
-	send_fields.push_back(rowid_field);
-
-	auto input_schema = arrow::schema(send_fields);
+	input_schema = input_schema->AddField(input_schema->num_fields(), value_schema->field(table_info.row_id_column));
 
 	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
 
@@ -828,18 +850,15 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 		// schema (sans rowid). Same shape used by GetLocalSinkState below.
 		auto response_schema = value_schema;
 		if (table_info.row_id_column >= 0) {
-			auto fields = response_schema->fields();
-			fields.erase(fields.begin() + table_info.row_id_column);
-			response_schema = arrow::schema(fields);
+			response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 		}
 		gstate->expected_returning_schema = response_schema;
 	}
-	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(),
-	                                                 table.GetTableInfo().schema_name,
-	                                                 write_func.function_name);
+	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(), table.GetTableInfo().schema_name,
+	                                                write_func.function_name);
 	{
 		auto setup = SetupWriteConnection(context, table, write_func, input_schema, write_options,
-		                                   vgi_tx.GetTransactionOpaqueData());
+		                                  vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
 	}
@@ -851,9 +870,7 @@ unique_ptr<LocalSinkState> VgiPhysicalUpdate::GetLocalSinkState(ExecutionContext
 	auto &table_info = table.GetTableInfo();
 	auto response_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 	if (table_info.row_id_column >= 0) {
-		auto fields = response_schema->fields();
-		fields.erase(fields.begin() + table_info.row_id_column);
-		response_schema = arrow::schema(fields);
+		response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 	}
 	return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 }
@@ -887,7 +904,8 @@ SinkResultType VgiPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chu
 		auto response = gstate.connection->ReadDataBatch();
 		if (response && response->num_rows() > 0) {
 			if (gstate.return_chunk) {
-				ValidateReturningSchema(gstate.expected_returning_schema, response->schema(), "UPDATE", table.name);
+				ValidateReturningSchema(gstate.expected_returning_schema, response->schema(), "UPDATE",
+				                        table.name.GetIdentifierName());
 				auto &lstate = input.local_state.Cast<VgiWriteLocalSinkState>();
 				LoadResponseBatch(lstate.arrow_state, response);
 				lstate.returning_chunk.Reset();
@@ -906,7 +924,7 @@ SinkResultType VgiPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chu
 }
 
 SinkFinalizeType VgiPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-                                              OperatorSinkFinalizeInput &input) const {
+                                             OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
 	auto finalize_count = FinalizeWriteConnection(gstate);
 	D_ASSERT(!gstate.return_chunk || finalize_count == 0);
@@ -919,7 +937,7 @@ unique_ptr<GlobalSourceState> VgiPhysicalUpdate::GetGlobalSourceState(ClientCont
 }
 
 SourceResultType VgiPhysicalUpdate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-                                                     OperatorSourceInput &input) const {
+                                                    OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<VgiWriteGlobalState>();
 	auto &source_state = input.global_state.Cast<VgiWriteSourceState>();
 	return WriteGetDataInternal(gstate, source_state, chunk, return_chunk);

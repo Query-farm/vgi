@@ -1,5 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "catch.hpp"
+#include "../support/vgi_contract_fixtures.hpp"
 #include "duckdb.hpp"
 #include "core_functions_extension.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -11,6 +12,8 @@
 #include <cstdlib>
 
 using namespace duckdb;
+using namespace duckdb::vgi;
+using namespace duckdb::vgi_test;
 
 namespace {
 void Execute(Connection &con, const string &sql) {
@@ -20,11 +23,11 @@ void Execute(Connection &con, const string &sql) {
 	REQUIRE_FALSE(result->HasError());
 }
 
-void CreateSchema(Connection &con, const string &catalog, const string &name, const Value &comment,
-                  const string &owner, OnCreateConflict conflict = OnCreateConflict::ERROR_ON_CONFLICT) {
+void CreateSchema(Connection &con, const string &catalog, const string &name, const Value &comment, const string &owner,
+                  OnCreateConflict conflict = OnCreateConflict::ERROR_ON_CONFLICT) {
 	auto info = make_uniq<CreateSchemaInfo>();
-	info->catalog = catalog;
-	info->schema = name;
+	info->SetCatalog(Identifier(catalog));
+	info->SetSchema(Identifier(name));
 	info->comment = comment;
 	info->tags["owner"] = owner;
 	info->tags["empty"] = "";
@@ -44,59 +47,57 @@ void CheckMetadata(Connection &con) {
 	INFO((result->HasError() ? result->GetError() : "ok"));
 	REQUIRE_FALSE(result->HasError());
 	REQUIRE(result->RowCount() == 3);
-	REQUIRE(result->GetValue(0, 0).ToString() == "no_comment");
-	REQUIRE(result->GetValue(1, 0).IsNull());
-	REQUIRE(result->GetValue(0, 1).ToString() == "with\"quote");
-	REQUIRE(result->GetValue(1, 1).ToString() == "kept");
-	REQUIRE(result->GetValue(0, 2).ToString() == "with.dot");
-	REQUIRE_FALSE(result->GetValue(1, 2).IsNull());
-	REQUIRE(result->GetValue(1, 2).ToString().empty());
+	REQUIRE(result->Collection().GetValue(0, 0).ToString() == "no_comment");
+	REQUIRE(result->Collection().GetValue(1, 0).IsNull());
+	REQUIRE(result->Collection().GetValue(0, 1).ToString() == "with\"quote");
+	REQUIRE(result->Collection().GetValue(1, 1).ToString() == "kept");
+	REQUIRE(result->Collection().GetValue(0, 2).ToString() == "with.dot");
+	REQUIRE_FALSE(result->Collection().GetValue(1, 2).IsNull());
+	REQUIRE(result->Collection().GetValue(1, 2).ToString().empty());
 	for (idx_t row = 0; row < 3; ++row) {
-		REQUIRE(result->GetValue(2, row).ToString() == "one");
-		REQUIRE_FALSE(result->GetValue(3, row).IsNull());
-		REQUIRE(result->GetValue(3, row).ToString().empty());
-		REQUIRE(result->GetValue(4, row).ToString() == "literal");
+		REQUIRE(result->Collection().GetValue(2, row).ToString() == "one");
+		REQUIRE_FALSE(result->Collection().GetValue(3, row).IsNull());
+		REQUIRE(result->Collection().GetValue(3, row).ToString().empty());
+		REQUIRE(result->Collection().GetValue(4, row).ToString() == "literal");
 	}
 }
 } // namespace
 
 TEST_CASE("Unqualified logical types fail before Arrow storage conversion", "[wire-contract-guards]") {
-	auto tuple_metadata = arrow::key_value_metadata({"vgi.logical_type.v1"}, {"tuple"});
-	auto tuple = arrow::field("value", arrow::struct_({arrow::field("element1", arrow::int64())}), true,
-	                          tuple_metadata);
-	for (auto type : {tuple->type(), arrow::list(tuple), arrow::dictionary(arrow::int32(), arrow::struct_({tuple}))}) {
+	auto plain_tuple = type::Struct({type::Int64().Named("element1")});
+	auto tuple = plain_tuple.Named("value").WithMetadata(Metadata({"vgi.logical_type.v1"}, {"tuple"}));
+	for (const auto &field : {tuple, type::List(tuple).Named("nested"),
+	                          type::Dictionary(type::Int32(), type::Struct({tuple})).Named("nested")}) {
 		ArrowSchemaWrapper exported;
-		auto field = type == tuple->type() ? tuple : arrow::field("nested", type);
-		CHECK_THROWS_AS(vgi::ExportSchema(arrow::schema({field}), exported), NotImplementedException);
+		CHECK_THROWS_AS(ExportSchema(MakeSchema({field}), exported), NotImplementedException);
 	}
 	for (const auto &key : {"vgi.logical_type.v1", "vgi.logical_type.v99"}) {
 		ArrowSchemaWrapper exported;
-		auto field = arrow::field("value", arrow::binary(), true, arrow::key_value_metadata({key}, {"variant"}));
-		CHECK_THROWS_AS(vgi::ExportSchema(arrow::schema({field}), exported), NotImplementedException);
+		auto field = type::Binary().Named("value").WithMetadata(Metadata({key}, {"variant"}));
+		CHECK_THROWS_AS(ExportSchema(MakeSchema({field}), exported), NotImplementedException);
 	}
 	ArrowSchemaWrapper parquet_variant;
-	auto variant = arrow::field("value", arrow::struct_({arrow::field("metadata", arrow::binary(), false),
-	                                                   arrow::field("value", arrow::binary())}),
-	                            true, arrow::key_value_metadata({"ARROW:extension:name"}, {"arrow.parquet.variant"}));
-	CHECK_THROWS_AS(vgi::ExportSchema(arrow::schema({variant}), parquet_variant), NotImplementedException);
+	auto variant = type::Struct({type::Binary().Named("metadata", false), type::Binary().Named("value")})
+	                   .Named("value")
+	                   .WithMetadata(Metadata({"ARROW:extension:name"}, {"arrow.parquet.variant"}));
+	CHECK_THROWS_AS(ExportSchema(MakeSchema({variant}), parquet_variant), NotImplementedException);
 	ArrowSchemaWrapper ordinary;
-	CHECK_NOTHROW(vgi::ExportSchema(arrow::schema({arrow::field("plain", tuple->type())}), ordinary));
+	CHECK_NOTHROW(ExportSchema(MakeSchema({plain_tuple.Named("plain")}), ordinary));
 }
 
 TEST_CASE("Unqualified column expressions fail before Arrow schema conversion", "[wire-contract-guards]") {
 	for (const auto &key : {"vgi.column.default.v1", "vgi.column.generated.v1", "vgi.column.generation.v1",
 	                        "vgi.column.default.v99", "vgi.column.generated.v99", "vgi.column.generation.v99"}) {
-		auto field = arrow::field("value", arrow::int64(), true, arrow::key_value_metadata({key}, {"opaque"}));
-		for (const auto &candidate :
-		     {field, arrow::field("nested", arrow::struct_({field})), arrow::field("items", arrow::list(field)),
-		      arrow::field("encoded", arrow::dictionary(arrow::int32(), arrow::struct_({field})))}) {
+		auto field = type::Int64().Named("value").WithMetadata(Metadata({key}, {"opaque"}));
+		for (const auto &candidate : {field, type::Struct({field}).Named("nested"), type::List(field).Named("items"),
+		                              type::Dictionary(type::Int32(), type::Struct({field})).Named("encoded")}) {
 			ArrowSchemaWrapper exported;
-			CHECK_THROWS_AS(vgi::ExportSchema(arrow::schema({candidate}), exported), NotImplementedException);
+			CHECK_THROWS_AS(ExportSchema(MakeSchema({candidate}), exported), NotImplementedException);
 		}
 	}
 	ArrowSchemaWrapper legacy;
-	auto field = arrow::field("value", arrow::int64(), true, arrow::key_value_metadata({"default"}, {"7"}));
-	CHECK_NOTHROW(vgi::ExportSchema(arrow::schema({field}), legacy));
+	auto field = type::Int64().Named("value").WithMetadata(Metadata({"default"}, {"7"}));
+	CHECK_NOTHROW(ExportSchema(MakeSchema({field}), legacy));
 }
 
 TEST_CASE("Schema create and copy preserve metadata through both cache paths", "[catalog-metadata]") {
@@ -107,8 +108,8 @@ TEST_CASE("Schema create and copy preserve metadata through both cache paths", "
 	db.LoadStaticExtension<CoreFunctionsExtension>();
 	db.LoadStaticExtension<VgiExtension>();
 	Connection con(db);
-	Execute(con, "ATTACH 'contents_reval' AS metadata (TYPE vgi, LOCATION '" +
-	                 StringUtil::Replace(worker, "'", "''") + "')");
+	Execute(con, "ATTACH 'contents_reval' AS metadata (TYPE vgi, LOCATION '" + StringUtil::Replace(worker, "'", "''") +
+	                 "')");
 	Execute(con, "ATTACH ':memory:' AS source");
 	// 1.5 rejects COMMENT ON SCHEMA in SQL. CreateInfo already carries both
 	// metadata fields, including through COPY FROM DATABASE's GetInfo path.

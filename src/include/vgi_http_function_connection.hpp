@@ -1,13 +1,14 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "duckdb/main/client_context.hpp"
 
@@ -64,7 +65,7 @@ public:
 	BindResult PerformBindRpc() override;
 	// HTTP has no spawn step; this is a no-op satisfying the interface.
 	void EnsureWorkerSpawned() override {}
-	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
+	void SetInputSchema(const VgiSchemaPtr &input_schema) override;
 	void SetSchemaName(const std::string &schema_name) override {
 		schema_name_ = schema_name;
 	}
@@ -86,13 +87,13 @@ public:
 	void SetCopyToContext(const CopyToBindContext &copy_to) override {
 		copy_to_ = copy_to;
 	}
-	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
+	void UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) override;
 
 	// Init RPC. bind_result must come from a prior PerformBindRpc.
 	InitResult PerformInit(const BindResult &bind_result,
 	                       const std::vector<int32_t> &projection_ids = {},
-	                       std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
-	                       std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
+	                       VgiBufferPtr pushdown_filters = nullptr,
+	                       std::vector<VgiBufferPtr> join_keys = {},
 	                       const std::string &phase = "",
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
@@ -103,9 +104,9 @@ public:
 
 	// Phase 3: Data exchange
 	void OpenInputWriter() override;
-	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) override;
+	void WriteInputBatch(const VgiBatchPtr &batch) override;
 	void CloseInputWriter() override;
-	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override;
+	VgiBatchPtr ReadDataBatch() override;
 	void CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) override;
 
 
@@ -113,7 +114,7 @@ public:
 	std::vector<uint8_t>
 	RpcTableBufferingProcess(const std::string &function_name,
 	                           const std::vector<uint8_t> &execution_id,
-	                           const std::shared_ptr<arrow::RecordBatch> &input_batch,
+	                           const VgiBatchPtr &input_batch,
 	                           std::optional<int64_t> batch_index = std::nullopt) override;
 	std::vector<std::vector<uint8_t>>
 	RpcTableBufferingCombine(const std::string &function_name,
@@ -173,8 +174,8 @@ private:
 	std::string base_url_;  // e.g. "http://localhost:8000/vgi"
 	std::string function_name_;
 	std::string function_type_;
-	std::shared_ptr<arrow::DataType> arguments_type_;
-	std::shared_ptr<arrow::Array> arguments_array_;
+	//! One-row {args: struct} batch (ArrowArguments::batch); null when there are none.
+	VgiBatchPtr arguments_batch_;
 	std::vector<uint8_t> attach_opaque_data_;
 	std::vector<uint8_t> transaction_opaque_data_;
 	std::vector<uint8_t> global_execution_id_;
@@ -204,10 +205,10 @@ private:
 	// server returns no batches: we synthesize a 0-row batch with this
 	// schema rather than nullptr, so downstream callers see an empty result
 	// instead of EOS. Not bind state — just streaming-shape data.
-	std::shared_ptr<arrow::Schema> cached_output_schema_;
+	VgiSchemaPtr cached_output_schema_;
 
 	// Input schema for exchange mode
-	std::shared_ptr<arrow::Schema> input_schema_;
+	VgiSchemaPtr input_schema_;
 
 	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
 	std::string at_unit_;
@@ -270,7 +271,7 @@ private:
 	// Raw little-endian int32[] from the most recent data batch's
 	// ``vgi_rpc.parent_row#b64`` metadata (batched-lateral provenance). Empty absent.
 	std::string last_parent_row_bytes_;
-	std::vector<std::shared_ptr<arrow::RecordBatch>> buffered_batches_;
+	std::vector<VgiBatchPtr> buffered_batches_;
 	// Parallel to ``buffered_batches_``: ``vgi_batch_index`` parsed off
 	// each batch's custom_metadata at buffer time (or INVALID if absent).
 	// We must capture this here because ``ReadDataBatch`` later returns
@@ -297,7 +298,7 @@ private:
 	bool is_producer_mode_ = false;
 
 	// Exchange mode pending input
-	std::shared_ptr<arrow::RecordBatch> pending_input_;
+	VgiBatchPtr pending_input_;
 	// pending_input_ is a continuation tick: its request carries vgi.status: CONTINUE.
 	bool pending_tick_ = false;
 	// Whether the most recent exchange reply said vgi.status: HAVE_MORE_OUTPUT.
@@ -311,19 +312,19 @@ private:
 	TickFilterCursor tick_filter_cursor_;
 
 	// Helper: serialize a batch with optional stream_state token as metadata
-	std::vector<uint8_t> SerializeBatchWithState(const std::shared_ptr<arrow::RecordBatch> &batch,
-	                                              const std::shared_ptr<arrow::Schema> &schema);
+	std::vector<uint8_t> SerializeBatchWithState(const VgiBatchPtr &batch,
+	                                              const VgiSchemaPtr &schema);
 
 	// Helper: extract stream_state from batch metadata, strip it, return the cleaned batch
-	std::shared_ptr<arrow::RecordBatch> ExtractStreamState(
-	    const std::shared_ptr<arrow::RecordBatch> &batch,
-	    const std::shared_ptr<arrow::KeyValueMetadata> &metadata);
+	VgiBatchPtr ExtractStreamState(
+	    const VgiBatchPtr &batch,
+	    const VgiMetadataPtr &metadata);
 
 	// Helper: read all data batches from an owning IPC stream buffer (starting
 	// at offset). Batches zero-copy reference ``owned`` (kept alive by their
 	// refcounted buffer slices), so the caller hands over ownership and the
 	// payload is materialized exactly once.
-	void BufferDataBatches(std::shared_ptr<arrow::Buffer> owned, size_t offset = 0);
+	void BufferDataBatches(VgiBufferPtr owned, size_t offset = 0);
 };
 
 } // namespace vgi

@@ -48,6 +48,8 @@ done
 
 rc=0
 declare -a FAILED=()
+ARROW_REFERENCE_ROOT=""
+trap 'if [ -n "$ARROW_REFERENCE_ROOT" ]; then rm -rf "$ARROW_REFERENCE_ROOT"; fi' EXIT
 
 run_leg() {
     local name="$1"; shift
@@ -67,8 +69,28 @@ run_leg() {
 # ---------------------------------------------------------------------------
 if [ "$CPP_ONLY" -eq 0 ]; then
     if [ -d "$VGI_PYTHON_DIR" ]; then
-        run_leg "codegen drift (all SDKs)" \
+        run_leg "codegen drift (native Nanoarrow)" \
+            bash "$VGI_DIR/scripts/regen_protocol.sh" --check
+
+        # The existing cross-language schema parser reads Arrow C++ syntax.
+        # Give it a rendered reference, while the strict check above validates
+        # every checked-in native artifact against the Nanoarrow backend.
+        ARROW_REFERENCE_ROOT="$(mktemp -d)"
+        run_leg "Arrow reference for cross-language schema checks" \
+            uv run --project "$VGI_PYTHON_DIR" python "$VGI_PYTHON_DIR/scripts/regen_generated.py" \
+                --only vgi --root "vgi=$ARROW_REFERENCE_ROOT" --require-all
+        export VGI_GENERATED_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_protocol_schemas.hpp"
+        export VGI_REQUEST_BUILDERS_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_request_builders.hpp"
+        export VGI_GENERATED_CONSTANTS_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_protocol_constants.hpp"
+        export VGI_GENERATED_PROTOCOL_VERSION_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_protocol_version.hpp"
+        export VGI_GENERATED_PROTOCOL_NAMES_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_protocol_names.hpp"
+        export VGI_SECRET_VERSION_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_secret_protocol_version.hpp"
+        export VGI_SECRET_SCHEMAS_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_secret_protocol_schemas.hpp"
+        export VGI_SECRET_BUILDERS_HPP="$ARROW_REFERENCE_ROOT/src/generated/vgi_secret_request_builders.hpp"
+
+        run_leg "codegen drift (SDKs) and cross-language schema semantics" \
             uv run --project "$VGI_PYTHON_DIR" pytest -q -p no:cacheprovider \
+                "$VGI_PYTHON_DIR/tests/test_generated_cpp_nanoarrow.py" \
                 "$VGI_PYTHON_DIR/tests/test_generated_cpp_schemas.py" \
                 "$VGI_PYTHON_DIR/tests/test_generated_cpp_request_builders.py" \
                 "$VGI_PYTHON_DIR/tests/test_generated_cpp_constants.py" \
@@ -104,7 +126,7 @@ fi
 # the target rather than about the code — so check the cache and say so plainly.
 # ---------------------------------------------------------------------------
 run_cpp_parity() {
-    local build_dir="$VGI_DIR/build/$BUILD_CONFIG"
+    local build_dir="${VGI_BUILD_DIR:-$VGI_DIR/build/$BUILD_CONFIG}"
     if [ ! -f "$build_dir/CMakeCache.txt" ]; then
         echo "no configured build at $build_dir."
         echo "Build it first:  make unit_test_rust_libs && BUILD_VGI_UNIT_TESTS=1 GEN=ninja make $BUILD_CONFIG"

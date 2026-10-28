@@ -4,8 +4,6 @@
 
 #include <algorithm>
 
-#include <arrow/api.h>
-
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -127,11 +125,11 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 				continue;
 			}
 			const auto previous_score = best.score;
-			const std::string previous_name = best.HasMatch() ? best.GetSecret().GetName() : std::string();
+			const std::string previous_name = best.HasMatch() ? best.GetSecret().GetName().GetIdentifierName() : std::string();
 			SecretEntry entry = MakeEntry(kv.second.secret->Clone(), GetName());
 			best = SelectBestMatch(entry, path, tie_break_offset, best);
 			if (best.HasMatch() &&
-			    (best.score != previous_score || best.GetSecret().GetName() != previous_name)) {
+			    (best.score != previous_score || best.GetSecret().GetName().GetIdentifierName() != previous_name)) {
 				best_entry = &kv.second;
 			}
 		}
@@ -302,7 +300,7 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 			auto provider = wire.provider.empty() ? std::string("orchard") : std::move(wire.provider);
 			// `values` is the one-row RecordBatch (IPC bytes) of typed key→value
 			// columns; absent when the worker shipped no values.
-			std::shared_ptr<arrow::RecordBatch> values_batch;
+			VgiBatchPtr values_batch;
 			if (wire.values && !wire.values->empty()) {
 				values_batch = DeserializeFromIpcBytes(*wire.values);
 			}
@@ -342,7 +340,7 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 std::unique_ptr<const KeyValueSecret>
 VgiRemoteSecretStorage::Synthesize(ClientContext &context, const string &type, const std::string &provider,
                                    const std::string &name, const std::vector<std::string> &scope,
-                                   const std::shared_ptr<arrow::RecordBatch> &values_batch,
+                                   const VgiBatchPtr &values_batch,
                                    const std::vector<std::string> &redact_keys) {
 	vector<string> prefix_paths(scope.begin(), scope.end());
 	if (prefix_paths.empty()) {
@@ -351,7 +349,7 @@ VgiRemoteSecretStorage::Synthesize(ClientContext &context, const string &type, c
 	std::string secret_name = name.empty() ? ("vgi_orchard_" + type) : name;
 	std::string secret_provider = provider.empty() ? std::string("orchard") : provider;
 
-	auto secret = make_uniq<KeyValueSecret>(prefix_paths, type, secret_provider, secret_name);
+	auto secret = make_uniq<KeyValueSecret>(prefix_paths, Identifier(type), Identifier(secret_provider), Identifier(secret_name));
 
 	// Convert the one-row values RecordBatch → DuckDB DataChunk via the Arrow→DuckDB
 	// bridge, then read each column's row-0 cell as a fully-typed Value (string,
@@ -385,12 +383,12 @@ VgiRemoteSecretStorage::Synthesize(ClientContext &context, const string &type, c
 		values_chunk.Verify();
 
 		for (idx_t col_idx = 0; col_idx < col_names.size(); col_idx++) {
-			secret->secret_map[col_names[col_idx]] = values_chunk.GetValue(col_idx, 0);
+			secret->secret_map[Identifier(col_names[col_idx])] = values_chunk.GetValue(col_idx, 0);
 		}
 	}
 
 	for (const auto &rk : redact_keys) {
-		secret->redact_keys.insert(rk);
+		secret->redact_keys.insert(Identifier(rk));
 	}
 	return std::move(secret);
 }
@@ -401,7 +399,7 @@ unique_ptr<SecretEntry> VgiRemoteSecretStorage::GetSecretByName(const string &na
 	const auto now = std::chrono::steady_clock::now();
 	PruneExpiredCachesLocked(now);
 	for (auto &kv : positive_cache_) {
-		if (kv.second.secret->GetName() == name) {
+		if (kv.second.secret->GetName() == Identifier(name)) {
 			kv.second.last_access = now;
 			return make_uniq<SecretEntry>(MakeEntry(kv.second.secret->Clone(), GetName()));
 		}
@@ -430,7 +428,7 @@ unique_ptr<SecretEntry> VgiRemoteSecretStorage::StoreSecret(unique_ptr<const Bas
 	    GetName());
 }
 
-void VgiRemoteSecretStorage::DropSecretByName(const string &name, OnEntryNotFound on_entry_not_found,
+void VgiRemoteSecretStorage::DropSecretByName(const Identifier &name, OnEntryNotFound on_entry_not_found,
                                               optional_ptr<CatalogTransaction> transaction) {
 	// No-op: nothing user-droppable lives here. Must not throw — DROP SECRET and
 	// ambiguity scans call this on every storage.

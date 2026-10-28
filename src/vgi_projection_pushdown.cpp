@@ -20,9 +20,8 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include <arrow/io/memory.h>
-#include <arrow/util/byte_size.h>
-#include <arrow/ipc/reader.h>
+#include "vgi_ipc.hpp"
+#include "nanoarrow/nanoarrow.h"
 #include <set>
 
 namespace duckdb {
@@ -33,40 +32,44 @@ void Require(bool condition, const char *message) {
 	if (!condition)
 		throw IOException("VGI expression projection: %s", message);
 }
-void Record(const std::shared_ptr<arrow::RecordBatch> &batch, const std::shared_ptr<arrow::Schema> &schema) {
+void Record(const VgiBatchPtr &batch, const VgiSchemaPtr &schema) {
 	Require(batch && batch->num_rows() == 1, "expected one record");
 	ValidateVgiQueryResultBatch(batch, schema);
-	Require(arrow::util::TotalBufferSize(*batch) <= MAX_PROJECTION_BYTES, "decoded record exceeds 8 MiB");
+	Require(batch->TotalBufferSize() <= MAX_PROJECTION_BYTES, "decoded record exceeds 8 MiB");
 }
-std::vector<uint8_t> Bytes(const std::shared_ptr<arrow::RecordBatch> &batch, const char *name) {
-	auto array = std::dynamic_pointer_cast<arrow::BinaryArray>(batch->GetColumnByName(name));
-	Require(array && !array->IsNull(0), "required binary field is NULL");
-	auto view = array->GetView(0);
+std::vector<uint8_t> Bytes(const VgiBatchPtr &batch, const char *name) {
+	auto array = batch->GetColumnByName(name);
+	Require(array && array.type().type == NANOARROW_TYPE_BINARY && !array.IsNull(0), "required binary field is NULL");
+	auto view = array.GetView(0);
 	Require(!view.empty() && view.size() <= MAX_PROJECTION_BYTES, "invalid binary record size");
 	return {view.begin(), view.end()};
 }
-std::shared_ptr<arrow::Schema> Schema(const std::vector<uint8_t> &bytes) {
-	arrow::io::BufferReader reader(arrow::Buffer::Wrap(bytes.data(), bytes.size()));
-	arrow::ipc::DictionaryMemo memo;
-	auto result = arrow::ipc::ReadSchema(&reader, &memo);
-	Require(result.ok(), "invalid Arrow schema");
-	auto offset = reader.Tell();
-	Require(offset.ok() && offset.ValueOrDie() >= 0 && offset.ValueOrDie() <= static_cast<int64_t>(bytes.size()),
-	        "invalid Arrow schema offset");
-	// Arrow schema-only streams may include one modern or legacy EOS marker.
+VgiSchemaPtr Schema(const std::vector<uint8_t> &bytes) {
+	auto input = std::make_shared<VgiBufferReader>(VgiBuffer::Wrap(bytes.data(), bytes.size()));
+	std::unique_ptr<VgiIpcReader> reader;
+	try {
+		reader = VgiIpcReader::Open(input);
+	} catch (const std::exception &) {
+		throw IOException("VGI expression projection: invalid Arrow schema");
+	}
+	auto offset = input->position();
+	Require(offset >= 0 && offset <= static_cast<int64_t>(bytes.size()), "invalid Arrow schema offset");
+	// Schema-only streams may include one modern or legacy EOS marker.
 	// No second message, repeated EOS or arbitrary trailing bytes are permitted.
-	auto tail = std::vector<uint8_t>(bytes.begin() + offset.ValueOrDie(), bytes.end());
+	auto tail = std::vector<uint8_t>(bytes.begin() + offset, bytes.end());
 	Require(tail.empty() || tail == std::vector<uint8_t>({255, 255, 255, 255, 0, 0, 0, 0}) ||
 	            tail == std::vector<uint8_t>({0, 0, 0, 0}),
 	        "trailing Arrow schema bytes");
-	return result.ValueOrDie();
+	return reader->schema();
 }
-std::shared_ptr<arrow::RecordBatch> Bind(const std::vector<uint8_t> &bytes) {
+VgiBatchPtr Bind(const std::vector<uint8_t> &bytes) {
 	auto batch = DeserializeVgiQueryRecord(bytes);
 	Record(batch, generated::BindResultSchema());
 	for (auto name : {"lookup_secret_types", "lookup_scopes", "lookup_names"}) {
-		auto list = std::static_pointer_cast<arrow::ListArray>(batch->GetColumnByName(name));
-		Require(list->value_length(0) == 0, "projection bind cannot request secret lookup");
+		auto list = batch->GetColumnByName(name);
+		int64_t begin, end;
+		list.ListRange(0, begin, end);
+		Require(begin == end, "projection bind cannot request secret lookup");
 	}
 	return batch;
 }
@@ -78,7 +81,7 @@ bool SupportedSource(const VgiTableFunctionBindData &data) {
 	       data.table_entry->Cast<VgiTableEntry>().GetTableInfo().required_filters.empty() &&
 	       !data.schema_name.empty() && !data.bind_result.bind_response_bytes.empty();
 }
-void RestrictAcceptedScan(TableFunction &function, VgiTableFunctionBindData &data) {
+void RestrictAcceptedScan(BaseTableFunction &function, VgiTableFunctionBindData &data) {
 	data.supports_splits = false;
 	data.partition_kind = VgiPartitionKind::NotPartitioned;
 	data.partition_column_indices.clear();
@@ -98,7 +101,7 @@ void RestrictAcceptedScan(TableFunction &function, VgiTableFunctionBindData &dat
 	function.late_materialization = false;
 	function.sampling_pushdown = false;
 }
-void Apply(ClientContext &context, VgiTableFunctionBindData &data, TableFunction &function,
+void Apply(ClientContext &context, VgiTableFunctionBindData &data, BaseTableFunction &function,
            const std::vector<uint8_t> &request, const std::vector<uint8_t> &response,
            const ProjectionAcceptance &accepted) {
 	auto parsed = ParseBindResponse(accepted.bind_result);
@@ -142,7 +145,7 @@ private:
 			return;
 		auto &get = child->Cast<LogicalGet>();
 		if (get.function.function != VgiTableFunctionScan || !get.bind_data || !get.children.empty() ||
-		    !get.table_filters.filters.empty() || get.ordinality_idx.IsValid())
+		    get.table_filters.HasFilters() || get.ordinality_idx.IsValid())
 			return;
 		auto &data = get.bind_data->Cast<VgiTableFunctionBindData>();
 		VGI_LOG(input.context, "projection.source",
@@ -159,11 +162,11 @@ private:
 		if (!source || get.returned_types.size() != static_cast<size_t>(source->num_fields()))
 			return;
 		std::set<string> names;
-		for (const auto &field : source->fields()) {
+		for (const auto &name : source->field_names()) {
 			// Until Unicode case-fold identity is shared, non-ASCII names remain local.
-			if (field->name().empty() || field->name().find('\0') != string::npos ||
-			    std::any_of(field->name().begin(), field->name().end(), [](unsigned char c) { return c >= 128; }) ||
-			    !names.insert(StringUtil::Lower(field->name())).second)
+			if (name.empty() || name.find('\0') != string::npos ||
+			    std::any_of(name.begin(), name.end(), [](unsigned char c) { return c >= 128; }) ||
+			    !names.insert(StringUtil::Lower(name)).second)
 				return;
 		}
 		VgiQueryEvaluationContext context;
@@ -175,67 +178,67 @@ private:
 		}
 		std::vector<idx_t> slots;
 		std::vector<std::vector<uint8_t>> expressions;
-		arrow::FieldVector fields;
+		std::vector<VgiField> fields;
 		for (idx_t i = 0; i < projection.expressions.size() && slots.size() < 1024; ++i) {
 			auto &expression = *projection.expressions[i];
 			VGI_LOG(input.context, "projection.expression",
 			        {{"class", std::to_string(static_cast<int>(expression.GetExpressionClass()))},
-			         {"type", expression.return_type.ToString()}});
-			if (expression.GetExpressionClass() != ExpressionClass::BOUND_CAST ||
-			    expression.return_type != LogicalType::BIGINT)
+			         {"type", expression.GetReturnType().ToString()}});
+			if (!BoundCastExpression::IsCast(expression) || expression.GetReturnType() != LogicalType::BIGINT)
 				continue;
-			auto &cast = expression.Cast<BoundCastExpression>();
-			if (cast.try_cast || cast.child->return_type != LogicalType::INTEGER ||
-			    cast.child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF)
+			auto &cast = expression.Cast<BoundFunctionExpression>();
+			if (!BoundCastExpression::HasValidBindData(cast) || BoundCastExpression::IsTryCast(cast))
 				continue;
-			auto builtin = BoundCastExpression::AddDefaultCastToType(cast.child->Copy(), LogicalType::BIGINT);
-			if (builtin->Cast<BoundCastExpression>().bound_cast.function != cast.bound_cast.function ||
-			    cast.bound_cast.cast_data || cast.bound_cast.init_local_state) {
-				VGI_LOG(
-				    input.context, "projection.decline",
-				    {{"reason", "cast_implementation"},
-				     {"same_function",
-				      builtin->Cast<BoundCastExpression>().bound_cast.function == cast.bound_cast.function ? "true"
-				                                                                                           : "false"},
-				     {"cast_data", cast.bound_cast.cast_data ? "true" : "false"},
-				     {"local_state", cast.bound_cast.init_local_state ? "true" : "false"}});
+			auto &cast_child = BoundCastExpression::Child(cast);
+			if (cast_child.GetReturnType() != LogicalType::INTEGER ||
+			    cast_child.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF)
+				continue;
+			auto builtin = BoundCastExpression::AddDefaultCastToType(cast_child.Copy(), LogicalType::BIGINT);
+			const auto &bound_cast = BoundCastExpression::GetBoundCast(cast);
+			const auto &default_cast = BoundCastExpression::GetBoundCast(builtin->Cast<BoundFunctionExpression>());
+			if (!default_cast.Equals(bound_cast) || bound_cast.GetCastData() || bound_cast.HasInitLocalState()) {
+				VGI_LOG(input.context, "projection.decline",
+				        {{"reason", "cast_implementation"},
+				         {"same_implementation", default_cast.Equals(bound_cast) ? "true" : "false"},
+				         {"cast_data", bound_cast.GetCastData() ? "true" : "false"},
+				         {"local_state", bound_cast.HasInitLocalState() ? "true" : "false"}});
 				continue;
 			}
-			auto &ref = cast.child->Cast<BoundColumnRefExpression>();
-			if (ref.depth || ref.binding.table_index != get.table_index ||
-			    ref.binding.column_index >= get.GetColumnIds().size())
+			auto &ref = cast_child.Cast<BoundColumnRefExpression>();
+			if (ref.Depth() || ref.Binding().table_index != get.table_index ||
+			    ref.Binding().column_index.GetIndex() >= get.GetColumnIds().size())
 				continue;
-			auto &column = get.GetColumnIds()[ref.binding.column_index];
+			auto &column = get.GetColumnIds()[ref.Binding().column_index.GetIndex()];
 			if (column.IsVirtualColumn() || column.HasChildren() ||
 			    column.GetPrimaryIndex() >= static_cast<idx_t>(source->num_fields()))
 				continue;
-			auto field = source->field(column.GetPrimaryIndex());
-			if (field->type()->id() != arrow::Type::INT32)
+			const auto &field = source->field(column.GetPrimaryIndex());
+			if (DescribeType(field).type != NANOARROW_TYPE_INT32)
 				continue;
 			string name = "__vgi_projection_" + std::to_string(i);
 			while (!names.insert(StringUtil::Lower(name)).second)
 				name += "_";
-			auto quoted = "\"" + StringUtil::Replace(field->name(), "\"", "\"\"") + "\"";
+			auto quoted = "\"" + StringUtil::Replace(source->field_name(column.GetPrimaryIndex()), "\"", "\"\"") + "\"";
 			expressions.push_back(
 			    BuildNativeColumnExpression("CAST(" + quoted + " AS BIGINT)", data.schema_name, context, true));
-			fields.push_back(arrow::field(name, arrow::int64(), true));
+			fields.push_back(type::Int64().Named(name));
 			slots.push_back(i);
 		}
 		VGI_LOG(input.context, "projection.candidates", {{"count", std::to_string(slots.size())}});
 		if (slots.empty())
 			return;
-		auto values = std::make_shared<arrow::LargeBinaryBuilder>();
-		arrow::ListBuilder list(arrow::default_memory_pool(), values);
-		ThrowOnArrowError(list.Append());
-		for (auto &expression : expressions)
-			ThrowOnArrowError(values->Append(expression.data(), expression.size()));
-		std::shared_ptr<arrow::Array> expression_array;
-		ThrowOnArrowError(list.Finish(&expression_array));
-		auto request =
-		    arrow::RecordBatch::Make(generated::TableFunctionProjectionRequestSchema(), 1,
-		                             {BuildBinaryScalarRequired(data.bind_result.bind_request_bytes),
-		                              BuildBinaryScalarRequired(data.bind_result.bind_response_bytes), expression_array,
-		                              BuildBinaryScalarRequired(SerializeSchemaToIpcBytes(arrow::schema(fields)))});
+		VgiBatchBuilder builder(generated::TableFunctionProjectionRequestSchema());
+		append::Bytes(builder.column(0), data.bind_result.bind_request_bytes.data(),
+		              static_cast<int64_t>(data.bind_result.bind_request_bytes.size()));
+		append::Bytes(builder.column(1), data.bind_result.bind_response_bytes.data(),
+		              static_cast<int64_t>(data.bind_result.bind_response_bytes.size()));
+		for (const auto &expression : expressions)
+			append::Bytes(builder.column(2)->children[0], expression.data(), static_cast<int64_t>(expression.size()));
+		append::FinishElement(builder.column(2));
+		auto result_schema = SerializeSchemaToIpcBytes(MakeSchema(fields));
+		append::Bytes(builder.column(3), result_schema.data(), static_cast<int64_t>(result_schema.size()));
+		builder.FinishRow();
+		auto request = builder.Finish();
 		auto request_bytes = SerializeToIpcBytes(request);
 		if (request_bytes.size() > MAX_PROJECTION_BYTES)
 			return; // The optional proposal cannot represent this bind.
@@ -252,10 +255,12 @@ private:
 			auto index = get.GetColumnIds().size();
 			get.AddColumnId(source->num_fields() + i);
 			projection.expressions[slot] = make_uniq<BoundColumnRefExpression>(
-			    projection.expressions[slot]->alias, LogicalType::BIGINT, ColumnBinding(get.table_index, index));
+			    projection.expressions[slot]->GetAlias(), LogicalType::BIGINT, ColumnBinding(get.table_index, ProjectionIndex(index)));
 		}
 		get.returned_types = data.all_column_types;
-		get.names = data.all_column_names;
+		get.names.clear();
+		for (const auto &name : data.all_column_names)
+			get.names.emplace_back(name);
 		input.optimizer.binder.SetAlwaysRequireRebind();
 	}
 	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
@@ -265,52 +270,55 @@ private:
 } // namespace
 
 ProjectionAcceptance ValidateProjectionAcceptance(const std::vector<uint8_t> &request_bytes,
-                                                  const std::shared_ptr<arrow::RecordBatch> &response) {
+                                                  const VgiBatchPtr &response) {
 	Require(request_bytes.size() <= MAX_PROJECTION_BYTES, "request exceeds 8 MiB");
 	auto request = DeserializeVgiQueryRecord(request_bytes);
 	Record(request, generated::TableFunctionProjectionRequestSchema());
 	auto original = Bind(Bytes(request, "bind_result"));
 	auto source = Schema(Bytes(original, "output_schema"));
 	auto results = Schema(Bytes(request, "result_schema"));
-	auto expressions = std::static_pointer_cast<arrow::ListArray>(request->GetColumnByName("expressions"));
-	Require(expressions->value_length(0) > 0 && expressions->value_length(0) <= 1024 &&
-	            expressions->value_length(0) == results->num_fields(),
+	auto expressions = request->GetColumnByName("expressions");
+	int64_t expressions_begin, expressions_end;
+	expressions.ListRange(0, expressions_begin, expressions_end);
+	const int64_t expression_count = expressions_end - expressions_begin;
+	Require(expression_count > 0 && expression_count <= 1024 && expression_count == results->num_fields(),
 	        "proposal result count mismatch");
-	Require(!results->metadata() || results->metadata()->size() == 0, "result schema has schema-level metadata");
+	Require(results->metadata().empty(), "result schema has schema-level metadata");
 	Record(response, generated::TableFunctionProjectionResultSchema());
-	auto indices = std::static_pointer_cast<arrow::ListArray>(response->GetColumnByName("accepted_indices"));
-	auto values = std::static_pointer_cast<arrow::Int64Array>(indices->values());
+	auto indices = response->GetColumnByName("accepted_indices");
+	auto values = indices.child(0);
+	int64_t indices_begin, indices_end;
+	indices.ListRange(0, indices_begin, indices_end);
 	ProjectionAcceptance accepted;
 	int64_t previous = -1;
-	for (int64_t i = indices->value_offset(0); i < indices->value_offset(0) + indices->value_length(0); ++i) {
-		Require(!values->IsNull(i), "accepted index is NULL");
-		auto value = values->Value(i);
+	for (int64_t i = indices_begin; i < indices_end; ++i) {
+		Require(!values.IsNull(i), "accepted index is NULL");
+		auto value = values.GetInt(i);
 		Require(value > previous && value < results->num_fields(), "accepted indices must be ordered unique in-range");
 		accepted.indices.push_back(value);
 		previous = value;
 	}
 	auto result = response->GetColumnByName("bind_result");
 	if (accepted.indices.empty()) {
-		Require(result->IsNull(0), "decline returned bind state");
+		Require(result.IsNull(0), "decline returned bind state");
 		return accepted;
 	}
 	accepted.bind_result = Bind(Bytes(response, "bind_result"));
-	Require(accepted.bind_result->GetColumnByName("projection_expression_profiles")
-	            ->Equals(original->GetColumnByName("projection_expression_profiles")),
+	Require(ParseBindResponse(accepted.bind_result).projection_expression_profiles ==
+	            ParseBindResponse(original).projection_expression_profiles,
 	        "acceptance changed projection profiles");
 	Require(ParseBindResponse(accepted.bind_result).repeatability == ParseBindResponse(original).repeatability,
 	        "acceptance changed repeatability");
-	auto fields = source->fields();
+	auto expected = source;
 	for (auto index : accepted.indices)
-		fields.push_back(results->field(index));
-	auto expected = arrow::schema(fields, source->metadata());
+		expected = expected->AddField(expected->num_fields(), results->field(index));
 	accepted.output_schema = Schema(Bytes(accepted.bind_result, "output_schema"));
 	Require(accepted.output_schema->Equals(*expected, true),
 	        "accepted output schema differs from exact requested schema");
 	return accepted;
 }
 
-void RestoreProjectionAcceptance(ClientContext &context, VgiTableFunctionBindData &data, TableFunction &function,
+void RestoreProjectionAcceptance(ClientContext &context, VgiTableFunctionBindData &data, BaseTableFunction &function,
                                  const std::vector<uint8_t> &request_bytes,
                                  const std::vector<uint8_t> &response_bytes) {
 	Require(SupportedSource(data), "serialized projected source is no longer supported");

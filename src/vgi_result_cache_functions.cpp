@@ -22,7 +22,7 @@ struct VgiResultCacheFlushData : public TableFunctionData {
 
 static unique_ptr<FunctionData> VgiResultCacheFlushBind(ClientContext &, TableFunctionBindInput &,
                                                         vector<LogicalType> &return_types,
-                                                        vector<string> &names) {
+                                                        vector<Identifier> &names) {
 	return_types.push_back(LogicalType::BIGINT);
 	names.emplace_back("flushed");
 	return make_uniq<VgiResultCacheFlushData>();
@@ -74,7 +74,7 @@ struct VgiResultCacheReapData : public TableFunctionData {
 
 static unique_ptr<FunctionData> VgiResultCacheReapBind(ClientContext &, TableFunctionBindInput &input,
                                                        vector<LogicalType> &return_types,
-                                                       vector<string> &names) {
+                                                       vector<Identifier> &names) {
 	return_types.push_back(LogicalType::BIGINT);
 	names.emplace_back("memory_reaped");
 	return_types.push_back(LogicalType::BIGINT);
@@ -105,7 +105,7 @@ static void VgiResultCacheReapScan(ClientContext &context, TableFunctionInput &d
 
 void RegisterVgiResultCacheReapFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_result_cache_reap", {}, VgiResultCacheReapScan, VgiResultCacheReapBind);
-	func.named_parameters["advance_seconds"] = LogicalType::BIGINT;
+	vgi::AddVgiFunctionOption(func, Identifier("advance_seconds"), LogicalType::BIGINT);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "Run one synchronous VGI result-cache cleanup pass over both tiers (the work the background "
@@ -127,7 +127,7 @@ struct VgiResultCacheListData : public TableFunctionData {
 
 static unique_ptr<FunctionData> VgiResultCacheListBind(ClientContext &context, TableFunctionBindInput &input,
                                                        vector<LogicalType> &return_types,
-                                                       vector<string> &names) {
+                                                       vector<Identifier> &names) {
 	names = {"catalog",         "function",        "key_hash",     "scope",
 	         "attached_data_version", "implementation_version", "catalog_version",
 	         "at_unit",         "at_value",        "num_batches",  "num_substreams", "num_rows",
@@ -207,7 +207,7 @@ static void VgiResultCacheListScan(ClientContext &, TableFunctionInput &input, D
 
 void RegisterVgiResultCacheFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_result_cache", {}, VgiResultCacheListScan, VgiResultCacheListBind);
-	func.named_parameters["include_disk"] = LogicalType::BOOLEAN;
+	vgi::AddVgiFunctionOption(func, Identifier("include_disk"), LogicalType::BOOLEAN);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "List cached VGI table-function results, one row per entry with its key hash, catalog/function, "
@@ -231,7 +231,7 @@ struct VgiResultCacheStatsData : public TableFunctionData {
 
 static unique_ptr<FunctionData> VgiResultCacheStatsBind(ClientContext &context, TableFunctionBindInput &,
                                                         vector<LogicalType> &return_types,
-                                                        vector<string> &names) {
+                                                        vector<Identifier> &names) {
 	names = {"hits",           "misses",         "inserts",         "evictions_lru",
 	         "evictions_ttl",  "capture_aborts", "entries",         "total_bytes",
 	         "exchange_hits",  "exchange_misses", "exchange_stores", "exchange_revalidations",

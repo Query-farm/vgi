@@ -1,8 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_result_cache.hpp"
 
-#include <arrow/api.h>
-
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -210,8 +208,8 @@ uint32_t GetU32(const std::string &b, size_t &pos) {
 // re-hash of the finished file (integrity check D) still matches. Readers loop
 // until they exhaust the bytes. Per batch:
 //   [u64 has_index][u64 batch_index][u64 rows][u64 pv_len][pv][u64 ipc_len][ipc]
-// `codec`/`level` (already resolved via ResolveDiskCompressionCodec) apply Arrow's
-// built-in IPC compression to each batch's payload — the per-batch `ipc_len` framing
+// `codec`/`level` (already resolved via ResolveDiskCompressionCodec) apply the
+// IPC format's built-in buffer compression to each batch's payload — the per-batch `ipc_len` framing
 // becomes the COMPRESSED length, and the content SHA (taken over this blob) covers the
 // compressed bytes. codec=="none" → TranscodeIpcWithCodec is a passthrough (unchanged
 // format). The ref's logical `bytes=` is entry.total_bytes, set by the caller — not here.
@@ -257,7 +255,7 @@ bool ParseEntryBlobIntoStream(const std::string &blob, CachedStream &stream, int
 		cb.partition_values_bytes = blob.substr(pos, pv_len);
 		pos += pv_len;
 		uint64_t ipc_len = GetU64(blob, pos);
-		cb.ipc = arrow::Buffer::FromString(blob.substr(pos, ipc_len));
+		cb.ipc = VgiBuffer::FromString(blob.substr(pos, ipc_len));
 		pos += ipc_len;
 		total_bytes += static_cast<int64_t>(ipc_len);
 		stream.rows += cb.rows;
@@ -410,13 +408,13 @@ std::string VgiResultCacheKey::Fingerprint() const {
 // ParseVgiCacheControl
 // ============================================================================
 
-VgiCacheControl ParseVgiCacheControl(const std::shared_ptr<const arrow::KeyValueMetadata> &metadata) {
+VgiCacheControl ParseVgiCacheControl(const VgiMetadataPtr &metadata) {
 	VgiCacheControl cc;
 	if (!metadata) {
 		return cc;
 	}
 	auto get = [&](const char *key, std::string &out) -> bool {
-		int idx = metadata->FindKey(key);
+		int64_t idx = metadata->FindKey(key);
 		if (idx < 0) {
 			return false;
 		}
@@ -1078,7 +1076,7 @@ VgiResultCache::PackStore *VgiResultCache::PackStoreIfExists() {
 
 VgiResultCache &VgiResultCache::Instance() {
 	// Intentionally leaked (same rationale as VgiWorkerPool::Instance): cached
-	// entries hold Arrow Buffers whose destructors touch the Arrow memory pool;
+	// entries hold IPC buffers that may outlive other process-static state;
 	// leaking sidesteps the static-destruction-order question at process exit.
 	static VgiResultCache *instance = new VgiResultCache();
 	return *instance;
@@ -1097,7 +1095,7 @@ VgiResultCache::VgiResultCache() {
 }
 
 VgiResultCache::~VgiResultCache() {
-	// Database-owned caches stop their reaper before releasing Arrow buffers.
+	// Database-owned caches stop their reaper before releasing cached IPC buffers.
 	// The standalone Instance() used by benchmarks retains its process lifetime.
 	shutdown_.store(true);
 	cleanup_cv_.notify_all();
@@ -1773,6 +1771,13 @@ void VgiResultCache::CleanupThread() {
 // ============================================================================
 // Layout (per-identity sharded — see IdentityShard):
 //   <dir>/<shard>/objects/<content_sha256>.vrc  immutable entry blob
+// The content SHA is taken over the entry blob, which embeds each batch's serialized
+// IPC bytes. Those bytes come from nanoarrow's IPC writer since the nanoarrow
+// migration; its encoding can differ byte-wise from Arrow C++'s, so object names (and
+// exchange keys, whose input_hash also hashes IPC bytes) changed once with that
+// migration. Encoding stays deterministic (same batch -> same bytes), so content
+// addressing and key matching are stable from then on; pre-migration objects/refs
+// just miss and are reaped.
 //   <dir>/<shard>/refs/<key_fingerprint>.ref    key -> content + expiry + keyfp
 // The ref filename is the SHA-256 Fingerprint() of the FULL key, and the ref
 // carries `keyfp=` which the loader re-verifies — so a 64-bit HexDigest bucket

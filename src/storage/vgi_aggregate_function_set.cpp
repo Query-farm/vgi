@@ -33,7 +33,7 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
                                                   const std::vector<vgi::VgiFunctionInfo> &overloads,
                                                   const VgiFunctionRegistrationTarget &target,
                                                   vector<FunctionDescription> &descriptions) {
-	AggregateFunctionSet func_set(registered_name);
+	AggregateFunctionSet func_set {Identifier(registered_name)};
 
 	for (const auto &func_info : overloads) {
 		// Parse argument types
@@ -52,16 +52,15 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 		}
 
 		// Check if output type is dynamic (ANY)
-		auto output_field = func_info.output_schema->field(0);
+		auto metadata = func_info.output_schema->field_metadata(0);
 		bool is_any_output = false;
-		if (output_field->HasMetadata()) {
-			auto metadata = output_field->metadata();
-			auto type_idx = metadata->FindKey("vgi:any");
+		if (!metadata.empty()) {
+			auto type_idx = metadata.FindKey("vgi:any");
 			if (type_idx >= 0) {
 				is_any_output = true;
 			}
-			type_idx = metadata->FindKey("vgi_type");
-			if (type_idx >= 0 && metadata->value(type_idx) == "any") {
+			type_idx = metadata.FindKey("vgi_type");
+			if (type_idx >= 0 && metadata.value(type_idx) == "any") {
 				is_any_output = true;
 			}
 		}
@@ -86,23 +85,23 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 		}
 
 		// Create AggregateFunction with all VGI callbacks
-		AggregateFunction agg_func(registered_name,                      // name
-		                           arg_types.positional_types,           // argument types
-		                           return_type,                          // return type
-		                           vgi::VgiAggregateStateSize,           // state_size
-		                           vgi::VgiAggregateInitialize,          // initialize
-		                           vgi::VgiAggregateUpdate,              // update
-		                           vgi::VgiAggregateCombine,             // combine
-		                           vgi::VgiAggregateFinalize,            // finalize
-		                           null_handling,                        // null_handling
-		                           nullptr,                              // simple_update (not used)
-		                           vgi::VgiAggregateFunctionBind,        // bind
-		                           vgi::VgiAggregateDestroy              // destructor
+		AggregateFunction agg_func(Identifier(registered_name),   // name
+		                           arg_types.positional_types,    // argument types
+		                           return_type,                   // return type
+		                           vgi::VgiAggregateStateSize,    // state_size
+		                           vgi::VgiAggregateInitialize,   // initialize
+		                           vgi::VgiAggregateUpdate,       // update
+		                           vgi::VgiAggregateCombine,      // combine
+		                           vgi::VgiAggregateFinalize,     // finalize
+		                           null_handling,                 // null_handling
+		                           nullptr,                       // simple_update (not used)
+		                           vgi::VgiAggregateFunctionBind, // bind
+		                           vgi::VgiAggregateDestroy       // destructor
 		);
 
 		// Set varargs if this function accepts variable arguments
 		if (arg_types.has_varargs) {
-			agg_func.varargs = arg_types.varargs_type;
+			agg_func.GetSignature().AddArgs("args", arg_types.varargs_type);
 		}
 
 		// Set order/distinct dependence from metadata
@@ -151,7 +150,7 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 			VGI_STDERR_DEBUG("[VGI] streaming_partitioned aggregate registered: %s\n", func_info.name.c_str());
 		}
 
-		agg_func.function_info = agg_func_info;
+		agg_func.SetExtraFunctionInfo(agg_func_info);
 
 		func_set.AddFunction(agg_func);
 
@@ -174,7 +173,7 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 
 } // namespace vgi
 
-void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
+void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> & /*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -189,9 +188,10 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 	}
 
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::AGGREGATE_FUNCTION_ENTRY, context);
 
@@ -216,7 +216,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 	// empty and DispatchSchema() falls through to func_info.schema_name.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
-	target.catalog_name = catalog_.GetName();
+	target.catalog_name = catalog_.GetName().GetIdentifierName();
 	target.attach_params = attach_params;
 	target.attach_opaque_data = attach_result->attach_opaque_data;
 	target.setting_names = setting_names;
@@ -226,7 +226,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 		auto func_set = vgi::BuildVgiAggregateFunctionSet(context, pair.first, pair.second, target, descriptions);
 
 		CreateAggregateFunctionInfo info(func_set);
-		info.schema = schema_.name;
+		info.SetQualifiedName(schema_.GetQualifiedName(info.GetFunctionName()));
 		info.internal = true;
 		info.descriptions = std::move(descriptions);
 
@@ -248,7 +248,10 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 			}
 		}
 
-		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(function_entry)); }
+		{
+			std::lock_guard<std::mutex> __entry_lk(entry_lock_);
+			CreateEntryLocked(std::move(function_entry));
+		}
 	}
 }
 

@@ -7,9 +7,9 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
-#include <arrow/util/bit_util.h>
+#include "nanoarrow/nanoarrow.h"
 
-#include <unordered_map>
+#include <cstring>
 
 namespace duckdb {
 namespace vgi {
@@ -44,11 +44,12 @@ void ThrowNull(const Ctx &ctx) {
 	        ctx.field, static_cast<long long>(ctx.row), ctx.record, WorkerOf(ctx)));
 }
 
-void ThrowType(const Ctx &ctx, const arrow::DataType &actual, const char *expected) {
+void ThrowType(const Ctx &ctx, const VgiColumn &actual, const char *expected) {
+	auto actual_type = actual.type_string();
 	throw InvalidInputException(
-	    ProtocolInfo(ctx).ExpectedActual(expected, actual.ToString()),
+	    ProtocolInfo(ctx).ExpectedActual(expected, actual_type),
 	    StringUtil::Format("VGI protocol error: Column '%s' in %s response from worker '%s' has type %s, expected %s",
-	                       ctx.field, ctx.record, WorkerOf(ctx), actual.ToString(), expected));
+	                       ctx.field, ctx.record, WorkerOf(ctx), actual_type, expected));
 }
 
 void ThrowBadEnum(const Ctx &ctx, const char *enum_name, const std::string &value) {
@@ -67,163 +68,168 @@ void ThrowDuplicateKey(const Ctx &ctx) {
 	                       ctx.field, ctx.record, WorkerOf(ctx)));
 }
 
-void CheckArrow(const arrow::Status &status, const char *what) {
-	if (!status.ok()) {
-		throw IOException("VGI wire codec: %s: %s", what, status.ToString());
-	}
-}
-
-template <class T>
-static T ValueOrThrow(arrow::Result<T> result, const char *what) {
-	CheckArrow(result.status(), what);
-	return result.MoveValueUnsafe();
-}
-
 // ============================================================================
 // Decoding
 // ============================================================================
 
-template <class ArrayType>
-static const ArrayType &Expect(const arrow::Array &array, arrow::Type::type id, const Ctx &ctx, const char *expected) {
-	if (array.type_id() != id) {
-		ThrowType(ctx, *array.type(), expected);
+namespace {
+
+//! The column's logical type (dictionary columns report NANOARROW_TYPE_DICTIONARY).
+int LogicalType(const VgiColumn &col) {
+	if (col.is_dictionary()) {
+		return NANOARROW_TYPE_DICTIONARY;
 	}
-	return static_cast<const ArrayType &>(array);
+	return col.type().type;
 }
 
-template <class ArrayType, class T>
-static void ReadPrimitive(const arrow::Array &array, int64_t i, T &out, const Ctx &ctx, arrow::Type::type id,
-                          const char *expected) {
-	const auto &typed = Expect<ArrayType>(array, id, ctx, expected);
-	if (typed.IsNull(i)) {
+void Expect(const VgiColumn &col, int type, const Ctx &ctx, const char *expected) {
+	if (col.is_dictionary() || col.storage_type() != type || col.type().type != type) {
+		ThrowType(ctx, col, expected);
+	}
+}
+
+template <class T>
+void ReadInt(const VgiColumn &col, int64_t i, T &out, const Ctx &ctx, int type, const char *expected) {
+	Expect(col, type, ctx, expected);
+	if (col.IsNull(i)) {
 		ThrowNull(ctx);
 	}
-	out = typed.Value(i);
+	out = static_cast<T>(col.GetInt(i));
 }
 
-void ReadValue(const arrow::Array &array, int64_t i, bool &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::BooleanArray>(array, i, out, ctx, arrow::Type::BOOL, "bool");
-}
-void ReadValue(const arrow::Array &array, int64_t i, int8_t &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::Int8Array>(array, i, out, ctx, arrow::Type::INT8, "int8");
-}
-void ReadValue(const arrow::Array &array, int64_t i, int16_t &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::Int16Array>(array, i, out, ctx, arrow::Type::INT16, "int16");
-}
-void ReadValue(const arrow::Array &array, int64_t i, int32_t &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::Int32Array>(array, i, out, ctx, arrow::Type::INT32, "int32");
-}
-void ReadValue(const arrow::Array &array, int64_t i, int64_t &out, const Ctx &ctx) {
-	if (array.type_id() == arrow::Type::TIMESTAMP) {
-		const auto &ts_type = static_cast<const arrow::TimestampType &>(*array.type());
-		if (ts_type.unit() != arrow::TimeUnit::MICRO) {
-			ThrowType(ctx, *array.type(), "timestamp[us]");
-		}
-		ReadPrimitive<arrow::TimestampArray>(array, i, out, ctx, arrow::Type::TIMESTAMP, "timestamp[us]");
-		return;
-	}
-	ReadPrimitive<arrow::Int64Array>(array, i, out, ctx, arrow::Type::INT64, "int64");
-}
-void ReadValue(const arrow::Array &array, int64_t i, uint8_t &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::UInt8Array>(array, i, out, ctx, arrow::Type::UINT8, "uint8");
-}
-void ReadValue(const arrow::Array &array, int64_t i, uint16_t &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::UInt16Array>(array, i, out, ctx, arrow::Type::UINT16, "uint16");
-}
-void ReadValue(const arrow::Array &array, int64_t i, uint32_t &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::UInt32Array>(array, i, out, ctx, arrow::Type::UINT32, "uint32");
-}
-void ReadValue(const arrow::Array &array, int64_t i, uint64_t &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::UInt64Array>(array, i, out, ctx, arrow::Type::UINT64, "uint64");
-}
-void ReadValue(const arrow::Array &array, int64_t i, float &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::FloatArray>(array, i, out, ctx, arrow::Type::FLOAT, "float");
-}
-void ReadValue(const arrow::Array &array, int64_t i, double &out, const Ctx &ctx) {
-	ReadPrimitive<arrow::DoubleArray>(array, i, out, ctx, arrow::Type::DOUBLE, "double");
-}
-
-void ReadValue(const arrow::Array &array, int64_t i, std::string &out, const Ctx &ctx) {
-	if (array.IsNull(i)) {
+template <class T>
+void ReadUInt(const VgiColumn &col, int64_t i, T &out, const Ctx &ctx, int type, const char *expected) {
+	Expect(col, type, ctx, expected);
+	if (col.IsNull(i)) {
 		ThrowNull(ctx);
 	}
-	switch (array.type_id()) {
-	case arrow::Type::STRING: {
-		auto view = static_cast<const arrow::StringArray &>(array).GetView(i);
-		out.assign(view.data(), view.size());
-		return;
+	out = static_cast<T>(col.GetUInt(i));
+}
+
+thread_local const VgiBatch *current_batch = nullptr;
+
+} // namespace
+
+void ReadValue(const VgiColumn &col, int64_t i, bool &out, const Ctx &ctx) {
+	Expect(col, NANOARROW_TYPE_BOOL, ctx, "bool");
+	if (col.IsNull(i)) {
+		ThrowNull(ctx);
 	}
-	case arrow::Type::LARGE_STRING: {
-		auto view = static_cast<const arrow::LargeStringArray &>(array).GetView(i);
-		out.assign(view.data(), view.size());
-		return;
-	}
-	case arrow::Type::STRING_VIEW: {
-		auto view = static_cast<const arrow::StringViewArray &>(array).GetView(i);
-		out.assign(view.data(), view.size());
-		return;
-	}
-	case arrow::Type::DICTIONARY: {
-		const auto &dict = static_cast<const arrow::DictionaryArray &>(array);
-		const auto &values = *dict.dictionary();
-		auto id = values.type_id();
-		if (id != arrow::Type::STRING && id != arrow::Type::LARGE_STRING && id != arrow::Type::STRING_VIEW) {
-			ThrowType(ctx, *array.type(), "dictionary<utf8>");
+	out = col.GetBool(i);
+}
+void ReadValue(const VgiColumn &col, int64_t i, int8_t &out, const Ctx &ctx) {
+	ReadInt(col, i, out, ctx, NANOARROW_TYPE_INT8, "int8");
+}
+void ReadValue(const VgiColumn &col, int64_t i, int16_t &out, const Ctx &ctx) {
+	ReadInt(col, i, out, ctx, NANOARROW_TYPE_INT16, "int16");
+}
+void ReadValue(const VgiColumn &col, int64_t i, int32_t &out, const Ctx &ctx) {
+	ReadInt(col, i, out, ctx, NANOARROW_TYPE_INT32, "int32");
+}
+void ReadValue(const VgiColumn &col, int64_t i, int64_t &out, const Ctx &ctx) {
+	if (!col.is_dictionary() && col.type().type == NANOARROW_TYPE_TIMESTAMP) {
+		if (col.type().time_unit != NANOARROW_TIME_UNIT_MICRO) {
+			ThrowType(ctx, col, "timestamp[us]");
 		}
-		auto index = dict.GetValueIndex(i);
+		if (col.IsNull(i)) {
+			ThrowNull(ctx);
+		}
+		out = col.GetInt(i);
+		return;
+	}
+	ReadInt(col, i, out, ctx, NANOARROW_TYPE_INT64, "int64");
+}
+void ReadValue(const VgiColumn &col, int64_t i, uint8_t &out, const Ctx &ctx) {
+	ReadUInt(col, i, out, ctx, NANOARROW_TYPE_UINT8, "uint8");
+}
+void ReadValue(const VgiColumn &col, int64_t i, uint16_t &out, const Ctx &ctx) {
+	ReadUInt(col, i, out, ctx, NANOARROW_TYPE_UINT16, "uint16");
+}
+void ReadValue(const VgiColumn &col, int64_t i, uint32_t &out, const Ctx &ctx) {
+	ReadUInt(col, i, out, ctx, NANOARROW_TYPE_UINT32, "uint32");
+}
+void ReadValue(const VgiColumn &col, int64_t i, uint64_t &out, const Ctx &ctx) {
+	ReadUInt(col, i, out, ctx, NANOARROW_TYPE_UINT64, "uint64");
+}
+void ReadValue(const VgiColumn &col, int64_t i, float &out, const Ctx &ctx) {
+	Expect(col, NANOARROW_TYPE_FLOAT, ctx, "float");
+	if (col.IsNull(i)) {
+		ThrowNull(ctx);
+	}
+	out = static_cast<float>(col.GetDouble(i));
+}
+void ReadValue(const VgiColumn &col, int64_t i, double &out, const Ctx &ctx) {
+	Expect(col, NANOARROW_TYPE_DOUBLE, ctx, "double");
+	if (col.IsNull(i)) {
+		ThrowNull(ctx);
+	}
+	out = col.GetDouble(i);
+}
+
+static bool IsStringType(int type) {
+	return type == NANOARROW_TYPE_STRING || type == NANOARROW_TYPE_LARGE_STRING || type == NANOARROW_TYPE_STRING_VIEW;
+}
+
+static bool IsBinaryType(int type) {
+	return type == NANOARROW_TYPE_BINARY || type == NANOARROW_TYPE_LARGE_BINARY || type == NANOARROW_TYPE_BINARY_VIEW;
+}
+
+void ReadValue(const VgiColumn &col, int64_t i, std::string &out, const Ctx &ctx) {
+	if (col.IsNull(i)) {
+		ThrowNull(ctx);
+	}
+	if (col.is_dictionary()) {
+		auto values = col.dictionary();
+		if (!IsStringType(values.type().type)) {
+			ThrowType(ctx, col, "dictionary<utf8>");
+		}
+		auto index = col.GetInt(i);
 		if (index < 0 || index >= values.length()) {
-			ThrowType(ctx, *array.type(), "dictionary index in range");
+			ThrowType(ctx, col, "dictionary index in range");
+		}
+		auto view = values.GetView(index);
+		out.assign(view.data(), view.size());
+		return;
+	}
+	if (!IsStringType(col.type().type)) {
+		ThrowType(ctx, col, "utf8");
+	}
+	auto view = col.GetView(i);
+	out.assign(view.data(), view.size());
+}
+
+bool IsNullValue(const VgiColumn &col, int64_t i, const Ctx &ctx) {
+	if (col.IsNull(i)) {
+		return true;
+	}
+	if (!col.is_dictionary()) {
+		return false;
+	}
+	auto values = col.dictionary();
+	const auto index = col.GetInt(i);
+	if (index < 0 || index >= values.length()) {
+		ThrowType(ctx, col, "dictionary index in range");
+	}
+	return IsNullValue(values, index, ctx);
+}
+
+void ReadValue(const VgiColumn &col, int64_t i, std::vector<uint8_t> &out, const Ctx &ctx) {
+	if (col.IsNull(i)) {
+		ThrowNull(ctx);
+	}
+	if (col.is_dictionary()) {
+		auto values = col.dictionary();
+		const auto index = col.GetInt(i);
+		if (index < 0 || index >= values.length()) {
+			ThrowType(ctx, col, "dictionary index in range");
 		}
 		ReadValue(values, index, out, ctx);
 		return;
 	}
-	default:
-		ThrowType(ctx, *array.type(), "utf8");
+	if (!IsBinaryType(col.type().type)) {
+		ThrowType(ctx, col, "binary");
 	}
-}
-
-bool IsNullValue(const arrow::Array &array, int64_t i, const Ctx &ctx) {
-	if (array.IsNull(i)) {
-		return true;
-	}
-	if (array.type_id() != arrow::Type::DICTIONARY) {
-		return false;
-	}
-	const auto &dictionary = static_cast<const arrow::DictionaryArray &>(array);
-	const auto index = dictionary.GetValueIndex(i);
-	if (index < 0 || index >= dictionary.dictionary()->length()) {
-		ThrowType(ctx, *array.type(), "dictionary index in range");
-	}
-	return IsNullValue(*dictionary.dictionary(), index, ctx);
-}
-
-void ReadValue(const arrow::Array &array, int64_t i, std::vector<uint8_t> &out, const Ctx &ctx) {
-	if (array.IsNull(i)) {
-		ThrowNull(ctx);
-	}
-	std::string_view view;
-	switch (array.type_id()) {
-	case arrow::Type::DICTIONARY: {
-		const auto &dictionary = static_cast<const arrow::DictionaryArray &>(array);
-		const auto index = dictionary.GetValueIndex(i);
-		if (index < 0 || index >= dictionary.dictionary()->length()) {
-			ThrowType(ctx, *array.type(), "dictionary index in range");
-		}
-		ReadValue(*dictionary.dictionary(), index, out, ctx);
-		return;
-	}
-	case arrow::Type::BINARY:
-		view = static_cast<const arrow::BinaryArray &>(array).GetView(i);
-		break;
-	case arrow::Type::LARGE_BINARY:
-		view = static_cast<const arrow::LargeBinaryArray &>(array).GetView(i);
-		break;
-	case arrow::Type::BINARY_VIEW:
-		view = static_cast<const arrow::BinaryViewArray &>(array).GetView(i);
-		break;
-	default:
-		ThrowType(ctx, *array.type(), "binary");
-	}
+	auto view = col.GetView(i);
 	if (view.empty()) {
 		out.clear();
 		return;
@@ -232,62 +238,40 @@ void ReadValue(const arrow::Array &array, int64_t i, std::vector<uint8_t> &out, 
 	           reinterpret_cast<const uint8_t *>(view.data()) + view.size());
 }
 
-void ReadValue(const arrow::Array &array, int64_t i, std::shared_ptr<arrow::Buffer> &out, const Ctx &ctx) {
-	if (array.IsNull(i)) {
+void ReadValue(const VgiColumn &col, int64_t i, VgiBufferPtr &out, const Ctx &ctx) {
+	if (col.IsNull(i)) {
 		ThrowNull(ctx);
 	}
-	switch (array.type_id()) {
-	case arrow::Type::LARGE_BINARY: {
-		const auto &typed = static_cast<const arrow::LargeBinaryArray &>(array);
-		out = arrow::SliceBuffer(typed.value_data(), typed.value_offset(i), typed.value_length(i));
-		return;
+	int type = col.is_dictionary() ? -1 : col.type().type;
+	if (type != NANOARROW_TYPE_LARGE_BINARY && type != NANOARROW_TYPE_BINARY) {
+		ThrowType(ctx, col, "large_binary");
 	}
-	case arrow::Type::BINARY: {
-		const auto &typed = static_cast<const arrow::BinaryArray &>(array);
-		out = arrow::SliceBuffer(typed.value_data(), typed.value_offset(i), typed.value_length(i));
-		return;
-	}
-	default:
-		ThrowType(ctx, *array.type(), "large_binary");
+	auto view = col.GetView(i);
+	if (current_batch) {
+		out = std::make_shared<const VgiBuffer>(current_batch->shared_from_this(),
+		                                        reinterpret_cast<const uint8_t *>(view.data()),
+		                                        static_cast<int64_t>(view.size()));
+	} else {
+		out = VgiBuffer::Copy(view.data(), static_cast<int64_t>(view.size()));
 	}
 }
 
-void ListBounds(const arrow::Array &array, int64_t i, const Ctx &ctx, int64_t &begin, int64_t &end,
-                const arrow::Array *&child) {
-	switch (array.type_id()) {
-	case arrow::Type::LIST: {
-		const auto &list = static_cast<const arrow::ListArray &>(array);
-		begin = list.value_offset(i);
-		end = begin + list.value_length(i);
-		child = list.values().get();
-		return;
+void ListBounds(const VgiColumn &col, int64_t i, const Ctx &ctx, int64_t &begin, int64_t &end) {
+	int type = LogicalType(col);
+	if (type != NANOARROW_TYPE_LIST && type != NANOARROW_TYPE_LARGE_LIST) {
+		ThrowType(ctx, col, "list");
 	}
-	case arrow::Type::LARGE_LIST: {
-		const auto &list = static_cast<const arrow::LargeListArray &>(array);
-		begin = list.value_offset(i);
-		end = begin + list.value_length(i);
-		child = list.values().get();
-		return;
-	}
-	default:
-		ThrowType(ctx, *array.type(), "list");
-	}
+	col.ListRange(i, begin, end);
 }
 
-void MapBounds(const arrow::Array &array, int64_t i, const Ctx &ctx, int64_t &begin, int64_t &end,
-               const arrow::Array *&keys, const arrow::Array *&items) {
-	if (array.type_id() != arrow::Type::MAP) {
-		ThrowType(ctx, *array.type(), "map");
+void MapBounds(const VgiColumn &col, int64_t i, const Ctx &ctx, int64_t &begin, int64_t &end) {
+	if (LogicalType(col) != NANOARROW_TYPE_MAP) {
+		ThrowType(ctx, col, "map");
 	}
-	const auto &map = static_cast<const arrow::MapArray &>(array);
-	begin = map.value_offset(i);
-	end = begin + map.value_length(i);
-	keys = map.keys().get();
-	items = map.items().get();
+	col.ListRange(i, begin, end);
 }
 
-RowReader::RowReader(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row, const char *record,
-                     const std::string &worker_path)
+RowReader::RowReader(const VgiBatchPtr &batch, int64_t row, const char *record, const std::string &worker_path)
     : RecordReader(Ctx {record, &worker_path, std::string(), row}, row), batch_(batch) {
 	if (!batch) {
 		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path),
@@ -303,328 +287,154 @@ RowReader::RowReader(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t r
 	}
 }
 
-std::shared_ptr<arrow::Array> RowReader::Column(const char *name) const {
-	auto index = batch_->schema()->GetFieldIndex(name);
-	return index < 0 ? nullptr : batch_->column(index);
+VgiColumn RowReader::Column(const char *name) const {
+	return batch_->GetColumnByName(name);
 }
 
-StructReader::StructReader(const arrow::Array &array, int64_t i, const Ctx &ctx, const char *record)
-    : RecordReader(ctx, i), array_(nullptr) {
+StructReader::StructReader(const VgiColumn &col, int64_t i, const Ctx &ctx, const char *record)
+    : RecordReader(ctx, i), col_(col) {
 	(void)record;
-	if (array.type_id() != arrow::Type::STRUCT) {
-		ThrowType(ctx, *array.type(), "struct");
+	if (LogicalType(col) != NANOARROW_TYPE_STRUCT) {
+		ThrowType(ctx, col, "struct");
 	}
-	if (array.IsNull(i)) {
+	if (col.IsNull(i)) {
 		ThrowNull(ctx);
 	}
-	array_ = &static_cast<const arrow::StructArray &>(array);
 }
 
-std::shared_ptr<arrow::Array> StructReader::Column(const char *name) const {
-	auto index = array_->struct_type()->GetFieldIndex(name);
-	return index < 0 ? nullptr : array_->field(index);
+VgiColumn StructReader::Column(const char *name) const {
+	const auto &schema = col_.schema();
+	for (int64_t k = 0; k < schema.n_children; k++) {
+		const char *child_name = schema.children[k]->name;
+		if (child_name && std::strcmp(child_name, name) == 0) {
+			return col_.child(k);
+		}
+	}
+	return VgiColumn();
+}
+
+const VgiBatch *CurrentBatch() {
+	return current_batch;
+}
+
+CurrentBatchScope::CurrentBatchScope(const VgiBatch *batch) : previous_(current_batch) {
+	current_batch = batch;
+}
+
+CurrentBatchScope::~CurrentBatchScope() {
+	current_batch = previous_;
 }
 
 // ============================================================================
 // Encoding
 // ============================================================================
 
-std::shared_ptr<arrow::Buffer> MakeValidity(const std::vector<bool> &valid, int64_t &null_count) {
-	null_count = 0;
-	for (bool v : valid) {
-		null_count += v ? 0 : 1;
+void WriteValue(ArrowArray *array, bool value) {
+	append::Bool(array, value);
+}
+void WriteValue(ArrowArray *array, int8_t value) {
+	append::Int(array, value);
+}
+void WriteValue(ArrowArray *array, int16_t value) {
+	append::Int(array, value);
+}
+void WriteValue(ArrowArray *array, int32_t value) {
+	append::Int(array, value);
+}
+void WriteValue(ArrowArray *array, int64_t value) {
+	append::Int(array, value);
+}
+void WriteValue(ArrowArray *array, uint8_t value) {
+	append::UInt(array, value);
+}
+void WriteValue(ArrowArray *array, uint16_t value) {
+	append::UInt(array, value);
+}
+void WriteValue(ArrowArray *array, uint32_t value) {
+	append::UInt(array, value);
+}
+void WriteValue(ArrowArray *array, uint64_t value) {
+	append::UInt(array, value);
+}
+void WriteValue(ArrowArray *array, float value) {
+	append::Double(array, value);
+}
+void WriteValue(ArrowArray *array, double value) {
+	append::Double(array, value);
+}
+
+void WriteValue(ArrowArray *array, const std::string &value) {
+	if (!array->dictionary) {
+		append::String(array, value);
+		return;
 	}
-	if (null_count == 0) {
-		return nullptr;
-	}
-	auto bitmap = ValueOrThrow(arrow::AllocateEmptyBitmap(static_cast<int64_t>(valid.size())), "allocate validity");
-	for (size_t i = 0; i < valid.size(); i++) {
-		if (valid[i]) {
-			arrow::bit_util::SetBit(bitmap->mutable_data(), static_cast<int64_t>(i));
+	// A plain string member on a dictionary column: dictionary in first-seen order.
+	ArrowArray *dict = array->dictionary;
+	auto *offsets = reinterpret_cast<const int32_t *>(ArrowArrayBuffer(dict, 1)->data);
+	auto *data = reinterpret_cast<const char *>(ArrowArrayBuffer(dict, 2)->data);
+	for (int64_t k = 0; k < dict->length; k++) {
+		auto len = static_cast<size_t>(offsets[k + 1] - offsets[k]);
+		if (len == value.size() && std::memcmp(data + offsets[k], value.data(), len) == 0) {
+			append::Int(array, k);
+			return;
 		}
 	}
-	return bitmap;
+	append::String(dict, value);
+	append::Int(array, dict->length - 1);
 }
 
-[[noreturn]] static void TypeMismatch(const TypePtr &type, const char *cpp_type) {
-	throw InternalException("VGI wire codec: cannot encode a %s member as Arrow type %s", cpp_type, type->ToString());
-}
-
-template <class BuilderType, class T>
-static ArrayPtr BuildWith(BuilderType &builder, const std::vector<const T *> &values) {
-	CheckArrow(builder.Reserve(static_cast<int64_t>(values.size())), "reserve");
-	for (auto *v : values) {
-		CheckArrow(v ? builder.Append(*v) : builder.AppendNull(), "append");
+void WriteValue(ArrowArray *array, const std::vector<uint8_t> &value) {
+	if (!array->dictionary) {
+		append::Bytes(array, value.data(), static_cast<int64_t>(value.size()));
+		return;
 	}
-	return ValueOrThrow(builder.Finish(), "finish");
-}
-
-template <class BuilderType, class T>
-static ArrayPtr BuildPrimitive(const TypePtr &type, arrow::Type::type id, const std::vector<const T *> &values,
-                               const char *cpp_type) {
-	if (type->id() != id) {
-		TypeMismatch(type, cpp_type);
-	}
-	BuilderType builder;
-	return BuildWith(builder, values);
-}
-
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const bool *> &values) {
-	return BuildPrimitive<arrow::BooleanBuilder>(type, arrow::Type::BOOL, values, "bool");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const int8_t *> &values) {
-	return BuildPrimitive<arrow::Int8Builder>(type, arrow::Type::INT8, values, "int8_t");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const int16_t *> &values) {
-	return BuildPrimitive<arrow::Int16Builder>(type, arrow::Type::INT16, values, "int16_t");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const int32_t *> &values) {
-	return BuildPrimitive<arrow::Int32Builder>(type, arrow::Type::INT32, values, "int32_t");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const int64_t *> &values) {
-	if (type->id() == arrow::Type::TIMESTAMP) {
-		arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
-		return BuildWith(builder, values);
-	}
-	return BuildPrimitive<arrow::Int64Builder>(type, arrow::Type::INT64, values, "int64_t");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const uint8_t *> &values) {
-	return BuildPrimitive<arrow::UInt8Builder>(type, arrow::Type::UINT8, values, "uint8_t");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const uint16_t *> &values) {
-	return BuildPrimitive<arrow::UInt16Builder>(type, arrow::Type::UINT16, values, "uint16_t");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const uint32_t *> &values) {
-	return BuildPrimitive<arrow::UInt32Builder>(type, arrow::Type::UINT32, values, "uint32_t");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const uint64_t *> &values) {
-	return BuildPrimitive<arrow::UInt64Builder>(type, arrow::Type::UINT64, values, "uint64_t");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const float *> &values) {
-	return BuildPrimitive<arrow::FloatBuilder>(type, arrow::Type::FLOAT, values, "float");
-}
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const double *> &values) {
-	return BuildPrimitive<arrow::DoubleBuilder>(type, arrow::Type::DOUBLE, values, "double");
-}
-
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const std::string *> &values) {
-	switch (type->id()) {
-	case arrow::Type::STRING: {
-		arrow::StringBuilder builder;
-		return BuildWith(builder, values);
-	}
-	case arrow::Type::LARGE_STRING: {
-		arrow::LargeStringBuilder builder;
-		return BuildWith(builder, values);
-	}
-	case arrow::Type::DICTIONARY: {
-		const auto &dict_type = static_cast<const arrow::DictionaryType &>(*type);
-		if (dict_type.index_type()->id() != arrow::Type::INT16 || dict_type.value_type()->id() != arrow::Type::STRING) {
-			TypeMismatch(type, "std::string");
-		}
-		// Dictionary in first-seen order.
-		std::unordered_map<std::string, int16_t> seen;
-		arrow::StringBuilder dict_builder;
-		arrow::Int16Builder index_builder;
-		for (auto *v : values) {
-			if (!v) {
-				CheckArrow(index_builder.AppendNull(), "append dictionary index");
-				continue;
-			}
-			auto it = seen.find(*v);
-			if (it == seen.end()) {
-				it = seen.emplace(*v, static_cast<int16_t>(seen.size())).first;
-				CheckArrow(dict_builder.Append(*v), "append dictionary value");
-			}
-			CheckArrow(index_builder.Append(it->second), "append dictionary index");
-		}
-		auto indices = ValueOrThrow(index_builder.Finish(), "finish dictionary indices");
-		auto dictionary = ValueOrThrow(dict_builder.Finish(), "finish dictionary");
-		return ValueOrThrow(arrow::DictionaryArray::FromArrays(type, indices, dictionary), "make dictionary array");
-	}
-	default:
-		TypeMismatch(type, "std::string");
-	}
-}
-
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const std::vector<uint8_t> *> &values) {
-	auto build = [&](auto &builder) {
-		CheckArrow(builder.Reserve(static_cast<int64_t>(values.size())), "reserve");
-		for (auto *v : values) {
-			CheckArrow(v ? builder.Append(v->data(), static_cast<int64_t>(v->size())) : builder.AppendNull(), "append");
-		}
-		return ValueOrThrow(builder.Finish(), "finish");
-	};
-	switch (type->id()) {
-	case arrow::Type::DICTIONARY: {
-		const auto &dictionary_type = static_cast<const arrow::DictionaryType &>(*type);
-		if (dictionary_type.index_type()->id() != arrow::Type::INT32 || dictionary_type.value_type()->id() != arrow::Type::BINARY) {
-			TypeMismatch(type, "Bytes");
-		}
-		std::map<std::vector<uint8_t>, int32_t> positions;
-		arrow::Int32Builder indices;
-		arrow::BinaryBuilder dictionary;
-		for (const auto *value : values) {
-			if (!value) {
-				CheckArrow(indices.AppendNull(), "append binary dictionary index");
-				continue;
-			}
-			auto inserted = positions.emplace(*value, static_cast<int32_t>(positions.size()));
-			if (inserted.second) {
-				CheckArrow(dictionary.Append(value->data(), static_cast<int64_t>(value->size())), "append binary dictionary value");
-			}
-			CheckArrow(indices.Append(inserted.first->second), "append binary dictionary index");
-		}
-		auto index_array = ValueOrThrow(indices.Finish(), "finish binary dictionary indices");
-		auto dictionary_array = ValueOrThrow(dictionary.Finish(), "finish binary dictionary values");
-		return ValueOrThrow(arrow::DictionaryArray::FromArrays(type, index_array, dictionary_array), "make binary dictionary array");
-	}
-	case arrow::Type::BINARY: {
-		arrow::BinaryBuilder builder;
-		return build(builder);
-	}
-	case arrow::Type::LARGE_BINARY: {
-		arrow::LargeBinaryBuilder builder;
-		return build(builder);
-	}
-	default:
-		TypeMismatch(type, "Bytes");
-	}
-}
-
-ArrayPtr BuildColumn(const TypePtr &type, const std::vector<const std::shared_ptr<arrow::Buffer> *> &values) {
-	auto build = [&](auto &builder) {
-		CheckArrow(builder.Reserve(static_cast<int64_t>(values.size())), "reserve");
-		for (auto *v : values) {
-			if (!v) {
-				CheckArrow(builder.AppendNull(), "append");
-			} else if (!*v) {
-				CheckArrow(builder.AppendEmptyValue(), "append");
-			} else {
-				CheckArrow(builder.Append((*v)->data(), (*v)->size()), "append");
-			}
-		}
-		return ValueOrThrow(builder.Finish(), "finish");
-	};
-	switch (type->id()) {
-	case arrow::Type::LARGE_BINARY: {
-		arrow::LargeBinaryBuilder builder;
-		return build(builder);
-	}
-	case arrow::Type::BINARY: {
-		arrow::BinaryBuilder builder;
-		return build(builder);
-	}
-	default:
-		TypeMismatch(type, "LargeBytes");
-	}
-}
-
-const TypePtr &ListValueType(const TypePtr &type) {
-	switch (type->id()) {
-	case arrow::Type::LIST:
-	case arrow::Type::LARGE_LIST:
-		return static_cast<const arrow::BaseListType &>(*type).value_type();
-	default:
-		TypeMismatch(type, "std::vector");
-	}
-}
-
-ArrayPtr FinishList(const TypePtr &type, const std::vector<int64_t> &offsets, const std::vector<bool> &valid,
-                    const ArrayPtr &values) {
-	int64_t null_count = 0;
-	auto validity = MakeValidity(valid, null_count);
-	if (type->id() == arrow::Type::LARGE_LIST) {
-		arrow::Int64Builder offset_builder;
-		CheckArrow(offset_builder.AppendValues(offsets), "append list offsets");
-		auto offset_array = ValueOrThrow(offset_builder.Finish(), "finish list offsets");
-		return ValueOrThrow(arrow::LargeListArray::FromArrays(type, *offset_array, *values,
-		                                                      arrow::default_memory_pool(), validity, null_count),
-		                    "make large list");
-	}
-	arrow::Int32Builder offset_builder;
-	for (auto offset : offsets) {
-		CheckArrow(offset_builder.Append(static_cast<int32_t>(offset)), "append list offset");
-	}
-	auto offset_array = ValueOrThrow(offset_builder.Finish(), "finish list offsets");
-	return ValueOrThrow(
-	    arrow::ListArray::FromArrays(type, *offset_array, *values, arrow::default_memory_pool(), validity, null_count),
-	    "make list");
-}
-
-ArrayPtr FinishMap(const TypePtr &type, const std::vector<int64_t> &offsets, const std::vector<bool> &valid,
-                   const ArrayPtr &keys, const ArrayPtr &items) {
-	int64_t null_count = 0;
-	auto validity = MakeValidity(valid, null_count);
-	arrow::Int32Builder offset_builder;
-	for (auto offset : offsets) {
-		CheckArrow(offset_builder.Append(static_cast<int32_t>(offset)), "append map offset");
-	}
-	auto offset_array = ValueOrThrow(offset_builder.Finish(), "finish map offsets");
-	return ValueOrThrow(arrow::MapArray::FromArrays(type, offset_array, keys, items, arrow::default_memory_pool(),
-	                                                validity),
-	                    "make map");
-}
-
-ArrayPtr FinishEnum(const TypePtr &type, const std::vector<int16_t> &indices, const char *const *wire_names,
-                    int16_t count) {
-	if (type->id() != arrow::Type::DICTIONARY) {
-		TypeMismatch(type, "enum");
-	}
-	arrow::StringBuilder dict_builder;
-	for (int16_t i = 0; i < count; i++) {
-		CheckArrow(dict_builder.Append(wire_names[i]), "append enum dictionary");
-	}
-	auto dictionary = ValueOrThrow(dict_builder.Finish(), "finish enum dictionary");
-	arrow::Int16Builder index_builder;
-	for (auto index : indices) {
-		if (index < 0) {
-			CheckArrow(index_builder.AppendNull(), "append enum index");
-		} else if (index >= count) {
-			throw InternalException("VGI wire codec: enum index %d out of range (%d enumerators)", index, count);
-		} else {
-			CheckArrow(index_builder.Append(index), "append enum index");
+	// Preserve byte identity (including empty values) in first-seen order.
+	auto *dictionary = array->dictionary;
+	const auto *offsets = reinterpret_cast<const int32_t *>(ArrowArrayBuffer(dictionary, 1)->data);
+	const auto *data = ArrowArrayBuffer(dictionary, 2)->data;
+	for (int64_t index = 0; index < dictionary->length; index++) {
+		const auto size = static_cast<size_t>(offsets[index + 1] - offsets[index]);
+		if (size == value.size() && (size == 0 || std::memcmp(data + offsets[index], value.data(), size) == 0)) {
+			append::Int(array, index);
+			return;
 		}
 	}
-	auto index_array = ValueOrThrow(index_builder.Finish(), "finish enum indices");
-	return ValueOrThrow(arrow::DictionaryArray::FromArrays(type, index_array, dictionary), "make enum array");
+	append::Bytes(dictionary, value.data(), static_cast<int64_t>(value.size()));
+	append::Int(array, dictionary->length - 1);
 }
 
-ArrayPtr FinishStruct(const TypePtr &type, int64_t length, const std::vector<ArrayPtr> &children,
-                      const std::vector<bool> &valid) {
-	for (size_t i = 0; i < children.size(); i++) {
-		if (!children[i]) {
-			throw InternalException("VGI wire codec: struct %s field %d was never encoded", type->ToString(),
-			                        static_cast<int>(i));
+void WriteValue(ArrowArray *array, const VgiBufferPtr &value) {
+	if (!value) {
+		append::Bytes(array, nullptr, 0);
+		return;
+	}
+	append::Bytes(array, value->data(), value->size());
+}
+
+void WriteEnum(ArrowArray *array, int16_t index, const char *const *wire_names, int16_t count) {
+	ArrowArray *dict = array->dictionary;
+	if (!dict) {
+		throw InternalException("VGI wire codec: enum member on a non-dictionary column");
+	}
+	if (dict->length == 0) {
+		for (int16_t k = 0; k < count; k++) {
+			append::String(dict, wire_names[k]);
 		}
 	}
-	int64_t null_count = 0;
-	auto validity = MakeValidity(valid, null_count);
-	return std::make_shared<arrow::StructArray>(type, length, children, validity, null_count);
+	append::Int(array, index);
 }
 
-TypePtr StructTypeOf(const std::shared_ptr<arrow::Schema> &schema) {
-	return arrow::struct_(schema->fields());
-}
+// ============================================================================
+// Equality
+// ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> BatchFromStruct(const std::shared_ptr<arrow::Schema> &schema,
-                                                    const ArrayPtr &struct_array) {
-	const auto &typed = static_cast<const arrow::StructArray &>(*struct_array);
-	std::vector<ArrayPtr> columns;
-	columns.reserve(static_cast<size_t>(schema->num_fields()));
-	for (int i = 0; i < schema->num_fields(); i++) {
-		columns.push_back(typed.field(i));
-	}
-	return arrow::RecordBatch::Make(schema, typed.length(), std::move(columns));
-}
-
-bool Equal(const std::shared_ptr<arrow::Buffer> &a, const std::shared_ptr<arrow::Buffer> &b) {
-	auto size_a = a ? a->size() : 0;
-	auto size_b = b ? b->size() : 0;
-	if (size_a != size_b) {
+bool Equal(const VgiBufferPtr &a, const VgiBufferPtr &b) {
+	int64_t sa = a ? a->size() : 0;
+	int64_t sb = b ? b->size() : 0;
+	if (sa != sb) {
 		return false;
 	}
-	return size_a == 0 || a->Equals(*b);
+	return sa == 0 || std::memcmp(a->data(), b->data(), static_cast<size_t>(sa)) == 0;
 }
 
 } // namespace wire

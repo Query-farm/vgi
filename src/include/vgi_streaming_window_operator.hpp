@@ -24,15 +24,15 @@ namespace vgi {
 
 class LogicalVgiStreamingWindow : public LogicalExtensionOperator {
 public:
-	explicit LogicalVgiStreamingWindow(idx_t window_index)
+	explicit LogicalVgiStreamingWindow(TableIndex window_index)
 	    : window_index(window_index) {
 	}
 
-	idx_t window_index;
+	TableIndex window_index;
 
 public:
 	vector<ColumnBinding> GetColumnBindings() override;
-	vector<idx_t> GetTableIndex() const override;
+	vector<TableIndex> GetTableIndex() const override;
 	string GetName() const override;
 	string GetExtensionName() const override;
 

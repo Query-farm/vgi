@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 // VgiResultCache — database-owned cache of complete table-function results.
 //
 // When a worker advertises `vgi.cache.*` metadata on the first batch of a
@@ -30,11 +32,6 @@
 
 #include "vgi_settings_defaults.hpp"
 #include "vgi_cache_control.hpp" // vgi.cache.* constants + VgiCacheControl + ParseVgiCacheControl
-
-namespace arrow {
-class Buffer;
-class KeyValueMetadata;
-} // namespace arrow
 
 namespace duckdb {
 
@@ -79,7 +76,7 @@ struct CopyableAtomicU64 {
 // batch + custom_metadata, produced by SerializeRecordBatch) plus the replayed
 // per-batch metadata the scan needs (`vgi_batch_index` / `vgi_partition_values`).
 struct VgiCachedBatch {
-	std::shared_ptr<arrow::Buffer> ipc;   // serialized IPC stream for this one batch
+	VgiBufferPtr ipc;   // serialized IPC stream for this one batch
 	int64_t rows = 0;
 	// vgi_meta to replay on serve so InstallBatch sees identical values:
 	uint64_t batch_index = 0;             // DConstants::INVALID_INDEX sentinel set by producer

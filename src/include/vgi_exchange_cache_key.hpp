@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <map>
 #include <memory>
 #include <string>
@@ -9,10 +11,6 @@
 #include "duckdb/common/types/value.hpp"
 
 // Arrow forward-declaration (the .cpp deserializes/serializes; keep this header light).
-namespace arrow {
-class RecordBatch;
-} // namespace arrow
-
 namespace duckdb {
 
 class ClientContext;
@@ -40,6 +38,12 @@ std::string SerializeSettingsForKey(const std::map<std::string, Value> &settings
 //! Canonical serialization of the projection id list for the cache key.
 std::string SerializeProjectionForKey(const std::vector<int32_t> &projection_ids);
 
+//! Canonical key component for a bind's const-argument batch (ArrowArguments::batch):
+//! SHA-256 hex of its deterministic IPC serialization (no message metadata); "" when
+//! there is none. Replaces Arrow C++'s Array::ToString() rendering (keys changed once
+//! with the nanoarrow migration).
+std::string SerializeArgumentsForKey(const VgiBatchPtr &arguments_batch);
+
 // ============================================================================
 // Input-hash helpers for EXCHANGE-mode cache keys
 // ============================================================================
@@ -48,7 +52,7 @@ std::string SerializeProjectionForKey(const std::vector<int32_t> &projection_ids
 //! IPC-stream framing. For streaming table-in-out maps, whose output is
 //! positionally aligned to input (identical ordered bytes == identical result).
 //! Divergent-but-equal framing only ever causes a miss (safe), never a wrong hit.
-std::string HashInputBatchOrdered(const std::shared_ptr<arrow::RecordBatch> &input_batch);
+std::string HashInputBatchOrdered(const VgiBatchPtr &input_batch);
 
 //! Order-INDEPENDENT, multiset-correct hash of a DataChunk: per-row canonical
 //! sort-key blobs (CreateSortKey — NULL-aware, all types), sorted, then SHA-256
@@ -147,7 +151,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 //! (`ipc==nullptr`, `disk_ipc_offset>=0`) by positioned-reading just that batch's
 //! bytes from `entry.disk_path` — so a disk-tier exchange entry that Lookup returned
 //! as a streaming (TOC-only) entry serves correctly, not just materialized ones.
-std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiResultCacheEntry &entry,
+VgiBatchPtr DeserializeCachedRecordBatch(const VgiResultCacheEntry &entry,
                                                                  const VgiCachedBatch &cached);
 
 //! Result of a StoreExchangeMemoEntry attempt (for the caller's result_cache.store /
@@ -180,7 +184,7 @@ void SlideRevalidatedExchangeEntry(VgiResultCache &cache, const VgiResultCacheEn
 //! with a 0% hit rate every chunk (B3). Refusing to store it is strictly better.
 ExchangeStoreResult StoreExchangeMemoEntry(VgiResultCache &cache, const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
-                                           const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
+                                           const std::vector<VgiBatchPtr> &out_batches,
                                            bool allow_disk = false, bool allow_immediately_stale = true);
 
 } // namespace vgi

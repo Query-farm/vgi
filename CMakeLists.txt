@@ -17,19 +17,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
 # Note that it should also be removed from vcpkg.json to prevent needlessly installing it..
-if(DEFINED DUCKDB_WASM_ARROW_PREFIX)
-    # WASM build: use Arrow from duckdb-wasm's vendored build
-    message(STATUS "VGI: Using duckdb-wasm Arrow from ${DUCKDB_WASM_ARROW_PREFIX}")
-    include_directories(${DUCKDB_WASM_ARROW_PREFIX}/include)
-    add_library(arrow_wasm STATIC IMPORTED)
-    set_target_properties(arrow_wasm PROPERTIES IMPORTED_LOCATION ${DUCKDB_WASM_ARROW_PREFIX}/lib/libarrow.a)
-    set(VGI_ARROW_LIB arrow_wasm)
+if(EMSCRIPTEN)
     # OpenSSL not needed in WASM (emscripten handles TLS via XHR)
     set(VGI_SSL_LIBS "")
 else()
     find_package(OpenSSL REQUIRED)
-    find_package(Arrow REQUIRED)
-    set(VGI_ARROW_LIB Arrow::arrow_static)
     set(VGI_SSL_LIBS OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
@@ -39,7 +31,6 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 
 option(BUILD_VGI_BENCHMARKS "Build the Linux CPU/memory benchmark host" OFF)
-option(VGI_BENCH_ARROW_PROBE "Expose Arrow allocator diagnostics in the benchmark extension only" OFF)
 if(BUILD_VGI_BENCHMARKS)
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "VGI benchmarks require Linux resource accounting")
@@ -291,12 +282,17 @@ if(MSVC)
   add_compile_options(/Zc:preprocessor)
   # Use the *static* CRT (/MT), matching duckdb (duckdb/CMakeLists.txt sets the
   # same value) and the static vcpkg deps. The extension links both duckdb_static
-  # and arrow/openssl/boost into one loadable module, so all three must share a
-  # CRT; LNK2038 otherwise. This requires the vcpkg deps to be built with a
+  # and native OpenSSL/compression dependencies into one loadable module, so
+  # every component must share a CRT; LNK2038 otherwise. This requires the vcpkg deps to be built with a
   # static-CRT triplet — x64-windows-static (NOT x64-windows-static-md, whose -md
   # forces the dynamic CRT). Requires CMP0091=NEW (set above).
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
+
+# nanoarrow (vendored bundle): Arrow IPC encode/decode for the wire. Its own
+# directory scope keeps DuckDB's vendored zstd.h off its include path.
+add_subdirectory(third_party/nanoarrow)
+include_directories(third_party/nanoarrow/include)
 
 include_directories(src/include)
 include_directories(duckdb/third_party/mbedtls/include)
@@ -319,6 +315,8 @@ src/vgi_named_pipe.cpp
 src/vgi_logging.cpp
 src/vgi_subprocess.cpp
 src/vgi_arrow_ipc.cpp
+src/vgi_arrow.cpp
+src/vgi_ipc.cpp
 src/vgi_arrow_utils.cpp
 src/vgi_rpc_client.cpp
 src/vgi_rpc_types.cpp
@@ -429,19 +427,26 @@ if(EMSCRIPTEN)
     src/vgi_sab_stream.cpp)
 endif()
 
+# DuckDB's WASM side-module post-link invokes emcc separately from the static
+# archive target, so target_link_libraries alone does not carry nanoarrow into it.
+if(EMSCRIPTEN)
+  set(DUCKDB_EXTENSION_VGI_LINKED_LIBS "$<TARGET_FILE:vgi_nanoarrow>")
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-if(VGI_BENCH_ARROW_PROBE)
-  if(NOT BUILD_VGI_BENCHMARKS)
-    message(FATAL_ERROR "VGI_BENCH_ARROW_PROBE requires BUILD_VGI_BENCHMARKS")
-  endif()
-  target_sources(${LOADABLE_EXTENSION_NAME} PRIVATE benchmarks/arrow_probe.cpp)
-endif()
-
 # Link OpenSSL in both the static library as the loadable extension
-target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
+target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} vgi_nanoarrow)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} vgi_nanoarrow)
+
+# POSIX shared memory lives in librt on the older glibc used by our Linux
+# distribution images. Arrow previously supplied this transitive dependency;
+# nanoarrow does not, so declare it for VGI's own shm_open/shm_unlink calls.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(${EXTENSION_NAME} rt)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} rt)
+endif()
 
 if(VGI_ENABLE_IROH)
   add_dependencies(${EXTENSION_NAME} vgi_iroh_rust)
@@ -474,7 +479,7 @@ if(NOT EMSCRIPTEN)
 endif()
 
 install(
-  TARGETS ${EXTENSION_NAME}
+  TARGETS ${EXTENSION_NAME} vgi_nanoarrow
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -488,8 +493,7 @@ if(WIN32 AND BUILD_VGI_OAUTH_STORE_TESTS)
   target_include_directories(vgi_oauth_store_probe PRIVATE src/include duckdb/src/include)
   target_link_libraries(vgi_oauth_store_probe
     ${EXTENSION_NAME}
-    duckdb_static
-    dummy_static_extension_loader)
+    duckdb_static)
   add_custom_target(test_vgi_oauth_store
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_oauth_store_windows.py
       --probe $<TARGET_FILE:vgi_oauth_store_probe>
@@ -527,6 +531,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_attach_credentials.cpp
     test/cpp/test_request_schema_parity.cpp
     test/cpp/test_protocol_records.cpp
+    test/cpp/test_vgi_arrow.cpp
     test/cpp/test_protocol_routing.cpp
     test/cpp/test_hosted_protocols.cpp
     test/cpp/test_sab_stream.cpp
@@ -549,6 +554,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_table_buffering_builders.cpp
     src/vgi_schema_registry.cpp
     src/vgi_arrow_ipc.cpp
+    src/vgi_arrow.cpp
+    src/vgi_ipc.cpp
     src/vgi_logging.cpp
     src/vgi_telemetry_util.cpp
     src/vgi_oauth_env.cpp
@@ -573,8 +580,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   target_compile_definitions(vgi_unit_tests PRIVATE VGI_SAB_NATIVE_TEST)
   # Layer-3 integration tests in test_launcher_e2e.cpp link against the real
   # launcher orchestration (which uses duckdb::IOException), so we now do
-  # need libduckdb_static plus the dummy static-extension loader stub that
-  # satisfies the LoadAllExtensions symbol DuckDB references.  The Layer-1 /
+  # need libduckdb_static. DuckDB 2 registers static extensions explicitly;
+  # these tests load their required extensions themselves. The Layer-1 /
   # Layer-2 helpers themselves stay DuckDB-free but link into the same binary
   # for convenience.
   # Rust FFI worker staticlib for the cross-language SAB e2e (test_sab_e2e.cpp).
@@ -594,9 +601,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     # follow the production archive instead of a second incomplete source list.
     ${EXTENSION_NAME}
     duckdb_static
-    dummy_static_extension_loader
     duckdb_mbedtls
-    ${VGI_ARROW_LIB}
+    vgi_nanoarrow
     ${SABFFI_LIB}
     ${SABTABLE_LIB})
   if(APPLE)
@@ -630,8 +636,7 @@ if((BUILD_VGI_FILTER_V2_TESTS OR DEFINED ENV{BUILD_VGI_FILTER_V2_TESTS} OR BUILD
     duckdb/third_party/catch)
   target_link_libraries(vgi_filter_v2_tests
     ${EXTENSION_NAME}
-    duckdb_static
-    dummy_static_extension_loader)
+    duckdb_static)
 
   add_executable(vgi_settings_tests
     test/cpp/test_main.cpp
@@ -644,8 +649,7 @@ if((BUILD_VGI_FILTER_V2_TESTS OR DEFINED ENV{BUILD_VGI_FILTER_V2_TESTS} OR BUILD
   target_link_libraries(vgi_settings_tests
     ${EXTENSION_NAME}
     duckdb_static
-    core_functions_extension
-    dummy_static_extension_loader)
+    core_functions_extension)
 endif()
 
 # VgiCancelDispatcher's worker-start policy (the WASM explicit-start rule) and
@@ -662,8 +666,7 @@ if((BUILD_VGI_CANCEL_DISPATCHER_TESTS OR DEFINED ENV{BUILD_VGI_CANCEL_DISPATCHER
     duckdb/third_party/catch)
   target_link_libraries(vgi_cancel_dispatcher_tests
     ${EXTENSION_NAME}
-    duckdb_static
-    dummy_static_extension_loader)
+    duckdb_static)
 endif()
 
 # Interrupting an in-flight VGI HTTP request, against the real client and
@@ -685,8 +688,20 @@ if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS
   target_link_libraries(vgi_http_interrupt_tests
     ${EXTENSION_NAME}
     httpfs_extension
-    duckdb_static
-    dummy_static_extension_loader)
+    duckdb_static)
+
+  # Verify request-local provider parameter copies independently of the VGI
+  # archive, so native-engine HTTP integration can be checked during an API port.
+  add_executable(vgi_http_params_clone_tests
+    test/cpp/test_main.cpp
+    test/cpp/test_http_params_clone.cpp)
+  target_include_directories(vgi_http_params_clone_tests PRIVATE
+    duckdb/src/include
+    duckdb/third_party/catch
+    $<TARGET_PROPERTY:httpfs_extension,SOURCE_DIR>/src/include)
+  target_link_libraries(vgi_http_params_clone_tests
+    httpfs_extension
+    duckdb_static)
 endif()
 
 # Catalog metadata fields exist in CreateInfo even where the pinned SQL parser
@@ -719,6 +734,5 @@ if(BUILD_VGI_CATALOG_TESTS AND NOT WIN32)
   target_link_libraries(vgi_catalog_tests
     ${EXTENSION_NAME}
     duckdb_static
-    core_functions_extension
-    dummy_static_extension_loader)
+    core_functions_extension)
 endif()

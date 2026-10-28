@@ -23,17 +23,11 @@ namespace duckdb {
 VgiSchemaSet::VgiSchemaSet(Catalog &catalog) : VgiCatalogSet(catalog, nullptr) {
 }
 
-std::string VgiSchemaSet::GetDefaultSchema(ClientContext &context) {
-	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
-	auto &attach_result = vgi_catalog.attach_result();
-
-	if (attach_result) {
-		return attach_result->default_schema;
-	}
-	return "main";
+optional<Identifier> VgiSchemaSet::GetDefaultSchema(ClientContext &context) {
+	return catalog_.Cast<VgiCatalog>().GetDefaultSchema();
 }
 
-void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
+void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> & /*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -44,7 +38,8 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 
 	// Call catalog_schemas via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx_load.GetTransactionOpaqueData()};
 
 	// Whole-catalog load: one catalog_contents RPC replaces catalog_schemas plus
 	// a catalog_schema_contents_* call per schema and kind. The contents seed
@@ -56,7 +51,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 		// Decode full SchemaInfo on first use and share the response buffers.
 		for (auto &contents : snapshot->schemas) {
 			CreateSchemaInfo info;
-			info.schema = contents.name;
+			info.SetQualifiedName(QualifiedName(catalog_.GetName(), Identifier(contents.name), Identifier()));
 			auto seed = std::make_shared<const vgi::VgiSchemaContents>(std::move(contents));
 			auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, std::move(seed));
 			std::lock_guard<std::mutex> entry_lk(entry_lock_);
@@ -67,7 +62,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 
 	for (auto &schema_info : vgi::InvokeCatalogSchemas(rpc_ctx, context)) {
 		CreateSchemaInfo info;
-		info.schema = schema_info.name;
+		info.SetQualifiedName(QualifiedName(catalog_.GetName(), Identifier(schema_info.name), Identifier()));
 		if (schema_info.comment.has_value()) {
 			info.comment = Value(*schema_info.comment);
 		}

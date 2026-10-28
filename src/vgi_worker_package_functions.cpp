@@ -78,7 +78,7 @@ SELECT
 FROM normalized
 )SQL";
 
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(definition);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw InternalException("vgi_worker_package macro definition did not parse as SELECT");
@@ -91,13 +91,13 @@ FROM normalized
 	for (const char *name : {"package_format", "entrypoint", "platform"}) {
 		macro->parameters.push_back(make_uniq<ColumnRefExpression>(name));
 	}
-	macro->default_parameters["package_format"] = make_uniq<ConstantExpression>(Value("auto"));
-	macro->default_parameters["entrypoint"] = make_uniq<ConstantExpression>(Value());
-	macro->default_parameters["platform"] = make_uniq<ConstantExpression>(Value());
+	macro->default_parameters["package_format"] = ConstantExpression::FromValue(Value("auto"));
+	macro->default_parameters["entrypoint"] = ConstantExpression::FromValue(Value());
+	macro->default_parameters["platform"] = ConstantExpression::FromValue(Value());
 
 	CreateMacroInfo info(CatalogType::TABLE_MACRO_ENTRY);
-	info.name = "vgi_worker_package";
-	info.schema = DEFAULT_SCHEMA;
+	info.SetName("vgi_worker_package");
+	info.SetSchema(Identifier::DefaultSchema());
 	info.internal = true;
 	info.macros.push_back(std::move(macro));
 	loader.RegisterFunction(info);
@@ -111,7 +111,7 @@ struct WorkerCacheScanData : TableFunctionData {
 };
 
 unique_ptr<FunctionData> WorkerCacheBind(ClientContext &context, TableFunctionBindInput &,
-	                                      vector<LogicalType> &types, vector<string> &names) {
+	                                      vector<LogicalType> &types, vector<Identifier> &names) {
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	         LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::BIGINT,
 	         LogicalType::BOOLEAN};
@@ -146,7 +146,7 @@ struct WorkerCacheActionData : TableFunctionData {
 	bool flush = false;
 };
 
-unique_ptr<FunctionData> WorkerCacheActionBind(bool flush, vector<LogicalType> &types, vector<string> &names) {
+unique_ptr<FunctionData> WorkerCacheActionBind(bool flush, vector<LogicalType> &types, vector<Identifier> &names) {
 	types = {LogicalType::BIGINT, LogicalType::UBIGINT, LogicalType::BIGINT};
 	names = {"removed", "bytes_removed", "skipped_in_use"};
 	auto data = make_uniq<WorkerCacheActionData>();
@@ -179,14 +179,14 @@ void RegisterVgiWorkerCacheFunctions(ExtensionLoader &loader) {
 	{
 		TableFunction function("vgi_worker_cache_prune", {}, WorkerCacheActionScan,
 		                       [](ClientContext &, TableFunctionBindInput &, vector<LogicalType> &types,
-		                          vector<string> &names) { return WorkerCacheActionBind(false, types, names); });
+		                          vector<Identifier> &names) { return WorkerCacheActionBind(false, types, names); });
 		CreateTableFunctionInfo info(function);
 		loader.RegisterFunction(std::move(info));
 	}
 	{
 		TableFunction function("vgi_worker_cache_flush", {}, WorkerCacheActionScan,
 		                       [](ClientContext &, TableFunctionBindInput &, vector<LogicalType> &types,
-		                          vector<string> &names) { return WorkerCacheActionBind(true, types, names); });
+		                          vector<Identifier> &names) { return WorkerCacheActionBind(true, types, names); });
 		CreateTableFunctionInfo info(function);
 		loader.RegisterFunction(std::move(info));
 	}

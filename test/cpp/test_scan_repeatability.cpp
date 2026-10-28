@@ -11,13 +11,20 @@
 #include "vgi_table_function_impl.hpp"
 #include "../../src/generated/vgi_protocol_schemas.hpp"
 #include <cstdlib>
+#include <functional>
+#include "nanoarrow/nanoarrow.h"
 
 using namespace duckdb;
 namespace {
-using Batch = std::shared_ptr<arrow::RecordBatch>;
-Batch Bind(const std::shared_ptr<arrow::Array> &repeatability) {
-	auto schema = arrow::schema({arrow::field("n", arrow::int32())});
-	return arrow::RecordBatch::Make(vgi::generated::BindResultSchema(), 1,
+using Batch = vgi::VgiBatchPtr;
+vgi::VgiField RepeatabilityType() {
+	return vgi::type::Dictionary(vgi::type::Int16(), vgi::type::Utf8());
+}
+Batch Bind(ArrowArray repeatability, const vgi::VgiField &field = RepeatabilityType()) {
+	auto schema = vgi::MakeSchema({vgi::type::Int32().Named("n")});
+	auto field_schema = vgi::MakeSchema({field.Named("repeatability", false)});
+	auto bind_schema = vgi::generated::BindResultSchema()->SetField(6, field_schema->field(0));
+	return vgi::VgiBatch::FromColumns(bind_schema, 1,
 	                                {vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(schema)),
 	                                 vgi::BuildBinaryScalarRequired({1, 2, 3}), vgi::BuildStringListScalar({}),
 	                                 vgi::BuildStringListScalar({}), vgi::BuildStringListScalar({}),
@@ -25,6 +32,16 @@ Batch Bind(const std::shared_ptr<arrow::Array> &repeatability) {
 }
 Batch Bind(const std::string &value) {
 	return Bind(vgi::BuildEnumArray(value, {"UNKNOWN", "STABLE_WITHIN_QUERY"}));
+}
+ArrowArray Column(const vgi::VgiField &field, const std::function<void(ArrowArray *)> &fill) {
+	vgi::VgiBatchBuilder builder(vgi::MakeSchema({field.Named("value")}));
+	fill(builder.column(0));
+	builder.FinishRow();
+	ArrowArrayWrapper exported;
+	builder.Finish()->ExportTo(exported);
+	ArrowArray column;
+	ArrowArrayMove(exported.arrow_array.children[0], &column);
+	return column;
 }
 LogicalGet *FindScan(LogicalOperator &op) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET &&
@@ -43,31 +60,31 @@ TEST_CASE("Bind repeatability validates the required enum independently of dicti
 	      vgi::BindRepeatability::STABLE_WITHIN_QUERY);
 	auto reversed = vgi::BuildEnumArray("STABLE_WITHIN_QUERY", {"STABLE_WITHIN_QUERY", "UNKNOWN"});
 	CHECK(vgi::ParseBindResponse(Bind(reversed)).repeatability == vgi::BindRepeatability::STABLE_WITHIN_QUERY);
-	CHECK_THROWS(vgi::ParseBindResponse(Bind("UNKNOWN")->RemoveColumn(6).ValueOrDie()));
+	CHECK_THROWS(vgi::ParseBindResponse(Bind("UNKNOWN")->SelectColumns({0, 1, 2, 3, 4, 5})));
 	CHECK_THROWS(vgi::ParseBindResponse(Bind(vgi::BuildEnumArray("stable_within_query", {"stable_within_query"}))));
 	CHECK_THROWS(vgi::ParseBindResponse(Bind(vgi::BuildEnumArray("ALWAYS", {"ALWAYS"}))));
-	CHECK_THROWS(vgi::ParseBindResponse(Bind(arrow::MakeArrayOfNull(arrow::utf8(), 1).ValueOrDie())));
-	CHECK_THROWS(vgi::ParseBindResponse(
-	    Bind(arrow::MakeArrayOfNull(arrow::dictionary(arrow::int16(), arrow::utf8()), 1).ValueOrDie())));
-	arrow::Int16Builder builder;
-	vgi::ThrowOnArrowError(builder.Append(0));
-	auto null_value = arrow::DictionaryArray::FromArrays(builder.Finish().ValueOrDie(),
-	                                                     arrow::MakeArrayOfNull(arrow::utf8(), 1).ValueOrDie())
-	                      .ValueOrDie();
+	CHECK_THROWS(vgi::ParseBindResponse(Bind(vgi::BuildOptionalStringScalar(std::nullopt), vgi::type::Utf8())));
+	CHECK_THROWS(vgi::ParseBindResponse(Bind(vgi::BuildOptionalEnumArray(std::nullopt, {"UNKNOWN"}))));
+	auto null_value = Column(RepeatabilityType(), [](ArrowArray *a) {
+		vgi::append::Null(a->dictionary);
+		vgi::append::Int(a, 0);
+	});
 	CHECK_THROWS(vgi::ParseBindResponse(Bind(null_value)));
 	// Arrow permits a NULL dictionary value to retain nonempty payload bytes.
 	// GetString alone would accidentally turn this NULL into a valid claim.
-	auto valid = std::static_pointer_cast<arrow::DictionaryArray>(reversed);
-	auto hidden = valid->dictionary()->data()->Copy();
-	hidden->buffers[0] = arrow::Buffer::FromString(std::string(1, '\0'));
-	hidden->SetNullCount(hidden->length);
-	auto hidden_null = arrow::DictionaryArray::FromArrays(valid->indices(), arrow::MakeArray(hidden)).ValueOrDie();
+	auto hidden_null = vgi::BuildEnumArray("STABLE_WITHIN_QUERY", {"STABLE_WITHIN_QUERY", "UNKNOWN"});
+	ArrowBitmap validity;
+	ArrowBitmapInit(&validity);
+	REQUIRE(ArrowBitmapAppend(&validity, 0, hidden_null.dictionary->length) == NANOARROW_OK);
+	ArrowArraySetValidityBitmap(hidden_null.dictionary, &validity);
+	hidden_null.dictionary->null_count = hidden_null.dictionary->length;
 	CHECK_THROWS(vgi::ParseBindResponse(Bind(hidden_null)));
-	arrow::Int32Builder wrong_index;
-	vgi::ThrowOnArrowError(wrong_index.Append(0));
-	auto values = std::static_pointer_cast<arrow::DictionaryArray>(reversed)->dictionary();
-	CHECK_THROWS(vgi::ParseBindResponse(
-	    Bind(arrow::DictionaryArray::FromArrays(wrong_index.Finish().ValueOrDie(), values).ValueOrDie())));
+	auto wrong_type = vgi::type::Dictionary(vgi::type::Int32(), vgi::type::Utf8());
+	auto wrong_index = Column(wrong_type, [](ArrowArray *a) {
+		vgi::append::String(a->dictionary, "STABLE_WITHIN_QUERY");
+		vgi::append::Int(a, 0);
+	});
+	CHECK_THROWS(vgi::ParseBindResponse(Bind(wrong_index, wrong_type)));
 }
 
 TEST_CASE("Stable bind snapshots survive direct copies and disable statement reuse without a projection offer",

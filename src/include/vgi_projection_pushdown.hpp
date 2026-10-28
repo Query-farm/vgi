@@ -1,26 +1,22 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #pragma once
 #include "duckdb/common/common.hpp"
-#include <memory>
+#include "vgi_arrow.hpp"
 #include <vector>
-namespace arrow {
-class RecordBatch;
-class Schema;
-} // namespace arrow
 namespace duckdb {
 class DBConfig;
 class ClientContext;
-class TableFunction;
+class BaseTableFunction;
 namespace vgi {
 struct VgiTableFunctionBindData;
 struct ProjectionAcceptance {
 	std::vector<idx_t> indices;
-	std::shared_ptr<arrow::RecordBatch> bind_result;
-	std::shared_ptr<arrow::Schema> output_schema;
+	VgiBatchPtr bind_result;
+	VgiSchemaPtr output_schema;
 };
 ProjectionAcceptance ValidateProjectionAcceptance(const std::vector<uint8_t> &request,
-                                                  const std::shared_ptr<arrow::RecordBatch> &response);
-void RestoreProjectionAcceptance(ClientContext &context, VgiTableFunctionBindData &data, TableFunction &function,
+                                                  const VgiBatchPtr &response);
+void RestoreProjectionAcceptance(ClientContext &context, VgiTableFunctionBindData &data, BaseTableFunction &function,
                                  const std::vector<uint8_t> &request, const std::vector<uint8_t> &response);
 void RegisterVgiProjectionOptimizer(DBConfig &config);
 } // namespace vgi

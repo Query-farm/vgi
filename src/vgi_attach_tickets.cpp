@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <vector>
 
-#include <arrow/api.h>
+#include "nanoarrow/nanoarrow.h"
 
 #include "duckdb.hpp"
 #include "duckdb/common/error_data.hpp"
@@ -26,51 +26,31 @@ namespace vgi {
 
 namespace {
 
-std::shared_ptr<arrow::Array> Utf8Scalar(const std::string &value) {
-	arrow::StringBuilder builder;
-	if (!builder.Append(value).ok()) {
-		throw IOException("vgi: failed to build a string request field");
-	}
-	return builder.Finish().ValueOrDie();
-}
-
-std::shared_ptr<arrow::Array> Int64Scalar(int64_t value) {
-	arrow::Int64Builder builder;
-	if (!builder.Append(value).ok()) {
-		throw IOException("vgi: failed to build an int64 request field");
-	}
-	return builder.Finish().ValueOrDie();
-}
-
 // A required string field of a one-row reply payload, read by name.
-std::string ReplyString(const std::shared_ptr<arrow::RecordBatch> &payload, const char *field, const char *what) {
+std::string ReplyString(const VgiBatchPtr &payload, const char *field, const char *what) {
 	auto column = payload->GetColumnByName(field);
-	if (!column || column->IsNull(0) || column->type_id() != arrow::Type::STRING) {
+	if (!column || column.IsNull(0) || column.type().type != NANOARROW_TYPE_STRING) {
 		throw IOException("vgi: the %s reply carries no string '%s'", what, field);
 	}
-	return std::static_pointer_cast<arrow::StringArray>(column)->GetString(0);
+	return column.GetString(0);
 }
 
 // A timestamp[us, tz=UTC] field of a one-row reply payload, read by name; nullopt when null.
-std::optional<int64_t> ReplyTimestampMicros(const std::shared_ptr<arrow::RecordBatch> &payload, const char *field,
-                                            const char *what) {
+std::optional<int64_t> ReplyTimestampMicros(const VgiBatchPtr &payload, const char *field, const char *what) {
 	auto column = payload->GetColumnByName(field);
 	if (!column) {
 		throw IOException("vgi: the %s reply carries no '%s'", what, field);
 	}
-	if (column->type_id() != arrow::Type::TIMESTAMP) {
+	const auto type = column.type();
+	if (type.type != NANOARROW_TYPE_TIMESTAMP || type.time_unit != NANOARROW_TIME_UNIT_MICRO ||
+	    type.timezone != "UTC") {
 		throw IOException("vgi: the %s reply's '%s' is %s, expected timestamp[us, tz=UTC]", what, field,
-		                  column->type()->ToString());
+		                  column.type_string());
 	}
-	const auto &type = static_cast<const arrow::TimestampType &>(*column->type());
-	if (type.unit() != arrow::TimeUnit::MICRO || type.timezone() != "UTC") {
-		throw IOException("vgi: the %s reply's '%s' is %s, expected timestamp[us, tz=UTC]", what, field,
-		                  type.ToString());
-	}
-	if (column->IsNull(0)) {
+	if (column.IsNull(0)) {
 		return std::nullopt;
 	}
-	return std::static_pointer_cast<arrow::TimestampArray>(column)->Value(0);
+	return column.GetInt(0);
 }
 
 } // namespace
@@ -78,17 +58,15 @@ std::optional<int64_t> ReplyTimestampMicros(const std::shared_ptr<arrow::RecordB
 VgiIssuedGrant InvokeIssueGrant(const CatalogRpcContext &ctx, ClientContext &context,
                                 const std::string &identity_version, const std::string &purpose, int64_t ttl_seconds) {
 	// issue_grant(purpose: utf8, scopes: list<utf8>, ttl_seconds: int64), all non-null.
-	auto scopes_type = arrow::list(arrow::utf8());
-	auto schema =
-	    arrow::schema({arrow::field("purpose", arrow::utf8(), false), arrow::field("scopes", scopes_type, false),
-	                   arrow::field("ttl_seconds", arrow::int64(), false)});
-	arrow::ListBuilder scopes_builder(arrow::default_memory_pool(), std::make_shared<arrow::StringBuilder>(),
-	                                  scopes_type);
-	if (!scopes_builder.Append().ok()) { // one empty list
-		throw IOException("vgi: failed to build issue_grant scopes");
-	}
-	auto scopes = scopes_builder.Finish().ValueOrDie();
-	auto params = arrow::RecordBatch::Make(schema, 1, {Utf8Scalar(purpose), scopes, Int64Scalar(ttl_seconds)});
+	static const VgiSchemaPtr schema =
+	    MakeSchema({type::Utf8().Named("purpose", false), type::List(type::Utf8()).Named("scopes", false),
+	                type::Int64().Named("ttl_seconds", false)});
+	VgiBatchBuilder builder(schema);
+	append::String(builder.column(0), purpose);
+	append::FinishElement(builder.column(1)); // one empty list
+	append::Int(builder.column(2), ttl_seconds);
+	builder.FinishRow();
+	auto params = builder.Finish();
 
 	const VgiProtocolId identity {IDENTITY_PROTOCOL_NAME, identity_version};
 	auto payload = InvokeProtocolUnary(ctx, context, identity, "issue_grant", params);
@@ -100,8 +78,8 @@ VgiIssuedGrant InvokeIssueGrant(const CatalogRpcContext &ctx, ClientContext &con
 	}
 	grant.expires_at_us = *expires_at;
 	auto grant_id = payload->GetColumnByName("grant_id");
-	if (grant_id && grant_id->type_id() == arrow::Type::STRING && !grant_id->IsNull(0)) {
-		grant.grant_id = std::static_pointer_cast<arrow::StringArray>(grant_id)->GetString(0);
+	if (grant_id && grant_id.type().type == NANOARROW_TYPE_STRING && !grant_id.IsNull(0)) {
+		grant.grant_id = grant_id.GetString(0);
 	}
 	return grant;
 }
@@ -111,38 +89,29 @@ VgiAttachTicket InvokeSealAttach(const CatalogRpcContext &ctx, ClientContext &co
 	// SealAttachRequest, serialized as the one-row batch carried in the
 	// `request` binary parameter (spec §5.2). `options` is the same Arrow IPC
 	// options record catalog_attach carries.
-	std::shared_ptr<arrow::Array> options;
-	{
-		arrow::BinaryBuilder builder;
-		arrow::Status status;
-		if (retained.options.empty()) {
-			status = builder.AppendNull();
-		} else {
-			auto bytes = SerializeToIpcBytes(BuildSettingsBatch(context, retained.options));
-			status = builder.Append(bytes.data(), static_cast<int32_t>(bytes.size()));
-		}
-		if (!status.ok()) {
-			throw IOException("vgi: failed to build seal_attach options");
-		}
-		options = builder.Finish().ValueOrDie();
+	static const VgiSchemaPtr request_schema = MakeSchema(
+	    {type::Utf8().Named("catalog_name", false), type::Binary().Named("options", true),
+	     type::Utf8().Named("data_version_spec", false), type::Utf8().Named("implementation_version", false),
+	     type::Int64().Named("ttl_seconds", false)});
+	VgiBatchBuilder request_builder(request_schema);
+	append::String(request_builder.column(0), retained.catalog_name);
+	if (retained.options.empty()) {
+		append::Null(request_builder.column(1));
+	} else {
+		auto bytes = SerializeToIpcBytes(BuildSettingsBatch(context, retained.options));
+		append::Bytes(request_builder.column(1), bytes.data(), static_cast<int64_t>(bytes.size()));
 	}
-	auto request_schema = arrow::schema({arrow::field("catalog_name", arrow::utf8(), false),
-	                                     arrow::field("options", arrow::binary(), true),
-	                                     arrow::field("data_version_spec", arrow::utf8(), false),
-	                                     arrow::field("implementation_version", arrow::utf8(), false),
-	                                     arrow::field("ttl_seconds", arrow::int64(), false)});
-	auto request =
-	    arrow::RecordBatch::Make(request_schema, 1,
-	                             {Utf8Scalar(retained.catalog_name), options, Utf8Scalar(retained.data_version_spec),
-	                              Utf8Scalar(retained.implementation_version), Int64Scalar(ttl_seconds)});
-	auto request_bytes = SerializeToIpcBytes(request);
+	append::String(request_builder.column(2), retained.data_version_spec);
+	append::String(request_builder.column(3), retained.implementation_version);
+	append::Int(request_builder.column(4), ttl_seconds);
+	request_builder.FinishRow();
+	auto request_bytes = SerializeToIpcBytes(request_builder.Finish());
 
-	arrow::BinaryBuilder request_builder;
-	if (!request_builder.Append(request_bytes.data(), static_cast<int32_t>(request_bytes.size())).ok()) {
-		throw IOException("vgi: failed to build the seal_attach request");
-	}
-	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("request", arrow::binary(), false)}), 1,
-	                                       {request_builder.Finish().ValueOrDie()});
+	static const VgiSchemaPtr params_schema = MakeSchema({type::Binary().Named("request", false)});
+	VgiBatchBuilder params_builder(params_schema);
+	append::Bytes(params_builder.column(0), request_bytes.data(), static_cast<int64_t>(request_bytes.size()));
+	params_builder.FinishRow();
+	auto params = params_builder.Finish();
 
 	static constexpr VgiProtocolId kTickets {ATTACH_TICKETS_PROTOCOL_NAME, ATTACH_TICKETS_PROTOCOL_VERSION};
 	auto payload = InvokeProtocolUnary(ctx, context, kTickets, "seal_attach", params);
@@ -188,10 +157,10 @@ struct VgiExportSessionState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> VgiExportSessionBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto data = make_uniq<VgiExportSessionBindData>();
 	for (auto &kv : input.named_parameters) {
-		auto name = StringUtil::Lower(kv.first);
+		auto name = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (name == "aliases" && !kv.second.IsNull()) {
 			data->all_catalogs = false;
 			for (auto &child : ListValue::GetChildren(kv.second)) {
@@ -303,7 +272,7 @@ unique_ptr<GlobalTableFunctionState> VgiExportSessionInit(ClientContext &context
 			if (db->IsSystem() || db->IsTemporary()) {
 				continue;
 			}
-			aliases.push_back(db->GetName());
+			aliases.push_back(db->GetName().GetIdentifierName());
 		}
 		std::sort(aliases.begin(), aliases.end());
 	}
@@ -313,7 +282,7 @@ unique_ptr<GlobalTableFunctionState> VgiExportSessionInit(ClientContext &context
 		row.alias = alias;
 		// Per-row failures never abort the export.
 		try {
-			auto catalog = Catalog::GetCatalogEntry(context, alias);
+			auto catalog = Catalog::GetCatalogEntry(context, Identifier(alias));
 			if (!catalog) {
 				row.status = "error";
 				row.message = Value(StringUtil::Format("no attached catalog named '%s'", alias));
@@ -359,8 +328,10 @@ void VgiExportSessionScan(ClientContext &context, TableFunctionInput &input, Dat
 
 void RegisterVgiExportSessionFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_export_session", {}, VgiExportSessionScan, VgiExportSessionBind, VgiExportSessionInit);
-	func.named_parameters["aliases"] = LogicalType::LIST(LogicalType::VARCHAR);
-	func.named_parameters["ttl_seconds"] = LogicalType::BIGINT;
+	func.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("aliases", LogicalType::LIST(LogicalType::VARCHAR));
+		options.Add("ttl_seconds", LogicalType::BIGINT);
+	});
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "Export each attached catalog (or each alias given) for unattended reattach: a sealed grant (who, from "

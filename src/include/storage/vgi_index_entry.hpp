@@ -12,8 +12,8 @@ public:
 	              const vgi::VgiIndexInfo &index_info);
 	~VgiIndexEntry() override;
 
-	string GetSchemaName() const override;
-	string GetTableName() const override;
+	Identifier GetSchemaName() const override;
+	Identifier GetTableName() const override;
 
 	const vgi::VgiIndexInfo &GetIndexInfo() const {
 		return index_info_;

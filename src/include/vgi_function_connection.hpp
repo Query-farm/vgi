@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -11,9 +13,6 @@
 #include <thread>
 #include <vector>
 
-#include <arrow/api.h>
-#include <arrow/io/api.h>
-#include <arrow/ipc/api.h>
 
 #include "duckdb/common/types/value.hpp"
 
@@ -84,7 +83,7 @@ struct FunctionConnectionParams {
 	// Optional input schema, required for function types that bind with a
 	// typed input stream (table-in-out, scalar). If set, AcquireAndBindConnection
 	// calls SetInputSchema before PerformBindRpc.
-	std::shared_ptr<arrow::Schema> input_schema;
+	VgiSchemaPtr input_schema;
 
 	// Convenience accessors (defined out-of-line in vgi_function_connection.cpp)
 	const std::string &worker_path() const;
@@ -223,7 +222,7 @@ public:
 	// Set the input schema for table-in-out/scalar functions
 	// Must be called before PerformBindRpc() for table-in-out functions
 	// input_schema: Arrow schema describing the input data
-	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
+	void SetInputSchema(const VgiSchemaPtr &input_schema) override;
 
 	void SetSchemaName(const std::string &schema_name) override {
 		schema_name_ = schema_name;
@@ -251,7 +250,7 @@ public:
 	}
 
 	// Update input schema for execution phase (when DataChunk types differ from bind types)
-	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
+	void UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) override;
 
 	// Send the VGI "init" RPC. Opens the data streams and returns the
 	// init response. The bind_result must come from a prior PerformBindRpc
@@ -262,8 +261,8 @@ public:
 	// Optional phase parameter for FINALIZE init calls
 	InitResult PerformInit(const BindResult &bind_result,
 	                       const std::vector<int32_t> &projection_ids = {},
-	                       std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
-	                       std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
+	                       VgiBufferPtr pushdown_filters = nullptr,
+	                       std::vector<VgiBufferPtr> join_keys = {},
 	                       const std::string &phase = "",
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
@@ -288,7 +287,7 @@ public:
 
 	// Write an input batch (scalar and table-in-out functions)
 	// Must be called after OpenInputWriter()
-	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) override;
+	void WriteInputBatch(const VgiBatchPtr &batch) override;
 
 	// Cancel the current stream by writing a zero-row batch tagged with
 	// VGI_RPC_CANCEL_KEY custom metadata. state_token + live_context unused
@@ -307,7 +306,7 @@ public:
 	std::vector<uint8_t>
 	RpcTableBufferingProcess(const std::string &function_name,
 	                           const std::vector<uint8_t> &execution_id,
-	                           const std::shared_ptr<arrow::RecordBatch> &input_batch,
+	                           const VgiBatchPtr &input_batch,
 	                           std::optional<int64_t> batch_index = std::nullopt) override;
 	std::vector<std::vector<uint8_t>>
 	RpcTableBufferingCombine(const std::string &function_name,
@@ -326,7 +325,7 @@ public:
 	// For producer mode: sends tick, reads response
 	// For exchange mode: reads response (caller must write input first)
 	// Returns nullptr when stream is exhausted (EOS)
-	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override;
+	VgiBatchPtr ReadDataBatch() override;
 
 	// Check if data stream is exhausted
 	bool IsFinished() const override {
@@ -395,8 +394,8 @@ private:
 	std::string implementation_version_;
 	std::string function_name_;
 	std::string function_type_;  // "TABLE", "SCALAR", "AGGREGATE"
-	std::shared_ptr<arrow::DataType> arguments_type_;
-	std::shared_ptr<arrow::Array> arguments_array_;
+	//! One-row {args: struct} batch (ArrowArguments::batch); null when there are none.
+	VgiBatchPtr arguments_batch_;
 	std::vector<uint8_t> attach_opaque_data_;
 	std::vector<uint8_t> transaction_opaque_data_;
 	std::vector<uint8_t> global_execution_id_;
@@ -409,8 +408,8 @@ private:
 	std::map<std::string, Value> settings_;
 	std::vector<VgiSecretRequirement> required_secrets_;
 	std::shared_ptr<IrohClientConfig> iroh_config_;
-	std::shared_ptr<arrow::io::InputStream> transport_input_;
-	std::shared_ptr<arrow::io::OutputStream> transport_output_;
+	std::shared_ptr<VgiInputStream> transport_input_;
+	std::shared_ptr<VgiOutputStream> transport_output_;
 	std::function<void()> transport_cancel_;
 
 	// Worker process (spawned lazily by PerformBindRpc, or adopted from the
@@ -420,11 +419,11 @@ private:
 
 	bool TransportReady() const;
 	pid_t TransportPid() const;
-	std::shared_ptr<arrow::io::InputStream> TransportInput();
-	std::shared_ptr<arrow::io::OutputStream> TransportOutput();
+	std::shared_ptr<VgiInputStream> TransportInput();
+	std::shared_ptr<VgiOutputStream> TransportOutput();
 	void WriteTransportRpc(const std::string &method,
-	                       const std::shared_ptr<arrow::RecordBatch> &params,
-	                       const std::shared_ptr<arrow::KeyValueMetadata> &metadata = nullptr);
+	                       const VgiBatchPtr &params,
+	                       const VgiMetadataPtr &metadata = nullptr);
 	UnaryResponseResult ReadTransportUnary();
 	StreamHeaderResult ReadTransportHeader();
 
@@ -438,14 +437,14 @@ private:
 
 	// Producer mode (true for table functions - tick-based data exchange)
 	bool is_producer_mode_ = false;
-	std::shared_ptr<arrow::Schema> tick_schema_;  // Empty schema for tick batches
+	VgiSchemaPtr tick_schema_;  // Empty schema for tick batches
 
 	// Data stream reader (opened during PerformInit, used for ReadDataBatch)
-	std::shared_ptr<arrow::io::InputStream> data_stream_;
-	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> data_reader_;
+	std::shared_ptr<VgiInputStream> data_stream_;
+	std::shared_ptr<VgiIpcReader> data_reader_;
 
 	// Input schema for table-in-out/scalar functions (nullptr for regular table functions)
-	std::shared_ptr<arrow::Schema> input_schema_;
+	VgiSchemaPtr input_schema_;
 
 	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
 	std::string at_unit_;
@@ -461,7 +460,7 @@ private:
 	std::optional<CopyToBindContext> copy_to_;
 
 	// Input data writer for exchange-mode functions
-	std::shared_ptr<arrow::ipc::RecordBatchWriter> input_writer_;
+	std::shared_ptr<VgiIpcWriter> input_writer_;
 	bool input_writer_opened_ = false;
 	bool input_writer_closed_ = false;
 

@@ -1,5 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "catch.hpp"
+#include "../support/vgi_contract_fixtures.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -14,32 +15,31 @@
 
 using namespace duckdb;
 namespace {
-std::vector<uint8_t> Pack(const std::shared_ptr<arrow::Schema> &schema,
-                          std::vector<std::shared_ptr<arrow::Array>> arrays) {
-	return vgi::SerializeToIpcBytes(arrow::RecordBatch::Make(schema, 1, std::move(arrays)));
-}
-std::shared_ptr<arrow::Array> Null(const std::shared_ptr<arrow::DataType> &type) {
-	return arrow::MakeArrayOfNull(type, 1).ValueOrDie();
+std::vector<uint8_t> Pack(const vgi::VgiSchemaPtr &schema, std::vector<ArrowArray> arrays) {
+	return vgi::SerializeToIpcBytes(vgi::VgiBatch::FromColumns(schema, 1, std::move(arrays)));
 }
 std::vector<uint8_t> Key(std::vector<std::string> path = {"a.b"}) {
-	return Pack(vgi::generated::IndexKeySchema(), {vgi::BuildStringListScalar(path), Null(arrow::binary())});
+	return Pack(vgi::generated::IndexKeySchema(),
+	            {vgi::BuildStringListScalar(path), vgi::BuildOptionalBinaryScalar(std::nullopt)});
 }
 std::vector<uint8_t> Definition(const std::vector<uint8_t> &key = Key(), const std::string &kind = "UNIQUE",
                                 bool association = false) {
 	auto table = vgi::BuildNativeIndexTableRef("main", "items");
-	return Pack(vgi::generated::IndexDefinitionSchema(), {vgi::BuildBinaryScalarRequired(table),
-	    vgi::BuildStringScalar("SQLITE.BTREE.V1"), vgi::BuildBinaryListScalar({key}),
-	    vgi::BuildBinaryScalarRequired(Pack(arrow::schema({}), {})),
-	    vgi::BuildEnumArray(kind, {"NONE", "UNIQUE", "PRIMARY"}),
-	    association ? vgi::BuildBinaryScalarRequired(table) : Null(arrow::binary())});
+	return Pack(vgi::generated::IndexDefinitionSchema(),
+	            {vgi::BuildBinaryScalarRequired(table), vgi::BuildStringScalar("SQLITE.BTREE.V1"),
+	             vgi::BuildBinaryListScalar({key}), vgi::BuildBinaryScalarRequired(Pack(vgi::MakeSchema({}), {})),
+	             vgi::BuildEnumArray(kind, {"NONE", "UNIQUE", "PRIMARY"}),
+	             association ? vgi::BuildBinaryScalarRequired(table) : vgi::BuildOptionalBinaryScalar(std::nullopt)});
 }
-std::shared_ptr<arrow::RecordBatch> Info(const std::vector<uint8_t> &definition = Definition()) {
-	auto options = Pack(vgi::generated::OptionStateSchema(), {
-	    vgi::BuildBinaryScalarRequired(Pack(arrow::schema({}), {})), vgi::BuildStringListScalar({})});
-	return arrow::RecordBatch::Make(vgi::generated::IndexInfoSchema(), 1, {
-	    Null(arrow::utf8()), vgi::BuildStringMapScalar({}), vgi::BuildStringScalar("index.with.dots"),
-	    vgi::BuildStringListScalar({"main"}), vgi::BuildBinaryScalarRequired(definition),
-	    vgi::BuildBinaryScalarRequired(options)});
+vgi::VgiBatchPtr Info(const std::vector<uint8_t> &definition = Definition()) {
+	auto options =
+	    Pack(vgi::generated::OptionStateSchema(),
+	         {vgi::BuildBinaryScalarRequired(Pack(vgi::MakeSchema({}), {})), vgi::BuildStringListScalar({})});
+	return vgi::VgiBatch::FromColumns(vgi::generated::IndexInfoSchema(), 1,
+	                                  {vgi::BuildOptionalStringScalar(std::nullopt), vgi::BuildStringMapScalar({}),
+	                                   vgi::BuildStringScalar("index.with.dots"), vgi::BuildStringListScalar({"main"}),
+	                                   vgi::BuildBinaryScalarRequired(definition),
+	                                   vgi::BuildBinaryScalarRequired(options)});
 }
 } // namespace
 
@@ -49,7 +49,7 @@ TEST_CASE("Typed index discovery preserves raw keys without SQL parsing", "[inde
 		CHECK(index.name == "index.with.dots");
 		CHECK(index.table_name == "items");
 		CHECK(index.algorithm == "SQLITE.BTREE.V1");
-		CHECK(index.columns == std::vector<std::string>{"a.b"});
+		CHECK(index.columns == std::vector<std::string> {"a.b"});
 		CHECK(index.unique);
 	}
 }
@@ -57,11 +57,14 @@ TEST_CASE("Native index rejects unsupported or malformed definitions", "[index-c
 	CHECK_THROWS(vgi::ParseNativeIndexInfo(Info(Definition(Key({"nested", "field"})))));
 	CHECK_THROWS(vgi::ParseNativeIndexInfo(Info(Definition(Key(), "PRIMARY"))));
 	CHECK_THROWS(vgi::ParseNativeIndexInfo(Info(Definition(Key(), "UNIQUE", true))));
-	auto key = Pack(vgi::generated::IndexKeySchema(), {Null(arrow::list(arrow::utf8())), Null(arrow::binary())});
+	auto key = Pack(vgi::generated::IndexKeySchema(),
+	                {vgi::BuildOptionalStringListScalar(std::nullopt), vgi::BuildOptionalBinaryScalar(std::nullopt)});
 	CHECK_THROWS(vgi::ParseNativeIndexInfo(Info(Definition(key))));
-	key = Pack(vgi::generated::IndexKeySchema(), {vgi::BuildStringListScalar({"a.b"}), vgi::BuildBinaryScalarRequired({1})});
+	key = Pack(vgi::generated::IndexKeySchema(),
+	           {vgi::BuildStringListScalar({"a.b"}), vgi::BuildBinaryScalarRequired({1})});
 	CHECK_THROWS(vgi::ParseNativeIndexInfo(Info(Definition(key))));
-	auto definition = Definition(); definition.push_back(0);
+	auto definition = Definition();
+	definition.push_back(0);
 	CHECK_THROWS(vgi::ParseNativeIndexInfo(Info(definition)));
 	CHECK_THROWS(vgi::ParseNativeIndexInfo(Info(Definition(Key({""})))));
 }
@@ -86,18 +89,19 @@ TEST_CASE("Native index CREATE uses typed parent and explicit profiles", "[index
 	CHECK_NOTHROW(vgi::RequireNativeIndexCapabilities(attached, vgi::VGI_INDEX_CREATE, true, true));
 }
 TEST_CASE("Native index option handshake requires an empty exact typed schema", "[index-contract]") {
-	auto batch = arrow::RecordBatch::Make(vgi::generated::OptionDefinitionsSchema(), 1, {
-	    vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(arrow::schema({}))),
-	    vgi::BuildBinaryScalarRequired(Pack(arrow::schema({}), {})),
-	    vgi::BuildStringListScalar({}), vgi::BuildStringListScalar({})});
+	auto batch =
+	    vgi::VgiBatch::FromColumns(vgi::generated::OptionDefinitionsSchema(), 1,
+	                               {vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(vgi::MakeSchema({}))),
+	                                vgi::BuildBinaryScalarRequired(Pack(vgi::MakeSchema({}), {})),
+	                                vgi::BuildStringListScalar({}), vgi::BuildStringListScalar({})});
 	CHECK_NOTHROW(vgi::ValidateNativeIndexOptionDefinitions(batch));
-	auto columns = batch->columns();
-	columns[0] = vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(arrow::schema({arrow::field("fill", arrow::int32())})));
-	CHECK_THROWS(vgi::ValidateNativeIndexOptionDefinitions(arrow::RecordBatch::Make(batch->schema(), 1, columns)));
-	auto bytes = vgi::SerializeSchemaToIpcBytes(arrow::schema({}));
+	auto nonempty = vgi::BuildBinaryScalarRequired(
+	    vgi::SerializeSchemaToIpcBytes(vgi::MakeSchema({vgi_test::Field("fill", vgi::type::Int32())})));
+	CHECK_THROWS(vgi::ValidateNativeIndexOptionDefinitions(vgi_test::ReplaceColumn(batch, 0, nonempty)));
+	auto bytes = vgi::SerializeSchemaToIpcBytes(vgi::MakeSchema({}));
 	bytes.push_back(0);
-	columns[0] = vgi::BuildBinaryScalarRequired(bytes);
-	CHECK_THROWS(vgi::ValidateNativeIndexOptionDefinitions(arrow::RecordBatch::Make(batch->schema(), 1, columns)));
+	CHECK_THROWS(vgi::ValidateNativeIndexOptionDefinitions(
+	    vgi_test::ReplaceColumn(batch, 0, vgi::BuildBinaryScalarRequired(bytes))));
 }
 
 TEST_CASE("Native index encoding resolves raw catalog column spelling", "[index-contract]") {
@@ -107,7 +111,7 @@ TEST_CASE("Native index encoding resolves raw catalog column spelling", "[index-
 	REQUIRE_FALSE(connection.Query("BEGIN")->HasError());
 	auto &table = Catalog::GetEntry<TableCatalogEntry>(*connection.context, "memory", "main", "t");
 	CreateIndexInfo create;
-	create.index_name = "ix";
+	create.SetIndexName("ix");
 	create.index_type = "SQLITE.BTREE.V1";
 	create.constraint_type = IndexConstraintType::NONE;
 	create.expressions.push_back(make_uniq<ColumnRefExpression>("A.B", "T"));
@@ -117,7 +121,7 @@ TEST_CASE("Native index encoding resolves raw catalog column spelling", "[index-
 	auto keys = row["keys"].value_not_null<std::vector<std::vector<uint8_t>>>();
 	auto key = vgi::DeserializeFromIpcBytes(keys[0]);
 	vgi::RecordBatchSingleRow key_row(key, 0, "IndexKey", "test");
-	CHECK(key_row["column_path"].value_not_null<std::vector<std::string>>() == std::vector<std::string>{"a.b"});
+	CHECK(key_row["column_path"].value_not_null<std::vector<std::string>>() == std::vector<std::string> {"a.b"});
 	create.options["unsupported"] = Value::INTEGER(1);
 	CHECK_THROWS(vgi::EncodeNativeIndexDefinition(create, table));
 	REQUIRE_FALSE(connection.Query("ROLLBACK")->HasError());

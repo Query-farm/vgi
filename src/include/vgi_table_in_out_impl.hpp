@@ -1,13 +1,14 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include "vgi_settings_defaults.hpp"
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -68,14 +69,14 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	ArrowArguments arguments;
 
 	// Output schema from bind handshake
-	std::shared_ptr<arrow::Schema> output_schema;
+	VgiSchemaPtr output_schema;
 
 	// Arrow C ABI schema and table schema for ArrowToDuckDB conversion
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 
 	// Input schema (built from table input types/names)
-	std::shared_ptr<arrow::Schema> input_schema;
+	VgiSchemaPtr input_schema;
 
 	// Bind output retained for init phase. The init payload (BuildInitRequest)
 	// carries bind_request_bytes + output_schema_bytes + opaque_data inline, so
@@ -207,8 +208,8 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 	// ``vgi_table_function_impl.hpp:305-323``.
 	vector<column_t> column_ids;            // DuckDB-side column_ids (worker schema indices)
 	std::vector<int32_t> projection_ids;    // int32 form sent on the InitRequest wire
-	std::shared_ptr<arrow::Buffer> static_filter_bytes;
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	VgiBufferPtr static_filter_bytes;
+	std::vector<VgiBufferPtr> join_keys_buffers;
 
 	// Phase A: parallel-by-default. A streaming table-in/out function is a
 	// per-substream map, so it fans out one worker per substream (see
@@ -360,7 +361,7 @@ struct VgiTableInOutBindParams {
 // Bind function for table-in-out functions
 // Receives table input schema via input.input_table_types/input_table_names
 unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names,
+                                            vector<LogicalType> &return_types, vector<Identifier> &names,
                                             const VgiTableInOutBindParams &params);
 
 // Init functions
@@ -394,12 +395,12 @@ void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &conn,
                                 const VgiTableInOutBindData &bind_data, ClientContext &context);
 
 // Convert an input DataChunk to the worker-input Arrow batch (casts to declared types).
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 ConvertInputToArrow(ClientContext &context, DataChunk &input, const VgiTableInOutBindData &bind_data);
 
 // Load a worker output Arrow batch into a scan local state for draining.
 void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
-                            const std::shared_ptr<arrow::RecordBatch> &batch);
+                            const VgiBatchPtr &batch);
 
 // Whether the scan local state has remaining rows to produce from its batch.
 bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state);

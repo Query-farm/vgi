@@ -89,7 +89,8 @@ void VgiCatalogSet::MarkPopulatedLocked() {
 
 bool VgiCatalogSet::IsKnownMissingLocked(const std::string &name) const {
 	auto &attach_result = catalog_.Cast<VgiCatalog>().attach_result();
-	return attach_result && !attach_result->supports_transactions && missing_entries_.find(name) != missing_entries_.end();
+	return attach_result && !attach_result->supports_transactions &&
+	       missing_entries_.find(name) != missing_entries_.end();
 }
 
 void VgiCatalogSet::CacheMissingEntryLocked(const std::string &name, uint64_t expected_generation) {
@@ -170,10 +171,7 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 	}
 	if (outcome) {
 		VGI_LOG(context, "catalog.entry_cache",
-		        {{"set_kind", CacheKindName()},
-		         {"name", name},
-		         {"outcome", outcome},
-		         {"triggered_load", "false"}});
+		        {{"set_kind", CacheKindName()}, {"name", name}, {"outcome", outcome}, {"triggered_load", "false"}});
 		return result;
 	}
 
@@ -224,11 +222,11 @@ void VgiCatalogSet::CreateEntryLocked(unique_ptr<CatalogEntry> entry) {
 	// see ColumnIsGenerated → ColumnList::GetColumn(0) UAF that surfaces as
 	// "Logical column index 0 out of range". Refresh goes through
 	// ClearEntries() / vgi_clear_cache() at safe points instead.
-	missing_entries_.erase(entry->name);
-	if (entries_.find(entry->name) != entries_.end()) {
+	missing_entries_.erase(entry->name.GetIdentifierName());
+	if (entries_.find(entry->name.GetIdentifierName()) != entries_.end()) {
 		return;
 	}
-	entries_[entry->name] = std::move(entry);
+	entries_[entry->name.GetIdentifierName()] = std::move(entry);
 	generation_.fetch_add(1, std::memory_order_release);
 }
 

@@ -204,11 +204,12 @@ vgi-python's `tests/test_generated_cpp_*.py` fail CI if checked-in headers diver
 `VGI_EXTENSION_ROOT=<checkout>` points the script at a checkout other than `~/Development/vgi`.
 
 **Protocol records are typed structs, not hand-parsed batches.** `vgi_protocol_records.hpp` has
-one struct per record and one `enum class` per protocol enum (Arrow only forward-declared);
+one struct per record and one `enum class` per protocol enum (over `vgi_arrow.hpp` types only);
 `vgi_protocol_records.cpp` has `ToBatch(record)` / `generated::Decode<T>(batch, row, worker)`
 plus `AllMethodSchemas()`, the per-method schema table the schema registry is built from. The
-codecs call the runtime in `vgi_wire_codec.{hpp,cpp}` — the only code that touches Arrow arrays
-for protocol records. Decoding is by column name: a missing nullable column is absent; a missing
+codecs call the runtime in `vgi_wire_codec.{hpp,cpp}` — the only code that touches arrays for
+protocol records. Generated with vgi-python's nanoarrow backend (`regen_generated.py` does this;
+vgi-c++/vgi-sqlite keep the Arrow C++ backend). Decoding is by column name: a missing nullable column is absent; a missing
 or null required column, a wrongly typed column, an unknown enum value or a repeated map key is a
 protocol error, as is a null in a non-nullable list/map or a null item in a list whose
 element is not optional. Enums accept only the canonical member name. Do not add leniency for an
@@ -223,30 +224,37 @@ and projected into the URL (`{base}/{protocol}/{method}`) over HTTP. Reserved me
 
 ## Coding Conventions
 
+### Arrow data: nanoarrow, not Arrow C++
+
+The extension does not link Arrow C++. Batches, schemas and bytes are the types in
+`src/include/vgi_arrow.hpp` (`VgiBatch`/`VgiBatchPtr`, `VgiSchema`, `VgiColumn` views, `VgiBuffer`,
+`VgiMetadata`, schema/array builders, `TakeRows`/`ConcatBatches`), built on the Arrow C data
+interface and the vendored nanoarrow bundle (`third_party/nanoarrow`, see its `NANOARROW_SOURCE`).
+IPC streams are `src/include/vgi_ipc.hpp` (`VgiIpcReader`/`VgiIpcWriter`, `VgiInputStream`/
+`VgiOutputStream`; errors throw). Do not reintroduce `arrow::` — `vcpkg.json` no longer has it.
+Worker batches reach DuckDB zero-copy through `VgiBatch::ExportTo(ArrowArrayWrapper&)`; DuckDB
+chunks become batches straight from `ArrowAppender` (`DataChunkToArrow`).
+
 ### Arrow-to-DuckDB type conversion
 
 Always use `ArrowSchemaToDuckDBTypes()` (`vgi_arrow_utils.hpp`). Never hand-write a switch over
-`arrow::Type` IDs — it misses complex types (struct, list, map, timestamp…) and silently falls
-back to VARCHAR.
+Arrow type ids — it misses complex types (struct, list, map, timestamp…) and silently falls back
+to VARCHAR.
 
 ### Header hygiene
 
-Widely-included headers must not pull in `<arrow/api.h>` / `arrow/ipc/api.h` (~8–10k lines per
-TU). When a header uses an Arrow type only as a `std::shared_ptr<T>`, pointer/reference, or
-parameter/return type, **forward-declare it** and include the real header in the `.cpp`.
-Blueprint: `src/include/vgi_logging.hpp`. Still needing the full type: `unique_ptr<T>` members
-(or out-of-line the dtor), by-value members, base classes, `sizeof`, inline functions that
-dereference it.
+No project header may include `nanoarrow/`, `flatcc/` or `arrow/` headers (`nanoarrow.h` carries
+thousands of lines of inline functions). Headers use the `vgi_arrow.hpp` / `vgi_ipc.hpp` types,
+which need only DuckDB's C data interface structs; include `nanoarrow/nanoarrow.h` in the `.cpp`
+that calls nanoarrow directly. `scripts/header_reach.py --check` (CI) enforces this for every header
+in `src/include`.
 
 `vgi_catalog_api.hpp` is a back-compat umbrella — include the most specific of
-`vgi_attach_parameters.hpp` (Arrow-free) ⊂ `vgi_catalog_metadata.hpp` (Arrow forward-declared)
-⊂ `vgi_catalog_rpc.hpp` (Arrow IPC; only for `.cpp` files that issue catalog RPCs).
+`vgi_attach_parameters.hpp` ⊂ `vgi_catalog_metadata.hpp` ⊂ `vgi_catalog_rpc.hpp` (only for `.cpp`
+files that issue catalog RPCs).
 
-Legitimate Arrow carriers (don't try to make them Arrow-free): `vgi_wire_codec.hpp`, `vgi_rpc_types.hpp`,
-`vgi_arrow_utils.hpp`, `vgi_arrow_ipc.hpp`, `vgi_function_connection.hpp`, `vgi_catalog_rpc.hpp`.
-
-`python3 scripts/header_reach.py` prints per-header TU reach; `--check` enforces the denylist on
-`GUARDED_HEADERS` and runs in CI.
+`python3 scripts/header_reach.py` prints per-header TU reach; `--check` enforces the denylist and
+runs in CI.
 
 ### Transports and location policy
 

@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "storage/vgi_macro_set.hpp"
+#include "vgi_column_expression.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
@@ -51,7 +52,7 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
 	                                vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 
 	auto macros = schema_.GetMacroInventory(rpc_ctx, macro_catalog_type_, context);
 	if (macros.empty()) {
@@ -65,7 +66,7 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 	std::vector<unique_ptr<CatalogEntry>> pending;
 	case_insensitive_set_t family_names;
 	for (auto &macro_info : macros) {
-		if (macro_info.schema_name != schema_.name ||
+		if (macro_info.schema_name != schema_.name.GetIdentifierName() ||
 		    macro_info.macro_type != (macro_catalog_type_ == CatalogType::MACRO_ENTRY ? "scalar" : "table")) {
 			throw InvalidInputException("VGI macro family kind or owner does not match its catalog listing");
 		}
@@ -73,9 +74,7 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 			throw InvalidInputException("VGI macro listing contains a duplicate family name");
 		}
 		CreateMacroInfo info(macro_catalog_type_);
-		info.name = macro_info.name;
-		info.catalog = catalog_.GetName();
-		info.schema = schema_.name;
+		info.SetQualifiedName(schema_.GetQualifiedName(Identifier(macro_info.name)));
 		info.internal = true;
 		if (!macro_info.comment.empty())
 			info.comment = Value(macro_info.comment);
@@ -85,23 +84,26 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 		for (const auto &overload : macro_info.overloads) {
 			unique_ptr<MacroFunction> function;
 			if (macro_catalog_type_ == CatalogType::MACRO_ENTRY) {
-				auto expressions = Parser::ParseExpressionList(overload.definition);
+				auto expressions = Parser(ParserOptions::Builtin()).ParseExpressionList(overload.definition);
 				if (expressions.size() != 1)
 					throw InvalidInputException("VGI scalar macro requires exactly one expression");
-				vgi::QualifyNativeMacroExpression(*expressions[0], *worker_functions, catalog_.GetName(), schema_.name);
+				vgi::QualifyNativeMacroExpression(*expressions[0], *worker_functions,
+				                                  catalog_.GetName().GetIdentifierName(),
+				                                  schema_.name.GetIdentifierName());
 				function = make_uniq<ScalarMacroFunction>(std::move(expressions[0]));
 			} else {
-				Parser parser;
+				Parser parser {ParserOptions::Builtin()};
 				parser.ParseQuery(overload.definition);
 				if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 					throw InvalidInputException("VGI table macro requires exactly one SELECT statement");
 				}
 				auto &select = parser.statements[0]->Cast<SelectStatement>();
-				vgi::QualifyNativeMacroQuery(*select.node, *worker_functions, catalog_.GetName(), schema_.name);
+				vgi::QualifyNativeMacroQuery(*select.node, *worker_functions, catalog_.GetName().GetIdentifierName(),
+				                             schema_.name.GetIdentifierName());
 				function = make_uniq<TableMacroFunction>(std::move(select.node));
 			}
 			for (const auto &parameter : overload.parameters) {
-				function->parameters.push_back(make_uniq<ColumnRefExpression>(parameter.name));
+				function->parameters.push_back(make_uniq<ColumnRefExpression>(Identifier(parameter.name)));
 				auto type = vgi::NativeMacroParameterType(context, parameter);
 				function->types.push_back(type);
 				if (parameter.default_value) {
@@ -110,7 +112,7 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 					    CastFunctionSet::ImplicitCastCost(context, value.type(), type) < 0) {
 						throw InvalidInputException("VGI macro literal default is incompatible with its declared type");
 					}
-					function->default_parameters[parameter.name] = make_uniq<ConstantExpression>(std::move(value));
+					function->default_parameters[Identifier(parameter.name)] = vgi::NativeLiteralExpression(value);
 				}
 			}
 			for (const auto &signature : signatures) {

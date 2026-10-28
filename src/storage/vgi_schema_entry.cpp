@@ -27,6 +27,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_table_entry.hpp"
 #include "storage/vgi_transaction.hpp"
+#include "nanoarrow/nanoarrow.h"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
@@ -48,9 +49,10 @@ VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const v
 
 VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info,
                                std::shared_ptr<const vgi::VgiSchemaContents> seed)
-    : SchemaCatalogEntry(catalog, info), info_source_(seed), schema_info_ready_(false), indexes_(catalog, *this), tables_(catalog, *this),
-      views_(catalog, *this), scalar_functions_(catalog, *this), aggregate_functions_(catalog, *this),
-      table_functions_(catalog, *this), scalar_macros_(catalog, *this, CatalogType::MACRO_ENTRY),
+    : SchemaCatalogEntry(catalog, info), info_source_(seed), schema_info_ready_(false), indexes_(catalog, *this),
+      tables_(catalog, *this), views_(catalog, *this), scalar_functions_(catalog, *this),
+      aggregate_functions_(catalog, *this), table_functions_(catalog, *this),
+      scalar_macros_(catalog, *this, CatalogType::MACRO_ENTRY),
       table_macros_(catalog, *this, CatalogType::TABLE_MACRO_ENTRY), seed_(std::move(seed)) {
 }
 
@@ -120,40 +122,40 @@ std::vector<T> LogSeedDecode(ClientContext &context, const std::string &schema, 
 std::vector<vgi::VgiTableInfo> VgiSchemaEntry::TakeTables(const vgi::CatalogRpcContext &rpc_ctx,
                                                           ClientContext &context) {
 	if (auto seed = ClaimSeed("table")) {
-		return LogSeedDecode(context, name, "table", vgi::DecodeContentsTables(*seed, context));
+		return LogSeedDecode(context, name.GetIdentifierName(), "table", vgi::DecodeContentsTables(*seed, context));
 	}
-	return vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, name, context);
+	return vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, name.GetIdentifierName(), context);
 }
 
 std::vector<vgi::VgiIndexInfo> VgiSchemaEntry::TakeIndexes(const vgi::CatalogRpcContext &rpc_ctx,
-                                                         ClientContext &context) {
+                                                           ClientContext &context) {
 	if (auto seed = ClaimSeed("index"))
-		return LogSeedDecode(context, name, "index", vgi::DecodeContentsIndexes(*seed));
-	return vgi::InvokeCatalogSchemaContentsIndexes(rpc_ctx, name, context);
+		return LogSeedDecode(context, name.GetIdentifierName(), "index", vgi::DecodeContentsIndexes(*seed));
+	return vgi::InvokeCatalogSchemaContentsIndexes(rpc_ctx, name.GetIdentifierName(), context);
 }
 
-std::vector<vgi::VgiViewInfo> VgiSchemaEntry::TakeViews(const vgi::CatalogRpcContext &rpc_ctx,
-                                                        ClientContext &context) {
+std::vector<vgi::VgiViewInfo> VgiSchemaEntry::TakeViews(const vgi::CatalogRpcContext &rpc_ctx, ClientContext &context) {
 	if (auto seed = ClaimSeed("view")) {
-		return LogSeedDecode(context, name, "view", vgi::DecodeContentsViews(*seed));
+		return LogSeedDecode(context, name.GetIdentifierName(), "view", vgi::DecodeContentsViews(*seed));
 	}
-	return vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, name, context);
+	return vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, name.GetIdentifierName(), context);
 }
 
 std::vector<vgi::VgiFunctionInfo> VgiSchemaEntry::FetchFunctions(const vgi::CatalogRpcContext &rpc_ctx,
                                                                  const char *rpc_type, ClientContext &context) {
 	if (auto seed = ClaimSeed(rpc_type)) {
-		return LogSeedDecode(context, name, rpc_type, vgi::DecodeContentsFunctions(*seed, rpc_type));
+		return LogSeedDecode(context, name.GetIdentifierName(), rpc_type,
+		                     vgi::DecodeContentsFunctions(*seed, rpc_type));
 	}
-	return vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name, rpc_type, context);
+	return vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name.GetIdentifierName(), rpc_type, context);
 }
 
-std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::FetchMacros(const vgi::CatalogRpcContext &rpc_ctx,
-                                                           const char *rpc_type, ClientContext &context) {
+std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::FetchMacros(const vgi::CatalogRpcContext &rpc_ctx, const char *rpc_type,
+                                                           ClientContext &context) {
 	if (auto seed = ClaimSeed(rpc_type)) {
-		return LogSeedDecode(context, name, rpc_type, vgi::DecodeContentsMacros(*seed, rpc_type));
+		return LogSeedDecode(context, name.GetIdentifierName(), rpc_type, vgi::DecodeContentsMacros(*seed, rpc_type));
 	}
-	return vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, rpc_type, context);
+	return vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name.GetIdentifierName(), rpc_type, context);
 }
 
 std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::GetMacroInventory(const vgi::CatalogRpcContext &rpc_ctx,
@@ -245,8 +247,7 @@ VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, boo
 
 	macro_callable_names_ = callable_names;
 	macro_callable_names_complete_ = scalar_function_inventory_.has_value() &&
-	                                 aggregate_function_inventory_.has_value() &&
-	                                 table_function_inventory_.has_value();
+	                                 aggregate_function_inventory_.has_value() && table_function_inventory_.has_value();
 	return macro_callable_names_;
 }
 
@@ -274,30 +275,37 @@ void DeferDrop(Catalog &catalog, unique_ptr<CatalogEntry> entry) {
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
-		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly).Set(vgi::error_key::kCatalog, catalog.GetName()).Set(vgi::error_key::kOperation, "CREATE TABLE"),
-		                      StringUtil::Format("Cannot CREATE TABLE in read-only VGI catalog '%s'", catalog.GetName()));
+		throw BinderException(
+		    vgi::ErrorInfo(vgi::error_subtype::kReadOnly)
+		        .Set(vgi::error_key::kCatalog, catalog.GetName().GetIdentifierName())
+		        .Set(vgi::error_key::kOperation, "CREATE TABLE"),
+		    StringUtil::Format("Cannot CREATE TABLE in read-only VGI catalog '%s'", catalog.GetName()));
 	}
 
 	auto &create_info = info.base->Cast<CreateTableInfo>();
 	auto &context = transaction.GetContext();
 
 	// The shared encoder preserves defaults for both CREATE and ADD COLUMN.
-	auto columns_schema = vgi::DuckDBColumnsToArrowSchema(context, create_info.columns, name);
+	auto columns_schema = vgi::DuckDBColumnsToArrowSchema(context, create_info.columns, name.GetIdentifierName());
 
 	// The binder accepts case-insensitive SQL spellings. Resolve referenced FK
 	// coordinates to actual catalog names before the raw-path wire boundary.
 	for (auto &constraint : create_info.constraints) {
-		if (constraint->type != ConstraintType::FOREIGN_KEY) continue;
+		if (constraint->type != ConstraintType::FOREIGN_KEY)
+			continue;
 		auto &fk = constraint->Cast<ForeignKeyConstraint>();
 		if (fk.info.type == ForeignKeyType::FK_TYPE_SELF_REFERENCE_TABLE) {
-			fk.info.table = create_info.table;
-			for (auto &column : fk.pk_columns) column = create_info.columns.GetColumn(column).Name();
+			fk.info.table = create_info.GetTableName();
+			for (auto &column : fk.pk_columns)
+				column = create_info.columns.GetColumn(column).Name();
 		} else {
-			auto target = tables_.GetEntry(context, fk.info.table);
-			if (!target) throw BinderException("Referenced table %s does not exist", fk.info.table);
+			auto target = tables_.GetEntry(context, fk.info.table.GetIdentifierName());
+			if (!target)
+				throw BinderException("Referenced table %s does not exist", fk.info.table);
 			auto &entry = target->Cast<VgiTableEntry>();
 			fk.info.table = entry.name;
-			for (auto &column : fk.pk_columns) column = entry.GetColumns().GetColumn(column).Name();
+			for (auto &column : fk.pk_columns)
+				column = entry.GetColumns().GetColumn(column).Name();
 		}
 	}
 
@@ -315,7 +323,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	// Send DDL RPC
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx.GetTransactionOpaqueData()};
 	if (!constraint_definitions.empty() && !rpc_ctx.transaction_opaque_data.empty() &&
 	    !attach_result->constraint_profiles.count("vgi.transaction.ddl.v1")) {
 		throw NotImplementedException("Constraint CREATE in a transaction requires vgi.transaction.ddl.v1");
@@ -329,9 +338,9 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 		DeferDrop(catalog, indexes_.HarvestEntries());
 		DeferDrop(catalog, views_.HarvestEntries());
 	}
-	vgi::InvokeCatalogTableCreate(rpc_ctx, name, create_info.table, columns_schema, on_conflict,
-	                             constraint_definitions, context);
-	return tables_.GetEntry(context, create_info.table);
+	vgi::InvokeCatalogTableCreate(rpc_ctx, name.GetIdentifierName(), create_info.GetTableName().GetIdentifierName(),
+	                              columns_schema, on_conflict, constraint_definitions, context);
+	return tables_.GetEntry(context, create_info.GetTableName().GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
@@ -341,7 +350,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateFunction(CatalogTransaction tra
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
                                                        TableCatalogEntry &table) {
 	auto &owner = catalog.Cast<VgiCatalog>();
-	if (owner.GetAccessMode() == AccessMode::READ_ONLY) throw BinderException("Cannot CREATE INDEX in read-only VGI catalog");
+	if (owner.GetAccessMode() == AccessMode::READ_ONLY)
+		throw BinderException("Cannot CREATE INDEX in read-only VGI catalog");
 	auto &context = transaction.GetContext();
 	const auto &collation = Settings::Get<DefaultCollationSetting>(context);
 	if (!collation.empty() && !StringUtil::CIEquals(collation, "binary"))
@@ -350,21 +360,27 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateIndex(CatalogTransaction transa
 	auto &attached = *owner.attach_result();
 	vgi::CatalogRpcContext rpc {owner.attach_parameters(), attached.attach_opaque_data, tx.GetTransactionOpaqueData()};
 	vgi::RequireNativeIndexCapabilities(attached, vgi::VGI_INDEX_CREATE,
-	    info.constraint_type == IndexConstraintType::UNIQUE, !rpc.transaction_opaque_data.empty());
+	                                    info.constraint_type == IndexConstraintType::UNIQUE,
+	                                    !rpc.transaction_opaque_data.empty());
 	auto definition = vgi::EncodeNativeIndexDefinition(info, table);
-	vgi::RequireCatalogIndexAlgorithm(rpc, name, table.name, info.index_type, context);
+	vgi::RequireCatalogIndexAlgorithm(rpc, name.GetIdentifierName(), table.name.GetIdentifierName(), info.index_type,
+	                                  context);
 	// Lost responses cannot leave stale index listings, including a cached empty kind.
 	DeferDrop(catalog, indexes_.HarvestEntries());
 	indexes_.MarkPopulatedLocked();
-	vgi::InvokeCatalogIndexCreate(rpc, name, info.index_name, definition, vgi::MapOnConflict(info.on_conflict), context);
+	vgi::InvokeCatalogIndexCreate(rpc, name.GetIdentifierName(), info.GetIndexName().GetIdentifierName(), definition,
+	                              vgi::MapOnConflict(info.on_conflict), context);
 	return nullptr;
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
-		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly).Set(vgi::error_key::kCatalog, catalog.GetName()).Set(vgi::error_key::kOperation, "CREATE VIEW"),
-		                      StringUtil::Format("Cannot CREATE VIEW in read-only VGI catalog '%s'", catalog.GetName()));
+		throw BinderException(
+		    vgi::ErrorInfo(vgi::error_subtype::kReadOnly)
+		        .Set(vgi::error_key::kCatalog, catalog.GetName().GetIdentifierName())
+		        .Set(vgi::error_key::kOperation, "CREATE VIEW"),
+		    StringUtil::Format("Cannot CREATE VIEW in read-only VGI catalog '%s'", catalog.GetName()));
 	}
 
 	auto &context = transaction.GetContext();
@@ -386,7 +402,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	std::map<std::string, std::string> column_comments;
 	for (const auto &entry : info.column_comments_map) {
 		if (!entry.second.IsNull()) {
-			column_comments.emplace(entry.first, entry.second.ToString());
+			column_comments.emplace(entry.first.GetIdentifierName(), entry.second.ToString());
 		}
 	}
 	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
@@ -397,9 +413,11 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	// Send DDL RPC
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
-	vgi::InvokeCatalogViewCreate(rpc_ctx, name, info.view_name, definition, std::vector<std::string>(info.aliases.begin(), info.aliases.end()),
-	                             on_conflict, comment, tags, column_comments, context);
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx.GetTransactionOpaqueData()};
+	vgi::InvokeCatalogViewCreate(rpc_ctx, name.GetIdentifierName(), info.GetViewName().GetIdentifierName(), definition,
+	                             IdentifiersToStrings(info.aliases), on_conflict, comment, tags, column_comments,
+	                             context);
 
 	// Invalidate view cache
 	DeferDrop(catalog, views_.HarvestEntries());
@@ -439,15 +457,19 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateType(CatalogTransaction transac
 void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
-		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly).Set(vgi::error_key::kCatalog, catalog.GetName()).Set(vgi::error_key::kOperation, "ALTER"),
-		                      StringUtil::Format("Cannot alter objects in read-only VGI catalog '%s'", catalog.GetName()));
+		throw BinderException(
+		    vgi::ErrorInfo(vgi::error_subtype::kReadOnly)
+		        .Set(vgi::error_key::kCatalog, catalog.GetName().GetIdentifierName())
+		        .Set(vgi::error_key::kOperation, "ALTER"),
+		    StringUtil::Format("Cannot alter objects in read-only VGI catalog '%s'", catalog.GetName()));
 	}
 
 	auto &context = transaction.GetContext();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	auto &vgi_tx = VgiTransaction::Get(context, catalog);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx.GetTransactionOpaqueData()};
 
 	// Handle COMMENT ON table or view
 	if (info.type == AlterType::SET_COMMENT) {
@@ -455,21 +477,23 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		if (comment_info.entry_catalog_type == CatalogType::TABLE_ENTRY) {
 			bool is_null = comment_info.comment_value.IsNull();
 			auto comment_str = is_null ? "" : comment_info.comment_value.ToString();
-			vgi::InvokeCatalogTableCommentSet(rpc_ctx, name, comment_info.name, comment_str, is_null,
-			                                   false, context);
-			DeferDrop(catalog, tables_.HarvestEntry(comment_info.name));
+			vgi::InvokeCatalogTableCommentSet(rpc_ctx, name.GetIdentifierName(),
+			                                  comment_info.GetQualifiedName().Name().GetIdentifierName(), comment_str,
+			                                  is_null, false, context);
+			DeferDrop(catalog, tables_.HarvestEntry(comment_info.GetQualifiedName().Name().GetIdentifierName()));
 			return;
 		}
 		if (comment_info.entry_catalog_type == CatalogType::VIEW_ENTRY) {
 			bool is_null = comment_info.comment_value.IsNull();
 			auto comment_str = is_null ? "" : comment_info.comment_value.ToString();
-			vgi::InvokeCatalogViewCommentSet(rpc_ctx, name, comment_info.name, comment_str, is_null,
-			                                  false, context);
-			DeferDrop(catalog, views_.HarvestEntry(comment_info.name));
+			vgi::InvokeCatalogViewCommentSet(rpc_ctx, name.GetIdentifierName(),
+			                                 comment_info.GetQualifiedName().Name().GetIdentifierName(), comment_str,
+			                                 is_null, false, context);
+			DeferDrop(catalog, views_.HarvestEntry(comment_info.GetQualifiedName().Name().GetIdentifierName()));
 			return;
 		}
 		throw BinderException("COMMENT ON %s is not supported for VGI catalogs",
-		                       EnumUtil::ToString(comment_info.entry_catalog_type));
+		                      EnumUtil::ToString(comment_info.entry_catalog_type));
 	}
 
 	// Handle COMMENT ON COLUMN
@@ -478,9 +502,10 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		bool is_null = col_comment.comment_value.IsNull();
 		auto comment_str = is_null ? "" : col_comment.comment_value.ToString();
 		if (col_comment.catalog_entry_type == CatalogType::VIEW_ENTRY) {
-			auto entry = views_.GetEntry(context, col_comment.name);
+			auto entry = views_.GetEntry(context, col_comment.GetQualifiedName().Name().GetIdentifierName());
 			if (!entry) {
-				throw BinderException("View \"%s\" does not exist", col_comment.name);
+				throw BinderException("View \"%s\" does not exist",
+				                      col_comment.GetQualifiedName().Name().GetIdentifierName());
 			}
 			auto &view = entry->Cast<ViewCatalogEntry>();
 			view.BindView(context);
@@ -496,15 +521,18 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			}
 			if (!found) {
 				throw BinderException("View \"%s\" does not have a column with name \"%s\"",
-				                      col_comment.name, col_comment.column_name);
+				                      col_comment.GetQualifiedName().Name().GetIdentifierName(),
+				                      col_comment.column_name);
 			}
-			vgi::InvokeCatalogViewColumnCommentSet(rpc_ctx, name, col_comment.name, col_comment.column_name,
-			                                    comment_str, is_null, false, context);
-			DeferDrop(catalog, views_.HarvestEntry(col_comment.name));
+			vgi::InvokeCatalogViewColumnCommentSet(
+			    rpc_ctx, name.GetIdentifierName(), col_comment.GetQualifiedName().Name().GetIdentifierName(),
+			    col_comment.column_name.GetIdentifierName(), comment_str, is_null, false, context);
+			DeferDrop(catalog, views_.HarvestEntry(col_comment.GetQualifiedName().Name().GetIdentifierName()));
 		} else if (col_comment.catalog_entry_type == CatalogType::TABLE_ENTRY) {
-			vgi::InvokeCatalogTableColumnCommentSet(rpc_ctx, name, col_comment.name, col_comment.column_name,
-			                                     comment_str, is_null, false, context);
-			DeferDrop(catalog, tables_.HarvestEntry(col_comment.name));
+			vgi::InvokeCatalogTableColumnCommentSet(
+			    rpc_ctx, name.GetIdentifierName(), col_comment.GetQualifiedName().Name().GetIdentifierName(),
+			    col_comment.column_name.GetIdentifierName(), comment_str, is_null, false, context);
+			DeferDrop(catalog, tables_.HarvestEntry(col_comment.GetQualifiedName().Name().GetIdentifierName()));
 		} else {
 			throw BinderException("COMMENT ON COLUMN is not supported for this VGI object kind");
 		}
@@ -516,11 +544,12 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto &alter_view = info.Cast<AlterViewInfo>();
 		if (alter_view.alter_view_type == AlterViewType::RENAME_VIEW) {
 			auto &rename = alter_view.Cast<RenameViewInfo>();
-			vgi::InvokeCatalogViewRename(rpc_ctx, name, alter_view.name, rename.new_view_name,
-			                              false, context);
+			vgi::InvokeCatalogViewRename(rpc_ctx, name.GetIdentifierName(),
+			                             alter_view.GetQualifiedName().Name().GetIdentifierName(),
+			                             rename.new_view_name.GetIdentifierName(), false, context);
 		} else {
 			throw BinderException("ALTER VIEW %s is not supported for VGI catalogs",
-			                       EnumUtil::ToString(alter_view.alter_view_type));
+			                      EnumUtil::ToString(alter_view.alter_view_type));
 		}
 		// Dependent views may reference the old name, so clear the entire views cache
 		DeferDrop(catalog, views_.HarvestEntries());
@@ -535,8 +564,8 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	// dispatch, including ambiguous failures; the provider owns dependencies.
 	DeferDrop(catalog, indexes_.HarvestEntries());
 	auto &alter_table = info.Cast<AlterTableInfo>();
-	auto &schema_name = name;  // VgiSchemaEntry::name
-	auto &table_name = alter_table.name;
+	const auto &schema_name = name.GetIdentifierName(); // VgiSchemaEntry::name
+	auto &table_name = alter_table.GetQualifiedName().Name().GetIdentifierName();
 	// The provider may commit a semantic change before its reply is lost.
 	// Retire table and affected view metadata before dispatch, so a failure
 	// cannot leave a stale definition available to a later statement.
@@ -567,50 +596,44 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	}
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &rem_col = alter_table.Cast<RemoveColumnInfo>();
-		vgi::InvokeCatalogTableColumnDrop(rpc_ctx, schema_name, table_name, rem_col.removed_column,
-		                                   rem_col.if_column_exists, rem_col.cascade, context);
+		vgi::InvokeCatalogTableColumnDrop(rpc_ctx, schema_name, table_name, rem_col.removed_column.GetIdentifierName(),
+		                                  rem_col.if_column_exists, rem_col.cascade, context);
 		break;
 	}
 	case AlterTableType::RENAME_COLUMN: {
 		auto &ren_col = alter_table.Cast<RenameColumnInfo>();
-		vgi::InvokeCatalogTableColumnRename(rpc_ctx, schema_name, table_name,
-		                                     ren_col.old_name, ren_col.new_name, context);
+		vgi::InvokeCatalogTableColumnRename(rpc_ctx, schema_name, table_name, ren_col.old_name.GetIdentifierName(),
+		                                    ren_col.new_name.GetIdentifierName(), context);
 		break;
 	}
 	case AlterTableType::RENAME_TABLE: {
 		auto &ren_tbl = alter_table.Cast<RenameTableInfo>();
-		vgi::InvokeCatalogTableRename(rpc_ctx, schema_name, table_name, ren_tbl.new_table_name,
-		                               false, context);
+		vgi::InvokeCatalogTableRename(rpc_ctx, schema_name, table_name, ren_tbl.new_table_name.GetIdentifierName(),
+		                              false, context);
 		break;
 	}
 	case AlterTableType::ALTER_COLUMN_TYPE: {
 		auto &change_type = alter_table.Cast<ChangeColumnTypeInfo>();
 		// Create a single-column Arrow schema from the column name and new type
 		ColumnList single_col;
-		single_col.AddColumn(ColumnDefinition(change_type.column_name, change_type.target_type));
+		single_col.AddColumn(ColumnDefinition(change_type.GetColumnName(), change_type.target_type));
 		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col);
 		std::optional<std::vector<uint8_t>> expression;
-		// DuckDB 1.5 synthesizes CAST(column AS target) for an omitted USING.
-		// Normalize that exact ordinary cast to absence. Explicit USING NULL
-		// remains a present SqlExpression, never a request to skip evaluation.
+		if (change_type.column_path.size() != 1)
+			throw NotImplementedException("Native VGI nested column type changes are not yet qualified");
+		// Normalize DuckDB's synthesized ordinary cast to an absent USING.
+		// An explicit USING NULL remains a present expression.
 		bool ordinary_cast = false;
 		if (change_type.expression && change_type.expression->GetExpressionClass() == ExpressionClass::CAST) {
 			auto &cast = change_type.expression->Cast<CastExpression>();
-			auto cast_type = cast.cast_type;
-			if (cast_type.id() == LogicalTypeId::UNBOUND) {
-				auto &type = UnboundType::GetTypeExpression(cast_type);
-				if (type->GetExpressionClass() == ExpressionClass::TYPE) {
-					auto &name = type->Cast<TypeExpression>();
-					if (name.GetCatalog().empty() && name.GetSchema().empty()) {
-						cast_type = UnboundType::TryDefaultBind(cast_type);
-					}
-				}
-			}
-			if (!cast.try_cast && cast_type == change_type.target_type &&
-			    cast.child->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-				auto &column = cast.child->Cast<ColumnRefExpression>();
-				ordinary_cast = column.column_names.size() == 1 &&
-				                StringUtil::CIEquals(column.column_names[0], change_type.column_name);
+			const auto &target = cast.TargetType();
+			auto cast_type = UnboundType::TryDefaultBind(target);
+			if (target.GetQualifiedName().Path().size() == 1 && !cast.IsTryCast() &&
+			    cast_type == change_type.target_type &&
+			    cast.Child().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				auto &column = cast.Child().Cast<ColumnRefExpression>();
+				ordinary_cast =
+				    column.ColumnNames().size() == 1 && column.ColumnNames()[0] == change_type.GetColumnName();
 			}
 		}
 		if (change_type.expression && !ordinary_cast) {
@@ -622,30 +645,38 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	}
 	case AlterTableType::SET_DEFAULT: {
 		auto &set_def = alter_table.Cast<SetDefaultInfo>();
+		if (set_def.column_path.size() != 1)
+			throw NotImplementedException("Native VGI nested column defaults are not yet qualified");
 		if (set_def.expression) {
 			// SET DEFAULT
 			auto expression = vgi::BuildNativeColumnExpression(set_def.expression->ToString(), schema_name,
 			                                                   vgi::NativeColumnEvaluationContext(context), false);
-			vgi::InvokeCatalogTableColumnDefaultSet(rpc_ctx, schema_name, table_name, set_def.column_name, expression,
-			                                        context);
+			vgi::InvokeCatalogTableColumnDefaultSet(rpc_ctx, schema_name, table_name,
+			                                        set_def.column_path[0].GetIdentifierName(), expression, context);
 		} else {
 			// DROP DEFAULT (null expression)
-			vgi::InvokeCatalogTableColumnDefaultDrop(rpc_ctx, schema_name, table_name, set_def.column_name,
-			                                          context);
+			vgi::InvokeCatalogTableColumnDefaultDrop(rpc_ctx, schema_name, table_name,
+			                                         set_def.column_path[0].GetIdentifierName(), context);
 		}
 		break;
 	}
 	case AlterTableType::SET_NOT_NULL:
 	case AlterTableType::DROP_NOT_NULL: {
 		vgi::RequireNativeConstraintCapabilities(*attach_result, vgi::VGI_CONSTRAINT_MUTATE);
-		if (!rpc_ctx.transaction_opaque_data.empty() && !attach_result->constraint_profiles.count("vgi.transaction.ddl.v1")) {
+		if (!rpc_ctx.transaction_opaque_data.empty() &&
+		    !attach_result->constraint_profiles.count("vgi.transaction.ddl.v1")) {
 			throw NotImplementedException("Constraint ALTER in a transaction requires vgi.transaction.ddl.v1");
 		}
 		const bool add = alter_table.alter_table_type == AlterTableType::SET_NOT_NULL;
-		auto column = add ? alter_table.Cast<SetNotNullInfo>().column_name : alter_table.Cast<DropNotNullInfo>().column_name;
+		const auto &path =
+		    add ? alter_table.Cast<SetNotNullInfo>().column_path : alter_table.Cast<DropNotNullInfo>().column_path;
+		if (path.size() != 1)
+			throw NotImplementedException("Native VGI nested nullability changes are not yet qualified");
+		const auto &column = path[0].GetIdentifierName();
 		// Fresh read ties stable constraint identity to its current definition revision.
 		auto current = vgi::InvokeCatalogTableGet(rpc_ctx, schema_name, table_name, context);
-		if (!current) throw BinderException("Table %s does not exist", table_name);
+		if (!current)
+			throw BinderException("Table %s does not exist", table_name);
 		auto change = vgi::BuildNativeNotNullChange(*current, column, add);
 		if (!change.empty()) {
 			// A remote mutation may succeed even if its response is lost or malformed.
@@ -656,7 +687,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	}
 	default:
 		throw BinderException("ALTER TABLE %s is not supported for VGI catalogs",
-		                       EnumUtil::ToString(alter_table.alter_table_type));
+		                      EnumUtil::ToString(alter_table.alter_table_type));
 	}
 }
 
@@ -712,13 +743,16 @@ void VgiSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntr
 }
 
 void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY && info.type != CatalogType::INDEX_ENTRY) {
+	if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY &&
+	    info.type != CatalogType::INDEX_ENTRY) {
 		throw BinderException("DROP %s is not supported for VGI catalogs", EnumUtil::ToString(info.type));
 	}
 
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
-		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly).Set(vgi::error_key::kCatalog, catalog.GetName()).Set(vgi::error_key::kOperation, "DROP " + EnumUtil::ToString(info.type)),
+		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly)
+		                          .Set(vgi::error_key::kCatalog, catalog.GetName().GetIdentifierName())
+		                          .Set(vgi::error_key::kOperation, "DROP " + EnumUtil::ToString(info.type)),
 		                      StringUtil::Format("Cannot DROP %s in read-only VGI catalog '%s'",
 		                                         EnumUtil::ToString(info.type), catalog.GetName()));
 	}
@@ -729,44 +763,53 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx.GetTransactionOpaqueData()};
 
 	if (info.type == CatalogType::INDEX_ENTRY) {
 		vgi::RequireNativeIndexCapabilities(*attach_result, vgi::VGI_INDEX_DROP, false,
-		                                  !rpc_ctx.transaction_opaque_data.empty());
-		if (info.cascade) throw BinderException("Native VGI DROP INDEX CASCADE is unsupported");
+		                                    !rpc_ctx.transaction_opaque_data.empty());
+		if (info.cascade)
+			throw BinderException("Native VGI DROP INDEX CASCADE is unsupported");
 		// Lookup validates unsupported associated/PRIMARY definitions before effects.
-		auto bound = indexes_.GetEntry(context, info.name);
-		const auto raw_name = bound ? bound->name : info.name;
-		auto current = vgi::InvokeCatalogIndexGet(rpc_ctx, name, raw_name, context);
-		if (!current && !ignore_not_found) throw BinderException("Index %s does not exist", info.name);
+		auto bound = indexes_.GetEntry(context, info.GetQualifiedName().Name().GetIdentifierName());
+		const auto raw_name =
+		    bound ? bound->name.GetIdentifierName() : info.GetQualifiedName().Name().GetIdentifierName();
+		auto current = vgi::InvokeCatalogIndexGet(rpc_ctx, name.GetIdentifierName(), raw_name, context);
+		if (!current && !ignore_not_found)
+			throw BinderException("Index %s does not exist", info.GetQualifiedName().Name().GetIdentifierName());
 		DeferDrop(catalog, indexes_.HarvestEntries());
-		vgi::InvokeCatalogIndexDrop(rpc_ctx, name, current ? current->name : info.name, ignore_not_found, false, context);
+		vgi::InvokeCatalogIndexDrop(rpc_ctx, name.GetIdentifierName(),
+		                            current ? current->name : info.GetQualifiedName().Name().GetIdentifierName(),
+		                            ignore_not_found, false, context);
 		return;
 	}
 
 	if (info.type == CatalogType::VIEW_ENTRY) {
-		vgi::InvokeCatalogViewDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
+		vgi::InvokeCatalogViewDrop(rpc_ctx, name.GetIdentifierName(),
+		                           info.GetQualifiedName().Name().GetIdentifierName(), ignore_not_found, info.cascade,
+		                           context);
 		if (info.cascade) {
 			// Dependents may live in other schemas; invalidate this transaction's
 			// whole catalog view, retaining entries held by bound statements.
 			vgi_tx.ClearSchemaCache();
 			vgi_catalog.ClearCache();
 		} else {
-			DeferDrop(catalog, views_.HarvestEntry(info.name));
+			DeferDrop(catalog, views_.HarvestEntry(info.GetQualifiedName().Name().GetIdentifierName()));
 		}
 		return;
 	}
 
 	DeferDrop(catalog, indexes_.HarvestEntries());
-	vgi::InvokeCatalogTableDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
+	vgi::InvokeCatalogTableDrop(rpc_ctx, name.GetIdentifierName(), info.GetQualifiedName().Name().GetIdentifierName(),
+	                            ignore_not_found, info.cascade, context);
 	if (info.cascade) {
 		vgi_tx.ClearSchemaCache();
 		vgi_catalog.ClearCache();
 		return;
 	}
 
-	DeferDrop(catalog, tables_.HarvestEntry(info.name));
+	DeferDrop(catalog, tables_.HarvestEntry(info.GetQualifiedName().Name().GetIdentifierName()));
 	// Views referencing the dropped table are now stale; clear to force re-fetch.
 	// With cascade, the worker may have also dropped dependent views.
 	DeferDrop(catalog, views_.HarvestEntries());

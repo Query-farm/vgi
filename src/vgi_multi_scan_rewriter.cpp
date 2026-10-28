@@ -32,7 +32,9 @@
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -75,7 +77,7 @@ static void MultiBranchMarkerExecute(ClientContext &, TableFunctionInput &, Data
 }
 
 void RequireVgiOptimizerExtensions(ClientContext &context, const std::string &what) {
-	if (!ClientConfig::GetConfig(context).enable_optimizer) {
+	if (!Settings::Get<EnableOptimizerSetting>(context)) {
 		throw BinderException("%s needs DuckDB's optimizer, which is disabled. Re-enable it with "
 		                      "PRAGMA enable_optimizer.",
 		                      what);
@@ -131,41 +133,41 @@ static unique_ptr<Expression> BindBranchFilterColumnRef(const ColumnRefExpressio
 }
 
 static unique_ptr<Expression> BindBranchFilterConstant(const ConstantExpression &cexpr) {
-	return make_uniq<BoundConstantExpression>(cexpr.value);
+	return make_uniq<BoundConstantExpression>(cexpr.GetLiteral().ToValue());
 }
 
 static unique_ptr<Expression> BindBranchFilterComparison(ClientContext &context, const ComparisonExpression &cmp,
                                                           const ArmColumnLookup &cols) {
-	auto left = BindBranchFilterExpr(context, *cmp.left, cols);
-	auto right = BindBranchFilterExpr(context, *cmp.right, cols);
+	auto left = BindBranchFilterExpr(context, cmp.Left(), cols);
+	auto right = BindBranchFilterExpr(context, cmp.Right(), cols);
 	// Implicit cast: if one side is a constant whose type differs from the
 	// other, cast the constant to the other side's type. Handles
 	// `ts >= TIMESTAMP '...'` cleanly without invoking the full type
 	// resolver. Mismatched non-constant types throw — arbitrary type
 	// coercion between non-constants is not supported.
-	if (left->return_type != right->return_type) {
+	if (left->GetReturnType() != right->GetReturnType()) {
 		if (left->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
-			left = BoundCastExpression::AddCastToType(context, std::move(left), right->return_type);
+			left = BoundCastExpression::AddCastToType(context, std::move(left), right->GetReturnType());
 		} else if (right->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
-			right = BoundCastExpression::AddCastToType(context, std::move(right), left->return_type);
+			right = BoundCastExpression::AddCastToType(context, std::move(right), left->GetReturnType());
 		} else {
 			throw BinderException(
 			    "VGI branch_filter comparison between mismatched types %s and %s is not supported "
 			    "(no automatic cast between two non-constant operands).",
-			    left->return_type.ToString(), right->return_type.ToString());
+			    left->GetReturnType().ToString(), right->GetReturnType().ToString());
 		}
 	}
-	return make_uniq<BoundComparisonExpression>(cmp.GetExpressionType(), std::move(left), std::move(right));
+	return BoundComparisonExpression::Create(cmp.GetExpressionType(), std::move(left), std::move(right));
 }
 
 static unique_ptr<Expression> BindBranchFilterConjunction(ClientContext &context, const ConjunctionExpression &conj,
                                                             const ArmColumnLookup &cols) {
-	if (conj.children.empty()) {
+	if (conj.GetChildren().empty()) {
 		throw BinderException("VGI branch_filter: empty conjunction is invalid.");
 	}
 	auto result = make_uniq<BoundConjunctionExpression>(conj.GetExpressionType());
-	for (const auto &child : conj.children) {
-		result->children.push_back(BindBranchFilterExpr(context, *child, cols));
+	for (const auto &child : conj.GetChildren()) {
+		result->GetChildrenMutable().push_back(BindBranchFilterExpr(context, *child, cols));
 	}
 	return result;
 }
@@ -237,7 +239,7 @@ static ArmBindResult BindCatalogTableArm(const VgiScanBranch &branch, ClientCont
 	// The companion catalog must already be attached. If it isn't (e.g.
 	// `attach_companions false`, or an optional companion that failed/conflicted),
 	// fail with a clear message rather than a bare "catalog not found".
-	if (!Catalog::GetCatalogEntry(context, branch.source_catalog)) {
+	if (!Catalog::GetCatalogEntry(context, Identifier(branch.source_catalog))) {
 		throw BinderException(
 		    "VGI multi-branch catalog-table branch references companion catalog '%s' (table '%s.%s') which is not "
 		    "attached. Companion catalogs are attached at VGI ATTACH time — was `attach_companions false` set, or did "
@@ -249,15 +251,15 @@ static ArmBindResult BindCatalogTableArm(const VgiScanBranch &branch, ClientCont
 	// EntryLookupInfo. Catalog-managed sources like DuckLake REQUIRE it — the
 	// 2-arg overload throws "called without entry lookup info" (it needs the
 	// lookup to bind the snapshot/file-list). No AT clause = current snapshot.
-	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, branch.source_table);
-	auto &table = Catalog::GetEntry<TableCatalogEntry>(context, branch.source_catalog, branch.source_schema,
-	                                                    branch.source_table);
+	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, QualifiedName(Identifier(branch.source_table)));
+	auto &table = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(branch.source_catalog),
+	                                                    Identifier(branch.source_schema), Identifier(branch.source_table));
 
 	unique_ptr<FunctionData> bind_data;
 	auto scan_function = table.GetScanFunction(context, bind_data, table_lookup);
 
 	vector<LogicalType> return_types;
-	vector<string> return_names;
+	vector<Identifier> return_names;
 	for (auto &col : table.GetColumns().Logical()) {
 		return_types.push_back(col.Type());
 		return_names.push_back(col.Name());
@@ -271,7 +273,7 @@ static ArmBindResult BindCatalogTableArm(const VgiScanBranch &branch, ClientCont
 	}
 
 	auto bind_index = binder.GenerateTableIndex();
-	auto get = make_uniq<LogicalGet>(bind_index, scan_function, std::move(bind_data), return_types, return_names,
+	auto get = make_uniq<LogicalGet>(bind_index, BoundTableFunction(std::move(scan_function)), std::move(bind_data), return_types, return_names,
 	                                 std::move(virtual_columns));
 
 	// Full column set (same rationale as the function path — avoid the
@@ -285,7 +287,7 @@ static ArmBindResult BindCatalogTableArm(const VgiScanBranch &branch, ClientCont
 	get->ResolveOperatorTypes();
 
 	ArmBindResult result;
-	result.raw_names = std::move(return_names);
+	result.raw_names = IdentifiersToStrings(return_names);
 	result.raw_types = std::move(return_types);
 	result.bindings = get->GetColumnBindings();
 	result.get = std::move(get);
@@ -344,7 +346,7 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	// design, not just a pre-1.5.0-peer compatibility case) fall back to the
 	// old cascade: the table's catalog/schema first, then the catalog's
 	// default schema, then the system catalog (read_parquet, iceberg_scan, etc.).
-	EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, eff_function_name);
+	EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(Identifier(eff_function_name)));
 	optional_ptr<CatalogEntry> entry;
 	// Only take the worker-provided schema_name path for a genuinely different
 	// third schema — one that names neither the table's own schema nor the
@@ -360,15 +362,15 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	                                     branch.schema_name != table_schema_name &&
 	                                     branch.schema_name != default_schema;
 	if (branch_schema_is_third_schema) {
-		entry = Catalog::GetEntry(context, table_catalog_name, branch.schema_name, lookup,
+		entry = Catalog::GetEntry(context, Identifier(table_catalog_name), Identifier(branch.schema_name), lookup,
 		                          OnEntryNotFound::RETURN_NULL);
 	}
 	if (!entry) {
-		entry = Catalog::GetEntry(context, table_catalog_name, table_schema_name, lookup,
+		entry = Catalog::GetEntry(context, Identifier(table_catalog_name), Identifier(table_schema_name), lookup,
 		                          OnEntryNotFound::RETURN_NULL);
 	}
 	if (!entry && !default_schema.empty() && default_schema != table_schema_name) {
-		entry = Catalog::GetEntry(context, table_catalog_name, default_schema, lookup,
+		entry = Catalog::GetEntry(context, Identifier(table_catalog_name), Identifier(default_schema), lookup,
 		                          OnEntryNotFound::RETURN_NULL);
 	}
 	if (!entry) {
@@ -381,31 +383,39 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	}
 	auto &fn_entry = entry->Cast<TableFunctionCatalogEntry>();
 
-	// Pick an overload by argument types. Same shape as the throwaway spike.
-	// Note: GetFunctionByArguments expects duckdb::vector (not std::vector).
-	vector<LogicalType> arg_types;
-	arg_types.reserve(eff_positional.size());
-	for (const auto &v : eff_positional) {
-		arg_types.push_back(v.type());
+	// Bind both positional and named arguments through DuckDB's signature
+	// resolver so casts, overload selection and keyword defaults agree with SQL.
+	vector<unique_ptr<Expression>> positional_arguments;
+	for (const auto &value : eff_positional) {
+		positional_arguments.push_back(make_uniq<BoundConstantExpression>(value));
 	}
-	TableFunction tf = fn_entry.functions.GetFunctionByArguments(context, arg_types);
-
-	// Build the bind input. The Binder + TableFunctionRef are required by
-	// the TableFunctionBindInput constructor; we pass the optimizer's binder
-	// and a default-constructed ref.
-	vector<Value> parameters(eff_positional.begin(), eff_positional.end());
-	named_parameter_map_t named_parameters;
-	for (auto &kv : eff_named) {
-		named_parameters.emplace(kv.first, kv.second);
+	vector<pair<Identifier, unique_ptr<Expression>>> named_arguments;
+	for (const auto &item : eff_named) {
+		named_arguments.emplace_back(Identifier(item.first), make_uniq<BoundConstantExpression>(item.second));
 	}
+	vector<Value> parameters;
+	named_argument_map_t named_parameters;
+	FunctionBinder function_binder(context);
+	ErrorData error;
+	auto overload = function_binder.BindFunction(fn_entry.name, fn_entry.functions, positional_arguments,
+	                                               named_arguments, parameters, named_parameters, error);
+	if (!overload.IsValid()) {
+		error.Throw();
+	}
+	BoundTableFunction tf(fn_entry.functions.GetFunctionByOffset(overload.GetIndex()));
+	tf.GetSignature().FillNamedDefaults(context, named_parameters);
+	tf.SetCallArguments(parameters, named_parameters);
 	vector<LogicalType> input_table_types;
-	vector<string> input_table_names;
+	vector<Identifier> input_table_names;
 	TableFunctionRef ref;
 	TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types, input_table_names,
 	                                  tf.function_info.get(), &binder, tf, ref);
 
 	vector<LogicalType> return_types;
-	vector<string> return_names;
+	vector<Identifier> return_names;
+	if (!tf.bind) {
+		throw NotImplementedException("VGI branch scans require a table-function bind callback");
+	}
 	auto bind_data = tf.bind(context, bind_input, return_types, return_names);
 
 	virtual_column_map_t virtual_columns;
@@ -451,7 +461,7 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	get->ResolveOperatorTypes();
 
 	ArmBindResult result;
-	result.raw_names = std::move(return_names);
+	result.raw_names = IdentifiersToStrings(return_names);
 	result.raw_types = std::move(return_types);
 	result.bindings = get->GetColumnBindings();
 	result.get = std::move(get);

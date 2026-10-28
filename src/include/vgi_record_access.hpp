@@ -12,7 +12,7 @@ namespace vgi {
 // unique. Ordinary protocol records should use generated::Decode instead.
 class RecordBatchSingleRow {
 public:
-	RecordBatchSingleRow(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row, const char *description,
+	RecordBatchSingleRow(const VgiBatchPtr &batch, int64_t row, const char *description,
 	                     const std::string &worker_path)
 	    : batch_(batch), row_(row), description_(description), worker_path_(worker_path),
 	      reader_(batch_, row_, description_.c_str(), worker_path_) {
@@ -26,12 +26,14 @@ public:
 		}
 		template <class T>
 		T value_not_null() const {
+			wire::CurrentBatchScope scope(owner_.batch_.get());
 			T value {};
 			owner_.reader_.Required(name_.c_str(), value);
 			return value;
 		}
 		template <class T>
 		std::optional<T> as() const {
+			wire::CurrentBatchScope scope(owner_.batch_.get());
 			std::optional<T> value;
 			owner_.reader_.Optional(name_.c_str(), value);
 			return value;
@@ -48,7 +50,7 @@ public:
 			wire::Ctx ctx {owner_.description_, &owner_.worker_path_, name_, owner_.row_};
 			if (!column)
 				wire::ThrowMissing(ctx);
-			return wire::IsNullValue(*column, owner_.row_, ctx);
+			return wire::IsNullValue(column, owner_.row_, ctx);
 		}
 
 	private:
@@ -61,7 +63,7 @@ public:
 	}
 
 private:
-	std::shared_ptr<arrow::RecordBatch> batch_;
+	VgiBatchPtr batch_;
 	int64_t row_;
 	std::string description_;
 	std::string worker_path_;

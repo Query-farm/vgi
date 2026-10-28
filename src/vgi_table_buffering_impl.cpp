@@ -3,15 +3,15 @@
 #include "vgi_table_buffering_impl.hpp"
 #include "vgi_batch_validation.hpp"
 
-#include <arrow/c/bridge.h>
 #include <exception>
-#include <arrow/util/byte_size.h> // TotalBufferSize — bound the whole-input RAM capture
 
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/query_profiler.hpp"
+#include "duckdb/parallel/thread_context.hpp"
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_table_buffering_builders.hpp"
@@ -32,7 +32,7 @@ namespace vgi {
 // LogicalVgiTableBufferingFunction
 // ============================================================================
 
-LogicalVgiTableBufferingFunction::LogicalVgiTableBufferingFunction(idx_t table_index_p,
+LogicalVgiTableBufferingFunction::LogicalVgiTableBufferingFunction(TableIndex table_index_p,
                                                                   vector<LogicalType> return_types_p,
                                                                   vector<string> return_names_p,
                                                                   unique_ptr<FunctionData> bind_data_p)
@@ -46,13 +46,13 @@ vector<ColumnBinding> LogicalVgiTableBufferingFunction::GetColumnBindings() {
 	vector<ColumnBinding> bindings;
 	bindings.reserve(return_types.size());
 	for (idx_t i = 0; i < return_types.size(); i++) {
-		bindings.emplace_back(table_index, i);
+		bindings.emplace_back(table_index, ProjectionIndex(i));
 	}
 	return bindings;
 }
 
-vector<idx_t> LogicalVgiTableBufferingFunction::GetTableIndex() const {
-	return vector<idx_t> {table_index};
+vector<TableIndex> LogicalVgiTableBufferingFunction::GetTableIndex() const {
+	return vector<TableIndex> {table_index};
 }
 
 string LogicalVgiTableBufferingFunction::GetName() const {
@@ -301,7 +301,7 @@ public:
 	bool capturing = false;
 	VgiCacheControl capture_cc;
 	bool capture_cc_latched = false;
-	std::vector<std::shared_ptr<arrow::RecordBatch>> capture_batches;
+	std::vector<VgiBatchPtr> capture_batches;
 	size_t total_finalize_states = 0;
 	std::atomic<size_t> finalize_eos_count {0};
 	// Set if the worker's finalize output is not cacheable (no vgi.cache.* advertised),
@@ -716,7 +716,7 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 				// the init runner is blocked (slow worker spawn, OAuth
 				// refresh, etc.) doesn't leave peers hung indefinitely.
 				while (!gstate.init_done.load(std::memory_order_acquire) && !gstate.init_failed) {
-					if (context.client.interrupted) {
+					if (context.client.IsInterrupted()) {
 						throw InterruptException();
 					}
 					gstate.init_cv.wait_for(lk, std::chrono::milliseconds(250));
@@ -1089,24 +1089,6 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 // Source
 // ============================================================================
 
-// Post-execution EXPLAIN ANALYZE line: whole-input (M3) cache hit vs miss. The
-// decision was made at Sink::Finalize and lives on the sink gstate; buffered is
-// whole-input keyed, so a query is a single hit or miss (binary, not a rate).
-InsertionOrderPreservingMap<string>
-PhysicalVgiTableBufferingFunction::ExtraSourceParams(GlobalSourceState & /*gstate*/,
-                                                     LocalSourceState & /*lstate*/) const {
-	InsertionOrderPreservingMap<string> result;
-	if (!sink_state) {
-		return result;
-	}
-	auto &sink = sink_state->Cast<VgiTableBufferingGlobalSinkState>();
-	if (!sink.cache_eligible) {
-		return result; // caching not active for this scan → no Cache line
-	}
-	result["Cache"] = sink.serving_from_cache ? "hit (memory)" : "miss";
-	return result;
-}
-
 unique_ptr<GlobalSourceState>
 PhysicalVgiTableBufferingFunction::GetGlobalSourceState(ClientContext & /*context*/) const {
 	auto gss = make_uniq<VgiTableBufferingGlobalSourceState>();
@@ -1136,6 +1118,10 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 	// state pointer via sink_state.
 	auto &gstate = sink_state->Cast<VgiTableBufferingGlobalSinkState>();
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
+	if (gstate.cache_eligible && QueryProfiler::Get(context.client).IsEnabled()) {
+		context.thread.profiler.GetOperatorMetrics(*this).AddExtraInfo(
+		    "Cache", gstate.serving_from_cache ? "hit (memory)" : "miss");
+	}
 
 	// Drain any rows still pending from the current emitted batch before
 	// reading a new one. finalize() may emit a batch larger than
@@ -1258,7 +1244,7 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 			// process-global in-flight budget aborts to uncached — drop what we've
 			// accumulated (freeing RAM now) and release any reserved budget; the dtor
 			// then won't commit. The query keeps streaming to DuckDB unaffected.
-			int64_t sz = arrow::util::TotalBufferSize(*batch);
+			int64_t sz = batch->TotalBufferSize();
 			if (gstate.capture_bytes + sz > gstate.cache_max_entry_bytes ||
 			    !GetResultCache(*gstate.db).TryReserveInflightCapture(sz)) {
 				gstate.capture_aborted.store(true);

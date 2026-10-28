@@ -21,7 +21,7 @@ struct VgiGithubCacheData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiGithubCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT};
 	names = {"owner", "repo", "tag", "asset", "digest", "dir", "entrypoint", "age_seconds"};
@@ -70,7 +70,7 @@ struct VgiGithubCacheFlushData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiGithubCacheFlushBind(ClientContext &context, TableFunctionBindInput &input,
-                                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.push_back(LogicalType::BIGINT);
 	names.emplace_back("flushed");
 	return make_uniq<VgiGithubCacheFlushData>();

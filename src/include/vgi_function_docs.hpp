@@ -2,11 +2,24 @@
 #pragma once
 
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
+#include "duckdb/function/function.hpp"
 
 #include <utility>
 
 namespace duckdb {
 namespace vgi {
+
+// Optional named options are **kwargs entries: omitting an option leaves it
+// absent in TableFunctionBindInput::named_parameters.
+inline void AddVgiFunctionOption(SimpleFunction &function, Identifier name, LogicalType type) {
+	auto &signature = function.GetSignature();
+	auto configure = [&](TypedKwargs &options) { options.Add(std::move(name), std::move(type)); };
+	if (signature.GetTypedKwargs()) {
+		signature.ExtendTypedKwargs(configure);
+	} else {
+		signature.WithTypedKwargs("options", configure);
+	}
+}
 
 // Build a FunctionDescription so the extension's built-in functions carry
 // compiled-in documentation surfaced through duckdb_functions()

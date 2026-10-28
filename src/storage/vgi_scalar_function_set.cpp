@@ -32,7 +32,7 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
                                             const std::vector<vgi::VgiFunctionInfo> &overloads,
                                             const VgiFunctionRegistrationTarget &target,
                                             vector<FunctionDescription> &descriptions) {
-	ScalarFunctionSet func_set(registered_name);
+	ScalarFunctionSet func_set {Identifier(registered_name)};
 
 	for (const auto &func_info : overloads) {
 		// Parse argument types, distinguishing positional from named arguments
@@ -54,17 +54,16 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 		}
 
 		// Check if output type is marked as "any" type (dynamic output type)
-		auto output_field = func_info.output_schema->field(0);
+		auto metadata = func_info.output_schema->field_metadata(0);
 		bool is_any_output = false;
-		if (output_field->HasMetadata()) {
-			auto metadata = output_field->metadata();
-			auto type_idx = metadata->FindKey("vgi:any");
+		if (!metadata.empty()) {
+			auto type_idx = metadata.FindKey("vgi:any");
 			if (type_idx >= 0) {
 				is_any_output = true;
 			}
 			// Also check vgi_type metadata
-			type_idx = metadata->FindKey("vgi_type");
-			if (type_idx >= 0 && metadata->value(type_idx) == "any") {
+			type_idx = metadata.FindKey("vgi_type");
+			if (type_idx >= 0 && metadata.value(type_idx) == "any") {
 				is_any_output = true;
 			}
 		}
@@ -98,12 +97,12 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 
 		// Set null handling from function metadata (SPECIAL_HANDLING allows function to receive nulls)
 		if (func_info.null_handling.has_value()) {
-			scalar_func.null_handling = func_info.null_handling.value();
+			scalar_func.SetNullHandling(func_info.null_handling.value());
 		}
 
 		// Set varargs if this function accepts variable arguments
 		if (arg_types.has_varargs) {
-			scalar_func.varargs = arg_types.varargs_type;
+			scalar_func.GetSignature().AddArgs("args", arg_types.varargs_type);
 		}
 
 		// Create VgiScalarFunctionInfo with worker connection details
@@ -161,7 +160,7 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 
 } // namespace vgi
 
-void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
+void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> & /*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -179,9 +178,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 	// Call catalog_schema_contents_functions via RPC for scalar functions
 	auto worker_path = attach_params->worker_path();
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::SCALAR_FUNCTION_ENTRY, context);
 
@@ -203,11 +203,11 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 	// Registration target: this catalog's own schema.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
-	target.catalog_name = catalog_.GetName();
+	target.catalog_name = catalog_.GetName().GetIdentifierName();
 	target.attach_params = attach_params;
 	target.attach_opaque_data = attach_result->attach_opaque_data;
 	target.setting_names = setting_names;
-	target.schema_name = schema_.name;
+	target.schema_name = schema_.name.GetIdentifierName();
 
 	// Create function entries
 	for (const auto &pair : functions_by_name) {
@@ -217,7 +217,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 
 		// Create function info and entry
 		CreateScalarFunctionInfo info(func_set);
-		info.schema = schema_.name;
+		info.SetQualifiedName(schema_.GetQualifiedName(info.GetFunctionName()));
 		info.internal = true;
 		info.descriptions = std::move(descriptions);
 
@@ -239,7 +239,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 			}
 		}
 
-		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(function_entry)); }
+		{
+			std::lock_guard<std::mutex> __entry_lk(entry_lock_);
+			CreateEntryLocked(std::move(function_entry));
+		}
 	}
 }
 

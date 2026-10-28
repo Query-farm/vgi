@@ -1,69 +1,48 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_memo_arena.hpp"
+#include "vgi_ipc.hpp"
 
+#include <exception>
 #include <stdexcept>
 #include <utility>
-
-#include <arrow/array/builder_primitive.h>
-#include <arrow/compute/api_vector.h> // arrow::compute::Take
-#include <arrow/datum.h>              // arrow::Datum (complete type for Result<Datum>)
-#include <arrow/io/memory.h>          // BufferReader / BufferOutputStream (IPC persist)
-#include <arrow/ipc/reader.h>         // RecordBatchStreamReader
-#include <arrow/ipc/writer.h>         // MakeStreamWriter
-#include <arrow/util/byte_size.h>     // arrow::util::TotalBufferSize
 
 namespace duckdb {
 namespace vgi {
 
 namespace {
 
-// Throw-on-error unwrap so a mid-serve arrow failure surfaces as an exception the
-// operator boundary catches (the arena stays DuckDB-free, so std::runtime_error).
-template <typename T>
-T Unwrap(arrow::Result<T> r, const char *what) {
-	if (!r.ok()) {
-		throw std::runtime_error(std::string("vgi memo arena: ") + what + ": " + r.status().ToString());
-	}
-	return std::move(r).ValueUnsafe();
-}
-
-void Check(const arrow::Status &s, const char *what) {
-	if (!s.ok()) {
-		throw std::runtime_error(std::string("vgi memo arena: ") + what + ": " + s.ToString());
+// Run `fn`, turning any failure into a std::runtime_error so a mid-serve failure
+// surfaces as an exception the operator boundary catches (same message shape as
+// before: "vgi memo arena: <what>: <detail>").
+template <typename F>
+auto Guard(const char *what, F &&fn) -> decltype(fn()) {
+	try {
+		return fn();
+	} catch (const std::exception &e) {
+		throw std::runtime_error(std::string("vgi memo arena: ") + what + ": " + e.what());
 	}
 }
 
-// Take `idx` rows from `src` (in idx order), bounds-check off (indices are arena
-// offsets, valid by construction).
-std::shared_ptr<arrow::RecordBatch> TakeRows(const std::shared_ptr<arrow::RecordBatch> &src,
-                                             const std::vector<int64_t> &idx) {
-	arrow::Int64Builder b;
-	Check(b.Reserve(static_cast<int64_t>(idx.size())), "index reserve");
-	for (auto v : idx) {
-		b.UnsafeAppend(v);
-	}
-	std::shared_ptr<arrow::Array> ia;
-	Check(b.Finish(&ia), "index build");
-	auto res = arrow::compute::Take(arrow::Datum(src), arrow::Datum(ia),
-	                                arrow::compute::TakeOptions::NoBoundsCheck());
-	return Unwrap(std::move(res), "take").record_batch();
+// Take `idx` rows from `src` (in idx order); indices are arena offsets, valid by
+// construction. TakeRows produces a compact copy (the result owns only the gathered
+// rows), so the footprint of a materialized batch is its own rows, never the source's.
+VgiBatchPtr TakeArenaRows(const VgiBatchPtr &src, const std::vector<int64_t> &idx) {
+	return Guard("take", [&] { return TakeRows(src, idx); });
 }
 
-std::shared_ptr<arrow::RecordBatch> ConcatBatches(const std::vector<std::shared_ptr<arrow::RecordBatch>> &parts) {
-	return Unwrap(arrow::ConcatenateRecordBatches(parts), "concat");
+VgiBatchPtr ConcatArenaBatches(const std::vector<VgiBatchPtr> &parts) {
+	return Guard("concat", [&] { return ConcatBatches(parts); });
 }
 
 // Serialize one batch as a self-contained Arrow IPC stream (schema + batch). The
 // columnar arena is the memory optimization; the DISK representation is per-slot IPC
 // (the same bytes the pre-arena per-value entries used), which the backend stores.
-std::string SerializeBatchToIpc(const std::shared_ptr<arrow::RecordBatch> &batch) {
-	auto sink = Unwrap(arrow::io::BufferOutputStream::Create(), "ipc sink");
-	auto writer = Unwrap(arrow::ipc::MakeStreamWriter(sink, batch->schema(), arrow::ipc::IpcWriteOptions::Defaults()),
-	                     "ipc writer");
-	Check(writer->WriteRecordBatch(*batch), "ipc write");
-	Check(writer->Close(), "ipc close");
-	auto buf = Unwrap(sink->Finish(), "ipc finish");
-	return std::string(reinterpret_cast<const char *>(buf->data()), static_cast<size_t>(buf->size()));
+// No message custom_metadata is written (an empty metadata overrides the batch's own).
+std::string SerializeBatchToIpc(const VgiBatchPtr &batch) {
+	return Guard("ipc write", [&] {
+		const VgiMetadata no_metadata;
+		return SerializeBatch(*batch, &no_metadata)->ToString();
+	});
 }
 
 int64_t NowUnix() {
@@ -71,13 +50,10 @@ int64_t NowUnix() {
 	    .count();
 }
 
-std::shared_ptr<arrow::RecordBatch> DeserializeBatchFromIpc(const std::string &ipc) {
-	auto buf = arrow::Buffer::FromString(ipc);
-	auto in = std::make_shared<arrow::io::BufferReader>(buf);
-	auto reader = Unwrap(arrow::ipc::RecordBatchStreamReader::Open(in), "ipc open");
-	std::shared_ptr<arrow::RecordBatch> batch;
-	Check(reader->ReadNext(&batch), "ipc readnext");
-	return batch; // schema included; may be a 0-row batch (a negative memo)
+VgiBatchPtr DeserializeBatchFromIpc(const std::string &ipc) {
+	// Zero-copy over a buffer that owns a copy of the bytes. Schema included; may be a
+	// 0-row batch (a negative memo).
+	return Guard("ipc read", [&] { return DeserializeBatch(VgiBuffer::FromString(ipc)); });
 }
 
 } // namespace
@@ -108,7 +84,7 @@ ArenaValidator VgiMemoArena::GetValidator(int32_t ref) {
 	return validators_[static_cast<size_t>(ref)];
 }
 
-std::shared_ptr<arrow::RecordBatch> VgiMemoArena::MaterializeLocked(const std::vector<int64_t> &logical) {
+VgiBatchPtr VgiMemoArena::MaterializeLocked(const std::vector<int64_t> &logical) {
 	const int64_t n = static_cast<int64_t>(logical.size());
 	if (n == 0) {
 		return nullptr;
@@ -121,7 +97,7 @@ std::shared_ptr<arrow::RecordBatch> VgiMemoArena::MaterializeLocked(const std::v
 		}
 	}
 	if (all_base) {
-		return TakeRows(base_, logical); // already base offsets, in output order
+		return TakeArenaRows(base_, logical); // already base offsets, in output order
 	}
 	// 2-source gather: split into base/tail, take each (only the touched rows, ≤ n),
 	// concat, then one reorder Take back into output order. O(n), never O(arena).
@@ -137,14 +113,14 @@ std::shared_ptr<arrow::RecordBatch> VgiMemoArena::MaterializeLocked(const std::v
 			tail_out.push_back(i);
 		}
 	}
-	std::vector<std::shared_ptr<arrow::RecordBatch>> parts;
+	std::vector<VgiBatchPtr> parts;
 	if (!base_idx.empty()) {
-		parts.push_back(TakeRows(base_, base_idx));
+		parts.push_back(TakeArenaRows(base_, base_idx));
 	}
 	if (!tail_idx.empty()) {
-		parts.push_back(TakeRows(tail_, tail_idx));
+		parts.push_back(TakeArenaRows(tail_, tail_idx));
 	}
-	auto combined = parts.size() == 1 ? parts[0] : ConcatBatches(parts);
+	auto combined = parts.size() == 1 ? parts[0] : ConcatArenaBatches(parts);
 	// combined rows are [base_out order..., tail_out order...]; reorder to output order.
 	std::vector<int64_t> inv(static_cast<size_t>(n));
 	const int64_t nb = static_cast<int64_t>(base_idx.size());
@@ -154,7 +130,7 @@ std::shared_ptr<arrow::RecordBatch> VgiMemoArena::MaterializeLocked(const std::v
 	for (int64_t r = 0; r < static_cast<int64_t>(tail_out.size()); r++) {
 		inv[static_cast<size_t>(tail_out[r])] = nb + r;
 	}
-	return TakeRows(combined, inv);
+	return TakeArenaRows(combined, inv);
 }
 
 ArenaProbeResult VgiMemoArena::Probe(const std::vector<std::string> &keys,
@@ -209,12 +185,12 @@ ArenaProbeResult VgiMemoArena::Probe(const std::vector<std::string> &keys,
 	if (!logical.empty()) {
 		r.rows = MaterializeLocked(logical);
 		r.parent = std::move(parent);
-		r.served_bytes = r.rows ? arrow::util::TotalBufferSize(*r.rows) : 0;
+		r.served_bytes = r.rows ? r.rows->TotalBufferSize() : 0;
 	}
 	return r;
 }
 
-int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
+int64_t VgiMemoArena::Store(const VgiBatchPtr &batch,
                             const std::vector<ArenaStoreSpec> &specs,
                             std::chrono::steady_clock::time_point expires_at, bool never_expires) {
 	std::unique_lock<std::shared_mutex> lg(mu_);
@@ -230,7 +206,7 @@ int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
 			tail_ = batch;
 			tail_rows_ = appended;
 		} else {
-			tail_ = ConcatBatches({tail_, batch});
+			tail_ = ConcatArenaBatches({tail_, batch});
 			tail_rows_ += appended;
 		}
 	}
@@ -289,7 +265,7 @@ int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
 	return after - before;
 }
 
-void VgiMemoArena::PersistNewSlotsLocked(const std::shared_ptr<arrow::RecordBatch> &batch,
+void VgiMemoArena::PersistNewSlotsLocked(const VgiBatchPtr &batch,
                                          const std::vector<std::pair<std::string, VgiMemoSlot>> &new_slots) {
 	if (!backend_ || !batch) {
 		return;
@@ -336,7 +312,7 @@ int64_t VgiMemoArena::LoadFromBackend(int64_t now_unix) {
 	}
 	// No lock: called pre-publication (the registry holds this arena's only reference).
 	const auto steady_now = std::chrono::steady_clock::now();
-	std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+	std::vector<VgiBatchPtr> batches;
 	int64_t cursor = 0;
 	for (auto &p : slots) {
 		auto b = DeserializeBatchFromIpc(p.ipc);
@@ -370,7 +346,7 @@ int64_t VgiMemoArena::LoadFromBackend(int64_t now_unix) {
 		}
 		cursor += p.rows;
 	}
-	base_ = batches.empty() ? Unwrap(arrow::RecordBatch::MakeEmpty(schema_), "empty base") : ConcatBatches(batches);
+	base_ = batches.empty() ? VgiBatch::MakeEmpty(schema_) : ConcatArenaBatches(batches);
 	base_rows_ = cursor;
 	return RecomputeFootprintLocked();
 }
@@ -407,9 +383,9 @@ void VgiMemoArena::CompactLocked(std::chrono::steady_clock::time_point now) {
 	for (auto &k : stale_keys) {
 		slots_.erase(k);
 	}
-	std::shared_ptr<arrow::RecordBatch> nb;
+	VgiBatchPtr nb;
 	if (logical.empty()) {
-		nb = Unwrap(arrow::RecordBatch::MakeEmpty(schema_), "empty base");
+		nb = VgiBatch::MakeEmpty(schema_);
 	} else {
 		nb = MaterializeLocked(logical);
 	}
@@ -423,10 +399,10 @@ void VgiMemoArena::CompactLocked(std::chrono::steady_clock::time_point now) {
 int64_t VgiMemoArena::RecomputeFootprintLocked() {
 	int64_t f = 0;
 	if (base_) {
-		f += arrow::util::TotalBufferSize(*base_);
+		f += base_->TotalBufferSize();
 	}
 	if (tail_) {
-		f += arrow::util::TotalBufferSize(*tail_);
+		f += tail_->TotalBufferSize();
 	}
 	// Slot-map + key-blob overhead. Per slot: the unordered_map node (~48), the
 	// VgiMemoSlot (~48), the std::string key control block (~32) + slack, plus the key
@@ -466,7 +442,7 @@ VgiMemoArenaRegistry &VgiMemoArenaRegistry::Instance() {
 }
 
 std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::GetOrCreate(const std::string &static_fp,
-                                                                const std::shared_ptr<arrow::Schema> &schema) {
+                                                                const VgiSchemaPtr &schema) {
 	std::lock_guard<std::mutex> lg(mu_);
 	++tick_;
 	auto it = arenas_.find(static_fp);

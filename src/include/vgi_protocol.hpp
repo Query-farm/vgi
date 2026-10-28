@@ -1,20 +1,18 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-// arrow::Schema appears only as a shared_ptr member below, so a forward
+// VgiSchema appears only as a shared_ptr member below, so a forward
 // declaration suffices here. The full <arrow/api.h> umbrella is expensive and
 // vgi_protocol.hpp is reached by ~34 TUs; the definition is only needed in the
 // .cpp files that build or dereference BindResult::output_schema (which already
 // pull in Arrow via vgi_rpc_types.hpp). Mirrors the vgi_logging.hpp pattern.
-namespace arrow {
-class Schema;
-} // namespace arrow
-
 namespace duckdb {
 namespace vgi {
 
@@ -28,7 +26,7 @@ enum class BindRepeatability : uint8_t { UNKNOWN, STABLE_WITHIN_QUERY };
 
 // Result from bind RPC call
 struct BindResult {
-	std::shared_ptr<arrow::Schema> output_schema;
+	VgiSchemaPtr output_schema;
 	std::vector<uint8_t> opaque_data;            // From BindResponse
 	std::vector<uint8_t> bind_request_bytes;     // Cached serialized BindRequest (needed for init)
 	std::vector<uint8_t> output_schema_bytes;    // Cached serialized output schema (needed for init)

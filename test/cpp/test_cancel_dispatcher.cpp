@@ -55,12 +55,12 @@ public:
 	}
 	void EnsureWorkerSpawned() override {
 	}
-	void SetInputSchema(const std::shared_ptr<arrow::Schema> &) override {
+	void SetInputSchema(const VgiSchemaPtr &) override {
 	}
-	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &) override {
+	void UpdateInputSchemaForExecution(const VgiSchemaPtr &) override {
 	}
-	InitResult PerformInit(const BindResult &, const std::vector<int32_t> &, std::shared_ptr<arrow::Buffer>,
-	                       std::vector<std::shared_ptr<arrow::Buffer>>, const std::string &,
+	InitResult PerformInit(const BindResult &, const std::vector<int32_t> &, VgiBufferPtr, std::vector<VgiBufferPtr>,
+	                       const std::string &,
 	                       const std::optional<OrderByHint> &, const std::optional<TableSampleHint> &,
 	                       const std::vector<uint8_t> &, const std::optional<std::vector<uint8_t>> &,
 	                       const std::vector<std::string> &) override {
@@ -70,15 +70,15 @@ public:
 	}
 	void OpenInputWriter() override {
 	}
-	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &) override {
+	void WriteInputBatch(const VgiBatchPtr &) override {
 	}
 	void CloseInputWriter() override {
 	}
-	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override {
+	VgiBatchPtr ReadDataBatch() override {
 		return nullptr;
 	}
 	std::vector<uint8_t> RpcTableBufferingProcess(const std::string &, const std::vector<uint8_t> &,
-	                                              const std::shared_ptr<arrow::RecordBatch> &,
+	                                              const VgiBatchPtr &,
 	                                              std::optional<int64_t>) override {
 		return {};
 	}
@@ -283,7 +283,7 @@ TEST_CASE("suspension interrupts and waits for an active cancellation", "[cancel
 		}
 		void CancelStream(const std::vector<uint8_t> &, ClientContext &context) override {
 			entered.store(true);
-			while (!context.interrupted.load()) {
+			while (!context.IsInterrupted()) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			}
 			// Suspend must wait for this call to finish after interrupting it.

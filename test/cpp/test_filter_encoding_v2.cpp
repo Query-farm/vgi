@@ -4,12 +4,6 @@
 #include "catch.hpp"
 
 #include "duckdb.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/dynamic_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -18,44 +12,67 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
 #include "vgi_table_function_impl.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/function/scalar/nested_functions.hpp"
+#include "duckdb/function/scalar/struct_functions.hpp"
 
-#include <arrow/api.h>
-#include <arrow/io/memory.h>
-#include <arrow/ipc/reader.h>
+#include "vgi_ipc.hpp"
+
+#include "nanoarrow/nanoarrow.h"
 
 using namespace duckdb;
 using namespace duckdb::vgi;
 
 namespace {
 
-std::shared_ptr<arrow::RecordBatch> ReadBatch(const std::shared_ptr<arrow::Buffer> &bytes) {
-	auto input = std::make_shared<arrow::io::BufferReader>(bytes);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	REQUIRE(reader_result.ok());
-	auto reader = reader_result.ValueUnsafe();
-	std::shared_ptr<arrow::RecordBatch> batch;
-	REQUIRE(reader->ReadNext(&batch).ok());
+unique_ptr<ExpressionFilter> InFilterValues(vector<Value> values) {
+	auto type = values.empty() ? LogicalType::INTEGER : values[0].type();
+	return make_uniq<ExpressionFilter>(
+	    ExpressionFilter::CreateInExpression(make_uniq<BoundReferenceExpression>(type, 0), std::move(values)));
+}
+
+unique_ptr<Expression> ExtractField(unique_ptr<Expression> child, idx_t index) {
+	auto type = StructType::GetChildType(child->GetReturnType(), index);
+	vector<unique_ptr<Expression>> arguments;
+	arguments.push_back(std::move(child));
+	arguments.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(index + 1)));
+	BoundScalarFunction function(GetExtractAtFunction());
+	function.SetReturnType(type);
+	return make_uniq<BoundFunctionExpression>(std::move(function), std::move(arguments),
+	                                          StructExtractAtFun::GetBindData(index));
+}
+
+VgiBatchPtr ReadBatch(const VgiBufferPtr &bytes) {
+	REQUIRE(bytes);
+	auto reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(bytes));
+	auto batch = reader->ReadNext();
 	REQUIRE(batch);
 	return batch;
 }
 
-std::string FilterSpec(const std::shared_ptr<arrow::RecordBatch> &batch) {
-	auto strings = std::static_pointer_cast<arrow::StringArray>(batch->column(0));
-	REQUIRE(strings->length() == 1);
-	REQUIRE(!strings->IsNull(0));
-	return strings->GetString(0);
+std::string FilterSpec(const VgiBatchPtr &batch) {
+	auto strings = batch->column(0);
+	REQUIRE(strings.length() == 1);
+	REQUIRE(!strings.IsNull(0));
+	return strings.GetString(0);
 }
 
-void RequireV2Schema(const std::shared_ptr<arrow::RecordBatch> &batch) {
-	REQUIRE(batch->schema()->field(0)->name() == "filter_spec");
-	REQUIRE_FALSE(batch->schema()->field(0)->nullable());
-	REQUIRE(batch->schema()->metadata());
-	REQUIRE(batch->schema()->metadata()->Get("vgi_filter_encoding").ValueOrDie() == "vgi.filters.v2");
-	REQUIRE(batch->schema()->metadata()->Get("vgi_filter_version").ValueOrDie() == "2");
-	REQUIRE(batch->schema()->metadata()->Get("vgi_evaluation_context").ValueOrDie() == "vgi.none.v1");
-	REQUIRE_FALSE(batch->schema()->field(0)->metadata());
+bool IsListField(const VgiBatchPtr &batch, int i) {
+	return DescribeType(batch->schema()->field(i)).type == NANOARROW_TYPE_LIST;
+}
+
+void RequireV2Schema(const VgiBatchPtr &batch) {
+	auto &schema = *batch->schema();
+	REQUIRE(schema.field_name(0) == "filter_spec");
+	REQUIRE_FALSE(schema.field_nullable(0));
+	REQUIRE_FALSE(schema.metadata().empty());
+	REQUIRE(schema.metadata().Get("vgi_filter_encoding") == std::string("vgi.filters.v2"));
+	REQUIRE(schema.metadata().Get("vgi_filter_version") == std::string("2"));
+	REQUIRE(schema.metadata().Get("vgi_evaluation_context") == std::string("vgi.none.v1"));
+	REQUIRE(schema.field_metadata(0).empty());
 }
 
 } // namespace
@@ -64,14 +81,15 @@ TEST_CASE("filter v2 snapshot uses schema metadata and unprojected column refs",
 	DuckDB db(nullptr);
 	Connection con(db);
 	TableFilterSet filters;
-	filters.filters[0] = make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(41));
+	filters.SetFilterByColumnIndex(ProjectionIndex(0), ExpressionFilter::CreateComparisonFilter(
+	                                                       ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(41)));
 
 	auto serialized = VgiSerializeFilters(*con.context, {1}, &filters, {"ignored", "actual"}, "test-worker");
 	REQUIRE(serialized.filter_bytes);
 	REQUIRE(serialized.join_keys_buffers.empty());
 	auto batch = ReadBatch(serialized.filter_bytes);
 	RequireV2Schema(batch);
-	REQUIRE(batch->schema()->field(1)->name() == "value_0");
+	REQUIRE(batch->schema()->field_name(1) == "value_0");
 	auto json = FilterSpec(batch);
 	REQUIRE(json.find("\"encoding\":\"vgi.filters.v2\"") != std::string::npos);
 	REQUIRE(json.find("\"kind\":\"snapshot\"") != std::string::npos);
@@ -100,9 +118,10 @@ TEST_CASE("filter v2 maps every comparison operator", "[filter-v2]") {
 	for (auto &entry : cases) {
 		CAPTURE(entry.name);
 		TableFilterSet filters;
-		filters.filters[0] = make_uniq<ConstantFilter>(entry.type, Value::INTEGER(1));
-		auto json = FilterSpec(ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"n"}, "test-worker")
-		                                     .filter_bytes));
+		filters.SetFilterByColumnIndex(ProjectionIndex(0),
+		                               ExpressionFilter::CreateComparisonFilter(entry.type, Value::INTEGER(1)));
+		auto json =
+		    FilterSpec(ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"n"}, "test-worker").filter_bytes));
 		REQUIRE(json.find(string("\"op\":\"") + entry.name + "\"") != std::string::npos);
 	}
 }
@@ -114,12 +133,18 @@ TEST_CASE("filter v2 maps null predicates", "[filter-v2]") {
 		CAPTURE(negated);
 		TableFilterSet filters;
 		if (negated) {
-			filters.filters[0] = make_uniq<IsNotNullFilter>();
+			filters.SetFilterByColumnIndex(ProjectionIndex(0),
+			                               make_uniq<ExpressionFilter>(ExpressionFilter::CreateNullCheckExpression(
+			                                   make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+			                                   ExpressionType::OPERATOR_IS_NOT_NULL)));
 		} else {
-			filters.filters[0] = make_uniq<IsNullFilter>();
+			filters.SetFilterByColumnIndex(
+			    ProjectionIndex(0),
+			    make_uniq<ExpressionFilter>(ExpressionFilter::CreateNullCheckExpression(
+			        make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0), ExpressionType::OPERATOR_IS_NULL)));
 		}
-		auto json = FilterSpec(ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"n"}, "test-worker")
-		                                     .filter_bytes));
+		auto json =
+		    FilterSpec(ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"n"}, "test-worker").filter_bytes));
 		REQUIRE(json.find("\"node\":\"is_null\"") != std::string::npos);
 		REQUIRE(json.find(negated ? "\"negated\":true" : "\"negated\":false") != std::string::npos);
 	}
@@ -129,9 +154,14 @@ TEST_CASE("filter v2 preserves arbitrarily nested field_ref nodes", "[filter-v2]
 	DuckDB db(nullptr);
 	Connection con(db);
 	TableFilterSet filters;
-	auto leaf = make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value("x"));
-	auto inner = make_uniq<StructFilter>(2, "leaf", std::move(leaf));
-	filters.filters[0] = make_uniq<StructFilter>(1, "middle", std::move(inner));
+	auto middle_type =
+	    LogicalType::STRUCT({{"a", LogicalType::INTEGER}, {"b", LogicalType::INTEGER}, {"leaf", LogicalType::VARCHAR}});
+	auto root_type = LogicalType::STRUCT({{"a", LogicalType::INTEGER}, {"middle", middle_type}});
+	auto reference = make_uniq<BoundReferenceExpression>(root_type, 0);
+	auto leaf = ExtractField(ExtractField(std::move(reference), 1), 2);
+	filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(BoundComparisonExpression::Create(
+	                                                       ExpressionType::COMPARE_EQUAL, std::move(leaf),
+	                                                       make_uniq<BoundConstantExpression>(Value("x")))));
 
 	auto serialized = VgiSerializeFilters(*con.context, {0}, &filters, {"root"}, "test-worker");
 	auto json = FilterSpec(ReadBatch(serialized.filter_bytes));
@@ -146,7 +176,8 @@ TEST_CASE("filter v2 makes the filter-key index domain explicit", "[filter-v2]")
 	DuckDB db(nullptr);
 	Connection con(db);
 	TableFilterSet filters;
-	filters.filters[2] = make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::INTEGER(7));
+	filters.SetFilterByColumnIndex(
+	    ProjectionIndex(2), ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_EQUAL, Value::INTEGER(7)));
 	auto direct = VgiSerializeFilters(*con.context, {}, &filters, {"a", "b", "c"}, "test-worker", "", -1, nullptr,
 	                                  VgiFilterColumnIndexDomain::BIND_SCHEMA);
 	auto json = FilterSpec(ReadBatch(direct.filter_bytes));
@@ -156,7 +187,8 @@ TEST_CASE("filter v2 makes the filter-key index domain explicit", "[filter-v2]")
 	                  InvalidInputException);
 
 	TableFilterSet rowid_filters;
-	rowid_filters.filters[0] = make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::BIGINT(9));
+	rowid_filters.SetFilterByColumnIndex(
+	    ProjectionIndex(0), ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_EQUAL, Value::BIGINT(9)));
 	auto rowid = VgiSerializeFilters(*con.context, {COLUMN_IDENTIFIER_ROW_ID}, &rowid_filters, {"a", "b"},
 	                                 "test-worker", "rid", 1);
 	auto rowid_json = FilterSpec(ReadBatch(rowid.filter_bytes));
@@ -164,7 +196,8 @@ TEST_CASE("filter v2 makes the filter-key index domain explicit", "[filter-v2]")
 	REQUIRE(rowid_json.find("\"column_name\":\"rid\"") != std::string::npos);
 
 	TableFilterSet shifted_filters;
-	shifted_filters.filters[0] = make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::INTEGER(7));
+	shifted_filters.SetFilterByColumnIndex(
+	    ProjectionIndex(0), ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_EQUAL, Value::INTEGER(7)));
 	auto shifted = VgiSerializeFilters(*con.context, {1}, &shifted_filters, {"a", "b"}, "test-worker", "rid", 0);
 	auto shifted_json = FilterSpec(ReadBatch(shifted.filter_bytes));
 	REQUIRE(shifted_json.find("\"column_index\":2") != std::string::npos);
@@ -176,12 +209,13 @@ TEST_CASE("filter v2 chooses exact inline and external IN encodings", "[filter-v
 	Connection con(db);
 
 	TableFilterSet small_filters;
-	small_filters.filters[0] = make_uniq<InFilter>(vector<Value> {Value::INTEGER(1), Value::INTEGER(2)});
+	small_filters.SetFilterByColumnIndex(ProjectionIndex(0),
+	                                     InFilterValues(vector<Value> {Value::INTEGER(1), Value::INTEGER(2)}));
 	auto small = VgiSerializeFilters(*con.context, {0}, &small_filters, {"key"}, "test-worker");
 	auto small_batch = ReadBatch(small.filter_bytes);
 	REQUIRE(small.join_keys_buffers.empty());
-	REQUIRE(small_batch->schema()->field(1)->name() == "value_0");
-	REQUIRE(small_batch->schema()->field(1)->type()->id() == arrow::Type::LIST);
+	REQUIRE(small_batch->schema()->field_name(1) == "value_0");
+	REQUIRE(IsListField(small_batch, 1));
 	REQUIRE(FilterSpec(small_batch).find("\"kind\":\"literal\"") != std::string::npos);
 
 	vector<Value> values;
@@ -189,7 +223,7 @@ TEST_CASE("filter v2 chooses exact inline and external IN encodings", "[filter-v
 		values.push_back(Value::INTEGER(NumericCast<int32_t>(i)));
 	}
 	TableFilterSet large_filters;
-	large_filters.filters[0] = make_uniq<InFilter>(std::move(values));
+	large_filters.SetFilterByColumnIndex(ProjectionIndex(0), InFilterValues(std::move(values)));
 	auto large = VgiSerializeFilters(*con.context, {0}, &large_filters, {"key"}, "test-worker");
 	REQUIRE(large.join_keys_buffers.size() == 1);
 	auto large_batch = ReadBatch(large.filter_bytes);
@@ -200,17 +234,16 @@ TEST_CASE("filter v2 chooses exact inline and external IN encodings", "[filter-v
 	REQUIRE(json.find("\"column_index\":0") != std::string::npos);
 	auto keys = ReadBatch(large.join_keys_buffers[0]);
 	REQUIRE(keys->num_rows() == 1100);
-	REQUIRE(keys->schema()->field(0)->name() == "key");
-	REQUIRE(keys->schema()->metadata()->Get("vgi_join_keys_version").ValueOrDie() == "2");
+	REQUIRE(keys->schema()->field_name(0) == "key");
+	REQUIRE(keys->schema()->metadata().Get("vgi_join_keys_version") == std::string("2"));
 
 	TableFilterSet empty_filters;
-	auto empty_in = make_uniq<InFilter>(vector<Value> {Value::INTEGER(1)});
-	empty_in->values.clear();
-	empty_filters.filters[0] = std::move(empty_in);
+	auto empty_in = InFilterValues({});
+	empty_filters.SetFilterByColumnIndex(ProjectionIndex(0), std::move(empty_in));
 	auto empty = VgiSerializeFilters(*con.context, {0}, &empty_filters, {"key"}, "test-worker");
 	auto empty_batch = ReadBatch(empty.filter_bytes);
 	REQUIRE(empty.join_keys_buffers.empty());
-	REQUIRE(empty_batch->schema()->field(1)->name() == "value_0");
+	REQUIRE(empty_batch->schema()->field_name(1) == "value_0");
 	REQUIRE(FilterSpec(empty_batch).find("\"node\":\"literal\",\"value_ref\":0") != std::string::npos);
 }
 
@@ -220,19 +253,19 @@ TEST_CASE("filter v2 safely serializes expression IN lists", "[filter-v2]") {
 	for (auto expression_type : {ExpressionType::COMPARE_IN, ExpressionType::COMPARE_NOT_IN}) {
 		CAPTURE(expression_type);
 		auto expression = make_uniq<BoundOperatorExpression>(expression_type, LogicalType::BOOLEAN);
-		expression->children.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0));
-		expression->children.push_back(make_uniq<BoundConstantExpression>(Value("green")));
-		expression->children.push_back(make_uniq<BoundConstantExpression>(Value("blue")));
+		expression->GetChildrenMutable().push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0));
+		expression->GetChildrenMutable().push_back(make_uniq<BoundConstantExpression>(Value("green")));
+		expression->GetChildrenMutable().push_back(make_uniq<BoundConstantExpression>(Value("blue")));
 		TableFilterSet filters;
-		filters.filters[0] = make_uniq<ExpressionFilter>(std::move(expression));
+		filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(std::move(expression)));
 
 		auto batch = ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"color"}, "test-worker").filter_bytes);
 		auto json = FilterSpec(batch);
 		REQUIRE(json.find("\"node\":\"in\"") != std::string::npos);
-		REQUIRE(json.find(expression_type == ExpressionType::COMPARE_NOT_IN ? "\"negated\":true"
-		                                                                      : "\"negated\":false") !=
-		        std::string::npos);
-		REQUIRE(batch->schema()->field(1)->type()->id() == arrow::Type::LIST);
+		REQUIRE(
+		    json.find(expression_type == ExpressionType::COMPARE_NOT_IN ? "\"negated\":true" : "\"negated\":false") !=
+		    std::string::npos);
+		REQUIRE(IsListField(batch, 1));
 	}
 }
 
@@ -257,12 +290,11 @@ TEST_CASE("filter v2 maps DuckDB standard functions to canonical names", "[filte
 		arguments.push_back(make_uniq<BoundConstantExpression>(Value("needle")));
 		ScalarFunction function(entry.bound_name, {entry.input_type, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 		                        scalar_function_t {});
-		function.catalog_name = "system";
-		function.schema_name = "main";
-		auto call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(function), std::move(arguments),
-		                                               nullptr);
+		function.SetCatalogName("system");
+		function.SetSchemaName("main");
+		auto call = make_uniq<BoundFunctionExpression>(BoundScalarFunction(function), std::move(arguments), nullptr);
 		TableFilterSet filters;
-		filters.filters[0] = make_uniq<ExpressionFilter>(std::move(call));
+		filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(std::move(call)));
 
 		auto json = FilterSpec(
 		    ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"input"}, "test-worker").filter_bytes));
@@ -274,12 +306,12 @@ TEST_CASE("filter v2 maps DuckDB standard functions to canonical names", "[filte
 	arguments.push_back(make_uniq<BoundConstantExpression>(Value("needle")));
 	ScalarFunction shadowed_function("contains", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                 scalar_function_t {});
-	shadowed_function.catalog_name = "user_catalog";
-	shadowed_function.schema_name = "main";
-	auto call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(shadowed_function),
-	                                               std::move(arguments), nullptr);
+	shadowed_function.SetCatalogName("user_catalog");
+	shadowed_function.SetSchemaName("main");
+	auto call =
+	    make_uniq<BoundFunctionExpression>(BoundScalarFunction(shadowed_function), std::move(arguments), nullptr);
 	TableFilterSet filters;
-	filters.filters[0] = make_uniq<ExpressionFilter>(std::move(call));
+	filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(std::move(call)));
 	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"input"}, "test-worker"),
 	                  InvalidInputException);
 
@@ -288,12 +320,13 @@ TEST_CASE("filter v2 maps DuckDB standard functions to canonical names", "[filte
 		rejected_arguments.push_back(make_uniq<BoundReferenceExpression>(first_type, 0));
 		rejected_arguments.push_back(make_uniq<BoundConstantExpression>(Value(second_type)));
 		ScalarFunction rejected_function(name, {first_type, second_type}, LogicalType::BOOLEAN, scalar_function_t {});
-		rejected_function.catalog_name = "system";
-		rejected_function.schema_name = "main";
-		auto rejected_call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(rejected_function),
-		                                                       std::move(rejected_arguments), nullptr);
+		rejected_function.SetCatalogName("system");
+		rejected_function.SetSchemaName("main");
+		auto rejected_call = make_uniq<BoundFunctionExpression>(BoundScalarFunction(rejected_function),
+		                                                        std::move(rejected_arguments), nullptr);
 		TableFilterSet rejected_filters;
-		rejected_filters.filters[0] = make_uniq<ExpressionFilter>(std::move(rejected_call));
+		rejected_filters.SetFilterByColumnIndex(ProjectionIndex(0),
+		                                        make_uniq<ExpressionFilter>(std::move(rejected_call)));
 		REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &rejected_filters, {"input"}, "test-worker"),
 		                  InvalidInputException);
 	};
@@ -310,7 +343,8 @@ TEST_CASE("required IN exceeding the transport limit fails closed", "[filter-v2]
 	    .AddExtensionOption("vgi_join_keys_max_bytes", "test limit", LogicalType::UBIGINT, Value::UBIGINT(0));
 	REQUIRE_FALSE(con.Query("SET vgi_join_keys_max_bytes=1")->HasError());
 	TableFilterSet filters;
-	filters.filters[0] = make_uniq<InFilter>(vector<Value> {Value::BIGINT(1), Value::BIGINT(2)});
+	filters.SetFilterByColumnIndex(ProjectionIndex(0),
+	                               InFilterValues(vector<Value> {Value::BIGINT(1), Value::BIGINT(2)}));
 	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"key"}, "test-worker"), InvalidInputException);
 }
 
@@ -318,12 +352,53 @@ TEST_CASE("required OR serialization is all or decline", "[filter-v2]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	TableFilterSet filters;
-	auto disjunction = make_uniq<ConjunctionOrFilter>();
-	disjunction->child_filters.push_back(make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1)));
-	disjunction->child_filters.push_back(make_uniq<DynamicFilter>());
-	filters.filters[0] = std::move(disjunction);
+	vector<unique_ptr<Expression>> children;
+	children.push_back(
+	    std::move(ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1))->expr));
+	auto dynamic = make_shared_ptr<DynamicFilterData>(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(0));
+	children.push_back(CreateDynamicFilterExpression(dynamic, LogicalType::INTEGER));
+	filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(BoundConjunctionExpression::Create(
+	                                                       ExpressionType::CONJUNCTION_OR, std::move(children))));
 
 	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"key"}, "test-worker"), InvalidInputException);
+}
+
+TEST_CASE("optional Top-N null ordering stays atomic before its dynamic bound arrives", "[filter-v2]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	for (bool include_required : {false, true}) {
+		CAPTURE(include_required);
+		auto dynamic = make_shared_ptr<DynamicFilterData>(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(0));
+		vector<unique_ptr<Expression>> alternatives;
+		alternatives.push_back(ExpressionFilter::CreateNullCheckExpression(
+		    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0), ExpressionType::OPERATOR_IS_NULL));
+		alternatives.push_back(CreateDynamicFilterExpression(dynamic, LogicalType::INTEGER));
+		auto optional = CreateOptionalFilterExpression(
+		    BoundConjunctionExpression::Create(ExpressionType::CONJUNCTION_OR, std::move(alternatives)),
+		    LogicalType::INTEGER);
+		vector<unique_ptr<Expression>> conjuncts;
+		conjuncts.push_back(std::move(optional));
+		if (include_required) {
+			conjuncts.push_back(std::move(
+			    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(5))
+			        ->expr));
+		}
+		auto filter = make_uniq<ExpressionFilter>(
+		    BoundConjunctionExpression::Create(ExpressionType::CONJUNCTION_AND, std::move(conjuncts)));
+		REQUIRE(VgiContainsDynamicFilter(*filter));
+		TableFilterSet filters;
+		filters.SetFilterByColumnIndex(ProjectionIndex(0), std::move(filter));
+		auto json = FilterSpec(
+		    ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"score"}, "test-worker").filter_bytes));
+		REQUIRE(json.find("\"node\":\"is_null\"") == std::string::npos);
+		REQUIRE(json.find("\"mode\":\"advisory\"") == std::string::npos);
+		if (include_required) {
+			REQUIRE(json.find("\"mode\":\"required\"") != std::string::npos);
+			REQUIRE(json.find("\"op\":\"gt\"") != std::string::npos);
+		} else {
+			REQUIRE(json.find("\"predicates\":[]") != std::string::npos);
+		}
+	}
 }
 
 TEST_CASE("required throwing AND remains one atomic predicate", "[filter-v2]") {
@@ -331,13 +406,15 @@ TEST_CASE("required throwing AND remains one atomic predicate", "[filter-v2]") {
 	Connection con(db);
 	auto reference = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0);
 	auto narrowing = BoundCastExpression::AddCastToType(*con.context, std::move(reference), LogicalType::TINYINT);
-	auto comparison = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, std::move(narrowing),
-	                                                       make_uniq<BoundConstantExpression>(Value::TINYINT(0)));
-	auto conjunction = make_uniq<ConjunctionAndFilter>();
-	conjunction->child_filters.push_back(make_uniq<ExpressionFilter>(std::move(comparison)));
-	conjunction->child_filters.push_back(make_uniq<ConstantFilter>(ExpressionType::COMPARE_NOTEQUAL, Value::BIGINT(0)));
+	auto comparison = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, std::move(narrowing),
+	                                                    make_uniq<BoundConstantExpression>(Value::TINYINT(0)));
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(comparison));
+	children.push_back(
+	    std::move(ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_NOTEQUAL, Value::BIGINT(0))->expr));
 	TableFilterSet filters;
-	filters.filters[0] = std::move(conjunction);
+	filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(BoundConjunctionExpression::Create(
+	                                                       ExpressionType::CONJUNCTION_AND, std::move(children))));
 
 	auto batch = ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"key"}, "test-worker").filter_bytes);
 	auto json = FilterSpec(batch);
@@ -351,14 +428,15 @@ TEST_CASE("filter v2 encodes advisory mode and canonical type references", "[fil
 	TableFilterSet filters;
 	auto reference = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
 	auto cast = BoundCastExpression::AddCastToType(*con.context, std::move(reference), LogicalType::BIGINT);
-	auto comparison = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_EQUAL, std::move(cast),
-	                                                       make_uniq<BoundConstantExpression>(Value::BIGINT(42)));
-	filters.filters[0] = make_uniq<OptionalFilter>(make_uniq<ExpressionFilter>(std::move(comparison)));
+	auto comparison = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(cast),
+	                                                    make_uniq<BoundConstantExpression>(Value::BIGINT(42)));
+	filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(CreateOptionalFilterExpression(
+	                                                       std::move(comparison), LogicalType::INTEGER)));
 
 	auto batch = ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"key"}, "test-worker").filter_bytes);
 	REQUIRE(batch->schema()->GetFieldIndex("type_0") >= 1);
 	REQUIRE(batch->schema()->GetFieldIndex("value_0") >= 1);
-	REQUIRE(batch->column(batch->schema()->GetFieldIndex("type_0"))->IsNull(0));
+	REQUIRE(batch->column(batch->schema()->GetFieldIndex("type_0")).IsNull(0));
 	auto json = FilterSpec(batch);
 	REQUIRE(json.find("\"type_ref\":0") != std::string::npos);
 	REQUIRE(json.find("\"value_ref\":0") != std::string::npos);
@@ -373,16 +451,14 @@ TEST_CASE("filter v2 gates structured extension calls on exact capabilities", "[
 	arguments.push_back(make_uniq<BoundConstantExpression>(Value(LogicalType::GEOMETRY())));
 	ScalarFunction function("&&", {LogicalType::GEOMETRY(), LogicalType::GEOMETRY()}, LogicalType::BOOLEAN,
 	                        scalar_function_t {});
-	auto call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(function), std::move(arguments),
-	                                               nullptr, true);
+	auto call = make_uniq<BoundFunctionExpression>(BoundScalarFunction(function), std::move(arguments), nullptr, true);
 	TableFilterSet filters;
-	filters.filters[0] = make_uniq<ExpressionFilter>(std::move(call));
+	filters.SetFilterByColumnIndex(ProjectionIndex(0), make_uniq<ExpressionFilter>(std::move(call)));
 
-	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"geom"}, "test-worker"),
-	                  InvalidInputException);
+	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"geom"}, "test-worker"), InvalidInputException);
 	std::vector<VgiFilterFunctionCapability> capabilities {{"duckdb.spatial", "intersects_extent", 1}};
 	auto encoded = VgiSerializeFilters(*con.context, {0}, &filters, {"geom"}, "test-worker", "", -1, nullptr,
-	                                  VgiFilterColumnIndexDomain::PROJECTED, capabilities);
+	                                   VgiFilterColumnIndexDomain::PROJECTED, capabilities);
 	auto json = FilterSpec(ReadBatch(encoded.filter_bytes));
 	REQUIRE(json.find("\"function\":{\"namespace\":\"duckdb.spatial\",\"name\":\"intersects_extent\","
 	                  "\"version\":1}") != std::string::npos);
@@ -391,7 +467,8 @@ TEST_CASE("filter v2 gates structured extension calls on exact capabilities", "[
 TEST_CASE("filter v2 tick delta carries revisioned upsert and remove", "[filter-v2]") {
 	DuckDB db(nullptr);
 	Connection con(db);
-	auto filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::INTEGER(99));
+	auto filter =
+	    ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::INTEGER(99));
 	vector<VgiDynamicFilterDeltaUpdate> updates {{"top_n:0", 3, 0, "score", filter.get()},
 	                                             {"top_n:1", 4, 1, "other", nullptr}};
 

@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "storage/vgi_catalog.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "vgi_result_cache.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -51,26 +52,26 @@ static void RequireWriteResultMode(const VgiTableEntry &table, const string &ope
 	const auto &modes = table.GetTableInfo().write_result_modes;
 	auto entry = modes.find(operation);
 	if (entry == modes.end()) {
-		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
-		                          .Set(vgi::error_key::kTable, table.name)
-		                          .Set(vgi::error_key::kOperation, StringUtil::Upper(operation)),
-		                      StringUtil::Format("Table '%s' does not support %s", table.name,
-		                                         StringUtil::Upper(operation)));
+		throw BinderException(
+		    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+		        .Set(vgi::error_key::kTable, table.name.GetIdentifierName())
+		        .Set(vgi::error_key::kOperation, StringUtil::Upper(operation)),
+		    StringUtil::Format("Table '%s' does not support %s", table.name, StringUtil::Upper(operation)));
 	}
 	if (WriteResultModeRank(entry->second) < WriteResultModeRank(requested)) {
-		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
-		                          .Set(vgi::error_key::kTable, table.name)
-		                          .Set(vgi::error_key::kOperation, StringUtil::Upper(operation))
-		                          .ExpectedActual(requested, entry->second),
-		                      StringUtil::Format("Table '%s' does not support result mode '%s' for %s (maximum is '%s')",
-		                                         table.name, requested, StringUtil::Upper(operation), entry->second));
+		throw BinderException(
+		    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+		        .Set(vgi::error_key::kTable, table.name.GetIdentifierName())
+		        .Set(vgi::error_key::kOperation, StringUtil::Upper(operation))
+		        .ExpectedActual(requested, entry->second),
+		    StringUtil::Format("Table '%s' does not support result mode '%s' for %s (maximum is '%s')", table.name,
+		                       requested, StringUtil::Upper(operation), entry->second));
 	}
 }
 
 VgiCatalog::VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name, AccessMode access_mode,
                        std::shared_ptr<vgi::VgiAttachParameters> attach_params,
-                       std::shared_ptr<vgi::CatalogAttachResult> attach_result,
-                       VgiObjectCounts eager_load_thresholds)
+                       std::shared_ptr<vgi::CatalogAttachResult> attach_result, VgiObjectCounts eager_load_thresholds)
     : Catalog(db_p), access_mode_(access_mode), attach_parameters_(std::move(attach_params)),
       attach_result_(std::move(attach_result)), internal_name_(internal_name),
       eager_load_thresholds_(eager_load_thresholds), schemas(*this) {
@@ -112,22 +113,23 @@ void VgiCatalog::Initialize(bool load_builtin) {
 	// Nothing to do - schemas are loaded lazily
 }
 
-std::string VgiCatalog::GetDefaultSchema() const {
-	if (attach_result_) {
-		return attach_result_->default_schema;
-	}
-	return "main";
+optional<Identifier> VgiCatalog::GetDefaultSchema() const {
+	if (!attach_result_ || !attach_result_->default_schema)
+		return optional<Identifier>();
+	return Identifier(*attach_result_->default_schema);
 }
 
 optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	if (access_mode_ == AccessMode::READ_ONLY) {
 		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly)
-		                          .Set(vgi::error_key::kCatalog, GetName())
+		                          .Set(vgi::error_key::kCatalog, GetName().GetIdentifierName())
 		                          .Set(vgi::error_key::kOperation, "CREATE SCHEMA"),
 		                      StringUtil::Format("Cannot CREATE SCHEMA in read-only VGI catalog '%s'", GetName()));
 	}
 
 	auto &context = transaction.GetContext();
+	if (info.IsNested())
+		throw NotImplementedException("Nested VGI schema creation is not yet qualified");
 	if (!attach_result_) {
 		throw IOException("VGI CREATE SCHEMA: catalog '%s' has no attach_result_", GetName());
 	}
@@ -135,13 +137,14 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 
 	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
 
-	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_parameters_, attach_result_->attach_opaque_data,
+	                                vgi_tx.GetTransactionOpaqueData()};
 	std::optional<std::string> comment;
 	if (!info.comment.IsNull()) {
 		comment = info.comment.GetValue<std::string>();
 	}
 	std::map<std::string, std::string> tags(info.tags.begin(), info.tags.end());
-	vgi::InvokeCatalogSchemaCreate(rpc_ctx, info.schema, on_conflict, comment, tags, context);
+	vgi::InvokeCatalogSchemaCreate(rpc_ctx, info.SchemaName().GetIdentifierName(), on_conflict, comment, tags, context);
 
 	// Invalidate schema cache so re-fetch picks up the new schema. Use the
 	// deferred path so any bound query holding a CatalogEntry* doesn't
@@ -177,14 +180,10 @@ void VgiCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCa
 optional_ptr<SchemaCatalogEntry> VgiCatalog::LookupSchema(CatalogTransaction transaction,
                                                           const EntryLookupInfo &schema_lookup,
                                                           OnEntryNotFound if_not_found) {
-	auto entry = SchemaSet(transaction.GetContext()).GetEntry(transaction.GetContext(), schema_lookup.GetEntryName());
-	if (entry) {
-		return &entry->Cast<SchemaCatalogEntry>();
-	}
-	if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
-		throw CatalogException("Schema '%s' not found in catalog '%s'", schema_lookup.GetEntryName(), GetName());
-	}
-	return nullptr;
+	return LookupSchemaPath(
+	    transaction, schema_lookup, if_not_found, [&](const EntryLookupInfo &root) -> optional_ptr<CatalogEntry> {
+		    return SchemaSet(transaction.GetContext()).GetEntry(transaction.GetContext(), root.GetEntryName());
+	    });
 }
 
 PhysicalOperator &VgiCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
@@ -219,7 +218,7 @@ PhysicalOperator &VgiCatalog::PlanDelete(ClientContext &context, PhysicalPlanGen
 	auto &table = op.table.Cast<VgiTableEntry>();
 	RequireWriteResultMode(table, "delete", op.return_chunk);
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
-	auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, bound_ref.index);
+	auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, bound_ref.Index());
 	del.children.push_back(plan);
 	return del;
 }
@@ -235,8 +234,8 @@ PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGen
 
 // Helper: plan a single merge action using VGI physical operators
 static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &context, LogicalMergeInto &op,
-                                                             PhysicalPlanGenerator &planner,
-                                                             BoundMergeIntoAction &action) {
+                                                            PhysicalPlanGenerator &planner,
+                                                            BoundMergeIntoAction &action) {
 	auto result = make_uniq<MergeIntoOperator>();
 	result->action_type = action.action_type;
 	result->condition = std::move(action.condition);
@@ -246,8 +245,8 @@ static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &conte
 	switch (action.action_type) {
 	case MergeActionType::MERGE_UPDATE: {
 		RequireWriteResultMode(table, "update", op.return_chunk);
-		auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk,
-		                                             std::move(action.columns), std::move(action.expressions));
+		auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk, std::move(action.columns),
+		                                            std::move(action.expressions));
 		result->op = upd;
 		break;
 	}
@@ -289,7 +288,7 @@ static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &conte
 }
 
 PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
-                                             LogicalMergeInto &op, PhysicalOperator &plan) {
+                                            LogicalMergeInto &op, PhysicalOperator &plan) {
 	auto &table_for_returning = op.table.Cast<VgiTableEntry>();
 
 	// Refuse MERGE on multi-branch tables, regardless of which clauses the
@@ -303,12 +302,12 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 	// Short-circuits on the cheap multi-branch hint to avoid an RPC on every
 	// MERGE bind to a single-branch VGI table.
 	if (!table_for_returning.IsKnownSingleBranchNoAT()) {
-		auto branches_result =
-		    table_for_returning.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
+		auto branches_result = table_for_returning.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
 		if (branches_result.branches.size() > 1) {
 			throw BinderException(
 			    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
-			        .Set(vgi::error_key::kTable, table_for_returning.ParentSchema().name + "." + table_for_returning.name)
+			        .Set(vgi::error_key::kTable, table_for_returning.ParentSchema().name.GetIdentifierName() + "." +
+			                                         table_for_returning.name.GetIdentifierName())
 			        .Set(vgi::error_key::kOperation, "MERGE"),
 			    StringUtil::Format("MERGE is not supported on multi-branch VGI table '%s.%s' (%d branches). "
 			                       "Issue the MERGE directly against the writable arm's underlying VGI table "
@@ -316,8 +315,8 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 			                       "(MERGE on multi-branch tables is not supported pending concrete "
 			                       "customer requirements for cross-arm semantics — see "
 			                       "docs/multi_branch.md.)",
-			                       table_for_returning.ParentSchema().name, table_for_returning.name,
-			                       static_cast<int>(branches_result.branches.size())));
+			                       table_for_returning.ParentSchema().name.GetIdentifierName(),
+			                       table_for_returning.name, static_cast<int>(branches_result.branches.size())));
 		}
 	}
 
@@ -340,12 +339,10 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 
 	bool parallel = append_count <= 1 && !op.return_chunk;
 
-	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
-	                                               parallel, op.return_chunk);
-	result.children.push_back(plan);
+	auto &result = planner.Make<PhysicalMergeInto>(op.types, plan, std::move(actions), op.row_id_start, op.source_marker,
+	                                               parallel, op.return_chunk, append_count > 1);
 	return result;
 }
-
 
 DatabaseSize VgiCatalog::GetDatabaseSize(ClientContext &context) {
 	DatabaseSize size;
@@ -373,8 +370,7 @@ void VgiCatalog::ClearCache(bool force) {
 	if (attach_parameters_) {
 		// identity_scope (catalog name + auth fingerprint) locates the per-identity
 		// disk shard so we drop ONLY this identity's on-disk entries.
-		auto identity = vgi::BuildCatalogIdentityScope(attach_parameters_->catalog_name(),
-		                                               attach_parameters_->auth());
+		auto identity = vgi::BuildCatalogIdentityScope(attach_parameters_->catalog_name(), attach_parameters_->auth());
 		vgi::GetResultCache(GetDatabase()).FlushCatalog(attach_parameters_->catalog_name(), identity);
 	}
 	{
@@ -438,7 +434,7 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 		return false;
 	}
 
-	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_opaque_data, transaction_opaque_data};
+	vgi::CatalogRpcContext rpc_ctx {attach_parameters_, attach_result_->attach_opaque_data, transaction_opaque_data};
 
 	// Conditional revalidation replaces the catalog_version poll when the
 	// caches were built from a catalog_contents snapshot that carried an etag.
@@ -592,7 +588,8 @@ std::shared_ptr<vgi::VgiCatalogContents> VgiCatalog::TakeCatalogContents(ClientC
 		         {"catalog_version", std::to_string(snapshot->catalog_version)},
 		         {"known_version", std::to_string(known)}});
 	}
-	VGI_LOG(context, "catalog.contents", {{"outcome", "fallback"}, {"error_message", "snapshot older than known catalog_version"}});
+	VGI_LOG(context, "catalog.contents",
+	        {{"outcome", "fallback"}, {"error_message", "snapshot older than known catalog_version"}});
 	forget_etag();
 	return nullptr;
 }
@@ -643,9 +640,11 @@ std::optional<bool> VgiCatalog::RevalidateContents(ClientContext &context, const
 }
 
 void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+	if (info.GetQualifiedName().Path().size() > 2)
+		throw NotImplementedException("Nested VGI schema deletion is not yet qualified");
 	if (access_mode_ == AccessMode::READ_ONLY) {
 		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kReadOnly)
-		                          .Set(vgi::error_key::kCatalog, GetName())
+		                          .Set(vgi::error_key::kCatalog, GetName().GetIdentifierName())
 		                          .Set(vgi::error_key::kOperation, "DROP SCHEMA"),
 		                      StringUtil::Format("Cannot DROP SCHEMA in read-only VGI catalog '%s'", GetName()));
 	}
@@ -658,8 +657,10 @@ void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	}
 	auto &vgi_tx = VgiTransaction::Get(context, *this);
 
-	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
-	vgi::InvokeCatalogSchemaDrop(rpc_ctx, info.name, ignore_not_found, cascade, context);
+	vgi::CatalogRpcContext rpc_ctx {attach_parameters_, attach_result_->attach_opaque_data,
+	                                vgi_tx.GetTransactionOpaqueData()};
+	vgi::InvokeCatalogSchemaDrop(rpc_ctx, info.GetQualifiedName().Name().GetIdentifierName(), ignore_not_found, cascade,
+	                             context);
 
 	// Invalidate schema cache via the deferred path so any bound query
 	// holding a CatalogEntry* doesn't dangle.

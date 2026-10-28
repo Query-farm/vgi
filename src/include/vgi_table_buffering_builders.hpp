@@ -1,12 +1,13 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 namespace duckdb {
 namespace vgi {
@@ -41,7 +42,7 @@ namespace vgi {
 //
 // Inner schemas match TableBuffering{Process,Combine,Destructor}Request in
 // vgi-python/vgi/protocol.py.
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableBufferingProcessInner(const std::string &function_name,
                                   const std::string &schema_name,
                                   const std::vector<uint8_t> &execution_id,
@@ -49,14 +50,14 @@ BuildTableBufferingProcessInner(const std::string &function_name,
                                   const std::vector<uint8_t> &attach_opaque_data,
                                   std::optional<int64_t> batch_index = std::nullopt);
 
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableBufferingCombineInner(const std::string &function_name,
                                   const std::string &schema_name,
                                   const std::vector<uint8_t> &execution_id,
                                   const std::vector<std::vector<uint8_t>> &state_ids,
                                   const std::vector<uint8_t> &attach_opaque_data);
 
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 BuildTableBufferingDestructorInner(const std::string &function_name,
                                      const std::string &schema_name,
                                      const std::vector<uint8_t> &execution_id,

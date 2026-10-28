@@ -6,30 +6,10 @@ duckdb_extension_load(vgi
     LOAD_TESTS
 )
 
-# httpfs source depends on the engine we're building against. The Haybarn
-# engine fork defines HAYBARN_VERSION_STRING (a top-level CMake var, set before
-# extension configs are included); stock DuckDB never does. Build against the
-# matching httpfs in each case — they have genuinely different sources.
-#
-# TEMPORARILY hard-coded to the haybarn fork: the CMake-side
-# `if(DEFINED HAYBARN_VERSION_STRING)` check wasn't firing on the local
-# `make release` path here (the C++ `-DHAYBARN_VERSION_STRING=...` preprocessor
-# define is set on the compile command line but no `set(...)` CMake variable
-# propagates to this scope), so the stock-DuckDB httpfs was being selected.
-# Force the haybarn fork until the CMake propagation is sorted out.
-#
-# Pins track the engine: 94d8fee is the same SHA the Haybarn engine's own
-# `.github/config/haybarn_extensions.cmake` pins for the v1.5.5 series (the
-# Haybarn HTTP stack rebased onto upstream's v1.5.5 httpfs pin, 827222f).
+# The v2.0 branch builds against Haybarn's DuckDB 2.0 engine. Pin its matching
+# HTTP stack so the extension and httpfs share the same engine APIs.
 set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
-set(HTTPFS_GIT_TAG 94d8fee6ea02ce952bab164e22689afe8f0cd8ed)
-# if(DEFINED HAYBARN_VERSION_STRING)
-#     set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
-#     set(HTTPFS_GIT_TAG 94d8fee6ea02ce952bab164e22689afe8f0cd8ed)
-# else()
-#     set(HTTPFS_GIT_URL https://github.com/duckdb/duckdb-httpfs)
-#     set(HTTPFS_GIT_TAG 827222fb45a043a7a852d1f7aae46901492a3cda)
-# endif()
+set(HTTPFS_GIT_TAG d312888956c2edef09c68a42f3fdb28e1dd55acf)
 
 # httpfs is curl-based. On the MinGW toolchain
 # (x64-mingw-static, rtools GCC) it fails to link against static curl with

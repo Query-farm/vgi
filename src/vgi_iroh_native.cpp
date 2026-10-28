@@ -7,9 +7,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "vgi_exception.hpp"
 
-#include <openssl/rand.h>
-
 #if VGI_ENABLE_IROH
+#include <openssl/rand.h>
 #include <vgi_iroh.h>
 #endif
 
@@ -79,7 +78,7 @@ std::string FormatIrohError(const char *operation, const vgi_iroh_error &error) 
 
 uint8_t CheckDuckDBInterrupted(void *userdata) {
 	auto context = static_cast<ClientContext *>(userdata);
-	return context && context->interrupted.load() ? 1 : 0;
+	return context && context->IsInterrupted() ? 1 : 0;
 }
 
 ErrorInfo IrohInfo(const char *subtype) {
@@ -242,36 +241,39 @@ const IrohSecretKey &ProcessEphemeralSecret() {
 	return *secret;
 }
 
-class IrohInputStream final : public arrow::io::InputStream {
+class IrohInputStream final : public VgiInputStream {
 public:
 	IrohInputStream(std::shared_ptr<StreamHandle> stream, ClientContext *context, uint64_t io_timeout_seconds)
 	    : stream_(std::move(stream)), context_(context), io_timeout_(std::chrono::seconds(io_timeout_seconds)) {
 	}
 
-	arrow::Status Close() override {
+	void Close() override {
 		closed_ = true;
-		return arrow::Status::OK();
 	}
 	bool closed() const override {
 		return closed_;
 	}
-	arrow::Result<int64_t> Tell() const override {
+	int64_t Tell() const {
 		return position_;
 	}
-	arrow::Result<int64_t> Read(int64_t nbytes, void *out) override {
+	// Errors throw: InvalidInputException for misuse (a closed stream, a
+	// negative size), InterruptException when the query is cancelled (the
+	// readers above treat cancellation as an interrupt, never as EOF), and
+	// IOException for transport failures.
+	int64_t Read(int64_t nbytes, void *out) override {
 		if (closed_) {
-			return arrow::Status::Invalid("Iroh input stream is closed");
+			throw InvalidInputException("Iroh input stream is closed");
 		}
 		if (nbytes < 0) {
-			return arrow::Status::Invalid("negative Iroh read size");
+			throw InvalidInputException("negative Iroh read size");
 		}
 		uint8_t *target = static_cast<uint8_t *>(out);
 		int64_t total = 0;
 		auto last_progress = std::chrono::steady_clock::now();
 		while (total < nbytes) {
-			if (context_ && context_->interrupted) {
+			if (context_ && context_->IsInterrupted()) {
 				vgi_iroh_stream_cancel(stream_->value);
-				return arrow::Status::Cancelled("VGI Iroh request cancelled");
+				throw InterruptException();
 			}
 			size_t got = 0;
 			uint8_t timed_out = 0;
@@ -280,12 +282,12 @@ public:
 			auto result = vgi_iroh_stream_read_timeout(stream_->value, target + total, want,
 			                                                   250, &got, &timed_out, &error);
 			if (result != VGI_IROH_OK) {
-				return arrow::Status::IOError(FormatIrohError("read", error));
+				throw IOException(FormatIrohError("read", error));
 			}
 			if (timed_out) {
 				if (std::chrono::steady_clock::now() - last_progress >= io_timeout_) {
 					vgi_iroh_stream_cancel(stream_->value);
-					return arrow::Status::IOError("VGI Iroh read exceeded its idle timeout");
+					throw IOException("VGI Iroh read exceeded its idle timeout");
 				}
 				continue;
 			}
@@ -298,12 +300,6 @@ public:
 		position_ += total;
 		return total;
 	}
-	arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override {
-		ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(nbytes));
-		ARROW_ASSIGN_OR_RAISE(auto count, Read(nbytes, buffer->mutable_data()));
-		ARROW_RETURN_NOT_OK(buffer->Resize(count, false));
-		return std::shared_ptr<arrow::Buffer>(std::move(buffer));
-	}
 
 private:
 	std::shared_ptr<StreamHandle> stream_;
@@ -313,28 +309,27 @@ private:
 	bool closed_ = false;
 };
 
-class IrohOutputStream final : public arrow::io::OutputStream {
+class IrohOutputStream final : public VgiOutputStream {
 public:
 	IrohOutputStream(std::shared_ptr<StreamHandle> stream, ClientContext *context)
 	    : stream_(std::move(stream)), context_(context) {
 	}
 
-	arrow::Status Close() override {
+	void Close() override {
 		closed_ = true;
-		return arrow::Status::OK();
 	}
 	bool closed() const override {
 		return closed_;
 	}
-	arrow::Result<int64_t> Tell() const override {
+	int64_t Tell() const override {
 		return position_;
 	}
-	arrow::Status Write(const void *data, int64_t nbytes) override {
+	void Write(const void *data, int64_t nbytes) override {
 		if (closed_) {
-			return arrow::Status::Invalid("Iroh output stream is closed");
+			throw InvalidInputException("Iroh output stream is closed");
 		}
 		if (nbytes < 0) {
-			return arrow::Status::Invalid("negative Iroh write size");
+			throw InvalidInputException("negative Iroh write size");
 		}
 		std::lock_guard<std::mutex> lock(stream_->write_mutex);
 		vgi_iroh_error error {};
@@ -343,15 +338,11 @@ public:
 		    CheckDuckDBInterrupted, context_, &error);
 		if (result != VGI_IROH_OK) {
 			if (error.category == VGI_IROH_CATEGORY_CANCELLED) {
-				return arrow::Status::Cancelled("VGI Iroh write cancelled");
+				throw InterruptException();
 			}
-			return arrow::Status::IOError(FormatIrohError("write", error));
+			throw IOException(FormatIrohError("write", error));
 		}
 		position_ += nbytes;
-		return arrow::Status::OK();
-	}
-	arrow::Status Flush() override {
-		return arrow::Status::OK();
 	}
 
 private:
@@ -565,7 +556,7 @@ IrohNativeHttpResponse PerformIrohHttpRequest(
 	uint8_t chunk[64 * 1024];
 	auto last_progress = std::chrono::steady_clock::now();
 	while (true) {
-		if (context && context->interrupted) {
+		if (context && context->IsInterrupted()) {
 			vgi_iroh_http_response_cancel(raw);
 			throw InterruptException();
 		}

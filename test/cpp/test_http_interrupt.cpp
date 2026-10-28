@@ -182,7 +182,7 @@ TEST_CASE("an armed POST is aborted mid-flight by an interrupt", "[http-interrup
 	try {
 		context.RunFunctionInTransaction([&] {
 			(void)HttpPostArrowIpc(context, url, body, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-			                       &context.interrupted);
+			                       &context);
 		});
 	} catch (const InterruptException &) {
 		interrupted = true;
@@ -206,7 +206,7 @@ TEST_CASE("an armed GET is aborted mid-flight by an interrupt", "[http-interrupt
 	auto interrupter = InterruptAfter(context, std::chrono::milliseconds(300));
 	bool interrupted = false;
 	try {
-		context.RunFunctionInTransaction([&] { (void)HttpGetBytes(context, url, &context.interrupted); });
+		context.RunFunctionInTransaction([&] { (void)HttpGetBytes(context, url, &context); });
 	} catch (const InterruptException &) {
 		interrupted = true;
 	}
@@ -280,7 +280,7 @@ TEST_CASE("protected unary HTTP mutations are not replayed after dispatch", "[ht
 	}
 }
 
-TEST_CASE("read-only unary HTTP calls preserve configured retries", "[http-no-replay]") {
+TEST_CASE("read-only unary HTTP POSTs follow DuckDB 2 single-dispatch policy", "[http-no-replay]") {
 	SlowServer server(std::chrono::milliseconds(100), SlowServer::Reply::ERROR);
 	Fixture fixture;
 	auto &context = fixture.context();
@@ -291,10 +291,22 @@ TEST_CASE("read-only unary HTTP calls preserve configured retries", "[http-no-re
 		auto owned = HTTPUtil::Get(*context.db).InitializeParameters(context, url);
 		auto cached = std::shared_ptr<HTTPParams>(owned.release());
 		cached->retries = 2;
-		try {
-			(void)HttpPostArrowIpc(context, url, std::vector<uint8_t>(16, 0), nullptr, nullptr,
-			    cached, nullptr, nullptr, nullptr, nullptr, &error_context);
-		} catch (const std::exception &) { }
+		REQUIRE_THROWS(HttpPostArrowIpc(context, url, std::vector<uint8_t>(16, 0), nullptr, nullptr,
+		    cached, nullptr, nullptr, nullptr, nullptr, &error_context));
+		REQUIRE(cached->retries == 2);
 	});
-	REQUIRE(server.DispatchedPosts() == 3);
+	REQUIRE(server.DispatchedPosts() == 1);
+	REQUIRE(server.Accepted() == 1);
+}
+
+TEST_CASE("HTTP GETs retain configured engine retries", "[http-no-replay]") {
+	SlowServer server(std::chrono::milliseconds(100), SlowServer::Reply::ERROR);
+	Fixture fixture;
+	REQUIRE_FALSE(fixture.con.Query("SET http_retries = 2")->HasError());
+	auto &context = fixture.context();
+	context.RunFunctionInTransaction([&] {
+		REQUIRE_THROWS(HttpGetBytes(context, server.Url("/externalized")));
+	});
+	REQUIRE(server.DispatchedPosts() == 0);
+	REQUIRE(server.Accepted() == 3);
 }

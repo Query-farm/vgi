@@ -49,9 +49,7 @@
 #include "vgi_hosted_protocols.hpp"
 #include "vgi_rpc_client.hpp"
 
-#include <arrow/api.h>
-#include <arrow/io/api.h>
-#include <arrow/ipc/api.h>
+#include "vgi_ipc.hpp"
 
 #include <memory>
 #include <string>
@@ -62,24 +60,21 @@ using namespace duckdb::vgi;
 namespace {
 
 // Read back the custom_metadata this client stamped on a serialized request.
-std::shared_ptr<arrow::KeyValueMetadata> RequestMetadata(const std::vector<uint8_t> &body) {
-	auto buffer = arrow::Buffer::Wrap(body.data(), body.size());
-	auto input = std::make_shared<arrow::io::BufferReader>(buffer);
-	auto reader = arrow::ipc::RecordBatchStreamReader::Open(input).ValueOrDie();
-	auto with_metadata = reader->ReadNext().ValueOrDie();
-	REQUIRE(with_metadata.batch != nullptr);
-	return with_metadata.custom_metadata;
+VgiMetadataPtr RequestMetadata(const std::vector<uint8_t> &body) {
+	auto batch = DeserializeBatch(body.data(), static_cast<int64_t>(body.size()));
+	REQUIRE(batch != nullptr);
+	return batch->metadata();
 }
 
-std::shared_ptr<arrow::RecordBatch> EmptyParams() {
-	return arrow::RecordBatch::Make(arrow::schema({}), 1, std::vector<std::shared_ptr<arrow::Array>> {});
+VgiBatchPtr EmptyParams() {
+	return VgiBatch::FromColumns(VgiSchema::Empty(), 1, {});
 }
 
-std::string MetadataValue(const std::shared_ptr<arrow::KeyValueMetadata> &md, const char *key) {
+std::string MetadataValue(const VgiMetadataPtr &md, const char *key) {
 	REQUIRE(md != nullptr);
 	auto found = md->Get(key);
-	REQUIRE(found.ok());
-	return found.ValueUnsafe();
+	REQUIRE(found.has_value());
+	return *found;
 }
 
 } // namespace

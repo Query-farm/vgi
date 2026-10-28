@@ -24,7 +24,7 @@ TableFunction MakeVgiCopyFromTableFunction() {
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;
-	func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
+	func.get_metrics = vgi::VgiTableFunctionGetMetrics;
 	func.statistics = vgi::VgiTableFunctionStatistics;
 	// COPY FROM always projects all target columns (identity), so no projection
 	// pushdown is needed; leave projection_pushdown at its default (false).
@@ -41,7 +41,7 @@ struct OptionSpec {
 };
 
 std::map<std::string, OptionSpec> ResolveOptionSpecs(ClientContext &context,
-                                                      const std::shared_ptr<arrow::Schema> &options_schema) {
+                                                      const VgiSchemaPtr &options_schema) {
 	std::map<std::string, OptionSpec> specs;
 	if (!options_schema || options_schema->num_fields() == 0) {
 		return specs;
@@ -60,7 +60,7 @@ std::map<std::string, OptionSpec> ResolveOptionSpecs(ClientContext &context,
 } // namespace
 
 unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctionBindInput &info,
-                                         vector<string> &expected_names, vector<LogicalType> &expected_types) {
+                                         vector<Identifier> &expected_names, vector<LogicalType> &expected_types) {
 	auto &table_info = info.tf.function_info;
 	if (!table_info) {
 		throw InternalException("VgiCopyFromBind: copy_from_function has no function_info carrier");
@@ -78,7 +78,7 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 	for (auto &entry : copy_info.options) {
 		const auto &key = entry.first;
 		const auto &values = entry.second;
-		auto key_lower = StringUtil::Lower(key);
+		auto key_lower = StringUtil::Lower(key.GetIdentifierName());
 		if (key_lower == "format") {
 			continue; // FORMAT is carried separately, never a worker option
 		}
@@ -96,14 +96,14 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 		} else {
 			raw = Value::LIST(values);
 		}
-		Value coerced;
 		string cast_error;
-		if (!raw.DefaultTryCastAs(spec_it->second.type, coerced, &cast_error)) {
+		auto coerced = raw.DefaultTryCastAs(spec_it->second.type, &cast_error);
+		if (!coerced) {
 			throw BinderException("COPY ... FROM (FORMAT %s): option '%s' value %s is not coercible to %s%s%s",
 			                      carrier.format_name, spec_it->second.name, raw.ToString(),
 			                      spec_it->second.type.ToString(), cast_error.empty() ? "" : ": ", cast_error);
 		}
-		named_args.emplace_back(spec_it->second.name, std::move(coerced));
+		named_args.emplace_back(spec_it->second.name, std::move(*coerced));
 	}
 
 	// --- 2. Build bind data targeting the worker handler ---
@@ -126,7 +126,7 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 
 	// --- 4. Bind against the worker (discovers + validates the output schema) ---
 	vector<LogicalType> worker_types;
-	vector<string> worker_names;
+	vector<Identifier> worker_names;
 	vgi::PerformVgiTableFunctionBind(context, *bind_data, worker_types, worker_names);
 
 	// --- 5. Hard-validate: DuckDB inserts NO cast between the scan and the INSERT,
@@ -143,7 +143,7 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 			    "COPY ... FROM (FORMAT %s): column %llu type mismatch — worker '%s' produces %s but the COPY "
 			    "target column '%s' is %s (DuckDB inserts no cast for COPY FROM)",
 			    carrier.format_name, (unsigned long long)i, carrier.handler, worker_types[i].ToString(),
-			    i < expected_names.size() ? expected_names[i] : std::to_string(i), expected_types[i].ToString());
+			    i < expected_names.size() ? expected_names[i].GetIdentifierName() : std::to_string(i), expected_types[i].ToString());
 		}
 	}
 

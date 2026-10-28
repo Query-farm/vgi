@@ -725,7 +725,7 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	constexpr int kPollIntervalMs = 250;
 
 	while (true) {
-		if (context && context->interrupted) {
+		if (context && context->IsInterrupted()) {
 			// InterruptException, not IOException: the pool retries
 			// IOException on a fresh worker, and a cancel must not be retried.
 			throw InterruptException();
@@ -1121,7 +1121,7 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 			// spin forever (recv() then observes the EOF). interrupted re-checked
 			// each iteration → prompt cancel.
 			for (unsigned attempt = 0;; attempt++) {
-				if (context && context->interrupted) {
+				if (context && context->IsInterrupted()) {
 					throw InterruptException(); // not IOException: never retried
 				}
 				u_long avail = 0;

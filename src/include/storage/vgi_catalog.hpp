@@ -26,8 +26,7 @@ class VgiCatalog : public Catalog {
 public:
 	VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name, AccessMode access_mode,
 	           std::shared_ptr<vgi::VgiAttachParameters> attach_params,
-	           std::shared_ptr<vgi::CatalogAttachResult> attach_result,
-	           VgiObjectCounts eager_load_thresholds);
+	           std::shared_ptr<vgi::CatalogAttachResult> attach_result, VgiObjectCounts eager_load_thresholds);
 	~VgiCatalog() override;
 
 public:
@@ -37,7 +36,7 @@ public:
 		return "vgi";
 	}
 
-	std::string GetDefaultSchema() const override;
+	optional<Identifier> GetDefaultSchema() const override;
 
 	bool SupportsTimeTravel() const override {
 		return attach_result_ && attach_result_->supports_time_travel;
@@ -168,7 +167,7 @@ private:
 
 	/// Last known catalog version from the worker. Initialized from attach_result.
 	/// Atomic since it can be read/written from concurrent transactions.
-	std::atomic<int64_t> last_known_catalog_version_{0};
+	std::atomic<int64_t> last_known_catalog_version_ {0};
 
 	/// catalog_contents state, guarded by contents_mutex_ (a leaf: nothing is
 	/// called while it is held).

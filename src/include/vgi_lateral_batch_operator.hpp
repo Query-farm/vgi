@@ -28,7 +28,7 @@ namespace vgi {
 
 class LogicalVgiLateralBatch : public LogicalExtensionOperator {
 public:
-	LogicalVgiLateralBatch(idx_t table_index, vector<column_t> projected_input,
+	LogicalVgiLateralBatch(TableIndex table_index, vector<column_t> projected_input,
 	                       vector<LogicalType> worker_output_types, vector<ColumnBinding> worker_bindings,
 	                       unique_ptr<FunctionData> bind_data, vector<column_t> worker_column_ids,
 	                       bool projection_pushdown)
@@ -38,7 +38,7 @@ public:
 	      projection_pushdown(projection_pushdown) {
 	}
 
-	idx_t table_index;
+	TableIndex table_index;
 	//! Trailing child-chunk column indices of the correlated/outer columns.
 	vector<column_t> projected_input;
 	//! Worker output column types (the leading base_idx columns).
@@ -60,7 +60,7 @@ public:
 
 public:
 	vector<ColumnBinding> GetColumnBindings() override;
-	vector<idx_t> GetTableIndex() const override;
+	vector<TableIndex> GetTableIndex() const override;
 	string GetName() const override;
 	string GetExtensionName() const override;
 

@@ -374,11 +374,10 @@ InputDedup BuildInputDedup(DataChunk &chunk, const std::vector<column_t> &key_co
 	if (!canonical_columns.empty()) {
 		DataChunk key_chunk;
 		key_chunk.InitializeEmpty(canonical_types);
-		key_chunk.SetCapacity(chunk.GetCapacity());
 		for (idx_t i = 0; i < canonical_columns.size(); i++) {
 			key_chunk.data[i].Reference(chunk.data[canonical_columns[i]]);
 		}
-		key_chunk.SetCardinality(n);
+		key_chunk.SetCardinalityUnsafe(n);
 		vector<OrderModifiers> mods(canonical_columns.size(),
 		                            OrderModifiers(OrderType::ASCENDING, OrderByNullType::NULLS_LAST));
 		CreateSortKeyHelpers::CreateSortKey(key_chunk, mods, canonical_keys);

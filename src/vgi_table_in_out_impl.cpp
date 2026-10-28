@@ -144,7 +144,7 @@ VgiTableInOutLocalState::~VgiTableInOutLocalState() = default;
 // ============================================================================
 
 unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names,
+                                            vector<LogicalType> &return_types, vector<Identifier> &names,
                                             const VgiTableInOutBindParams &params) {
 	auto bind_data = make_uniq<VgiTableInOutBindData>();
 
@@ -278,7 +278,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 		}
 		bind_data->single_row_scan = all_names_empty;
 	} else {
-		bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, input.input_table_names);
+		bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, IdentifiersToStrings(input.input_table_names));
 	}
 
 	VGI_LOG(context, "table_in_out.bind",
@@ -438,7 +438,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		vector<string> output_names;
 		output_names.reserve(bind_data.output_schema->num_fields());
 		for (int i = 0; i < bind_data.output_schema->num_fields(); ++i) {
-			output_names.push_back(bind_data.output_schema->field(i)->name());
+			output_names.push_back(bind_data.output_schema->field_name(i));
 		}
 		auto serialized =
 		    vgi::VgiSerializeFilters(context, input.column_ids, input.filters, output_names, bind_data.worker_path());
@@ -566,10 +566,10 @@ unique_ptr<LocalTableFunctionState> VgiTableInOutInitLocal(ExecutionContext &con
 // Arrow Batch to DuckDB DataChunk Conversion Helpers
 // ============================================================================
 
-//! Load an Arrow C++ RecordBatch into the ArrowScanLocalState for consumption.
+//! Load a batch into the ArrowScanLocalState for consumption.
 //! Must call Reset() to clear stale owned_data references before loading a new batch.
 void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
-                            const std::shared_ptr<arrow::RecordBatch> &batch) {
+                            const VgiBatchPtr &batch) {
 	auto chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(batch, *chunk);
 	local_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
@@ -765,7 +765,7 @@ void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &conn,
 // INTEGER for 52) rather than the DOUBLE signature; the column/LATERAL shape has
 // already been cast to the signature by DuckDB, so this is a no-op there. A no-op
 // for classic (non-blended) table-in-out (empty declared_input_types).
-std::shared_ptr<arrow::RecordBatch>
+VgiBatchPtr
 ConvertInputToArrow(ClientContext &context, DataChunk &input, const VgiTableInOutBindData &bind_data) {
 	const auto &declared = bind_data.declared_input_types;
 	bool needs_cast = false;
@@ -892,7 +892,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		//    return a 0-row chunk (SetCardinality(0)) only on nullptr (true EOS). A run
 		//    of empty continued replies stays in this loop, so check for interrupts.
 		while (true) {
-			if (client_context.interrupted) {
+			if (client_context.IsInterrupted()) {
 				throw InterruptException();
 			}
 			if (!local_state.input_submitted) {
@@ -910,7 +910,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 				conn.CloseInputWriter();
 				local_state.input_closed = true;
 			}
-			std::shared_ptr<arrow::RecordBatch> output_batch;
+			VgiBatchPtr output_batch;
 			bool worker_exited = false;
 			try {
 				output_batch = conn.ReadDataBatch();
@@ -1008,12 +1008,12 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	};
 
 	const bool timing = ClientTiming::Enabled();
-	std::shared_ptr<arrow::RecordBatch> output_batch;
+	VgiBatchPtr output_batch;
 	if (local_state.more_pending) {
 		output_batch = read_continued_reply();
 	} else {
 	// Convert input DataChunk to Arrow RecordBatch
-	std::shared_ptr<arrow::RecordBatch> input_batch;
+	VgiBatchPtr input_batch;
 	if (timing) {
 		ScopedNs _t(ClientTiming::Instance().convert_in_ns);
 		input_batch = ConvertInputToArrow(client_context, input, bind_data);
@@ -1331,7 +1331,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	// empty output chunk from FinalExecute. The loop terminates because an
 	// exhausted producer returns null: over HTTP once the response carries no
 	// continuation token, over subprocess at IPC EOS.
-	std::shared_ptr<arrow::RecordBatch> output_batch;
+	VgiBatchPtr output_batch;
 	for (;;) {
 		output_batch = conn->ReadDataBatch();
 		if (!output_batch || output_batch->num_rows() > 0) {

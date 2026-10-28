@@ -26,11 +26,6 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
-#include <arrow/array/builder_primitive.h> // Int64Builder (per-value distinct-order gather)
-#include <arrow/c/bridge.h>
-#include <arrow/compute/api_vector.h>       // arrow::compute::Take (per-value distinct-order gather)
-#include <arrow/datum.h>
-#include <arrow/record_batch.h> // arrow::ConcatenateRecordBatches (per-value full-hit assembly)
 
 namespace duckdb {
 
@@ -101,8 +96,10 @@ unique_ptr<FunctionLocalState> VgiScalarFunctionInitLocalState(ExpressionState &
 // Scalar Function Bind (for dynamic return types)
 // ============================================================================
 
-unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFunction &bound_function,
-                                                vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	// Get the function info attached to the function
 	if (!bound_function.HasExtraFunctionInfo()) {
 		throw InternalException("VgiScalarFunctionBind: missing VgiScalarFunctionInfo");
@@ -115,7 +112,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// refreshes it transparently, and a DETACHed catalog throws a clear error.
 	shared_ptr<VgiScalarFunctionInfo> live_info;
 	if (registered_info.global) {
-		auto binding = ResolveVgiGlobalBinding(context, registered_info.catalog_name, bound_function.name);
+		auto binding = ResolveVgiGlobalBinding(context, registered_info.catalog_name, bound_function.GetName().GetIdentifierName());
 		live_info = make_shared_ptr<VgiScalarFunctionInfo>(registered_info);
 		live_info->attach_params = binding.attach_params;
 		live_info->attach_opaque_data = binding.attach_opaque_data;
@@ -124,14 +121,16 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	}
 	const auto &func_info = live_info ? *live_info : registered_info;
 
-	// DuckDB 1.5 has no named scalar-call syntax, but VGI 2.0 still carries the
-	// resolved parameter names so every engine presents the worker with the same
-	// bind shape. Fixed slots use the declared schema names; extra varargs are
-	// unnamed. Capture this before ConstParam expressions are erased below.
+	// Preserve DuckDB's resolved argument names, including named calls. Metadata
+	// supplies names only when the binder has none (e.g. unnamed varargs).
+	// Capture this before ConstParam expressions are erased below.
 	std::vector<std::optional<std::string>> resolved_argument_names;
 	resolved_argument_names.reserve(arguments.size());
 	for (idx_t i = 0; i < arguments.size(); i++) {
-		if (i < func_info.positional_names.size()) {
+		if (input.GetArgumentNames() && i < input.GetArgumentNames()->size() &&
+		    !(*input.GetArgumentNames())[i].GetIdentifierName().empty()) {
+			resolved_argument_names.emplace_back((*input.GetArgumentNames())[i].GetIdentifierName());
+		} else if (i < func_info.positional_names.size()) {
 			resolved_argument_names.emplace_back(func_info.positional_names[i]);
 		} else {
 			resolved_argument_names.emplace_back(std::nullopt);
@@ -183,13 +182,13 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 				// type-mismatch deep inside compute(). Cast to the function's
 				// declared positional type when concrete; ANY/INVALID stays
 				// polymorphic and we let the worker resolve it.
-				if (i < bound_function.arguments.size()) {
-					const auto &declared = bound_function.arguments[i];
+				if (i < bound_function.GetArguments().size()) {
+					const auto &declared = bound_function.GetArguments()[i];
 					if (declared.id() != LogicalTypeId::ANY && declared.id() != LogicalTypeId::INVALID &&
 					    val.type() != declared) {
 						string cast_error;
-						Value casted;
-						if (!val.DefaultTryCastAs(declared, casted, &cast_error)) {
+						auto casted = val.DefaultTryCastAs(declared, &cast_error);
+						if (!casted) {
 							string param_name = i < func_info.positional_names.size()
 							                        ? func_info.positional_names[i]
 							                        : "parameter " + std::to_string(i);
@@ -198,7 +197,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 							    param_name, func_info.function_name, val.type().ToString(),
 							    declared.ToString(), cast_error);
 						}
-						val = std::move(casted);
+						val = std::move(*casted);
 					}
 				}
 				const_values.push_back(val);
@@ -210,7 +209,9 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		// Phase 2: Erase const arguments in reverse order (to preserve indices)
 		// ========================================================================
 		for (auto it = const_indices.rbegin(); it != const_indices.rend(); ++it) {
-			Function::EraseArgument(bound_function, arguments, *it);
+			auto index = *it;
+			arguments.erase(arguments.begin() + index);
+			bound_function.GetArguments().erase(bound_function.GetArguments().begin() + index);
 		}
 	}
 
@@ -227,15 +228,10 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	vector<LogicalType> input_types;
 	vector<string> input_names;
 	for (idx_t i = 0; i < arguments.size(); i++) {
-		// For fixed positional params, bound_function.arguments holds the
-		// declared type; beyond that we're in the varargs tail and fall back
-		// to bound_function.varargs. In either case, ANY means polymorphic
-		// and we surface the caller's concrete type instead.
-		const bool is_vararg_tail = i >= bound_function.arguments.size();
-		LogicalType declared = is_vararg_tail ? bound_function.varargs
-		                                       : bound_function.arguments[i];
+		// DuckDB resolves each variadic argument to its per-call type before bind.
+		LogicalType declared = bound_function.GetArguments()[i];
 		if (declared.id() == LogicalTypeId::ANY || declared.id() == LogicalTypeId::INVALID) {
-			declared = arguments[i]->return_type;
+			declared = arguments[i]->GetReturnType();
 		}
 		input_types.push_back(declared);
 		input_names.push_back("col_" + std::to_string(i));
@@ -257,7 +253,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// ========================================================================
 	// Phase 5: Connect to worker and perform bind to get output schema
 	// ========================================================================
-	std::shared_ptr<arrow::Schema> output_schema;
+	VgiSchemaPtr output_schema;
 	bool secret_dependent = !func_info.required_secrets.empty();
 
 	// Skip the worker call on re-bind when const values were already extracted
@@ -337,7 +333,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	ArrowSchemaToDuckDBTypes(context, output_schema, c_schema, arrow_table, output_types, output_names);
 
 	// Set the actual return type on the bound function
-	bound_function.return_type = output_types[0];
+	bound_function.SetReturnType(output_types[0]);
 
 	VGI_LOG(context, "scalar.bind",
 	        {{"function_name", func_info.function_name},
@@ -372,10 +368,10 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	// Get the function info from the expression
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	if (!func_expr.function.HasExtraFunctionInfo()) {
+	if (!func_expr.Function().HasExtraFunctionInfo()) {
 		throw InternalException("VgiScalarFunctionExecute: missing VgiScalarFunctionInfo");
 	}
-	auto &func_info = func_expr.function.GetExtraFunctionInfo().Cast<VgiScalarFunctionInfo>();
+	auto &func_info = func_expr.Function().GetExtraFunctionInfo().Cast<VgiScalarFunctionInfo>();
 
 	// Get the local state
 	auto &local_state = ExecuteFunctionState::GetFunctionState(state)->Cast<VgiScalarFunctionLocalState>();
@@ -383,8 +379,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 
 	// Get bind data if available (present when function has const params or dynamic return type)
 	VgiScalarFunctionBindData *bind_data = nullptr;
-	if (func_expr.bind_info) {
-		bind_data = &func_expr.bind_info->Cast<VgiScalarFunctionBindData>();
+	if (func_expr.BindInfo()) {
+		bind_data = &func_expr.BindInfo()->Cast<VgiScalarFunctionBindData>();
 	}
 
 	// Initialize connection on first call
@@ -561,7 +557,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	// same input (RNG, etc.), so collapsing duplicate inputs would serve one row's value
 	// for all of them. The worker declares stability (FunctionStability) and it is set on
 	// the ScalarFunction at registration; CONSISTENT / CONSISTENT_WITHIN_QUERY are safe.
-	const bool is_volatile = func_expr.function.stability == FunctionStability::VOLATILE;
+	const bool is_volatile = func_expr.Function().GetStability() == FunctionStability::VOLATILE;
 	InputDedup dedup;
 	DataChunk deduped_chunk;
 	DataChunk *ship = to_serialize;
@@ -646,7 +642,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	// distinct order + a per-tuple hit mask; a miss (or no arena yet) leaves pv_hit=0.
 	std::vector<std::string> pv_blobs;
 	std::vector<char> pv_hit;                      // parallel to ship (1 = served from arena)
-	std::shared_ptr<arrow::RecordBatch> pv_cached; // hit rows, ascending-distinct order
+	VgiBatchPtr pv_cached; // hit rows, ascending-distinct order
 	int64_t pv_hit_count = 0;
 	if (pv_enabled) {
 		pv_blobs = InputRowSortKeys(context, *ship);
@@ -679,7 +675,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		local_state.input_arrow_names.reserve(to_serialize->ColumnCount());
 		for (idx_t i = 0; i < to_serialize->ColumnCount(); i++) {
 			local_state.input_arrow_types.push_back(to_serialize->data[i].GetType());
-			local_state.input_arrow_names.push_back(local_state.input_schema->field(i)->name());
+			local_state.input_arrow_names.push_back(local_state.input_schema->field_name(static_cast<int>(i)));
 		}
 		local_state.input_client_props = context.GetClientProperties();
 		local_state.input_extension_types =
@@ -688,7 +684,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	}
 
 	const bool timing = ClientTiming::Enabled();
-	std::shared_ptr<arrow::RecordBatch> output_batch;
+	VgiBatchPtr output_batch;
 
 	if (full_pv_hit) {
 		// Every distinct tuple is memoized → the arena already returned all K rows in
@@ -725,7 +721,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			ship_to_worker = &miss_ship;
 		}
 
-		std::shared_ptr<arrow::RecordBatch> input_batch;
+		VgiBatchPtr input_batch;
 		if (timing) {
 			ScopedNs _t(ClientTiming::Instance().convert_in_ns);
 			input_batch = DataChunkToArrowCached(context, *ship_to_worker, local_state.input_schema,
@@ -746,7 +742,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			         {"input_rows", std::to_string(input_batch->num_rows())}});
 		}
 
-		std::shared_ptr<arrow::RecordBatch> fresh;
+		VgiBatchPtr fresh;
 		if (timing) {
 			{
 				ScopedNs _t(ClientTiming::Instance().write_ns);
@@ -788,32 +784,35 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		// combined = [cached | fresh]; perm[d] picks the right combined row.
 		if (partial_pv && pv_cached && pv_cached->num_rows() > 0) {
 			const int64_t H = pv_cached->num_rows();
-			std::vector<std::shared_ptr<arrow::RecordBatch>> parts {pv_cached};
+			std::vector<VgiBatchPtr> parts {pv_cached};
 			if (fresh->num_rows() > 0) {
 				parts.push_back(fresh);
 			}
-			auto combined_r = arrow::ConcatenateRecordBatches(parts);
-			if (!combined_r.ok()) {
+			VgiBatchPtr combined;
+			try {
+				// ConcatBatches trusts equal schemas; check here (as Arrow's concat did) so
+				// a worker whose fresh rows disagree with the memoized rows' schema fails
+				// cleanly instead of misreading buffers.
+				if (parts.size() > 1 && !pv_cached->schema()->Equals(*fresh->schema())) {
+					throw InvalidInputException("Schema at index 1 does not match the first schema.");
+				}
+				combined = ConcatBatches(parts);
+			} catch (const std::exception &e) {
 				throw IOException("VGI scalar '%s' per-value splice concat failed: %s", func_info.function_name,
-				                  combined_r.status().ToString());
+				                  ErrorData(e).RawMessage());
 			}
-			auto combined = combined_r.ValueUnsafe();
-			arrow::Int64Builder ib;
-			(void)ib.Reserve(static_cast<int64_t>(ship->size()));
+			std::vector<int64_t> perm(ship->size());
 			int64_t hc = 0;
 			int64_t mc = 0;
 			for (idx_t d = 0; d < ship->size(); d++) {
-				ib.UnsafeAppend(pv_hit[d] ? hc++ : H + mc++);
+				perm[d] = pv_hit[d] ? hc++ : H + mc++;
 			}
-			std::shared_ptr<arrow::Array> perm;
-			(void)ib.Finish(&perm);
-			auto tk = arrow::compute::Take(arrow::Datum(combined), arrow::Datum(perm),
-			                               arrow::compute::TakeOptions::NoBoundsCheck());
-			if (!tk.ok()) {
+			try {
+				output_batch = TakeRows(combined, perm);
+			} catch (const std::exception &e) {
 				throw IOException("VGI scalar '%s' per-value splice take failed: %s", func_info.function_name,
-				                  tk.status().ToString());
+				                  ErrorData(e).RawMessage());
 			}
-			output_batch = tk.ValueUnsafe().record_batch();
 			VGI_LOG(context, "result_cache.partial_hit",
 			        {{"function", func_info.function_name},
 			         {"key_hash", local_state.cache_static_fp},
@@ -907,10 +906,10 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	if (bind_data && bind_data->resolved_output_schema &&
 	    GetWorkerBatchValidation(&context) != WorkerBatchValidation::NONE) {
 		const auto &declared = *bind_data->resolved_output_schema;
-		std::vector<std::shared_ptr<arrow::DataType>> expected;
+		std::vector<const ArrowSchema *> expected;
 		expected.reserve(declared.num_fields());
 		for (int i = 0; i < declared.num_fields(); i++) {
-			expected.push_back(declared.field(i)->type());
+			expected.push_back(&declared.field(i));
 		}
 		ValidateWireBatchTypes(*output_batch, expected, func_info.worker_path(), func_info.function_name);
 	}

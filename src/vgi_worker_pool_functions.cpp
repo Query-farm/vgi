@@ -19,7 +19,7 @@ struct VgiWorkerPoolFlushData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiWorkerPoolFlushBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.push_back(LogicalType::BIGINT);
 	names.emplace_back("flushed");
 	return make_uniq<VgiWorkerPoolFlushData>();
@@ -57,7 +57,7 @@ struct VgiWorkerPoolData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiWorkerPoolBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::BIGINT, LogicalType::BIGINT};
 	names = {"worker_path", "data_version_spec", "implementation_version", "pid", "age_seconds"};
@@ -105,7 +105,7 @@ struct VgiWorkerPoolStatsData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiWorkerPoolStatsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT};
 	names = {"worker_path", "hits", "misses"};
 

@@ -4,6 +4,7 @@
 #include "vgi_iroh_config.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -74,7 +75,7 @@ std::unique_ptr<SecretEntry> LookupIrohSecret(ClientContext &context, const std:
 	int64_t best_score = -1;
 	bool best_temporary = false;
 	for (const auto &entry : all) {
-		if (!entry.secret || !StringUtil::CIEquals(entry.secret->GetType(), "iroh")) {
+		if (!entry.secret || entry.secret->GetType() != "iroh") {
 			continue;
 		}
 		const bool temporary = entry.storage_mode == SecretManager::TEMPORARY_STORAGE_NAME;

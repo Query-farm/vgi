@@ -41,7 +41,7 @@ TEST_CASE("Explicit query interruption leaves the connection usable for detach",
 	ExecuteQuerySetup(connection, "ATTACH 'queries' AS w (TYPE vgi, LOCATION '" +
 	                             StringUtil::Replace(worker, "'", "''") + "')");
 
-	unique_ptr<MaterializedQueryResult> result;
+	unique_ptr<QueryResult> result;
 	std::exception_ptr failure;
 	std::atomic<bool> finished {false};
 	std::thread query_thread([&] {

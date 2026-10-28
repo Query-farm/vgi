@@ -42,7 +42,7 @@ struct VgiCopyToBindData : public FunctionData {
 	std::string function_name;                    // worker handler
 	ArrowArguments arguments;                     // resolved COPY options (for re-bind at init)
 	std::map<std::string, Value> settings;
-	std::shared_ptr<arrow::Schema> input_schema; // source columns
+	VgiSchemaPtr input_schema; // source columns
 	BindResult bind_result;                      // bind_request_bytes carries the copy_to context
 	std::string format;
 	std::string file_path;
@@ -74,7 +74,7 @@ struct OptionSpec {
 };
 
 std::map<std::string, OptionSpec> ResolveOptionSpecs(ClientContext &context,
-                                                      const std::shared_ptr<arrow::Schema> &options_schema) {
+                                                      const VgiSchemaPtr &options_schema) {
 	std::map<std::string, OptionSpec> specs;
 	if (!options_schema || options_schema->num_fields() == 0) {
 		return specs;
@@ -252,7 +252,7 @@ void ReleaseWorkerToPool(std::unique_ptr<IFunctionConnection> conn, const VgiCop
 // ---------------------------------------------------------------------------
 
 unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
-                                       const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                       const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
 	if (!input.function_info) {
 		throw InternalException("VgiCopyToBind: CopyFunction has no function_info carrier");
 	}
@@ -272,7 +272,7 @@ unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindI
 	for (auto &entry : copy_info.options) {
 		const auto &key = entry.first;
 		const auto &values = entry.second;
-		auto key_lower = StringUtil::Lower(key);
+		auto key_lower = StringUtil::Lower(key.GetIdentifierName());
 		if (key_lower == "format") {
 			continue;
 		}
@@ -281,18 +281,18 @@ unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindI
 			throw BinderException("Unsupported option '%s' for COPY ... TO (FORMAT %s)", key, carrier.format_name);
 		}
 		Value raw = values.empty() ? Value(LogicalType::BOOLEAN) : (values.size() == 1 ? values[0] : Value::LIST(values));
-		Value coerced;
 		string cast_error;
-		if (!raw.DefaultTryCastAs(spec_it->second.type, coerced, &cast_error)) {
+		auto coerced = raw.DefaultTryCastAs(spec_it->second.type, &cast_error);
+		if (!coerced) {
 			throw BinderException("COPY ... TO (FORMAT %s): option '%s' value %s is not coercible to %s%s%s",
 			                      carrier.format_name, spec_it->second.name, raw.ToString(),
 			                      spec_it->second.type.ToString(), cast_error.empty() ? "" : ": ", cast_error);
 		}
-		named_args.emplace_back(spec_it->second.name, std::move(coerced));
+		named_args.emplace_back(spec_it->second.name, std::move(*coerced));
 	}
 
 	// The source columns become the worker's input_schema (rides the bind).
-	auto input_schema = BuildArrowSchemaFromDuckDB(context, sql_types, names);
+	auto input_schema = BuildArrowSchemaFromDuckDB(context, sql_types, IdentifiersToStrings(names));
 	auto arguments = vgi::BuildArgumentsFromValues(context, /*positional=*/{}, named_args);
 	auto settings = ExtractVgiSettings(context, carrier.setting_names);
 
@@ -477,7 +477,7 @@ void VgiCopyToInitializeOperator(GlobalFunctionData & /*gstate*/, const Physical
 	// PARTITION_BY / PER_THREAD_OUTPUT / FILE_SIZE_BYTES gets a clean error rather
 	// than a directory-as-file failure deep in the worker.
 	auto &copy_op = op.Cast<PhysicalCopyToFile>();
-	if (copy_op.partition_output || copy_op.per_thread_output || copy_op.rotate) {
+	if (copy_op.partition_output || copy_op.per_thread_output || copy_op.Rotate()) {
 		throw NotImplementedException(
 		    "VGI COPY ... TO formats do not support PARTITION_BY, PER_THREAD_OUTPUT, or file rotation "
 		    "(FILE_SIZE_BYTES) — write to a single destination instead");

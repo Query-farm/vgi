@@ -41,7 +41,7 @@ struct VgiCatalogsGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<VgiCatalogsBindData>();
 
 	auto target = vgi::BindDiscoveryTarget(context, input.inputs[0].GetValue<string>(), input.named_parameters,
@@ -195,7 +195,7 @@ static InsertionOrderPreservingMap<string> VgiCatalogsToString(TableFunctionToSt
 namespace vgi {
 
 VgiDiscoveryTarget BindDiscoveryTarget(ClientContext &context, std::string worker_path,
-                                       named_parameter_map_t &named_parameters, const char *function_name,
+                                       named_argument_map_t &named_parameters, const char *function_name,
                                        LocationEntryPoint entry, const std::unordered_set<std::string> &skip) {
 	VgiDiscoveryTarget target;
 	target.worker_path = std::move(worker_path);
@@ -211,7 +211,7 @@ VgiDiscoveryTarget BindDiscoveryTarget(ClientContext &context, std::string worke
 	// client and resource, so the default does not merge unrelated services.
 	std::string profile = "default";
 	for (auto &kv : named_parameters) {
-		auto name = StringUtil::Lower(kv.first);
+		auto name = StringUtil::Lower(kv.first.GetIdentifierName());
 		if (skip.count(name)) {
 			continue;
 		}
@@ -284,19 +284,19 @@ VgiDiscoveryTarget BindDiscoveryTarget(ClientContext &context, std::string worke
 void AddDiscoveryNamedParameters(TableFunction &func) {
 	// Authentication uses the same handlers and options as ATTACH, including
 	// challenge discovery, token refresh and the vgi_oauth_enabled setting.
-	func.named_parameters["bearer_token"] = LogicalType::VARCHAR;
-	func.named_parameters["oauth_refresh_token"] = LogicalType::VARCHAR;
-	func.named_parameters["oauth_profile"] = LogicalType::VARCHAR;
-	func.named_parameters["oauth_cache"] = LogicalType::VARCHAR;
+	vgi::AddVgiFunctionOption(func, Identifier("bearer_token"), LogicalType::VARCHAR);
+	vgi::AddVgiFunctionOption(func, Identifier("oauth_refresh_token"), LogicalType::VARCHAR);
+	vgi::AddVgiFunctionOption(func, Identifier("oauth_profile"), LogicalType::VARCHAR);
+	vgi::AddVgiFunctionOption(func, Identifier("oauth_cache"), LogicalType::VARCHAR);
 
 	// Optional iroh_* options, with the same names and meaning as the ATTACH
 	// options, for iroh:// / httpi:// LOCATIONs. Without them the default
 	// configuration applies (scoped TYPE iroh secret, else ephemeral identity).
-	func.named_parameters["iroh_secret_key"] = LogicalType::VARCHAR;
-	func.named_parameters["iroh_relay_urls"] = LogicalType::LIST(LogicalType::VARCHAR);
-	func.named_parameters["iroh_no_relay"] = LogicalType::BOOLEAN;
-	func.named_parameters["iroh_remote_relay_url"] = LogicalType::VARCHAR;
-	func.named_parameters["iroh_direct_addresses"] = LogicalType::LIST(LogicalType::VARCHAR);
+	vgi::AddVgiFunctionOption(func, Identifier("iroh_secret_key"), LogicalType::VARCHAR);
+	vgi::AddVgiFunctionOption(func, Identifier("iroh_relay_urls"), LogicalType::LIST(LogicalType::VARCHAR));
+	vgi::AddVgiFunctionOption(func, Identifier("iroh_no_relay"), LogicalType::BOOLEAN);
+	vgi::AddVgiFunctionOption(func, Identifier("iroh_remote_relay_url"), LogicalType::VARCHAR);
+	vgi::AddVgiFunctionOption(func, Identifier("iroh_direct_addresses"), LogicalType::LIST(LogicalType::VARCHAR));
 }
 
 } // namespace vgi

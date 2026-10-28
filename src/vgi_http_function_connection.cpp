@@ -82,12 +82,12 @@ static RpcErrorContext HttpCallErrorContext(const std::string &base_url, const s
 // when present but un-parseable. The cap and monotonicity checks
 // live downstream in VgiTableFunctionImpl::InstallBatch — we only
 // extract the raw uint64 here.
-static idx_t ParseVgiBatchIndex(const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+static idx_t ParseVgiBatchIndex(const VgiMetadataPtr &custom_metadata,
                                 const std::string &base_url, const ErrorInfo &error_context) {
 	if (!custom_metadata) {
 		return DConstants::INVALID_INDEX;
 	}
-	int idx = custom_metadata->FindKey("vgi_batch_index");
+	int64_t idx = custom_metadata->FindKey("vgi_batch_index");
 	if (idx < 0) {
 		return DConstants::INVALID_INDEX;
 	}
@@ -120,12 +120,12 @@ static idx_t ParseVgiBatchIndex(const std::shared_ptr<arrow::KeyValueMetadata> &
 // the key is absent. Raises IOException when present but the base64 is invalid.
 // IPC/int32 decode + validation happen downstream on the consumer thread.
 static std::string ParseVgiB64Bytes(
-    const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+    const VgiMetadataPtr &custom_metadata,
     const char *key, const std::string &base_url, const ErrorInfo &error_context) {
 	if (!custom_metadata) {
 		return "";
 	}
-	int idx = custom_metadata->FindKey(key);
+	int64_t idx = custom_metadata->FindKey(key);
 	if (idx < 0) {
 		return "";
 	}
@@ -145,11 +145,11 @@ static std::string ParseVgiB64Bytes(
 }
 
 // Helper: extract stream_state token value from batch metadata, or return empty string.
-static std::string ExtractStreamStateValue(const std::shared_ptr<arrow::KeyValueMetadata> &metadata) {
+static std::string ExtractStreamStateValue(const VgiMetadataPtr &metadata) {
 	if (!metadata) {
 		return "";
 	}
-	int idx = metadata->FindKey(RPC_STREAM_STATE_KEY);
+	int64_t idx = metadata->FindKey(RPC_STREAM_STATE_KEY);
 	if (idx >= 0) {
 		return metadata->value(idx);
 	}
@@ -171,7 +171,7 @@ HttpFunctionConnection::HttpFunctionConnection(
     const std::shared_ptr<VgiAttachParameters> &attach_params)
     : conn_id_hex_(VgiGenerateConnId()), base_url_(worker_path),
       function_name_(function_name), function_type_(function_type),
-      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
+      arguments_batch_(arguments.batch), attach_opaque_data_(attach_opaque_data),
       transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
       attach_params_(attach_params) {
@@ -211,8 +211,8 @@ std::string HttpFunctionConnection::GetTransactionOpaqueDataDigest() const {
 // ============================================================================
 
 std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
-    const std::shared_ptr<arrow::RecordBatch> &batch,
-    const std::shared_ptr<arrow::Schema> &schema) {
+    const VgiBatchPtr &batch,
+    const VgiSchemaPtr &schema) {
 	// Guard: the batch must match the declared (worker-facing) schema. Arrow's
 	// stream writer enforced this (schema equality, metadata excluded — the
 	// same check MakeStreamWriter's WriteRecordBatch performs); we replicate it
@@ -221,9 +221,9 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 	// ReconcileBatchToSchema guarantees a match.
 	if (schema && batch->schema().get() != schema.get() &&
 	    !batch->schema()->Equals(*schema, /*check_metadata=*/false)) {
-		std::string writer_schema_str = schema->ToString(/*show_metadata=*/true);
+		std::string writer_schema_str = schema->ToString();
 		std::string batch_schema_str = batch->schema()
-		    ? batch->schema()->ToString(/*show_metadata=*/true) : "<null>";
+		    ? batch->schema()->ToString() : "<null>";
 		throw IOException(
 		    "Failed to write batch: schema mismatch\n"
 		    "  writer schema (advertised at bind):\n%s\n"
@@ -232,23 +232,19 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 	}
 
 	// Build metadata with stream_state and optional dynamic filters
-	std::vector<std::string> meta_keys;
-	std::vector<std::string> meta_values;
+	std::vector<std::pair<std::string, std::string>> meta_pairs;
 	if (!stream_state_token_.empty()) {
-		meta_keys.push_back(RPC_STREAM_STATE_KEY);
-		meta_values.push_back(stream_state_token_);
+		meta_pairs.emplace_back(RPC_STREAM_STATE_KEY, stream_state_token_);
 	}
 	if (!call_state_token_.empty()) {
-		meta_keys.push_back(RPC_CALL_STATE_KEY);
-		meta_values.push_back(call_state_token_);
+		meta_pairs.emplace_back(RPC_CALL_STATE_KEY, call_state_token_);
 	}
 	if (tick_filter_state_) {
 		// Only a delta this stream has not been sent yet; an unchanged filter
 		// rides no tick at all (see UpdateDynamicFilterState).
 		auto delta = tick_filter_cursor_.Take(*tick_filter_state_);
 		if (!delta.empty()) {
-			meta_keys.push_back("vgi_pushdown_filters");
-			meta_values.push_back(std::move(delta));
+			meta_pairs.emplace_back("vgi_pushdown_filters", std::move(delta));
 		}
 	}
 	// Conditional-revalidation validators (M6): send once on the first tick that
@@ -256,23 +252,20 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 	// vgi.cache.if_none_match / if_modified_since to answer 304 not_modified.
 	if (!cond_sent_ && (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty())) {
 		if (!cond_if_none_match_.empty()) {
-			meta_keys.push_back(VGI_CACHE_IF_NONE_MATCH_KEY);
-			meta_values.push_back(cond_if_none_match_);
+			meta_pairs.emplace_back(VGI_CACHE_IF_NONE_MATCH_KEY, cond_if_none_match_);
 		}
 		if (!cond_if_modified_since_.empty()) {
-			meta_keys.push_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY);
-			meta_values.push_back(cond_if_modified_since_);
+			meta_pairs.emplace_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY, cond_if_modified_since_);
 		}
 		cond_sent_ = true;
 	}
 	if (pending_tick_) {
-		meta_keys.push_back(VGI_STATUS_KEY);
-		meta_values.push_back(VGI_STATUS_CONTINUE);
+		meta_pairs.emplace_back(VGI_STATUS_KEY, VGI_STATUS_CONTINUE);
 		pending_tick_ = false;
 	}
-	std::shared_ptr<arrow::KeyValueMetadata> metadata;
-	if (!meta_keys.empty()) {
-		metadata = arrow::KeyValueMetadata::Make(meta_keys, meta_values);
+	VgiMetadataPtr metadata;
+	if (!meta_pairs.empty()) {
+		metadata = VgiMetadata::Make(std::move(meta_pairs));
 	}
 
 	// Single-allocation serialization (schema + batch-with-metadata + EOS);
@@ -281,19 +274,19 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 	return SerializeToIpcBytes(batch, metadata);
 }
 
-std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ExtractStreamState(
-    const std::shared_ptr<arrow::RecordBatch> &batch,
-    const std::shared_ptr<arrow::KeyValueMetadata> &metadata) {
+VgiBatchPtr HttpFunctionConnection::ExtractStreamState(
+    const VgiBatchPtr &batch,
+    const VgiMetadataPtr &metadata) {
 	if (!metadata) {
 		return batch;
 	}
 
-	int idx = metadata->FindKey(RPC_STREAM_STATE_KEY);
+	int64_t idx = metadata->FindKey(RPC_STREAM_STATE_KEY);
 	if (idx >= 0) {
 		stream_state_token_ = metadata->value(idx);
 	}
 	// Only /init carries this; keep the first one we see for the whole stream.
-	int call_idx = metadata->FindKey(RPC_CALL_STATE_KEY);
+	int64_t call_idx = metadata->FindKey(RPC_CALL_STATE_KEY);
 	if (call_idx >= 0) {
 		call_state_token_ = metadata->value(call_idx);
 	}
@@ -301,7 +294,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ExtractStreamState(
 	return batch;
 }
 
-void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> owned, size_t offset) {
+void HttpFunctionConnection::BufferDataBatches(VgiBufferPtr owned, size_t offset) {
 	buffered_batches_.clear();
 	buffered_batch_indexes_.clear();
 	buffered_partition_values_bytes_.clear();
@@ -318,20 +311,21 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 	}
 	const size_t data_bytes = static_cast<size_t>(owned->size()) - offset;
 
-	// Slice the data section out of the owning buffer — Arrow IPC zero-copy
-	// reads reference the parent buffer through the slice's refcount, so no
-	// copy of the payload is made here.
-	auto buffer = arrow::SliceBuffer(std::move(owned), static_cast<int64_t>(offset));
-	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
+	// Slice the data section out of the owning buffer — the IPC reader's
+	// ReadBuffer returns zero-copy slices that reference the parent buffer's
+	// owner, so no copy of the payload is made here.
+	auto buffer = owned->Slice(static_cast<int64_t>(offset), static_cast<int64_t>(data_bytes));
+	owned.reset();
+	std::unique_ptr<VgiIpcReader> reader;
+	try {
+		reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(std::move(buffer)));
+	} catch (const std::exception &) {
 		if (function_name_ == VGI_QUERY_EXECUTOR) {
 			throw IOException("vgi_query response has an invalid Arrow output stream");
 		}
 		// Empty data stream is valid (no output yet)
 		return;
 	}
-	auto reader = reader_result.ValueUnsafe();
 	if (function_name_ == VGI_QUERY_EXECUTOR &&
 	    !reader->schema()->Equals(*cached_output_schema_, true)) {
 		throw IOException("vgi_query output stream schema differs from the prepared schema");
@@ -349,29 +343,35 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 	while (true) {
 		// A bundled response can hold many batches, each possibly an external
 		// location costing its own GET.
-		if (context_.interrupted) {
+		if (context_.IsInterrupted()) {
 			throw InterruptException();
 		}
-		auto read_result = reader->ReadNext();
-		if (function_name_ == VGI_QUERY_EXECUTOR && !read_result.ok()) {
-			throw IOException("vgi_query response contains an invalid Arrow batch: %s",
-			                  read_result.status().ToString());
-		}
-		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
+		// A stream that ends early or carries a malformed message ends the
+		// response (lenient HTTP bodies), except for a prepared query.
+		VgiBatchPtr batch;
+		try {
+			batch = reader->ReadNext();
+		} catch (const std::exception &e) {
+			if (function_name_ == VGI_QUERY_EXECUTOR) {
+				throw IOException("vgi_query response contains an invalid Arrow batch: %s", RawMessageOf(e));
+			}
 			break;
 		}
-		auto &bwm = read_result.ValueUnsafe();
+		if (!batch) {
+			break;
+		}
+		const VgiMetadataPtr &batch_metadata = batch->metadata();
 
 		// Check for log/error batches
-		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
+		auto batch_type = ClassifyBatch(batch, batch_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
+			HandleBatchLogMessage(batch, batch_metadata, &context_, base_url_,
 			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 			                     &log_error_context);
 			throw IOException(violation, "VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
+			HandleBatchLogMessage(batch, batch_metadata, &context_, base_url_,
 			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 			                     &log_error_context);
 			++spike_log_batches;
@@ -381,10 +381,10 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 		// Resolve external location pointer batches.
 		// Stream_state is inside the resolved data, not on the pointer batch itself.
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
-			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
+			auto location_url = batch_metadata->value(batch_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
-			                                         bwm.custom_metadata, &context_.interrupted, GetConnIdHex());
+			                                         batch_metadata, &context_, GetConnIdHex());
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_, violation));
 			buffered_partition_values_bytes_.push_back(
@@ -399,17 +399,17 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 
 		// Validate what DuckDB will read (externalized batches above are
 		// validated by the reader that fetched them).
-		ValidateWorkerBatch(&context_, bwm.batch.get(), base_url_);
+		ValidateWorkerBatch(&context_, batch.get(), base_url_);
 
 		// Extract stream_state from regular data batches.
-		ExtractStreamState(bwm.batch, bwm.custom_metadata);
-		buffered_batches_.push_back(bwm.batch);
-		buffered_batch_indexes_.push_back(ParseVgiBatchIndex(bwm.custom_metadata, base_url_, violation));
+		ExtractStreamState(batch, batch_metadata);
+		buffered_batches_.push_back(batch);
+		buffered_batch_indexes_.push_back(ParseVgiBatchIndex(batch_metadata, base_url_, violation));
 		buffered_partition_values_bytes_.push_back(
-		    ParseVgiB64Bytes(bwm.custom_metadata, "vgi_partition_values#b64", base_url_, violation));
+		    ParseVgiB64Bytes(batch_metadata, "vgi_partition_values#b64", base_url_, violation));
 		buffered_parent_row_bytes_.push_back(
-		    ParseVgiB64Bytes(bwm.custom_metadata, "vgi_rpc.parent_row#b64", base_url_, violation));
-		buffered_cache_controls_.push_back(ParseVgiCacheControl(bwm.custom_metadata));
+		    ParseVgiB64Bytes(batch_metadata, "vgi_rpc.parent_row#b64", base_url_, violation));
+		buffered_cache_controls_.push_back(ParseVgiCacheControl(batch_metadata));
 		++spike_data_batches;
 	}
 
@@ -428,7 +428,7 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 // Phase 1: Bind
 // ============================================================================
 
-void HttpFunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {
+void HttpFunctionConnection::SetInputSchema(const VgiSchemaPtr &input_schema) {
 	// HTTP has no "worker spawned" lifecycle marker (every RPC is its own
 	// POST), so we don't gate this. The schema is captured into the bind
 	// RPC payload at the time PerformBindRpc runs; calling SetInputSchema
@@ -437,7 +437,7 @@ void HttpFunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema>
 	input_schema_ = input_schema;
 }
 
-void HttpFunctionConnection::UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) {
+void HttpFunctionConnection::UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) {
 	if (input_writer_opened_) {
 		throw IOException("HttpFunctionConnection::UpdateInputSchemaForExecution called after OpenInputWriter [url: %s]",
 		                   base_url_);
@@ -455,7 +455,7 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 	}
 
 	// Transport: send bind via HTTP
-	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
+	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> VgiBatchPtr {
 		auto rpc_params = ::duckdb::vgi::generated::BuildBindParams(request_bytes);
 		auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 		auto cached_params = attach_params_ && IsHttpTransport(base_url_)
@@ -475,7 +475,7 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 	};
 
 	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
-	                                        arguments_array_, input_schema_, attach_opaque_data_,
+	                                        arguments_batch_, input_schema_, attach_opaque_data_,
 	                                        transaction_opaque_data_, settings_, required_secrets_,
 	                                        base_url_, transport_fn, at_unit_, at_value_,
 	                                        copy_from_ ? &*copy_from_ : nullptr,
@@ -497,8 +497,8 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 
 InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
                                                 const std::vector<int32_t> &projection_ids,
-                                                std::shared_ptr<arrow::Buffer> pushdown_filters,
-                                                std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
+                                                VgiBufferPtr pushdown_filters,
+                                                std::vector<VgiBufferPtr> join_keys,
                                                 const std::string &phase,
                                                 const std::optional<OrderByHint> &order_by,
                                                 const std::optional<TableSampleHint> &table_sample,
@@ -540,7 +540,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		ts_seed = table_sample->seed;
 	}
 
-	// Build InitRequest — pass arrow::Buffer directly to avoid copying
+	// Build InitRequest — pass the VgiBuffers directly to avoid copying
 	auto init_request = BuildInitRequest(
 	    bind_result.bind_request_bytes,
 	    bind_result.output_schema_bytes,
@@ -615,29 +615,29 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
 	                                        /*cookie_jar=*/nullptr, cached_params_init, &http_client_,
 	                                        &harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-	                                        &context_.interrupted, &call_error_context);
+	                                        &context_, &call_error_context);
 	PublishHarvestedCapabilities(harvested);
 #ifdef __EMSCRIPTEN__
 #endif
 
-	// Adopt the response body as the single owning Arrow buffer. The header
+	// Adopt the response body as the single owning buffer. The header
 	// parse and the data-section buffering below both operate on zero-copy
 	// slices of it — previously the whole payload was copied twice more
 	// (CopyToOwnedBuffer for the header parse + substr for the data section),
 	// tripling peak memory for a large first producer turn.
-	auto owned_body = arrow::Buffer::FromString(std::move(response_body));
+	auto owned_body = VgiBuffer::FromString(std::move(response_body));
 
 	// Parse response: header IPC stream + data IPC stream
 	auto header_result = ReadStreamHeaderFromBuffer(owned_body, &context_, init_url);
 
 	// Resolve external location pointer batch in stream header if needed
 	if (header_result.header.header_batch && header_result.header.metadata) {
-		int loc_idx = header_result.header.metadata->FindKey(RPC_LOCATION_KEY);
+		int64_t loc_idx = header_result.header.metadata->FindKey(RPC_LOCATION_KEY);
 		if (loc_idx >= 0) {
 			auto location_url = header_result.header.metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, base_url_, GetExecutionIdHex(),
 			                                         GetAttachOpaqueDataDigest(), header_result.header.metadata,
-			                                         &context_.interrupted, GetConnIdHex());
+			                                         &context_, GetConnIdHex());
 			header_result.header.header_batch = resolved.batch;
 			header_result.header.metadata = resolved.metadata;
 		}
@@ -734,9 +734,9 @@ void HttpFunctionConnection::PerformFinalizeInit(const BindResult &bind_result) 
 	global_execution_id_ = execution_id_;
 
 	struct RestoreGuard {
-		std::shared_ptr<arrow::Schema> &input_schema;
+		VgiSchemaPtr &input_schema;
 		std::vector<uint8_t> &global_exec_id;
-		std::shared_ptr<arrow::Schema> saved_schema;
+		VgiSchemaPtr saved_schema;
 		std::vector<uint8_t> saved_id;
 		~RestoreGuard() {
 			input_schema = std::move(saved_schema);
@@ -756,7 +756,7 @@ void HttpFunctionConnection::OpenInputWriter() {
 	input_writer_opened_ = true;
 }
 
-void HttpFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
+void HttpFunctionConnection::WriteInputBatch(const VgiBatchPtr &batch) {
 	if (!input_writer_opened_) {
 		throw IOException("HttpFunctionConnection::WriteInputBatch called before OpenInputWriter [url: %s]", base_url_);
 	}
@@ -770,7 +770,7 @@ void HttpFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::Record
 	// not match the schema the IPC stream was opened with even when the
 	// data would round-trip cleanly. ReconcileBatchToSchema handles the
 	// metadata reshape (no copy) and any genuine type cast
-	// (arrow::compute::Cast) recursively into nested types. Fast-path
+	// recursively into nested types. Fast-path
 	// returns the batch unchanged when schemas already match. This mirrors
 	// FunctionConnection::WriteInputBatch (subprocess transport) which
 	// gained the same call in commit ca8ad96.
@@ -786,11 +786,11 @@ void HttpFunctionConnection::WriteContinuationTick() {
 		throw IOException("HttpFunctionConnection::WriteContinuationTick called without an open input writer [url: %s]",
 		                  base_url_);
 	}
-	auto tick = arrow::RecordBatch::MakeEmpty(input_schema_);
-	if (!tick.ok()) {
-		throw IOException("Failed to build continuation tick: %s [url: %s]", tick.status().ToString(), base_url_);
+	try {
+		pending_input_ = VgiBatch::MakeEmpty(input_schema_);
+	} catch (const std::exception &e) {
+		throw IOException("Failed to build continuation tick: %s [url: %s]", RawMessageOf(e), base_url_);
 	}
-	pending_input_ = tick.ValueUnsafe();
 	pending_tick_ = true;
 }
 
@@ -815,7 +815,7 @@ namespace {
 // Decode the outer envelope's 'result' column (binary blob containing
 // IPC bytes of the inner response batch). Returns nullptr if 'result' is null
 // (used for empty-response methods like table_buffering_destructor).
-std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseResult &response,
+VgiBatchPtr DecodeHttpOuterResponse(const UnaryResponseResult &response,
                                                               const std::string &method_name,
                                                               const std::string &base_url) {
 	return UnwrapResultEnvelope(response.batch, method_name,
@@ -833,7 +833,7 @@ std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseR
 std::vector<uint8_t>
 HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
                                                     const std::vector<uint8_t> &execution_id,
-                                                    const std::shared_ptr<arrow::RecordBatch> &input_batch,
+                                                    const VgiBatchPtr &input_batch,
                                                     std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id,
@@ -906,7 +906,7 @@ void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &func
 	(void)inner;
 }
 
-std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
+VgiBatchPtr HttpFunctionConnection::ReadDataBatch() {
 	if (!init_done_) {
 		throw IOException("HttpFunctionConnection::ReadDataBatch called before PerformInit [url: %s]", base_url_);
 	}
@@ -936,11 +936,12 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		// Continuation: POST exchange with state token to get more data. The
 		// request itself is cancellable, but a fast worker answers each one before
 		// an interrupt lands mid-transfer, so check between them too.
-		if (context_.interrupted) {
+		if (context_.IsInterrupted()) {
 			throw InterruptException();
 		}
-		auto tick_schema = arrow::schema({});
-		auto tick_batch = arrow::RecordBatch::Make(tick_schema, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+		// Immutable and shared: built once, reused by every continuation tick.
+		static const VgiSchemaPtr tick_schema = VgiSchema::Empty();
+		static const VgiBatchPtr tick_batch = VgiBatch::MakeEmpty(tick_schema);
 
 		auto body = SerializeBatchWithState(tick_batch, tick_schema);
 
@@ -962,11 +963,11 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
 		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_,
 		                                        &p_harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-		                                        &context_.interrupted, &call_error_context);
+		                                        &context_, &call_error_context);
 		PublishHarvestedCapabilities(p_harvested);
 
 		// Parse response — buffer new data batches (adopt the body, no copy)
-		BufferDataBatches(arrow::Buffer::FromString(std::move(response_body)));
+		BufferDataBatches(VgiBuffer::FromString(std::move(response_body)));
 
 		if (buffered_batch_index_ < buffered_batches_.size()) {
 			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
@@ -1042,13 +1043,13 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
 	                                        /*cookie_jar=*/nullptr, x_cached_params, &http_client_,
 	                                        &x_harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-	                                        &context_.interrupted, &call_error_context);
+	                                        &context_, &call_error_context);
 	PublishHarvestedCapabilities(x_harvested);
 
-	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
-	auto buffer = arrow::Buffer::FromString(std::move(response_body));
-	auto input_stream = std::make_shared<arrow::io::BufferReader>(buffer);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input_stream);
+	// Parse response — adopt the body as the owning buffer (no copy); the
+	// decoded batches zero-copy reference it.
+	auto buffer = VgiBuffer::FromString(std::move(response_body));
+	std::unique_ptr<VgiIpcReader> reader;
 	const auto violation =
 	    HttpFunctionInfo(error_subtype::kProtocolViolation, base_url_, function_name_, function_type_);
 	// Reset batch_index + partition_values BEFORE the loop (and before the
@@ -1063,7 +1064,9 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	last_parent_row_bytes_.clear();
 	last_cache_control_ = VgiCacheControl{};
 	last_more_output_ = false;
-	if (!reader_result.ok()) {
+	try {
+		reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(std::move(buffer)));
+	} catch (const std::exception &) {
 		// While output is pending this exchange was a continuation tick, which the
 		// worker must answer with a reply; an empty body would otherwise end the
 		// output silently (or, with a stale "more", tick forever).
@@ -1072,32 +1075,38 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			                  function_name_);
 		}
 		// Empty response in exchange mode means no output for this input
-		return arrow::RecordBatch::Make(
-		    cached_output_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+		return VgiBatch::MakeEmpty(cached_output_schema_);
 	}
-	auto reader = reader_result.ValueUnsafe();
 
 	const auto log_error_context = HttpFunctionInfo(nullptr, base_url_, function_name_, function_type_);
-	std::shared_ptr<arrow::RecordBatch> output_batch;
+	VgiBatchPtr output_batch;
 	std::string new_state_token;
 
 	while (true) {
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
+		// A stream that ends early or carries a malformed message ends the
+		// response (lenient HTTP bodies), as before.
+		VgiBatchPtr batch;
+		try {
+			batch = reader->ReadNext();
+		} catch (const std::exception &) {
 			break;
 		}
-		auto bwm = std::move(read_result).ValueUnsafe();
+		if (!batch) {
+			break;
+		}
+		// By value: an externalized batch is replaced by the resolved one below.
+		VgiMetadataPtr batch_metadata = batch->metadata();
 
 		// Dispatch log/error batches
-		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
+		auto batch_type = ClassifyBatch(batch, batch_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
+			HandleBatchLogMessage(batch, batch_metadata, &context_, base_url_,
 			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 			                     &log_error_context);
 			throw IOException(violation, "VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
+			HandleBatchLogMessage(batch, batch_metadata, &context_, base_url_,
 			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 			                     &log_error_context);
 			continue;
@@ -1109,43 +1118,43 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		// RESOLVED batch's metadata, not the pointer's. (The fetching reader
 		// already validated it.)
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
-			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
+			auto location_url = batch_metadata->value(batch_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataDigest(),
-			                                         bwm.custom_metadata, &context_.interrupted, GetConnIdHex());
-			bwm.batch = std::move(resolved.batch);
-			bwm.custom_metadata = std::move(resolved.metadata);
+			                                         batch_metadata, &context_, GetConnIdHex());
+			batch = std::move(resolved.batch);
+			batch_metadata = std::move(resolved.metadata);
 		} else {
-			ValidateWorkerBatch(&context_, bwm.batch.get(), base_url_);
+			ValidateWorkerBatch(&context_, batch.get(), base_url_);
 		}
 
 		// Data batch — extract stream_state
-		new_state_token = ExtractStreamStateValue(bwm.custom_metadata);
+		new_state_token = ExtractStreamStateValue(batch_metadata);
 		// Parse vgi_batch_index + vgi_partition_values#b64 off the wire
 		// if present. Only update on positive matches — a subsequent
 		// continuation batch carrying STATE_KEY but no values must NOT
 		// clobber values parsed from the upstream data batch. Validation
 		// happens in VgiTableFunctionImpl::InstallBatch on the consumer.
 		{
-			const idx_t parsed = ParseVgiBatchIndex(bwm.custom_metadata, base_url_, violation);
+			const idx_t parsed = ParseVgiBatchIndex(batch_metadata, base_url_, violation);
 			if (parsed != DConstants::INVALID_INDEX) {
 				last_batch_index_ = parsed;
 			}
-			std::string pv = ParseVgiB64Bytes(bwm.custom_metadata, "vgi_partition_values#b64", base_url_, violation);
+			std::string pv = ParseVgiB64Bytes(batch_metadata, "vgi_partition_values#b64", base_url_, violation);
 			if (!pv.empty()) {
 				last_partition_values_bytes_ = std::move(pv);
 			}
-			last_parent_row_bytes_ = ParseVgiB64Bytes(bwm.custom_metadata, "vgi_rpc.parent_row#b64", base_url_, violation);
-			auto cc = ParseVgiCacheControl(bwm.custom_metadata);
+			last_parent_row_bytes_ = ParseVgiB64Bytes(batch_metadata, "vgi_rpc.parent_row#b64", base_url_, violation);
+			auto cc = ParseVgiCacheControl(batch_metadata);
 			if (cc.present) {
 				last_cache_control_ = cc;
 			}
-			if (HasMoreOutputStatus(bwm.custom_metadata)) {
+			if (HasMoreOutputStatus(batch_metadata)) {
 				last_more_output_ = true;
 			}
 		}
 		if (!output_batch) {
-			output_batch = bwm.batch;
+			output_batch = batch;
 		}
 	}
 
@@ -1176,41 +1185,18 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 		return;
 	}
 
-	auto schema = arrow::schema({});
-	auto cancel_batch = arrow::RecordBatch::Make(schema, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-
-	auto sink_result = arrow::io::BufferOutputStream::Create();
-	if (!sink_result.ok()) {
-		return;
-	}
-	auto sink = sink_result.ValueUnsafe();
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
-	if (!writer_result.ok()) {
-		return;
-	}
-	auto writer = writer_result.ValueUnsafe();
-
-	auto metadata = arrow::KeyValueMetadata::Make(
-	    {RPC_STREAM_STATE_KEY, std::string(generated::VGI_RPC_CANCEL_KEY)},
-	    {token, "1"});
+	VgiMetadata metadata {{RPC_STREAM_STATE_KEY, token}, {std::string(generated::VGI_RPC_CANCEL_KEY), "1"}};
 	if (!call_state_token_.empty()) {
-		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make(
-		    {RPC_CALL_STATE_KEY}, {call_state_token_}));
+		metadata.Set(RPC_CALL_STATE_KEY, call_state_token_);
 	}
-	auto write_status = writer->WriteRecordBatch(*cancel_batch, metadata);
-	if (!write_status.ok()) {
+	std::vector<uint8_t> body;
+	try {
+		auto cancel_batch = VgiBatch::MakeEmpty(VgiSchema::Empty());
+		body = SerializeBatch(*cancel_batch, &metadata)->ToVector();
+	} catch (const std::exception &) {
+		// Best-effort, as before: a cancel that cannot be encoded is dropped.
 		return;
 	}
-	auto close_status = writer->Close();
-	if (!close_status.ok()) {
-		return;
-	}
-	auto finish_result = sink->Finish();
-	if (!finish_result.ok()) {
-		return;
-	}
-	auto buffer = finish_result.ValueUnsafe();
-	std::vector<uint8_t> body(buffer->data(), buffer->data() + buffer->size());
 
 	std::string exchange_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/exchange";
 	auto c_auth = attach_params_ ? attach_params_->auth() : nullptr;
@@ -1223,7 +1209,7 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 	(void)HttpPostArrowIpc(live_context, exchange_url, body, c_auth,
 	                        /*cookie_jar=*/nullptr, c_cached_params, nullptr, nullptr,
 	                        attach_params_ ? attach_params_->iroh() : nullptr,
-	                        &live_context.interrupted);
+	                        &live_context);
 }
 
 } // namespace vgi

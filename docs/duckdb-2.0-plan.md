@@ -1,15 +1,18 @@
 # VGI migration plan for DuckDB 2.0
 
-**Status:** protocol preparation started on DuckDB 1.5.x, October 13, 2026. Planning branch:
-`codex/duckdb-2.0-plan`, starting at VGI `74015fc3cb0b`. Implementation continues
-on `codex/duckdb-2.0-protocol` in the isolated `vgi-duckdb2` worktree.
+**Status (October 27):** native DuckDB 2.0 implementation is now in progress on
+`v2.0` in `~/Development/vgi`. It combines protocol preparation at `0592bf510d66`
+with the existing `nanoarrow-migration` work at `b3a65011`. The earlier 1.5.x
+preparation remains on `codex/duckdb-2.0-protocol` in `vgi-duckdb2`.
 
-**Build/test workflow:** edit the isolated worktrees locally, then synchronize
+**Build/test workflow:** edit locally, then synchronize
 source changes to `ec2-user@54.224.166.207` and build/test there (same instance, resumed October 27;
 previous addresses `18.234.89.245`, `3.82.45.233`, `98.81.121.120`, `18.234.138.19`, `32.192.49.19` and `52.90.218.118`). This task owns
 `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC` on that Linux ARM64 host (48 CPUs).
 Keep source copies, build outputs, logs, and test state inside that unique
 directory. Record the synchronized revisions and local changes with each run.
+The native 2.0/nanoarrow build has its own subdirectory,
+`vgi-native2-nano-20261027-1i9LOE`, separate from the qualified 1.5 binaries.
 Synchronize by content and give changed remote inputs fresh timestamps so a
 local edit made during a remote build cannot leave stale objects undetected.
 The implementation goal is active. Preparing this remote workspace does not
@@ -17,8 +20,49 @@ qualify any protocol/native migration gate.
 
 **Overall completion: incomplete. P0 scope/inventory review is complete.** The
 October 23 combined review and remote checks cover every scope and field mapping.
-P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation,
-not a frozen protocol or a native DuckDB 2.0 port.
+P1–P3 and M0–M4 remain open. The tested groundwork below is partial implementation;
+the native 2.0 port has started and is not yet qualified.
+
+**Native 2.0 + nanoarrow implementation checkpoint (October 27):** the engine
+now builds from Haybarn `19e399c22f53` plus the committed minimal HTTP parameter
+clone patch, `831cdbed22ea`. The patch provides request-private cancellation
+contexts while retaining HTTPFS parameters; two regression cases with 17
+assertions pass. The final engine pin, `5afbe7302db8`, also adds a missing
+include in an upstream test; production artifacts retain the tested
+`831cdbed22ea`/dev88798 version configuration. All 113 VGI production
+translation units now compile, and the static/loadable
+extensions and `v2.0.0-dev88798` shell link. Loading the new extension succeeds.
+The full native unit suite passes 177 cases / 2,703 assertions; the filter suite
+passes 15 cases / 221 assertions. Settings pass 8 / 137 and cancellation passes
+9 / 37, and the HTTP suite passes 9 cases / 276 assertions. Focused catalog/query
+contracts pass 48 cases / 716 assertions. Fixture-backed contracts and the full
+framework-language SQLLogic matrix are still being qualified. Native Iroh is disabled in this initial lane; these
+results do not establish optional Iroh or other-platform coverage.
+
+On DuckDB 2, VGI follows the engine's conservative HTTP retry policy: the HTTP
+transport does not automatically retry POSTs, including read-only RPCs. Cached retry settings are
+preserved, but do not authorize replay of a POST. HTTP GETs used to fetch
+externalized batches retain configured engine retries. Protected mutations
+continue to use the existing single-attempt policy; this adds no response-loss
+recovery or replay mechanism.
+
+The v3 record shapes and fingerprints are retained while replacing Arrow C++
+with nanoarrow. Python generator commit `81a182bc08e4` adds an explicit
+`--native-cpp-backend nanoarrow` option; default Arrow C++ generation remains
+available. Its 37 focused tests, lint/format checks, all-SDK default generation
+check and native nanoarrow generation check pass on EC2. Native contracts,
+query parameters, strict IPC framing and metadata validation have been ported
+to nanoarrow; their execution checks are being completed against the new binary.
+
+DuckDB 2.0 adaptation includes bound function signatures, raw `Identifier`
+conversion at catalog boundaries, nullable default schemas, active
+`ExpressionFilter` nodes and projection-index mapping. In particular, the 2.0
+optimizer remaps pushed filter indices through `LogicalGet::column_ids`;
+retaining the 1.5 mapping would target incorrect columns after pruning.
+Existing required-filter, nested-struct, buffered-filter and native-delegation
+SQL tests must qualify that change. Automatic whole-query pushdown remains
+separate outstanding adapter work. Java/Rust publication below is still a
+release gate, and is not a prerequisite for this isolated native development.
 
 **Dependency fix preparation (October 27):** the minimal Java RPC dictionary
 fix is committed, with a 0.33.2 release candidate. Its full core suite passes

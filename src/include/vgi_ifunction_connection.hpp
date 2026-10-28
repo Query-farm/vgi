@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -8,7 +10,6 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
@@ -33,7 +34,7 @@ inline constexpr const char *VGI_STATUS_HAVE_MORE_OUTPUT = "HAVE_MORE_OUTPUT";
 inline constexpr const char *VGI_STATUS_CONTINUE = "CONTINUE";
 
 // Whether a data batch's metadata says ``vgi.status: HAVE_MORE_OUTPUT``.
-inline bool HasMoreOutputStatus(const std::shared_ptr<const arrow::KeyValueMetadata> &metadata) {
+inline bool HasMoreOutputStatus(const VgiMetadataPtr &metadata) {
 	if (!metadata) {
 		return false;
 	}
@@ -42,8 +43,8 @@ inline bool HasMoreOutputStatus(const std::shared_ptr<const arrow::KeyValueMetad
 }
 
 // The metadata a continuation tick carries.
-inline std::shared_ptr<arrow::KeyValueMetadata> ContinuationTickMetadata() {
-	return arrow::KeyValueMetadata::Make({VGI_STATUS_KEY}, {VGI_STATUS_CONTINUE});
+inline VgiMetadataPtr ContinuationTickMetadata() {
+	return VgiMetadata::Make({{VGI_STATUS_KEY, VGI_STATUS_CONTINUE}});
 }
 
 class PooledWorker;
@@ -155,7 +156,7 @@ public:
 	// HTTP transport has no spawn step; this is a no-op there.
 	virtual void EnsureWorkerSpawned() = 0;
 
-	virtual void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) = 0;
+	virtual void SetInputSchema(const VgiSchemaPtr &input_schema) = 0;
 
 	// Set the time-travel AT clause (empty = none) carried into the bind request
 	// so function-backed tables can read it at init via init_call.bind_call.at_value.
@@ -211,7 +212,7 @@ public:
 
 	// Update input schema for execute phase (after bind, before OpenInputWriter)
 	// Used when reusing bind connection and actual DataChunk types differ from bind types
-	virtual void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) = 0;
+	virtual void UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) = 0;
 
 	// Send the VGI init RPC. The bind_result must come from a prior
 	// PerformBindRpc on this connection — its bind_request_bytes,
@@ -230,8 +231,8 @@ public:
 	// nullopt means "no finalize_state_id supplied" (non-finalize phases).
 	virtual InitResult PerformInit(const BindResult &bind_result,
 	                               const std::vector<int32_t> &projection_ids = {},
-	                               std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
-	                               std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
+	                               VgiBufferPtr pushdown_filters = nullptr,
+	                               std::vector<VgiBufferPtr> join_keys = {},
 	                               const std::string &phase = "",
 	                               const std::optional<OrderByHint> &order_by = std::nullopt,
 	                               const std::optional<TableSampleHint> &table_sample = std::nullopt,
@@ -253,9 +254,9 @@ public:
 
 	// Phase 3: Data exchange
 	virtual void OpenInputWriter() = 0;
-	virtual void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) = 0;
+	virtual void WriteInputBatch(const VgiBatchPtr &batch) = 0;
 	virtual void CloseInputWriter() = 0;
-	virtual std::shared_ptr<arrow::RecordBatch> ReadDataBatch() = 0;
+	virtual VgiBatchPtr ReadDataBatch() = 0;
 
 	// ========== Buffered Table Function RPCs ==========
 	// Used only when the function declared Meta.table_buffering = True. The
@@ -282,7 +283,7 @@ public:
 	virtual std::vector<uint8_t>
 	RpcTableBufferingProcess(const std::string &function_name,
 	                           const std::vector<uint8_t> &execution_id,
-	                           const std::shared_ptr<arrow::RecordBatch> &input_batch,
+	                           const VgiBatchPtr &input_batch,
 	                           std::optional<int64_t> batch_index = std::nullopt) = 0;
 
 	virtual std::vector<std::vector<uint8_t>>

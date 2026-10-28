@@ -24,10 +24,10 @@ public:
 	explicit SecretFreeFileOpener(ClientContext &context_p) : context(context_p) {
 	}
 
-	SettingLookupResult TryGetCurrentSetting(const string &key, Value &result) override {
+	SettingLookupResult TryGetCurrentSetting(const Identifier &key, Value &result) override {
 		return context.TryGetCurrentSetting(key, result);
 	}
-	SettingLookupResult TryGetCurrentSetting(const string &key, Value &result, FileOpenerInfo &) override {
+	SettingLookupResult TryGetCurrentSetting(const Identifier &key, Value &result, FileOpenerInfo &) override {
 		return context.TryGetCurrentSetting(key, result);
 	}
 	optional_ptr<ClientContext> TryGetClientContext() override {

@@ -75,14 +75,14 @@ static Value ExtractMaxValue(const BaseStatistics &stats) {
 }
 
 static unique_ptr<FunctionData> VgiTableStatisticsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto catalog_name = input.inputs[0].GetValue<string>();
 	auto schema_name = input.inputs[1].GetValue<string>();
 	auto table_name = input.inputs[2].GetValue<string>();
 
 	// Look up the table entry
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
-	auto table_entry = catalog.GetEntry<TableCatalogEntry>(context, schema_name, table_name,
+	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
+	auto table_entry = catalog.GetEntry<TableCatalogEntry>(context, Identifier(schema_name), Identifier(table_name),
 	                                                        OnEntryNotFound::THROW_EXCEPTION);
 
 	auto data = make_uniq<VgiTableStatisticsData>();
@@ -94,7 +94,7 @@ static unique_ptr<FunctionData> VgiTableStatisticsBind(ClientContext &context, T
 	for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
 		auto &col = columns.GetColumn(PhysicalIndex(i));
 		VgiTableStatisticsData::ColumnStat cs;
-		cs.column_name = col.GetName();
+		cs.column_name = col.GetName().GetIdentifierName();
 		cs.column_type = col.GetType();
 		cs.stats = table_entry->GetStatistics(context, i);
 
@@ -110,7 +110,7 @@ static unique_ptr<FunctionData> VgiTableStatisticsBind(ClientContext &context, T
 		if (type_tag_map.find(type_name) == type_tag_map.end()) {
 			auto tag = static_cast<uint8_t>(type_tag_map.size());
 			type_tag_map[type_name] = tag;
-			data->union_members.push_back({type_name, display_type});
+			data->union_members.push_back({Identifier(type_name), display_type});
 		}
 
 		data->columns.push_back(std::move(cs));
@@ -118,7 +118,7 @@ static unique_ptr<FunctionData> VgiTableStatisticsBind(ClientContext &context, T
 
 	// Build the UNION type (or use a single VARCHAR if no columns)
 	if (data->union_members.empty()) {
-		data->union_members.push_back({"varchar", LogicalType::VARCHAR});
+		data->union_members.push_back({Identifier("varchar"), LogicalType::VARCHAR});
 	}
 	data->union_type = LogicalType::UNION(data->union_members);
 

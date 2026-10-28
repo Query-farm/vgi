@@ -2,6 +2,8 @@
 #include "vgi_rpc_client.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "nanoarrow/nanoarrow.h"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
@@ -15,8 +17,7 @@ namespace vgi {
 // Batch Classification
 // ============================================================================
 
-RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata) {
+RpcBatchType ClassifyBatch(const VgiBatchPtr &batch, const VgiMetadataPtr &custom_metadata) {
 	// No metadata → DATA
 	if (!custom_metadata) {
 		return RpcBatchType::DATA;
@@ -34,7 +35,7 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 	// missing message field). Previously we required both keys for non-
 	// EXCEPTION levels, silently swallowing the LOG as a 0-row data
 	// batch — making the worker bug invisible at this layer.
-	int level_idx = custom_metadata->FindKey(RPC_LOG_LEVEL_KEY);
+	int64_t level_idx = custom_metadata->FindKey(RPC_LOG_LEVEL_KEY);
 	if (level_idx < 0) {
 		// Legacy key — HandleBatchLogMessage also falls back to "vgi.log_level".
 		// ClassifyBatch is the gate on the unary/header paths, so if it doesn't
@@ -52,7 +53,7 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 	}
 
 	// Check for external location (pointer batch)
-	int loc_idx = custom_metadata->FindKey(RPC_LOCATION_KEY);
+	int64_t loc_idx = custom_metadata->FindKey(RPC_LOCATION_KEY);
 	if (loc_idx >= 0) {
 		return RpcBatchType::EXTERNAL_LOCATION;
 	}
@@ -67,8 +68,8 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 
 // Handle a log or error batch. Returns true if it was handled (log/error),
 // false if it's a data batch that the caller should process.
-static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                          const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+static bool DispatchBatch(const VgiBatchPtr &batch,
+                          const VgiMetadataPtr &custom_metadata,
                           ClientContext *context, const std::string &worker_path, pid_t worker_pid,
                           const std::string &execution_id_hex = "",
                           const std::string &attach_opaque_data_digest = "",
@@ -101,11 +102,41 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 }
 
 // ============================================================================
+// IPC read-failure classification
+// ============================================================================
+
+bool IsIpcStreamInvalid(const std::exception &e) {
+	ErrorData error(e);
+	switch (error.Type()) {
+	case ExceptionType::INVALID_INPUT:   // malformed IPC (VgiIpcReader), closed Iroh stream
+	case ExceptionType::NOT_IMPLEMENTED: // unsupported IPC framing
+		return true;
+	case ExceptionType::IO: {
+		// The IPC reader's truncation errors (input ended mid-message or before
+		// the schema) and a closed fd stream: Arrow reported all of them as
+		// Status::Invalid. Anything else is the transport's own failure.
+		const auto &msg = error.RawMessage();
+		static const char *const kPrefixes[] = {"Expected to read ", "Expected to be able to read ",
+		                                        "Tried reading schema message", "Expected IPC message of type schema",
+		                                        "Stream is closed"};
+		for (const char *prefix : kPrefixes) {
+			if (msg.rfind(prefix, 0) == 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+	default:
+		return false;
+	}
+}
+
+// ============================================================================
 // Shared unary / stream-header reading
 // ============================================================================
 
-bool DispatchWorkerBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                         const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+bool DispatchWorkerBatch(const VgiBatchPtr &batch,
+                         const VgiMetadataPtr &custom_metadata,
                          const WorkerStreamOptions &opts) {
 	return DispatchBatch(batch, custom_metadata, opts.context, opts.log_worker.empty() ? opts.worker : opts.log_worker,
 	                     opts.pid, opts.execution_id_hex, opts.attach_opaque_data_digest,
@@ -124,21 +155,22 @@ template <typename... ARGS>
 	ThrowVgiIOException(msg, opts.worker, opts.pid, opts.execution_id_hex, params...);
 }
 
-std::shared_ptr<arrow::ipc::RecordBatchStreamReader>
-OpenWorkerStream(const std::shared_ptr<arrow::io::InputStream> &input, const WorkerStreamOptions &opts,
-                 const std::string &eof_msg, const std::string &open_msg) {
+std::unique_ptr<VgiIpcReader> OpenWorkerStream(const std::shared_ptr<VgiInputStream> &input,
+                                               const WorkerStreamOptions &opts, const std::string &eof_msg,
+                                               const std::string &open_msg) {
 	if (opts.before_read) {
 		opts.before_read();
 	}
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		auto status = reader_result.status();
-		if (status.IsInvalid()) {
+	try {
+		return VgiIpcReader::Open(input);
+	} catch (const InterruptException &) {
+		throw;
+	} catch (const std::exception &e) {
+		if (IsIpcStreamInvalid(e)) {
 			ThrowWorkerStreamError(opts, eof_msg);
 		}
-		ThrowWorkerStreamError(opts, open_msg, status.ToString());
+		ThrowWorkerStreamError(opts, open_msg, ErrorData(e).RawMessage());
 	}
-	return reader_result.ValueUnsafe();
 }
 
 enum class WorkerReadMode {
@@ -147,38 +179,46 @@ enum class WorkerReadMode {
 	STOP_ON_ERROR,     // any read error ends the read
 };
 
+// One batch read off a worker stream, with its message custom_metadata.
+struct WorkerBatch {
+	VgiBatchPtr batch;
+	VgiMetadataPtr custom_metadata;
+};
+
 // Read the next batch into `out`. False at end of stream (or on a read error
 // the mode tolerates). Cancellation always interrupts.
-bool NextWorkerBatch(arrow::ipc::RecordBatchStreamReader &reader, const WorkerStreamOptions &opts,
-                     arrow::RecordBatchWithMetadata &out, const std::string &fail_msg, WorkerReadMode mode) {
+bool NextWorkerBatch(VgiIpcReader &reader, const WorkerStreamOptions &opts, WorkerBatch &out,
+                     const std::string &fail_msg, WorkerReadMode mode) {
 	if (opts.before_read) {
 		opts.before_read();
 	}
-	auto read_result = reader.ReadNext();
-	if (!read_result.ok()) {
-		auto status = read_result.status();
-		if (status.IsCancelled()) {
-			throw InterruptException();
-		}
+	VgiBatchPtr batch;
+	try {
+		batch = reader.ReadNext();
+	} catch (const InterruptException &) {
+		throw;
+	} catch (const std::exception &e) {
 		if (mode == WorkerReadMode::STOP_ON_ERROR ||
-		    (mode == WorkerReadMode::EOS_ON_TRUNCATION && status.IsInvalid())) {
+		    (mode == WorkerReadMode::EOS_ON_TRUNCATION && IsIpcStreamInvalid(e))) {
+			out = WorkerBatch();
 			return false;
 		}
-		ThrowWorkerStreamError(opts, fail_msg, status.ToString());
+		ThrowWorkerStreamError(opts, fail_msg, ErrorData(e).RawMessage());
 	}
-	out = read_result.MoveValueUnsafe();
-	if (!out.batch) {
+	if (!batch) {
+		out = WorkerBatch();
 		return false;
 	}
+	out.custom_metadata = batch->metadata()->empty() ? nullptr : batch->metadata();
+	out.batch = std::move(batch);
 	ValidateWorkerBatch(opts.context, out.batch.get(), opts.worker);
 	return true;
 }
 
 // Drain to EOS after the data batch, still honouring log / error batches.
-void DrainWorkerStream(arrow::ipc::RecordBatchStreamReader &reader, const WorkerStreamOptions &opts,
-                       const std::string &fail_msg) {
+void DrainWorkerStream(VgiIpcReader &reader, const WorkerStreamOptions &opts, const std::string &fail_msg) {
 	auto mode = opts.lenient ? WorkerReadMode::STOP_ON_ERROR : WorkerReadMode::STRICT;
-	arrow::RecordBatchWithMetadata bwm;
+	WorkerBatch bwm;
 	while (NextWorkerBatch(reader, opts, bwm, fail_msg, mode)) {
 		DispatchWorkerBatch(bwm.batch, bwm.custom_metadata, opts);
 	}
@@ -186,7 +226,7 @@ void DrainWorkerStream(arrow::ipc::RecordBatchStreamReader &reader, const Worker
 
 } // namespace
 
-UnaryResponseResult ReadWorkerUnaryStream(const std::shared_ptr<arrow::io::InputStream> &input,
+UnaryResponseResult ReadWorkerUnaryStream(const std::shared_ptr<VgiInputStream> &input,
                                           const WorkerStreamOptions &opts) {
 	const std::string noun =
 	    !opts.noun.empty() ? opts.noun : (opts.http_messages ? "HTTP RPC response" : "RPC response");
@@ -194,7 +234,7 @@ UnaryResponseResult ReadWorkerUnaryStream(const std::shared_ptr<arrow::io::Input
 
 	// Log / error batches until the data batch.
 	UnaryResponseResult result;
-	arrow::RecordBatchWithMetadata bwm;
+	WorkerBatch bwm;
 	const auto mode = opts.lenient ? WorkerReadMode::EOS_ON_TRUNCATION : WorkerReadMode::STRICT;
 	bool at_eos = true;
 	while (NextWorkerBatch(*reader, opts, bwm, "Failed to read " + noun + " batch: %s", mode)) {
@@ -212,12 +252,12 @@ UnaryResponseResult ReadWorkerUnaryStream(const std::shared_ptr<arrow::io::Input
 	return result;
 }
 
-StreamHeaderResult ReadWorkerStreamHeader(const std::shared_ptr<arrow::io::InputStream> &input,
+StreamHeaderResult ReadWorkerStreamHeader(const std::shared_ptr<VgiInputStream> &input,
                                           const WorkerStreamOptions &opts) {
 	const bool http = opts.http_messages;
 	auto reader = OpenWorkerStream(input, opts, http ? "HTTP stream header EOF (no schema)" : "Stream header EOF (no schema)",
 	                               http ? "Failed to open HTTP stream header: %s" : "Failed to open stream header: %s");
-	arrow::RecordBatchWithMetadata bwm;
+	WorkerBatch bwm;
 
 	// An empty schema is an error stream (init failed): decode the error, drain,
 	// then rethrow it.
@@ -280,17 +320,18 @@ StreamHeaderResult ReadWorkerStreamHeader(const std::shared_ptr<arrow::io::Input
 // buffer-based equivalents further down. See vgi_platform.hpp.
 #if VGI_SUBPROCESS_TRANSPORT
 
-void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
+void WriteRpcRequest(const std::shared_ptr<VgiOutputStream> &sink,
                      const std::string &method_name,
-                     const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata,
+                     const VgiBatchPtr &params_batch,
+                     const VgiMetadataPtr &extra_metadata,
                      const VgiProtocolId &protocol) {
 	// Create an IPC stream writer with the params schema
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, params_batch->schema());
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create RPC request writer: " + writer_result.status().ToString());
+	std::unique_ptr<VgiIpcWriter> writer;
+	try {
+		writer = VgiIpcWriter::Open(sink, params_batch->schema());
+	} catch (const std::exception &e) {
+		throw IOException("Failed to create RPC request writer: " + ErrorData(e).RawMessage());
 	}
-	auto writer = writer_result.ValueUnsafe();
 
 	// Create custom metadata with method, wire version, application
 	// protocol_version, plus any caller-provided extras (e.g. shm segment
@@ -303,55 +344,48 @@ void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
 	// routing key, so it is what makes the request routable at all. Reserved
 	// server-level methods are resolved by the server before routing and are
 	// owned by no protocol, so they are sent without the key.
-	std::vector<std::string> keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY};
-	std::vector<std::string> values = {
-	    method_name,
-	    RPC_REQUEST_VERSION_VALUE,
-	};
+	VgiMetadata metadata;
+	metadata.Append(RPC_METHOD_KEY, method_name);
+	metadata.Append(RPC_REQUEST_VERSION_KEY, RPC_REQUEST_VERSION_VALUE);
 	// A protocol that declares no version (vgi_rpc.Reflection.v1, which is
 	// exempt from the version gate) is sent without the key, as other clients do.
 	if (!protocol.version.empty()) {
-		keys.push_back(RPC_PROTOCOL_VERSION_KEY);
-		values.emplace_back(protocol.version);
+		metadata.Append(RPC_PROTOCOL_VERSION_KEY, std::string(protocol.version));
 	}
 	if (!IsReservedRpcMethod(method_name)) {
-		keys.push_back(RPC_PROTOCOL_KEY);
-		values.emplace_back(protocol.name);
+		metadata.Append(RPC_PROTOCOL_KEY, std::string(protocol.name));
 	}
 	if (extra_metadata) {
 		for (int64_t i = 0; i < extra_metadata->size(); ++i) {
-			keys.push_back(extra_metadata->key(i));
-			values.push_back(extra_metadata->value(i));
+			metadata.Append(extra_metadata->key(i), extra_metadata->value(i));
 		}
 	}
-	auto metadata = arrow::KeyValueMetadata::Make(keys, values);
 
 	// Write the single-row batch with metadata
-	auto status = writer->WriteRecordBatch(*params_batch, metadata);
-	if (!status.ok()) {
-		throw IOException("Failed to write RPC request batch: " + status.ToString());
+	try {
+		writer->Write(*params_batch, &metadata);
+	} catch (const std::exception &e) {
+		throw IOException("Failed to write RPC request batch: " + ErrorData(e).RawMessage());
 	}
 
 	// Close writer (writes EOS marker)
-	status = writer->Close();
-	if (!status.ok()) {
-		throw IOException("Failed to close RPC request stream: " + status.ToString());
+	try {
+		writer->Close();
+	} catch (const std::exception &e) {
+		throw IOException("Failed to close RPC request stream: " + ErrorData(e).RawMessage());
 	}
 }
 
 void WriteRpcRequest(int fd, const std::string &method_name,
-                     const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata,
+                     const VgiBatchPtr &params_batch,
+                     const VgiMetadataPtr &extra_metadata,
                      const VgiProtocolId &protocol) {
 	WriteRpcRequest(std::make_shared<FdOutputStream>(fd), method_name, params_batch, extra_metadata, protocol);
 }
 
 void WriteEmptyRpcRequest(int fd, const std::string &method_name, const VgiProtocolId &protocol) {
-	// Create an empty schema with zero fields
-	auto schema = arrow::schema({});
-
-	// Create a 1-row batch with zero columns
-	auto batch = arrow::RecordBatch::Make(schema, 1, std::vector<std::shared_ptr<arrow::Array>> {});
+	// A 1-row batch with zero columns (zero-field schema)
+	auto batch = VgiBatch::FromColumns(VgiSchema::Empty(), 1, {});
 
 	WriteRpcRequest(fd, method_name, batch, /*extra_metadata=*/nullptr, protocol);
 }
@@ -361,7 +395,7 @@ void WriteEmptyRpcRequest(int fd, const std::string &method_name, const VgiProto
 // ============================================================================
 
 static UnaryResponseResult ReadUnaryResponseImpl(
-    const std::shared_ptr<arrow::io::InputStream> &input, ClientContext *context,
+    const std::shared_ptr<VgiInputStream> &input, ClientContext *context,
     const std::string &worker_path, pid_t worker_pid, const std::string &execution_id_hex,
     const std::string &attach_opaque_data_digest, const std::string &transaction_opaque_data_digest,
     const std::string &conn_id_hex, const std::function<void()> &before_read) {
@@ -389,7 +423,7 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 	                             transaction_opaque_data_digest, conn_id_hex, wait);
 }
 
-UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStream> &input,
+UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<VgiInputStream> &input,
                                       ClientContext *context, const std::string &worker_path,
                                       pid_t worker_pid, const std::string &execution_id_hex,
                                       const std::string &attach_opaque_data_digest,
@@ -400,7 +434,7 @@ UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStre
 	                             []() {});
 }
 
-static StreamHeaderResult ReadStreamHeaderImpl(const std::shared_ptr<arrow::io::InputStream> &input,
+static StreamHeaderResult ReadStreamHeaderImpl(const std::shared_ptr<VgiInputStream> &input,
                                                ClientContext *context,
                                                const std::string &worker_path, pid_t worker_pid,
                                                const std::function<void()> &before_read) {
@@ -419,7 +453,7 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	                            worker_pid, wait);
 }
 
-StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream> &input,
+StreamHeaderResult ReadStreamHeader(const std::shared_ptr<VgiInputStream> &input,
                                     ClientContext *context, const std::string &worker_path,
                                     pid_t worker_pid) {
 	return ReadStreamHeaderImpl(input, context, worker_path, worker_pid, []() {});
@@ -432,7 +466,7 @@ StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream
 // ============================================================================
 
 std::vector<uint8_t> SerializeRpcRequest(
-    const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params_batch,
+    const std::string &method_name, const VgiBatchPtr &params_batch,
     const VgiProtocolId &protocol,
     const std::vector<std::pair<std::string, std::string>> &extra_metadata) {
 	// Create custom metadata with method, wire version, the protocol routing key,
@@ -441,22 +475,21 @@ std::vector<uint8_t> SerializeRpcRequest(
 	// carrier and the URL's protocol segment its projection: the server rejects a
 	// request whose two disagree, so both are built from this one VgiProtocolId.
 	// Reserved server-level methods are owned by no protocol and carry no key.
-	std::vector<std::string> meta_keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY};
-	std::vector<std::string> meta_values = {method_name, RPC_REQUEST_VERSION_VALUE};
+	std::vector<std::pair<std::string, std::string>> pairs;
+	pairs.reserve(4 + extra_metadata.size());
+	pairs.emplace_back(RPC_METHOD_KEY, method_name);
+	pairs.emplace_back(RPC_REQUEST_VERSION_KEY, RPC_REQUEST_VERSION_VALUE);
 	// Omitted for a protocol that declares no version (reflection).
 	if (!protocol.version.empty()) {
-		meta_keys.emplace_back(RPC_PROTOCOL_VERSION_KEY);
-		meta_values.emplace_back(protocol.version);
+		pairs.emplace_back(RPC_PROTOCOL_VERSION_KEY, protocol.version);
 	}
 	if (!IsReservedRpcMethod(method_name)) {
-		meta_keys.emplace_back(RPC_PROTOCOL_KEY);
-		meta_values.emplace_back(protocol.name);
+		pairs.emplace_back(RPC_PROTOCOL_KEY, protocol.name);
 	}
 	for (const auto &kv : extra_metadata) {
-		meta_keys.push_back(kv.first);
-		meta_values.push_back(kv.second);
+		pairs.push_back(kv);
 	}
-	auto metadata = arrow::KeyValueMetadata::Make(std::move(meta_keys), std::move(meta_values));
+	auto metadata = VgiMetadata::Make(std::move(pairs));
 
 	// Single-allocation serialization (schema + batch-with-metadata + EOS) —
 	// wire-identical to the previous MakeStreamWriter path, minus its
@@ -466,29 +499,25 @@ std::vector<uint8_t> SerializeRpcRequest(
 
 std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name,
                                               const VgiProtocolId &protocol) {
-	auto schema = arrow::schema({});
-	auto batch = arrow::RecordBatch::Make(schema, 1, std::vector<std::shared_ptr<arrow::Array>> {});
+	auto batch = VgiBatch::FromColumns(VgiSchema::Empty(), 1, {});
 	return SerializeRpcRequest(method_name, batch, protocol);
 }
 
-// Helper: copy raw data into an owning Arrow buffer.
-// Arrow IPC zero-copy reads reference the buffer memory, so it must outlive any returned batches.
-static std::shared_ptr<arrow::Buffer> CopyToOwnedBuffer(const uint8_t *data, size_t len) {
-	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
-	if (!alloc_result.ok()) {
-		throw IOException("Failed to allocate buffer for HTTP RPC response: %s",
-		                  alloc_result.status().ToString());
+// Helper: copy raw data into an owning buffer.
+// IPC zero-copy reads reference the buffer memory, so it must outlive any returned batches.
+static VgiBufferPtr CopyToOwnedBuffer(const uint8_t *data, size_t len) {
+	try {
+		return VgiBuffer::Copy(data, static_cast<int64_t>(len));
+	} catch (const std::bad_alloc &) {
+		throw IOException("Failed to allocate buffer for HTTP RPC response: Out of memory");
 	}
-	auto owned = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
-	memcpy(const_cast<uint8_t *>(owned->data()), data, len);
-	return owned;
 }
 
-// Core implementation over an owning Arrow buffer. Arrow IPC reads are
+// Core implementation over an owning buffer. IPC reads are
 // zero-copy views into ``buffer``, so it must stay alive as long as any
 // returned batch — the BufferReader holds a reference for us.
 static UnaryResponseResult ReadUnaryResponseFromOwnedBuffer(
-    std::shared_ptr<arrow::Buffer> buffer,
+    VgiBufferPtr buffer,
     ClientContext *context,
     const std::string &url,
     const std::string &execution_id_hex,
@@ -504,7 +533,7 @@ static UnaryResponseResult ReadUnaryResponseFromOwnedBuffer(
 	opts.attach_opaque_data_digest = attach_opaque_data_digest;
 	opts.transaction_opaque_data_digest = transaction_opaque_data_digest;
 	opts.conn_id_hex = conn_id_hex;
-	return ReadWorkerUnaryStream(std::make_shared<arrow::io::BufferReader>(std::move(buffer)), opts);
+	return ReadWorkerUnaryStream(std::make_shared<VgiBufferReader>(std::move(buffer)), opts);
 }
 
 void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientContext *context,
@@ -514,48 +543,57 @@ void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientConte
 	// and an error raised right after init in the next stream, so the caller
 	// cannot know the id yet. Adopt it from the header as the walk passes it.
 	std::string execution_id_hex = call ? call->execution_id_hex : std::string();
-	int64_t offset = 0;
 	const auto total = static_cast<int64_t>(len);
+	if (total <= 0) {
+		return;
+	}
+	// One owning copy for the whole walk; each stream is read from a zero-copy
+	// slice of it.
+	auto whole = CopyToOwnedBuffer(data, len);
+	int64_t offset = 0;
 	while (offset < total) {
-		auto buffer = CopyToOwnedBuffer(data + offset, static_cast<size_t>(total - offset));
-		auto input = std::make_shared<arrow::io::BufferReader>(buffer);
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-		if (!reader_result.ok()) {
+		auto input = std::make_shared<VgiBufferReader>(whole->Slice(offset, total - offset));
+		std::unique_ptr<VgiIpcReader> reader;
+		try {
+			reader = VgiIpcReader::Open(input);
+		} catch (const std::exception &) {
 			// Trailing bytes that are not an IPC stream: nothing more to find.
 			return;
 		}
-		auto reader = reader_result.ValueUnsafe();
 		while (true) {
-			auto next = reader->ReadNext();
-			if (!next.ok()) {
+			VgiBatchPtr batch;
+			try {
+				batch = reader->ReadNext();
+			} catch (const std::exception &) {
 				break;
 			}
-			auto batch_with_metadata = next.ValueUnsafe();
-			if (!batch_with_metadata.batch) {
+			if (!batch) {
 				break; // end of this stream
 			}
+			const VgiMetadataPtr custom_metadata = batch->metadata()->empty() ? nullptr : batch->metadata();
 			// Throws when the batch carries error metadata — the whole point.
 			if (call) {
-				const bool handled = DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
-				                                   context, worker, -1, execution_id_hex,
+				const bool handled = DispatchBatch(batch, custom_metadata, context, worker, -1, execution_id_hex,
 				                                   call->attach_opaque_data_digest, "", call->conn_id_hex, &call->fields);
-				if (!handled && execution_id_hex.empty() && batch_with_metadata.batch->num_rows() > 0) {
-					auto exec = std::dynamic_pointer_cast<arrow::BinaryArray>(
-					    batch_with_metadata.batch->GetColumnByName("execution_id"));
-					if (exec && !exec->IsNull(0)) {
-						auto view = exec->GetView(0);
-						execution_id_hex = BytesToHex(std::vector<uint8_t>(view.begin(), view.end()));
+				if (!handled && execution_id_hex.empty() && batch->num_rows() > 0) {
+					auto exec = batch->GetColumnByName("execution_id");
+					if (exec && !exec.is_dictionary()) {
+						const auto storage = exec.storage_type();
+						if (storage == NANOARROW_TYPE_BINARY && !exec.IsNull(0)) {
+							auto view = exec.GetView(0);
+							execution_id_hex = BytesToHex(std::vector<uint8_t>(view.begin(), view.end()));
+						}
 					}
 				}
 			} else {
-				DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata, context, url, -1);
+				DispatchBatch(batch, custom_metadata, context, url, -1);
 			}
 		}
-		auto pos = input->Tell();
-		if (!pos.ok() || pos.ValueUnsafe() <= 0) {
+		auto pos = input->position();
+		if (pos <= 0) {
 			return; // cannot advance; avoid spinning on the same bytes
 		}
-		offset += pos.ValueUnsafe();
+		offset += pos;
 	}
 }
 
@@ -578,7 +616,7 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(std::string &&body,
                                                  const std::string &attach_opaque_data_digest,
                                                  const std::string &transaction_opaque_data_digest,
                                                  const std::string &conn_id_hex) {
-	return ReadUnaryResponseFromOwnedBuffer(arrow::Buffer::FromString(std::move(body)), context, url,
+	return ReadUnaryResponseFromOwnedBuffer(VgiBuffer::FromString(std::move(body)), context, url,
 	                                        execution_id_hex, attach_opaque_data_digest,
 	                                        transaction_opaque_data_digest, conn_id_hex);
 }
@@ -589,7 +627,7 @@ BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t 
 	return ReadStreamHeaderFromBuffer(CopyToOwnedBuffer(data, len), context, url);
 }
 
-BufferStreamHeaderResult ReadStreamHeaderFromBuffer(std::shared_ptr<arrow::Buffer> buffer,
+BufferStreamHeaderResult ReadStreamHeaderFromBuffer(VgiBufferPtr buffer,
                                                      ClientContext *context,
                                                      const std::string &url) {
 	WorkerStreamOptions opts;
@@ -597,16 +635,12 @@ BufferStreamHeaderResult ReadStreamHeaderFromBuffer(std::shared_ptr<arrow::Buffe
 	opts.worker = url;
 	opts.http_messages = true;
 	opts.lenient = true;
-	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
+	auto input = std::make_shared<VgiBufferReader>(std::move(buffer));
 	BufferStreamHeaderResult result;
 	result.header = ReadWorkerStreamHeader(input, opts);
 
 	// Record the byte offset where the data IPC stream begins
-	auto tell_result = input->Tell();
-	if (!tell_result.ok()) {
-		throw IOException("Failed to get buffer position after header [url: %s]", url);
-	}
-	result.data_offset = static_cast<size_t>(tell_result.ValueUnsafe());
+	result.data_offset = static_cast<size_t>(input->position());
 	return result;
 }
 

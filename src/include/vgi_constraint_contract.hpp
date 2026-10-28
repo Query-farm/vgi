@@ -18,9 +18,8 @@ void RequireNativeConstraintRead(const CatalogAttachResult &result, const VgiTab
 void RequireNativeConstraintWrite(const CatalogAttachResult &result, const VgiTableInfo &info);
 void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability = true);
 void AppendNativeCheckConstraints(ClientContext &context, const VgiTableInfo &info, CreateTableInfo &create);
-void ValidateNativeConstraintList(const std::shared_ptr<arrow::Array> &array, int64_t row);
-std::vector<std::vector<uint8_t>> EncodeNativeConstraints(const CreateTableInfo &info,
-                                                          std::shared_ptr<arrow::Schema> &schema);
+void ValidateNativeConstraintList(const VgiColumn &array, int64_t row);
+std::vector<std::vector<uint8_t>> EncodeNativeConstraints(const CreateTableInfo &info, VgiSchemaPtr &schema);
 std::vector<uint8_t> BuildNativeNotNullChange(const VgiTableInfo &info, const std::string &column, bool add);
 std::vector<uint8_t> BuildNativeConstraintsApply(const std::vector<uint8_t> &attachment,
                                                  const std::vector<uint8_t> &transaction, const VgiTableInfo &info,

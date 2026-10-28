@@ -36,7 +36,7 @@ struct VgiDiscoveryTarget {
 // `function_name` names the caller in Iroh errors; named parameters in `skip`
 // (lower-case) belong to the caller and are left alone.
 VgiDiscoveryTarget BindDiscoveryTarget(ClientContext &context, std::string worker_path,
-                                       named_parameter_map_t &named_parameters, const char *function_name,
+                                       named_argument_map_t &named_parameters, const char *function_name,
                                        LocationEntryPoint entry, const std::unordered_set<std::string> &skip = {});
 
 // Register the named parameters BindDiscoveryTarget understands.

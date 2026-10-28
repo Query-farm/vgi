@@ -1,12 +1,13 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
 
-#include <arrow/api.h>
 
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -116,7 +117,7 @@ struct UnaryRpcOptions {
 //
 // params may be nullptr, in which case an empty RPC request is sent.
 UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
-                                          const std::shared_ptr<arrow::RecordBatch> &params);
+                                          const VgiBatchPtr &params);
 
 } // namespace vgi
 } // namespace duckdb

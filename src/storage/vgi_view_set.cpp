@@ -37,7 +37,7 @@ public:
 		}
 	}
 
-	void UpdateBinding(const vector<LogicalType> &types, const vector<string> &names) override {
+	void UpdateBinding(const vector<LogicalType> &types, const vector<Identifier> &names) override {
 		if (aliases.empty()) {
 			ViewCatalogEntry::UpdateBinding(types, names);
 			return;
@@ -55,11 +55,10 @@ public:
 // entry whose query is null crashes any subsequent SELECT * FROM v. Skipping
 // the entry instead surfaces a clean "view not found" error to the user.
 static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, SchemaCatalogEntry &schema,
-                                                             const vgi::VgiViewInfo &view_info) {
-	CreateViewInfo info;
-	info.view_name = view_info.name;
+                                                            const vgi::VgiViewInfo &view_info) {
+	CreateViewInfo info(schema, Identifier(view_info.name));
 	info.sql = view_info.definition;
-	info.aliases.assign(view_info.aliases.begin(), view_info.aliases.end());
+	info.aliases = StringsToIdentifiers(vector<string>(view_info.aliases.begin(), view_info.aliases.end()));
 	if (view_info.comment) {
 		info.comment = Value(*view_info.comment);
 	}
@@ -69,15 +68,14 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 	// Per-column comments — DuckDB aligns these by name against the columns it
 	// binds from the view's SQL and exposes them via duckdb_columns().
 	for (auto &[col, comment] : view_info.column_comments) {
-		info.column_comments_map[col] = Value(comment);
+		info.column_comments_map[Identifier(col)] = Value(comment);
 	}
 	// Parse SQL to get SelectStatement
 	try {
-		Parser parser;
+		Parser parser {ParserOptions::Builtin()};
 		parser.ParseQuery(view_info.definition);
 		if (parser.statements.empty() || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-			VGI_STDERR_DEBUG("[VGI] view.skipped name=%s reason=not_a_select_statement\n",
-			                  view_info.name.c_str());
+			VGI_STDERR_DEBUG("[VGI] view.skipped name=%s reason=not_a_select_statement\n", view_info.name.c_str());
 			return nullptr;
 		}
 		info.query = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
@@ -122,11 +120,9 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 		return cached_result;
 	}
 	if (fast_outcome) {
-		VGI_LOG(context, "catalog.entry_cache",
-		        {{"set_kind", CacheKindName()},
-		         {"name", name},
-		         {"outcome", fast_outcome},
-		         {"triggered_load", "false"}});
+		VGI_LOG(
+		    context, "catalog.entry_cache",
+		    {{"set_kind", CacheKindName()}, {"name", name}, {"outcome", fast_outcome}, {"triggered_load", "false"}});
 		return nullptr;
 	}
 
@@ -165,11 +161,12 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "view";
-	rpc_ctx.entity_qualifier = schema_.name + "." + name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName() + "." + name;
 
-	auto view_info_opt = vgi::InvokeCatalogViewGet(rpc_ctx, schema_.name, name, context);
+	auto view_info_opt = vgi::InvokeCatalogViewGet(rpc_ctx, schema_.name.GetIdentifierName(), name, context);
 
 	if (!view_info_opt) {
 		std::lock_guard<std::mutex> lock(entry_lock_);
@@ -197,7 +194,7 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	return result;
 }
 
-void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
+void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> & /*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -208,9 +205,10 @@ void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::
 
 	// Call catalog_schema_contents_views via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
-	rpc_ctx.entity_qualifier = schema_.name;
+	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 	auto views = schema_.TakeViews(rpc_ctx, context);
 
 	for (auto &view_info : views) {
@@ -218,7 +216,10 @@ void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::
 		if (!view_entry) {
 			continue; // skip un-parseable views; CreateViewEntryFromInfo logged it
 		}
-		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(view_entry)); }
+		{
+			std::lock_guard<std::mutex> __entry_lk(entry_lock_);
+			CreateEntryLocked(std::move(view_entry));
+		}
 	}
 }
 

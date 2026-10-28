@@ -14,8 +14,6 @@
 // Reports each catalog's current/attached data version (no time travel).
 // =============================================================================
 
-#include <arrow/api.h>
-
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -80,29 +78,22 @@ struct VgiFunctionArgumentsData : public TableFunctionData {
 };
 
 // Read a presence-only string field-metadata value; returns "" when absent.
-static std::string MetadataValue(const std::shared_ptr<const arrow::KeyValueMetadata> &md, const char *key) {
-	if (!md) {
-		return "";
-	}
-	int idx = md->FindKey(key);
-	if (idx < 0) {
-		return "";
-	}
-	return md->value(idx);
+static std::string MetadataValue(const VgiMetadata &md, const char *key) {
+	return md.Get(key).value_or("");
 }
 
 // Expand an arguments_schema (from a function OR a macro) into per-argument
 // rows. function_type is the display string (e.g. "scalar", "table_macro").
 static void EmitArgsFromSchema(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
                                const std::string &function_name, const std::string &function_type,
-                               const std::shared_ptr<arrow::Schema> &arguments_schema, bool input_from_args,
+                               const VgiSchemaPtr &arguments_schema, bool input_from_args,
                                std::vector<ArgRow> &out) {
 	if (!arguments_schema || arguments_schema->num_fields() == 0) {
 		return; // No declared arguments — emit no rows.
 	}
 
 	// Resolve each field's DuckDB type in field order (reuses the shared
-	// Arrow->DuckDB bridge; never a manual arrow::Type switch).
+	// Arrow->DuckDB bridge; never a manual Arrow type switch).
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> types;
@@ -113,8 +104,7 @@ static void EmitArgsFromSchema(ClientContext &context, const std::string &catalo
 	int64_t positional_ordinal = 0;
 
 	for (int i = 0; i < num_fields; i++) {
-		auto field = arguments_schema->field(i);
-		auto md = field->HasMetadata() ? field->metadata() : nullptr;
+		const auto md = arguments_schema->field_metadata(i);
 
 		const bool is_named = MetadataValue(md, VGI_ARG_METADATA_KEY) == VGI_ARG_NAMED_VALUE;
 		const bool is_varargs = MetadataValue(md, VGI_VARARGS_METADATA_KEY) == VGI_VARARGS_TRUE_VALUE;
@@ -157,7 +147,7 @@ static void EmitArgsFromSchema(ClientContext &context, const std::string &catalo
 		if (has_position) {
 			positional_ordinal++;
 		}
-		row.arg_name = field->name();
+		row.arg_name = arguments_schema->field_names()[static_cast<size_t>(i)];
 		row.arg_type = arg_type.ToString();
 		row.arg_description = doc;
 		row.arg_description_present = !doc.empty();
@@ -219,7 +209,7 @@ static void EmitMacroArgs(ClientContext &context, const std::string &catalog_nam
 }
 
 static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {
 	    LogicalType::VARCHAR, // catalog_name
 	    LogicalType::VARCHAR, // schema_name
@@ -262,7 +252,7 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 			continue;
 		}
 		if (selected_catalog != input.named_parameters.end() && !selected_catalog->second.IsNull() &&
-		    !StringUtil::CIEquals(catalog.GetName(), selected_catalog->second.ToString())) {
+		    !StringUtil::CIEquals(catalog.GetName().GetIdentifierName(), selected_catalog->second.ToString())) {
 			continue;
 		}
 		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
@@ -271,12 +261,12 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 		if (!attach_params || !attach_result) {
 			continue; // Not fully attached — skip (same guard as LoadEntries).
 		}
-		const auto catalog_name = vgi_catalog.GetName();
+		const auto catalog_name = vgi_catalog.GetName().GetIdentifierName();
 		auto &vgi_tx = VgiTransaction::Get(context, catalog);
 		const auto transaction_opaque = vgi_tx.GetTransactionOpaqueData();
 
 		vgi_catalog.ScanSchemas(context, [&](SchemaCatalogEntry &schema) {
-			const auto schema_name = schema.name;
+			const auto schema_name = schema.name.GetIdentifierName();
 			auto &vgi_schema = schema.Cast<VgiSchemaEntry>();
 			for (const auto function_type : kFunctionTypes) {
 				try {
@@ -359,7 +349,7 @@ static void VgiFunctionArgumentsScan(ClientContext &context, TableFunctionInput 
 
 void RegisterVgiFunctionArgumentsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_function_arguments", {}, VgiFunctionArgumentsScan, VgiFunctionArgumentsBind);
-	func.named_parameters["catalog"] = LogicalType::VARCHAR;
+	AddVgiFunctionOption(func, "catalog", LogicalType::VARCHAR);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "Inspect the arguments of every function and macro exposed by every attached VGI catalog, one row per "

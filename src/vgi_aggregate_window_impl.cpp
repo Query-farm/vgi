@@ -4,9 +4,6 @@
 
 #include <cstring>
 
-#include <arrow/builder.h>
-#include <arrow/c/bridge.h>
-
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -23,12 +20,6 @@ namespace duckdb {
 namespace vgi {
 
 namespace {
-
-void ThrowOnArrowError(const arrow::Status &status) {
-	if (!status.ok()) {
-		throw IOException("Arrow error in VGI aggregate window: %s", status.ToString());
-	}
-}
 
 // Encode (4 × int64) frame-delta tuples as little-endian bytes, matching the
 // worker-side _unpack_frame_stats decoder.
@@ -66,22 +57,13 @@ std::vector<uint8_t> PackValidityMask(const ValidityMask &mask, idx_t row_count)
 	return out;
 }
 
-std::vector<uint8_t> SerializeSchemaBytes(const std::shared_ptr<arrow::Schema> &schema) {
-	auto buf = arrow::ipc::SerializeSchema(*schema);
-	ThrowOnArrowError(buf.status());
-	auto &b = buf.ValueUnsafe();
-	return std::vector<uint8_t>(b->data(), b->data() + b->size());
-}
-
-// Convert the partition's ColumnDataCollection into an Arrow RecordBatch.
+// Convert the partition's ColumnDataCollection into a batch.
 // Handles the inputs=nullptr edge case (no-column aggregate — rare but legal).
-std::shared_ptr<arrow::RecordBatch> PartitionToArrow(ClientContext &context,
+VgiBatchPtr PartitionToArrow(ClientContext &context,
                                                      const WindowPartitionInput &partition) {
 	if (!partition.inputs || partition.column_ids.empty()) {
 		// No input columns — return an empty 0-column batch with just the row count.
-		auto schema = arrow::schema({});
-		return arrow::RecordBatch::Make(schema, partition.count,
-		                                std::vector<std::shared_ptr<arrow::Array>> {});
+		return VgiBatch::FromColumns(VgiSchema::Empty(), static_cast<int64_t>(partition.count), {});
 	}
 
 	// Project only the columns this aggregate cares about.
@@ -129,12 +111,12 @@ std::shared_ptr<arrow::RecordBatch> PartitionToArrow(ClientContext &context,
 // so a bare-name re-resolve on the worker can land on a different schema's
 // implementation than the bind did. Empty string serialises as null (the
 // legitimate "no schema named" form) — the field stays nullable.
-std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
+VgiBatchPtr BuildAggregateWindowInitRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id, int64_t row_count,
-    const std::shared_ptr<arrow::RecordBatch> &partition_batch,
-    const std::shared_ptr<arrow::Schema> &output_schema,
+    const VgiBatchPtr &partition_batch,
+    const VgiSchemaPtr &output_schema,
     const std::vector<uint8_t> &filter_mask_bytes,
     const std::vector<uint8_t> &frame_stats_bytes,
     const std::vector<uint8_t> &all_valid_bytes) {
@@ -144,7 +126,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 	request.partition_id = partition_id;
 	request.row_count = row_count;
 	request.partition_batch = SerializeToIpcBytes(partition_batch);
-	request.output_schema = SerializeSchemaBytes(output_schema);
+	request.output_schema = SerializeSchemaToIpcBytes(output_schema);
 	request.filter_mask = filter_mask_bytes;
 	request.frame_stats = frame_stats_bytes;
 	request.all_valid = all_valid_bytes;
@@ -153,7 +135,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 	return generated::BuildAggregateWindowInitParams(SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
+VgiBatchPtr BuildAggregateWindowRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id, int64_t rid,
@@ -176,7 +158,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
 // Evaluate() call in a single RPC. The frames_per_row array gives the
 // subframe cardinality per row so the worker can unflatten frame_starts /
 // frame_ends (flat arrays of length sum(frames_per_row)).
-std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
+VgiBatchPtr BuildAggregateWindowBatchRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id,
@@ -200,7 +182,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
 	return generated::BuildAggregateWindowBatchParams(SerializeRecord(request));
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
+VgiBatchPtr BuildAggregateWindowDestructorRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id) {

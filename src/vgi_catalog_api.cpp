@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
+#include "nanoarrow/nanoarrow.h"
 #include "vgi_catalog_api.hpp"
 #include "vgi_column_expression.hpp"
 #include "vgi_column_metadata.hpp"
@@ -43,6 +44,7 @@
 #include "generated/vgi_request_builders.hpp"
 #include "vgi_schema_registry.hpp"
 #include "vgi_wire_codec.hpp"
+#include "vgi_batch_validation.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
 #include "vgi_unary_retry.hpp"
@@ -276,7 +278,7 @@ static ErrorInfo CatalogProtocolViolation(const std::string &method_name, const 
 // Only `vgi.v3` methods have entries in the schema registry, so request
 // validation applies to those alone; other protocols' callers decode by name.
 static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const std::string &method_name,
-                                            const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context,
+                                            const VgiBatchPtr &params, ClientContext &context,
                                             const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL) {
 	CatalogRpcInstrumentation instr(context, ctx, method_name);
 	try {
@@ -342,10 +344,10 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 
 // Extract result binary bytes from a unary RPC response batch,
 // then deserialize to a RecordBatch.
-static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
+static VgiBatchPtr ExtractAndDeserializeResult(
     const UnaryResponseResult &response, const std::string &method_name, const std::string &worker_path) {
 	// An empty envelope or a NULL result is a void/absent result, not an error.
-	std::shared_ptr<arrow::RecordBatch> result;
+	VgiBatchPtr result;
 	if (response.batch && response.batch->num_rows() != 0) {
 		result = UnwrapResultEnvelope(response.batch, method_name, CatalogProtocolViolation(method_name, worker_path),
 		                              /*null_result_ok=*/true);
@@ -360,7 +362,7 @@ static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
 // (or empty inner batch) for methods registered as void. Any payload triggers
 // a clear mismatch error instead of being silently discarded.
 static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &method_name,
-                          const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context) {
+                          const VgiBatchPtr &params, ClientContext &context) {
 	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 	ExtractAndDeserializeResult(response, method_name, ctx.params->worker_path());
 }
@@ -369,9 +371,9 @@ static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &metho
 // vgi_rpc.Reflection.v1
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
+VgiBatchPtr InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
                                                         const VgiProtocolId &protocol, const std::string &method_name,
-                                                        const std::shared_ptr<arrow::RecordBatch> &params) {
+                                                        const VgiBatchPtr &params) {
 	auto response = InvokeRpcMethod(ctx, method_name, params, context, protocol);
 	const auto &worker_path = ctx.params->worker_path();
 	const std::string protocol_name(protocol.name);
@@ -381,24 +383,25 @@ std::shared_ptr<arrow::RecordBatch> InvokeProtocolUnary(const CatalogRpcContext 
 	// The ordinary unary envelope: a structured return rides as one serialized
 	// IPC batch in a binary `result` column.
 	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col || result_col->type()->id() != arrow::Type::BINARY) {
+	if (!result_col || result_col.type().type != NANOARROW_TYPE_BINARY) {
 		throw IOException(reflection_violation(), "%s/%s reply carried no binary 'result' column [worker: %s]",
 		                  protocol_name, method_name, worker_path);
 	}
-	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-	if (binary_array->IsNull(0)) {
+	auto binary_array = result_col;
+	if (binary_array.IsNull(0)) {
 		throw IOException(reflection_violation(), "%s/%s reply carried a NULL 'result' [worker: %s]", protocol_name,
 		                  method_name, worker_path);
 	}
-	std::shared_ptr<arrow::RecordBatch> payload;
+	VgiBatchPtr payload;
 	try {
 		if (method_name == "table_function_projection") {
-			auto bytes = binary_array->GetView(0);
+			auto bytes = binary_array.GetView(0);
 			if (bytes.size() > 8 * 1024 * 1024)
 				throw IOException("Projection response exceeds 8 MiB");
 			payload = DeserializeVgiQueryRecord(std::vector<uint8_t>(bytes.begin(), bytes.end()));
 		} else {
-			payload = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
+			payload = DeserializeFromIpcBytesZeroCopy(std::make_shared<const VgiBuffer>(response.batch,
+			    reinterpret_cast<const uint8_t *>(binary_array.GetView(0).data()), binary_array.GetView(0).size()));
 		}
 	} catch (const std::exception &e) {
 		throw IOException(reflection_violation().Merge(ExtraInfoOf(e)), "Could not decode the %s/%s reply [worker: %s]: %s",
@@ -411,7 +414,7 @@ std::shared_ptr<arrow::RecordBatch> InvokeProtocolUnary(const CatalogRpcContext 
 	return payload;
 }
 
-std::shared_ptr<arrow::RecordBatch> InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
+VgiBatchPtr InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
                                                                   ClientContext &context) {
 	// Reflection declares no protocol_version and is exempt from the version
 	// gate, so the request carries the routing key and no version.
@@ -547,19 +550,20 @@ void InvokeCatalogDetach(const CatalogRpcContext &ctx, ClientContext &context) {
 
 VgiQueryPrepareResult InvokeCatalogQueryPrepare(const CatalogRpcContext &ctx,
                                               const VgiQueryCapabilities &capabilities, const std::string &sql,
-                                              const std::shared_ptr<arrow::Schema> &parameter_schema,
+                                              const VgiSchemaPtr &parameter_schema,
                                               ClientContext &context, const std::string &required_ordering) {
     if (!IsVgiQueryEnabled(context)) throw InvalidInputException("vgi_query_enabled must be true before preparing a remote query");
     auto request = SerializeToIpcBytes(BuildVgiQueryPrepareRequest(ctx, capabilities, sql, parameter_schema, required_ordering));
     if (request.size() > VGI_QUERY_MAX_RECORD_BYTES) throw InvalidInputException("VGI query request is too large");
     auto response = InvokeRpcMethod(ctx, "catalog_query_prepare", generated::BuildCatalogQueryPrepareParams(request), context);
-    if (!response.batch || !response.batch->ValidateFull().ok() ||
+    if (!response.batch ||
         response.batch->num_rows() != 1 || response.batch->num_columns() != 1 ||
-        response.batch->schema()->field(0)->name() != "result" || response.batch->column(0)->type_id() != arrow::Type::BINARY) {
+        response.batch->column_name(0) != "result" || response.batch->column(0).type().type != NANOARROW_TYPE_BINARY) {
         throw IOException("Malformed catalog_query_prepare response envelope");
     }
-    auto payload = std::static_pointer_cast<arrow::BinaryArray>(response.batch->column(0));
-    if (payload->IsNull(0) || payload->value_length(0) > VGI_QUERY_MAX_RECORD_BYTES) {
+    ValidateWorkerBatch(response.batch.get(), WorkerBatchValidation::FULL, ctx.params->worker_path());
+    auto payload = response.batch->column(0);
+    if (payload.IsNull(0) || payload.GetView(0).size() > VGI_QUERY_MAX_RECORD_BYTES) {
         throw IOException("Invalid catalog_query_prepare response size");
     }
     RecordBatchSingleRow envelope(response.batch, 0, "catalog_query_prepare response", ctx.params->worker_path());
@@ -611,6 +615,29 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, Cl
 
 namespace {
 
+// A (non-dictionary) column of exactly nanoarrow type `type`.
+bool HasType(const VgiColumn &column, int type) {
+	return column && column.type().type == type;
+}
+
+// Arrow C++'s BinaryArray covers binary and (its subclass) utf8, but not the large
+// or view variants; the casts this replaces accepted exactly those two.
+bool IsBinaryOrUtf8(const VgiColumn &column) {
+	if (!column) {
+		return false;
+	}
+	const auto type = column.type().type;
+	return type == NANOARROW_TYPE_BINARY || type == NANOARROW_TYPE_STRING;
+}
+
+// Cell `i` of binary column `values` as a zero-copy buffer that keeps `owner`
+// (the batch holding `values`) alive.
+VgiBufferPtr BinaryCell(const VgiBatchPtr &owner, const VgiColumn &values, int64_t i) {
+	auto view = values.GetView(i);
+	return std::make_shared<const VgiBuffer>(owner, reinterpret_cast<const uint8_t *>(view.data()),
+	                                         static_cast<int64_t>(view.size()));
+}
+
 struct ContentsCategory {
 	const char *column;
 	const char *items_method;
@@ -625,24 +652,16 @@ const ContentsCategory kContentsCategories[] = {
     {"indexes", "catalog_schema_contents_indexes"},
 };
 
-// Open a category exactly once, retaining slices of the response's buffers.
-// Singleton deserializers deliberately read only the first batch and must
-// not be used for these streams.
-std::vector<std::shared_ptr<arrow::RecordBatch>> ReadContentsStream(
-    const arrow::BinaryArray &values, const ContentsCategory &category, const std::string &worker_path) {
-	std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+// Open each nested stream once and retain the response backing buffers.
+std::vector<VgiBatchPtr> ReadContentsStream(const VgiBatchPtr &owner, const VgiColumn &values,
+                                           const ContentsCategory &category, const std::string &worker_path) {
+	std::vector<VgiBatchPtr> batches;
 	if (values.IsNull(0)) {
 		return batches;
 	}
 	auto violation = CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, category.column);
-	auto buffer = arrow::SliceBuffer(values.value_data(), values.value_offset(0), values.value_length(0));
-	auto input = std::make_shared<arrow::io::BufferReader>(buffer);
-	auto opened = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!opened.ok()) {
-		throw IOException(violation, "catalog_contents: invalid '%s' IPC stream: %s", category.column,
-		                  opened.status().ToString());
-	}
-	auto reader = opened.ValueUnsafe();
+	auto input = std::make_shared<VgiBufferReader>(BinaryCell(owner, values, 0));
+	auto reader = VgiIpcReader::Open(input);
 	const auto *contract = LookupResponseSchema(category.items_method);
 	if (!contract || !contract->item_schema) {
 		throw InternalException("Missing catalog metadata schema for %s", category.column);
@@ -650,54 +669,42 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> ReadContentsStream(
 	if (!reader->schema()->Equals(*contract->item_schema, /*check_metadata=*/false)) {
 		throw IOException(violation, "catalog_contents: '%s' stream has an incompatible metadata schema", category.column);
 	}
-	for (;;) {
-		std::shared_ptr<arrow::RecordBatch> batch;
-		auto status = reader->ReadNext(&batch);
-		if (!status.ok()) {
-			throw IOException(violation, "catalog_contents: cannot read '%s' batch: %s", category.column, status.ToString());
-		}
-		if (!batch) {
-			break;
-		}
-		status = batch->ValidateFull();
-		if (!status.ok()) {
-			throw IOException(violation, "catalog_contents: invalid '%s' batch: %s", category.column, status.ToString());
-		}
+	while (auto batch = reader->ReadNext()) {
+		ValidateWorkerBatch(batch.get(), WorkerBatchValidation::FULL, worker_path);
 		for (int column = 0; column < batch->num_columns(); column++) {
-			if (batch->schema()->field(column)->nullable()) {
+			if (batch->schema()->field_nullable(column)) {
 				continue;
 			}
-			bool has_null = batch->column(column)->null_count() != 0;
-			if (auto dictionary = std::dynamic_pointer_cast<arrow::DictionaryArray>(batch->column(column))) {
-				for (int64_t row = 0; !has_null && row < batch->num_rows(); row++) {
-					has_null = dictionary->dictionary()->IsNull(dictionary->GetValueIndex(row));
+			auto values = batch->column(column);
+			for (int64_t row = 0; row < batch->num_rows(); row++) {
+				wire::Ctx ctx {"catalog_contents", &worker_path, batch->column_name(column), row};
+				if (wire::IsNullValue(values, row, ctx)) {
+					throw IOException(violation, "catalog_contents: required '%s.%s' contains nulls", category.column,
+					                  batch->column_name(column));
 				}
-			}
-			if (has_null) {
-				throw IOException(violation, "catalog_contents: required '%s.%s' contains nulls", category.column,
-				                  batch->schema()->field(column)->name());
 			}
 		}
 		batches.push_back(std::move(batch));
 	}
-	const auto position = input->Tell();
-	if (!position.ok() || position.ValueUnsafe() != buffer->size()) {
+	if (input->remaining() != 0) {
 		throw IOException(violation, "catalog_contents: trailing bytes after '%s' IPC stream", category.column);
 	}
 	return batches;
 }
 
-std::vector<std::string> ContentsPath(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row,
-                                       const char *field, const std::string &worker_path) {
-	const auto values = std::static_pointer_cast<arrow::ListArray>(batch->GetColumnByName(field));
-	const auto parts = std::static_pointer_cast<arrow::StringArray>(values->values());
+std::vector<std::string> ContentsPath(const VgiBatchPtr &batch, int64_t row,
+                                    const char *field, const std::string &worker_path) {
+	auto values = batch->GetColumnByName(field);
+	auto parts = values.child(0);
 	std::vector<std::string> path;
-	for (int64_t i = values->value_offset(row); i < values->value_offset(row + 1); i++) {
-		if (parts->IsNull(i) || parts->value_length(i) == 0) {
+	int64_t begin = 0, end = 0;
+	values.ListRange(row, begin, end);
+	for (int64_t i = begin; i < end; i++) {
+		if (parts.IsNull(i) || parts.GetView(i).empty()) {
 			throw IOException(CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, field),
 			                  "catalog_contents: schema path contains a null or empty component");
 		}
-		path.push_back(parts->GetString(i));
+		path.push_back(parts.GetString(i));
 	}
 	if (path.empty()) {
 		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path).Set(error_key::kField, field),
@@ -731,7 +738,7 @@ VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientCon
 	return ParseCatalogContents(result_batch, worker_path, if_none_match);
 }
 
-VgiCatalogContents ParseCatalogContents(const std::shared_ptr<arrow::RecordBatch> &result_batch,
+VgiCatalogContents ParseCatalogContents(const VgiBatchPtr &result_batch,
                                          const std::string &worker_path,
                                          const std::optional<std::string> &if_none_match) {
 	ValidateResponseSchema(result_batch, "catalog_contents", worker_path);
@@ -739,28 +746,23 @@ VgiCatalogContents ParseCatalogContents(const std::shared_ptr<arrow::RecordBatch
 		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
 		                  "catalog_contents must contain exactly one response row [worker: %s]", worker_path);
 	}
-	auto validity = result_batch->ValidateFull();
-	if (!validity.ok()) {
-		throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
-		                  "Invalid catalog_contents response: %s", validity.ToString());
-	}
+	ValidateWorkerBatch(result_batch.get(), WorkerBatchValidation::FULL, worker_path);
 	for (int column = 0; column < result_batch->num_columns(); column++) {
-		if (!result_batch->schema()->field(column)->nullable() && result_batch->column(column)->IsNull(0)) {
+		if (!result_batch->schema()->field_nullable(column) && result_batch->column(column).IsNull(0)) {
 			throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
-			                  "catalog_contents required field '%s' is null", result_batch->schema()->field(column)->name());
+			                  "catalog_contents required field '%s' is null", result_batch->column_name(column));
 		}
 	}
 
 	VgiCatalogContents result;
-	auto version_col = std::static_pointer_cast<arrow::Int64Array>(result_batch->GetColumnByName("catalog_version"));
-	result.catalog_version = version_col->Value(0);
-	auto etag_col = std::static_pointer_cast<arrow::StringArray>(result_batch->GetColumnByName("etag"));
-	if (!etag_col->IsNull(0)) {
-		result.etag = etag_col->GetString(0);
+	auto version_col = result_batch->GetColumnByName("catalog_version");
+	result.catalog_version = version_col.GetInt(0);
+	auto etag_col = result_batch->GetColumnByName("etag");
+	if (!etag_col.IsNull(0)) {
+		result.etag = etag_col.GetString(0);
 	}
-	auto not_modified_col =
-	    std::static_pointer_cast<arrow::BooleanArray>(result_batch->GetColumnByName("not_modified"));
-	result.not_modified = !not_modified_col->IsNull(0) && not_modified_col->Value(0);
+	auto not_modified_col = result_batch->GetColumnByName("not_modified");
+	result.not_modified = !not_modified_col.IsNull(0) && not_modified_col.GetBool(0);
 	if (result.not_modified) {
 		// Only meaningful as the answer to a matching if_none_match.
 		if (!if_none_match || result.etag != if_none_match) {
@@ -769,7 +771,7 @@ VgiCatalogContents ParseCatalogContents(const std::shared_ptr<arrow::RecordBatch
 			                  worker_path);
 		}
 		for (auto &category : kContentsCategories) {
-			if (!result_batch->GetColumnByName(category.column)->IsNull(0)) {
+			if (!result_batch->GetColumnByName(category.column).IsNull(0)) {
 				throw IOException(CatalogProtocolViolation("catalog_contents", worker_path),
 				                  "catalog_contents not_modified response contains '%s' metadata", category.column);
 			}
@@ -779,8 +781,8 @@ VgiCatalogContents ParseCatalogContents(const std::shared_ptr<arrow::RecordBatch
 
 	std::map<std::vector<std::string>, size_t> schema_index;
 	for (auto &category : kContentsCategories) {
-		auto values = std::static_pointer_cast<arrow::BinaryArray>(result_batch->GetColumnByName(category.column));
-		for (auto &batch : ReadContentsStream(*values, category, worker_path)) {
+		auto values = result_batch->GetColumnByName(category.column);
+		for (auto &batch : ReadContentsStream(result_batch, values, category, worker_path)) {
 			const bool is_schema = std::string(category.column) == "schemas";
 			for (int64_t row_idx = 0; row_idx < batch->num_rows(); row_idx++) {
 				auto path = ContentsPath(batch, row_idx, is_schema ? "path" : "schema_path", worker_path);
@@ -1200,7 +1202,7 @@ static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
     const std::string &schema_name, const std::string &table_name, ClientContext &context,
     const std::optional<std::string> &writable_branch_function_name = std::nullopt) {
 	auto &worker_path = ctx.params->worker_path();
-	std::shared_ptr<arrow::RecordBatch> params;
+	VgiBatchPtr params;
 	if (rpc_method == "catalog_table_insert_function_get") {
 		params =
 		    generated::BuildCatalogTableInsertFunctionGetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
@@ -1306,7 +1308,7 @@ void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContex
 void InvokeCatalogTableCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
-    const std::shared_ptr<arrow::Schema> &columns_schema,
+    const VgiSchemaPtr &columns_schema,
     const std::string &on_conflict,
     const std::vector<std::vector<uint8_t>> &constraint_definitions,
     ClientContext &context) {
@@ -1326,7 +1328,7 @@ void InvokeCatalogTableConstraintsApply(const CatalogRpcContext &ctx, const VgiT
 	auto response = InvokeRpcMethod(ctx, "catalog_table_constraints_apply", params, context);
 	if (!response.batch || response.batch->num_rows() != 1 ||
 	    !response.batch->GetColumnByName("result") ||
-	    response.batch->GetColumnByName("result")->type_id() != arrow::Type::BINARY) {
+	    response.batch->GetColumnByName("result").type().type != NANOARROW_TYPE_BINARY) {
 		throw IOException("Malformed catalog_table_constraints_apply response envelope");
 	}
 	RecordBatchSingleRow row(response.batch, 0, "ConstraintsApplyResponse", ctx.params->worker_path());
@@ -1356,14 +1358,14 @@ void InvokeCatalogTableRename(
 void InvokeCatalogTableColumnAdd(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
-    const std::shared_ptr<arrow::Schema> &column_definition,
+    const VgiSchemaPtr &column_definition,
     bool if_column_not_exists,
     ClientContext &context) {
 	ValidateNativeColumnMetadata(column_definition);
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
 	auto params = generated::BuildCatalogTableColumnAddParams(
 	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-	    std::vector<std::string> {column_definition->field(0)->name()}, column_bytes,
+	    std::vector<std::string> {column_definition->field_name(0)}, column_bytes,
 	    /*ignore_not_found=*/false, if_column_not_exists, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_add", params, context);
 }
@@ -1417,12 +1419,12 @@ void InvokeCatalogTableColumnCommentSet(
 
 void InvokeCatalogTableColumnTypeChange(const CatalogRpcContext &ctx, const std::string &schema_name,
                                         const std::string &table_name,
-                                        const std::shared_ptr<arrow::Schema> &column_definition,
+                                        const VgiSchemaPtr &column_definition,
                                         const std::optional<std::vector<uint8_t>> &expression, ClientContext &context) {
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
 	auto params = generated::BuildCatalogTableColumnTypeChangeParams(
 	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-	    std::vector<std::string> {column_definition->field(0)->name()}, column_bytes, expression,
+	    std::vector<std::string> {column_definition->field_name(0)}, column_bytes, expression,
 	    /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_type_change", params, context);
 }
@@ -1584,7 +1586,7 @@ TableFunctionCardinalityResult InvokeTableFunctionCardinality(
 //! Everything is optional except ``splits`` itself, and an EMPTY splits list is
 //! legal — a fully-pruned scan plans zero splits, and that must produce an empty
 //! result rather than an error.
-VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
                                      const std::string &worker_path) {
 	VgiScanPlanPage page;
 	if (!batch || batch->num_rows() == 0) {
@@ -1592,17 +1594,18 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 	}
 
 	// splits: list<binary>, one serialized ScanSplit per entry.
-	if (auto col = batch->GetColumnByName("splits")) {
-		if (auto list = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
-			if (!list->IsNull(0)) {
-				auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
-				if (!values) {
+	if (auto list = batch->GetColumnByName("splits")) {
+		if (HasType(list, NANOARROW_TYPE_LIST)) {
+			if (!list.IsNull(0)) {
+				auto values = list.child(0);
+				if (!IsBinaryOrUtf8(values)) {
 					throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
 					                  "VGI worker '%s' returned a plan whose 'splits' entries are not binary",
 					                  worker_path);
 				}
-				const auto start = list->value_offset(0);
-				const auto end = list->value_offset(1);
+				int64_t start = 0;
+				int64_t end = 0;
+				list.ListRange(0, start, end);
 				page.splits.reserve(static_cast<size_t>(end - start));
 				for (auto i = start; i < end; i++) {
 					// Each entry is a serialized ScanSplit. What gets redeemed is its
@@ -1617,21 +1620,20 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 					// split for ~100 bytes of payload, and that runs single-threaded
 					// at the head of every scan, so on a large plan it was hundreds of
 					// milliseconds of dead time before the first reader started.
-					auto split_batch = DeserializeFromIpcBytesZeroCopy(*values, i);
+					auto split_batch = DeserializeFromIpcBytesZeroCopy(BinaryCell(batch, values, i));
 					if (!split_batch || split_batch->num_rows() == 0) {
 						throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
 						                  "VGI worker '%s' returned an unparseable ScanSplit", worker_path);
 					}
-					auto token_col = split_batch->GetColumnByName("token");
-					auto token_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(token_col);
-					if (!token_arr || token_arr->IsNull(0)) {
+					auto token_arr = split_batch->GetColumnByName("token");
+					if (!IsBinaryOrUtf8(token_arr) || token_arr.IsNull(0)) {
 						throw IOException(
 						    CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "token"),
 						    "VGI worker '%s' returned a ScanSplit with no token; the framework stamps this, "
 						    "so an absent token means the worker bypassed it.",
 						    worker_path);
 					}
-					auto tok = token_arr->GetView(0);
+					auto tok = token_arr.GetView(0);
 					page.splits.emplace_back(tok.data(), tok.size());
 				}
 			}
@@ -1640,23 +1642,17 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 
 	auto binary_field = [&](const char *name) -> std::vector<uint8_t> {
 		std::vector<uint8_t> out;
-		if (auto col = batch->GetColumnByName(name)) {
-			if (auto arr = std::dynamic_pointer_cast<arrow::BinaryArray>(col)) {
-				if (!arr->IsNull(0)) {
-					auto view = arr->GetView(0);
-					out.assign(view.begin(), view.end());
-				}
-			}
+		auto arr = batch->GetColumnByName(name);
+		if (IsBinaryOrUtf8(arr) && !arr.IsNull(0)) {
+			auto view = arr.GetView(0);
+			out.assign(view.begin(), view.end());
 		}
 		return out;
 	};
 	auto int_field = [&](const char *name) -> int64_t {
-		if (auto col = batch->GetColumnByName(name)) {
-			if (auto arr = std::dynamic_pointer_cast<arrow::Int64Array>(col)) {
-				if (!arr->IsNull(0)) {
-					return arr->Value(0);
-				}
-			}
+		auto arr = batch->GetColumnByName(name);
+		if (HasType(arr, NANOARROW_TYPE_INT64) && !arr.IsNull(0)) {
+			return arr.GetInt(0);
 		}
 		return 0;
 	};
@@ -1665,14 +1661,15 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 	// enumeration, which is only sound if the cursors partition the remainder
 	// disjointly. DuckDB paginates serially, so it follows the first and ignores
 	// the rest rather than pretending to fan out.
-	if (auto col = batch->GetColumnByName("next_cursors")) {
-		if (auto list = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
-			if (!list->IsNull(0) && list->value_length(0) > 0) {
-				auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
-				if (values) {
-					auto view = values->GetView(list->value_offset(0));
-					page.next_cursor.assign(view.begin(), view.end());
-				}
+	if (auto list = batch->GetColumnByName("next_cursors")) {
+		if (HasType(list, NANOARROW_TYPE_LIST) && !list.IsNull(0)) {
+			int64_t start = 0;
+			int64_t end = 0;
+			list.ListRange(0, start, end);
+			auto values = list.child(0);
+			if (end > start && IsBinaryOrUtf8(values)) {
+				auto view = values.GetView(start);
+				page.next_cursor.assign(view.begin(), view.end());
 			}
 		}
 	}
@@ -1682,12 +1679,9 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 	page.execution_id = binary_field("execution_id");
 	page.init_opaque_data = binary_field("init_opaque_data");
 
-	if (auto col = batch->GetColumnByName("scope")) {
-		if (auto arr = std::dynamic_pointer_cast<arrow::StringArray>(col)) {
-			if (!arr->IsNull(0)) {
-				page.scope = arr->GetString(0);
-			}
-		}
+	auto scope = batch->GetColumnByName("scope");
+	if (HasType(scope, NANOARROW_TYPE_STRING) && !scope.IsNull(0)) {
+		page.scope = scope.GetString(0);
 	}
 
 	return page;
@@ -1760,7 +1754,7 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	idx_t pages = 0;
 
 	while (true) {
-		if (context.interrupted) {
+		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
 		if (pages >= max_pages) {
@@ -1865,9 +1859,7 @@ static unique_ptr<BaseStatistics> BuildColumnStatistics(
 			// Cast not available — if the physical types match, reinterpret
 			// the value with the target logical type (e.g., BLOB → GEOMETRY)
 			if (val.type().InternalType() == duck_type.InternalType()) {
-				auto reinterpreted = val;
-				reinterpreted.Reinterpret(duck_type);
-				return reinterpreted;
+				return val.WithType(duck_type);
 			}
 			return val;
 		}
@@ -1913,7 +1905,7 @@ static unique_ptr<BaseStatistics> BuildColumnStatistics(
 // `log_source_key` / `log_source_value` identify the RPC source in log records
 // (e.g. {"table", "public.users"} or {"function_name", "sequence"}).
 std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
-    const std::shared_ptr<arrow::RecordBatch> &result_batch,
+    const VgiBatchPtr &result_batch,
     const std::vector<LogicalType> &column_types,
     const std::vector<std::string> &column_names,
     const std::string &worker_path, const std::string &log_source_key,
@@ -2281,110 +2273,37 @@ static AggregateDistinctDependent FromWire(generated::AggregateDistinctDependent
 // Result parsing
 // ============================================================================
 
-// Helper to extract a single value from an Arrow array at given row index
-// Uses DuckDB type from ArrowSchemaToDuckDBTypes and constructs Value appropriately
-static Value ExtractArrowValue(const std::shared_ptr<arrow::Array> &array, int64_t row_idx,
-                               const LogicalType &duck_type) {
-	if (!array || array->IsNull(row_idx)) {
-		return Value(duck_type);
-	}
-
-	// Extract value based on Arrow type and construct DuckDB Value
-	switch (array->type()->id()) {
-	case arrow::Type::BOOL: {
-		auto typed = std::static_pointer_cast<arrow::BooleanArray>(array);
-		return Value::BOOLEAN(typed->Value(row_idx));
-	}
-	case arrow::Type::INT8: {
-		auto typed = std::static_pointer_cast<arrow::Int8Array>(array);
-		return Value::TINYINT(typed->Value(row_idx));
-	}
-	case arrow::Type::INT16: {
-		auto typed = std::static_pointer_cast<arrow::Int16Array>(array);
-		return Value::SMALLINT(typed->Value(row_idx));
-	}
-	case arrow::Type::INT32: {
-		auto typed = std::static_pointer_cast<arrow::Int32Array>(array);
-		return Value::INTEGER(typed->Value(row_idx));
-	}
-	case arrow::Type::INT64: {
-		auto typed = std::static_pointer_cast<arrow::Int64Array>(array);
-		return Value::BIGINT(typed->Value(row_idx));
-	}
-	case arrow::Type::UINT8: {
-		auto typed = std::static_pointer_cast<arrow::UInt8Array>(array);
-		return Value::UTINYINT(typed->Value(row_idx));
-	}
-	case arrow::Type::UINT16: {
-		auto typed = std::static_pointer_cast<arrow::UInt16Array>(array);
-		return Value::USMALLINT(typed->Value(row_idx));
-	}
-	case arrow::Type::UINT32: {
-		auto typed = std::static_pointer_cast<arrow::UInt32Array>(array);
-		return Value::UINTEGER(typed->Value(row_idx));
-	}
-	case arrow::Type::UINT64: {
-		auto typed = std::static_pointer_cast<arrow::UInt64Array>(array);
-		return Value::UBIGINT(typed->Value(row_idx));
-	}
-	case arrow::Type::FLOAT: {
-		auto typed = std::static_pointer_cast<arrow::FloatArray>(array);
-		return Value::FLOAT(typed->Value(row_idx));
-	}
-	case arrow::Type::DOUBLE: {
-		auto typed = std::static_pointer_cast<arrow::DoubleArray>(array);
-		return Value::DOUBLE(typed->Value(row_idx));
-	}
-	case arrow::Type::STRING: {
-		auto typed = std::static_pointer_cast<arrow::StringArray>(array);
-		return Value(typed->GetString(row_idx));
-	}
-	case arrow::Type::LARGE_STRING: {
-		auto typed = std::static_pointer_cast<arrow::LargeStringArray>(array);
-		return Value(typed->GetString(row_idx));
-	}
-	case arrow::Type::BINARY: {
-		auto typed = std::static_pointer_cast<arrow::BinaryArray>(array);
-		auto view = typed->GetView(row_idx);
-		return Value::BLOB(reinterpret_cast<const_data_ptr_t>(view.data()), view.size());
-	}
-	case arrow::Type::LARGE_BINARY: {
-		auto typed = std::static_pointer_cast<arrow::LargeBinaryArray>(array);
-		auto view = typed->GetView(row_idx);
-		return Value::BLOB(reinterpret_cast<const_data_ptr_t>(view.data()), view.size());
-	}
-	default:
-		// For complex/unsupported types, try to get string representation
-		auto scalar_result = array->GetScalar(row_idx);
-		if (scalar_result.ok()) {
-			return Value(scalar_result.ValueUnsafe()->ToString());
-		}
-		return Value(duck_type);
-	}
-}
-
-// Helper to convert Arrow RecordBatch to vector of DuckDB Values
-// Uses DuckDB's ArrowSchemaToDuckDBTypes for proper type mapping
-static vector<Value> ArrowBatchToValues(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch) {
+vector<Value> BatchRowToValues(ClientContext &context, const VgiBatchPtr &batch, int64_t row) {
 	vector<Value> result;
-	if (!batch || batch->num_rows() == 0) {
+	if (!batch || batch->num_columns() == 0 || row < 0 || row >= batch->num_rows()) {
 		return result;
 	}
 
-	// Use DuckDB's proper Arrow schema conversion to get correct types
+	// DuckDB's own Arrow scanner does the conversion, so every type DuckDB can
+	// read from Arrow is supported, with the column types ArrowSchemaToDuckDBTypes
+	// assigns (int8..uint64 / float / double / bool / utf8 / binary map onto the
+	// matching DuckDB scalar types).
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> types;
 	vector<string> names;
 	ArrowSchemaToDuckDBTypes(context, batch->schema(), c_schema, arrow_table, types, names);
 
-	// Extract value from each column at row 0
-	for (int64_t col_idx = 0; col_idx < batch->num_columns(); col_idx++) {
-		auto array = batch->column(col_idx);
-		auto &duck_type = types[col_idx];
-		result.push_back(ExtractArrowValue(array, 0, duck_type));
-	}
+	// One row, zero-copy; the exported array keeps the batch's buffers alive.
+	auto one_row = batch->num_rows() == 1 ? batch : batch->Slice(row, 1);
+	auto current_chunk = make_uniq<ArrowArrayWrapper>();
+	one_row->ExportTo(*current_chunk);
 
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(context), types, 1);
+	chunk.SetCardinality(1);
+	ArrowScanLocalState local_state(std::move(current_chunk), context);
+	ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), chunk, false);
+
+	result.reserve(types.size());
+	for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+		result.push_back(chunk.GetValue(col_idx, 0));
+	}
 	return result;
 }
 
@@ -2407,11 +2326,16 @@ static LogicalType SingleFieldType(const std::vector<uint8_t> &schema_bytes, Cli
 
 // A setting's / attach option's default: the first cell of a serialized
 // one-column batch, or NULL of `type` when absent or empty.
-static Value DefaultValueOf(const std::optional<std::vector<uint8_t>> &bytes, const LogicalType &type) {
+static Value DefaultValueOf(ClientContext &context, const std::optional<std::vector<uint8_t>> &bytes,
+                            const LogicalType &type) {
 	if (bytes && !bytes->empty()) {
 		auto batch = DeserializeFromIpcBytes(*bytes);
 		if (batch && batch->num_rows() > 0 && batch->num_columns() > 0) {
-			return ExtractArrowValue(batch->column(0), 0, type);
+			auto values = BatchRowToValues(context, batch->SelectColumns({0}), 0);
+			// NULL keeps the declared type.
+			if (!values.empty() && !values[0].IsNull()) {
+				return std::move(values[0]);
+			}
 		}
 	}
 	return Value(type);
@@ -2424,7 +2348,7 @@ VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string 
 	setting.name = std::move(spec.name);
 	setting.description = std::move(spec.description);
 	setting.type = SingleFieldType(spec.type, context, "Setting", setting.name, worker_path);
-	setting.default_value = DefaultValueOf(spec.default_value, setting.type);
+	setting.default_value = DefaultValueOf(context, spec.default_value, setting.type);
 	return setting;
 }
 
@@ -2435,7 +2359,7 @@ VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes, con
 	spec.name = std::move(wire.name);
 	spec.description = std::move(wire.description);
 	spec.type = SingleFieldType(wire.type, context, "Attach option", spec.name, worker_path);
-	spec.default_value = DefaultValueOf(wire.default_value, spec.type);
+	spec.default_value = DefaultValueOf(context, wire.default_value, spec.type);
 	spec.required = wire.required;
 	spec.secret = wire.secret;
 	return spec;
@@ -2461,11 +2385,9 @@ VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::s
 		VgiSecretTypeParam param;
 		param.name = names[i];
 		param.type = types[i];
-		auto field_metadata = params_schema->field(i)->metadata();
-		if (field_metadata) {
-			auto redact_idx = field_metadata->FindKey("redact");
-			param.redact = redact_idx >= 0 && field_metadata->value(redact_idx) == "true";
-		}
+		auto field_metadata = params_schema->field_metadata(i);
+		auto redact_idx = field_metadata.FindKey("redact");
+		param.redact = redact_idx >= 0 && field_metadata.value(redact_idx) == "true";
 		secret_type.parameters.push_back(std::move(param));
 	}
 	return secret_type;
@@ -2485,7 +2407,7 @@ static VgiAttachCatalogInfo ParseVgiAttachCatalog(const std::vector<uint8_t> &by
 	return info;
 }
 
-CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+CatalogAttachResult ParseCatalogAttachResult(const VgiBatchPtr &batch,
                                              const std::string &worker_path, ClientContext &context, bool query_offered) {
 	auto wire = generated::Decode<generated::CatalogAttachResult>(batch, 0, worker_path);
 	CatalogAttachResult result;
@@ -2495,15 +2417,11 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	result.catalog_version_frozen = wire.catalog_version_frozen;
 	result.catalog_version = wire.catalog_version;
 	result.attach_opaque_data_required = wire.attach_opaque_data_required;
-	if (!wire.default_schema) {
-		throw NotImplementedException("VGI native DuckDB 1.5 requires an explicit default_schema; catalogs with no "
-		                              "implicit default are unsupported");
-	}
-	if (wire.default_schema->empty() || wire.default_schema->find('\0') != std::string::npos) {
+	if (wire.default_schema && (wire.default_schema->empty() || wire.default_schema->find('\0') != std::string::npos)) {
 		throw IOException(CatalogProtocolViolation("catalog_attach", worker_path),
-		                  "CatalogAttachResult.default_schema must be a nonempty raw identifier without NUL");
+		                  "CatalogAttachResult.default_schema must be NULL or a nonempty raw identifier without NUL");
 	}
-	result.default_schema = std::move(*wire.default_schema);
+	result.default_schema = std::move(wire.default_schema);
 	for (const auto &setting_bytes : wire.settings) {
 		result.settings.push_back(ParseVgiSetting(setting_bytes, worker_path, context));
 	}
@@ -2544,11 +2462,11 @@ static VgiSchemaInfo SchemaInfoFromWire(generated::SchemaInfo wire) {
 	return info;
 }
 
-VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+VgiSchemaInfo ParseSchemaInfo(const VgiBatchPtr &batch, const std::string &worker_path) {
 	return SchemaInfoFromWire(generated::Decode<generated::SchemaInfo>(batch, 0, worker_path));
 }
 
-VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
                             int64_t row_idx, const std::string &worker_path) {
 	auto wire = generated::Decode<generated::TableInfo>(batch, row_idx, worker_path);
 	VgiTableInfo info;
@@ -2561,8 +2479,7 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 	info.arrow_schema = DeserializeSchema(wire.columns);
 	ValidateNativeColumnMetadata(info.arrow_schema);
 	for (int i = 0; info.arrow_schema && i < info.arrow_schema->num_fields(); i++) {
-		auto &field = info.arrow_schema->field(i);
-		if (field->HasMetadata() && field->metadata()->FindKey(VGI_ROW_ID_METADATA_KEY) >= 0) {
+		if (info.arrow_schema->field_metadata(i).FindKey(VGI_ROW_ID_METADATA_KEY) >= 0) {
 			if (info.row_id_column >= 0) {
 				throw InvalidInputException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kTable, info.name).Set(error_key::kField, "columns"),
 		                            StringUtil::Format("Table '%s' has multiple is_row_id columns — at most one is allowed", info.name));
@@ -2632,55 +2549,50 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 		        .Set(error_key::kTable, info.name).Set(error_key::kField, "required_filters"),
 		    StringUtil::Format("Invalid required_filters for table '%s': %s", info.name, reason));
 	};
-	auto outer = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("required_filters"));
-	auto groups = outer ? std::dynamic_pointer_cast<arrow::ListArray>(outer->values()) : nullptr;
-	auto paths = groups ? std::dynamic_pointer_cast<arrow::ListArray>(groups->values()) : nullptr;
-	auto components = paths ? std::dynamic_pointer_cast<arrow::StringArray>(paths->values()) : nullptr;
-	if (!components || outer->IsNull(row_idx)) {
+	auto outer = batch->GetColumnByName("required_filters");
+	if (!HasType(outer, NANOARROW_TYPE_LIST) || outer.IsNull(row_idx))
 		fail_required("expected non-null list<list<list<utf8>>>");
-	}
-	for (int64_t i = outer->value_offset(row_idx); i < outer->value_offset(row_idx + 1); ++i) {
-		if (groups->IsNull(i) || groups->value_length(i) == 0) {
-			fail_required("groups must be non-null and nonempty");
-		}
+	auto groups = outer.child(0);
+	if (!HasType(groups, NANOARROW_TYPE_LIST)) fail_required("expected groups of paths");
+	auto paths = groups.child(0);
+	if (!HasType(paths, NANOARROW_TYPE_LIST)) fail_required("expected lists of path components");
+	auto components = paths.child(0);
+	if (!HasType(components, NANOARROW_TYPE_STRING)) fail_required("expected UTF-8 path components");
+	int64_t first_group = 0, last_group = 0;
+	outer.ListRange(row_idx, first_group, last_group);
+	for (int64_t i = first_group; i < last_group; ++i) {
+		int64_t first_path = 0, last_path = 0;
+		groups.ListRange(i, first_path, last_path);
+		if (groups.IsNull(i) || first_path == last_path) fail_required("groups must be non-null and nonempty");
 		std::vector<std::vector<std::string>> group;
-		for (int64_t j = groups->value_offset(i); j < groups->value_offset(i + 1); ++j) {
-			if (paths->IsNull(j) || paths->value_length(j) == 0) {
-				fail_required("paths must be non-null and nonempty");
-			}
+		for (int64_t j = first_path; j < last_path; ++j) {
+			int64_t first = 0, last = 0;
+			paths.ListRange(j, first, last);
+			if (paths.IsNull(j) || first == last) fail_required("paths must be non-null and nonempty");
 			std::vector<std::string> path;
-			auto fields = info.arrow_schema->fields();
-			for (int64_t k = paths->value_offset(j); k < paths->value_offset(j + 1); ++k) {
-				if (components->IsNull(k)) {
-					fail_required("components must be non-null");
-				}
-				auto component = components->GetString(k);
-				if (component.empty() || component.find('\0') != std::string::npos) {
+			auto parent = &info.arrow_schema->c_schema();
+			for (int64_t k = first; k < last; ++k) {
+				if (components.IsNull(k)) fail_required("components must be non-null");
+				auto component = components.GetString(k);
+				if (component.empty() || component.find('\0') != std::string::npos)
 					fail_required("components must be nonempty and contain no NUL");
-				}
-				std::shared_ptr<arrow::Field> resolved;
-				for (const auto &field : fields) {
-					if (field->name() == component) {
-						if (resolved) {
-							fail_required("ambiguous component: " + component);
-						}
-						resolved = field;
+				const ArrowSchema *resolved = nullptr;
+				for (int64_t child = 0; child < parent->n_children; ++child) {
+					if (component == parent->children[child]->name) {
+						if (resolved) fail_required("ambiguous component: " + component);
+						resolved = parent->children[child];
 					}
 				}
-				if (!resolved) {
-					fail_required("unknown component: " + component);
-				}
-				if (k + 1 < paths->value_offset(j + 1)) {
-					if (resolved->type()->id() != arrow::Type::STRUCT) {
+				if (!resolved) fail_required("unknown component: " + component);
+				if (k + 1 < last) {
+					auto type = DescribeType(*resolved);
+					if (type.type != NANOARROW_TYPE_STRUCT || !type.extension_name.empty())
 						fail_required("non-struct parent: " + component);
-					}
-					fields = resolved->type()->fields();
+					parent = resolved;
 				}
 				path.push_back(std::move(component));
 			}
-			if (std::find(group.begin(), group.end(), path) != group.end()) {
-				fail_required("duplicate path in group");
-			}
+			if (std::find(group.begin(), group.end(), path) != group.end()) fail_required("duplicate path in group");
 			group.push_back(std::move(path));
 		}
 		info.required_filters.push_back(std::move(group));
@@ -2702,12 +2614,12 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 	return info;
 }
 
-VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
                             const std::string &worker_path) {
 	return ParseTableInfo(context, batch, 0, worker_path);
 }
 
-std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,
+std::vector<VgiSchemaInfo> ParseSchemaList(const VgiBatchPtr &batch,
                                            const std::string &worker_path) {
 	std::vector<VgiSchemaInfo> schemas;
 	for (int64_t i = 0; batch && i < batch->num_rows(); i++) {
@@ -2716,7 +2628,7 @@ std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBa
 	return schemas;
 }
 
-VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+VgiViewInfo ParseViewInfo(const VgiBatchPtr &batch, const std::string &worker_path) {
 	auto wire = generated::Decode<generated::ViewInfo>(batch, 0, worker_path);
 	VgiViewInfo info;
 	info.name = std::move(wire.name);
@@ -2741,7 +2653,7 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 	return info;
 }
 
-VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const VgiBatchPtr &batch,
                                               const std::string &worker_path) {
 	auto wire = generated::Decode<generated::CopyFromFormatInfo>(batch, 0, worker_path);
 	VgiCopyFromFormatInfo info;
@@ -2776,10 +2688,10 @@ static void DecodeScanArguments(ClientContext &context,
 	if (!arguments_batch || arguments_batch->num_rows() == 0) {
 		return;
 	}
-	auto values = ArrowBatchToValues(context, arguments_batch);
+	auto values = BatchRowToValues(context, arguments_batch, 0);
 	auto &schema = arguments_batch->schema();
 	for (int i = 0; i < schema->num_fields(); i++) {
-		const auto &field_name = schema->field(i)->name();
+		const auto &field_name = schema->field_names()[static_cast<size_t>(i)];
 		auto &duck_value = values[i];
 		if (field_name.rfind("arg_", 0) == 0) {
 			// Cap to a sane ceiling: a worker-supplied index is used to size the
@@ -2813,7 +2725,7 @@ static void DecodeScanArguments(ClientContext &context,
 	}
 }
 
-VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const VgiBatchPtr &batch,
                                                const std::string &worker_path) {
 	auto wire = generated::Decode<generated::ScanFunctionResult>(batch, 0, worker_path);
 	VgiScanFunctionResult result;
@@ -2828,13 +2740,13 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std:
 // 1-row record with a list<binary> column carrying serialized ScanBranch
 // 1-row batches; each branch's `arguments` field is itself a nested IPC
 // stream of typed scalars. The branch_filter SQL string (when non-empty) is
-// parsed eagerly via Parser::ParseExpressionList — the resulting
+// parsed eagerly via Parser(ParserOptions::Builtin()).ParseExpressionList — the resulting
 // ParsedExpression lives on the catalog entry alongside the branches list.
 // We do NOT bind the expression here; binding happens in the rewriter where
 // a Binder + the branch's column list are in hand. See plan: §C++ wiring
 // sketch "branch_filter parse-at-attach, re-bind-per-rewrite, no bound cache".
 VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
-                                               const std::shared_ptr<arrow::RecordBatch> &batch,
+                                               const VgiBatchPtr &batch,
                                                const std::string &worker_path) {
 	VgiScanBranchesResult result;
 
@@ -2872,7 +2784,7 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 			// as a "parse error".
 			duckdb::vector<duckdb::unique_ptr<ParsedExpression>> exprs;
 			try {
-				exprs = Parser::ParseExpressionList(branch.branch_filter);
+				exprs = Parser(ParserOptions::Builtin()).ParseExpressionList(branch.branch_filter);
 			} catch (const std::exception &e) {
 				throw BinderException(ErrorInfo(error_subtype::kProtocolViolation)
 				                          .Worker(worker_path)
@@ -3040,8 +2952,7 @@ static std::string RenderRequiredFiltersJson(const std::vector<std::vector<std::
 CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo &table_info,
                                             const std::string &schema_name) {
 	CreateTableInfo create_info;
-	create_info.table = table_info.name;
-	create_info.schema = schema_name;
+	create_info.SetQualifiedName(QualifiedName(Identifier(), Identifier(schema_name), Identifier(table_info.name)));
 	if (!table_info.comment.empty()) {
 		create_info.comment = Value(table_info.comment);
 	}
@@ -3058,13 +2969,13 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		auto type_schema = NativeColumnTypeSchema(table_info.arrow_schema, schema_name);
 		if (table_info.row_id_column >= 0) {
 			// Convert the row_id field type to DuckDB LogicalType
-			auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
+			const auto &rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
 			if (ReadNativeColumnDefault(rowid_field, schema_name) ||
 			    ReadNativeColumnGenerated(rowid_field, schema_name)) {
 				throw InvalidInputException(
 				    "VGI column expression: a row ID cannot declare a default or generated expression");
 			}
-			auto rowid_schema = arrow::schema({rowid_field});
+			auto rowid_schema = type_schema->Select({table_info.row_id_column});
 			ArrowSchemaWrapper c_schema;
 			ArrowTableSchema arrow_table;
 			vector<LogicalType> types;
@@ -3073,13 +2984,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			table_info.rowid_type = types[0];
 
 			// Build filtered schema excluding the row_id field
-			std::vector<std::shared_ptr<arrow::Field>> filtered_fields;
-			for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
-				if (i != table_info.row_id_column) {
-					filtered_fields.push_back(type_schema->field(i));
-				}
-			}
-			auto filtered_schema = arrow::schema(filtered_fields);
+			auto filtered_schema = type_schema->RemoveField(table_info.row_id_column);
 			ArrowSchemaToColumnList(context, filtered_schema, create_info.columns);
 		} else {
 			ArrowSchemaToColumnList(context, type_schema, create_info.columns);
@@ -3102,7 +3007,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 
 	// Apply UNIQUE constraints
 	for (auto &cols : table_info.unique_constraints) {
-		vector<string> col_names;
+		vector<duckdb::Identifier> col_names;
 		for (auto idx : cols) {
 			int adjusted = idx;
 			if (table_info.row_id_column >= 0) {
@@ -3116,7 +3021,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			if (adjusted < 0 || (idx_t)adjusted >= create_info.columns.LogicalColumnCount()) {
 				throw InvalidInputException(
 				    "VGI: UNIQUE constraint references column index %d out of range (table '%s' has %llu columns)",
-				    adjusted, create_info.table, (unsigned long long)create_info.columns.LogicalColumnCount());
+				    adjusted, create_info.GetTableName(), (unsigned long long)create_info.columns.LogicalColumnCount());
 			}
 			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
 		}
@@ -3128,7 +3033,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 
 	// Apply PRIMARY KEY constraints (UniqueConstraint with is_primary_key=true)
 	for (auto &cols : table_info.primary_key_constraints) {
-		vector<string> col_names;
+		vector<duckdb::Identifier> col_names;
 		for (auto idx : cols) {
 			int adjusted = idx;
 			if (table_info.row_id_column >= 0) {
@@ -3142,7 +3047,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			if (adjusted < 0 || (idx_t)adjusted >= create_info.columns.LogicalColumnCount()) {
 				throw InvalidInputException(
 				    "VGI: PRIMARY KEY constraint references column index %d out of range (table '%s' has %llu columns)",
-				    adjusted, create_info.table, (unsigned long long)create_info.columns.LogicalColumnCount());
+				    adjusted, create_info.GetTableName(), (unsigned long long)create_info.columns.LogicalColumnCount());
 			}
 			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
 		}
@@ -3155,12 +3060,12 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	for (auto &fk : table_info.foreign_key_constraints) {
 		ForeignKeyInfo fk_info;
 		fk_info.type = ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE;
-		fk_info.schema = fk.referenced_schema;
-		fk_info.table = fk.referenced_table;
+		fk_info.schema = duckdb::Identifier(fk.referenced_schema);
+		fk_info.table = duckdb::Identifier(fk.referenced_table);
 		// The negotiated authority enforces this validated key on every write.
 		// Worker physical indices are intentionally never imported into DuckDB.
-		vector<string> pk_cols(fk.pk_columns.begin(), fk.pk_columns.end());
-		vector<string> fk_cols(fk.fk_columns.begin(), fk.fk_columns.end());
+		auto pk_cols = StringsToIdentifiers(vector<string>(fk.pk_columns.begin(), fk.pk_columns.end()));
+		auto fk_cols = StringsToIdentifiers(vector<string>(fk.fk_columns.begin(), fk.fk_columns.end()));
 		create_info.constraints.push_back(
 		    make_uniq<ForeignKeyConstraint>(std::move(pk_cols), std::move(fk_cols), std::move(fk_info)));
 	}
@@ -3187,10 +3092,11 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			auto canonical_default = BindNativeColumnDefault(context, field, schema_name, column.Type());
 			if (canonical_default)
 				column.SetDefaultValue(std::move(canonical_default));
-			else if (field->metadata() && field->metadata()->FindKey(VGI_COLUMN_DEFAULT) < 0) {
-				auto index = field->metadata()->FindKey("default");
+			else if (field.metadata && VgiMetadata::FromC(field.metadata).FindKey(VGI_COLUMN_DEFAULT) < 0) {
+				auto metadata = VgiMetadata::FromC(field.metadata);
+				auto index = metadata.FindKey("default");
 				if (index >= 0) {
-					auto expressions = Parser::ParseExpressionList(field->metadata()->value(index));
+					auto expressions = Parser(ParserOptions::Builtin()).ParseExpressionList(metadata.value(index));
 					if (!expressions.empty())
 						column.SetDefaultValue(std::move(expressions[0]));
 				}
@@ -3205,7 +3111,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			auto expression = column.GeneratedExpression().Copy();
 			// Avoid duplicating a canonical CREATE's explicit engine cast.
 			if (expression->GetExpressionClass() != ExpressionClass::CAST ||
-			    expression->Cast<CastExpression>().cast_type != column.Type()) {
+			    UnboundType::TryDefaultBind(expression->Cast<CastExpression>().TargetType()) != column.Type()) {
 				column.SetGeneratedExpression(std::move(expression));
 			}
 		}
@@ -3218,6 +3124,28 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	return create_info;
 }
 
+// Arrow C++ DataType::Equals: the field's own name, nullability and metadata are not
+// part of its type; child fields compare by name, type and nullability.
+static bool DataTypesEqual(const ArrowSchema &a, const ArrowSchema &b) {
+	if (std::string(a.format ? a.format : "") != std::string(b.format ? b.format : "") ||
+	    a.n_children != b.n_children) {
+		return false;
+	}
+	constexpr int64_t kTypeFlags = ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED;
+	if ((a.flags & kTypeFlags) != (b.flags & kTypeFlags)) {
+		return false;
+	}
+	for (int64_t i = 0; i < a.n_children; i++) {
+		if (!TypesEqual(*a.children[i], *b.children[i], /*check_names=*/true, /*check_metadata=*/false)) {
+			return false;
+		}
+	}
+	if ((a.dictionary == nullptr) != (b.dictionary == nullptr)) {
+		return false;
+	}
+	return !a.dictionary || DataTypesEqual(*a.dictionary, *b.dictionary);
+}
+
 // extra_info for a FunctionInfo the worker sent that breaks the protocol.
 static ErrorInfo FunctionInfoViolation(const std::string &worker_path, const std::string &function_name,
                                        const char *field) {
@@ -3227,7 +3155,7 @@ static ErrorInfo FunctionInfoViolation(const std::string &worker_path, const std
 	                     .Set(error_key::kField, field));
 }
 
-VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
+VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
                                   const std::string &worker_path) {
 	auto wire = generated::Decode<generated::FunctionInfo>(batch, row_idx, worker_path);
 	VgiFunctionInfo info;
@@ -3324,21 +3252,24 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 			throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' has parameter_default_values without an arguments schema", info.name);
 		}
 
+		const auto &defaults_schema = defaults_batch->schema();
 		int previous_argument_index = -1;
-		for (const auto &default_field : defaults_batch->schema()->fields()) {
-			const auto argument_index = info.arguments_schema->GetFieldIndex(default_field->name());
+		for (int default_field_index = 0; default_field_index < defaults_schema->num_fields(); default_field_index++) {
+			const auto &default_name = defaults_schema->field_names()[static_cast<size_t>(default_field_index)];
+			const auto &default_field = defaults_schema->field(default_field_index);
+			const auto argument_index = info.arguments_schema->GetFieldIndex(default_name);
 			if (argument_index < 0) {
 				throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' has a default for unknown parameter '%s'", info.name,
-				                  default_field->name());
+				                  default_name);
 			}
 			if (argument_index <= previous_argument_index) {
 				throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' parameter defaults are not in signature order", info.name);
 			}
 			const auto &argument_field = info.arguments_schema->field(argument_index);
-			if (!argument_field->type()->Equals(default_field->type())) {
+			if (!DataTypesEqual(argument_field, default_field)) {
 				throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' default for parameter '%s' has type %s, expected %s", info.name,
-				                  default_field->name(), default_field->type()->ToString(),
-				                  argument_field->type()->ToString());
+				                  default_name, TypeToString(default_field),
+				                  TypeToString(argument_field));
 			}
 			previous_argument_index = argument_index;
 		}
@@ -3347,13 +3278,10 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 			const auto default_count = defaults_batch->num_columns();
 			int fixed_parameter_count = info.arguments_schema->num_fields();
 			if (fixed_parameter_count > 0) {
-				const auto &last_field = info.arguments_schema->field(fixed_parameter_count - 1);
-				if (last_field->HasMetadata()) {
-					const auto metadata = last_field->metadata();
-					const auto varargs_index = metadata->FindKey(VGI_VARARGS_METADATA_KEY);
-					if (varargs_index >= 0 && metadata->value(varargs_index) == VGI_VARARGS_TRUE_VALUE) {
-						fixed_parameter_count--;
-					}
+				const auto metadata = info.arguments_schema->field_metadata(fixed_parameter_count - 1);
+				const auto varargs_index = metadata.FindKey(VGI_VARARGS_METADATA_KEY);
+				if (varargs_index >= 0 && metadata.value(varargs_index) == VGI_VARARGS_TRUE_VALUE) {
+					fixed_parameter_count--;
 				}
 			}
 			if (default_count > fixed_parameter_count) {
@@ -3361,8 +3289,8 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 			}
 			for (int default_index = 0; default_index < default_count; default_index++) {
 				const auto expected_parameter = fixed_parameter_count - default_count + default_index;
-				if (defaults_batch->schema()->field(default_index)->name() !=
-				    info.arguments_schema->field(expected_parameter)->name()) {
+				if (defaults_schema->field_names()[static_cast<size_t>(default_index)] !=
+				    info.arguments_schema->field_names()[static_cast<size_t>(expected_parameter)]) {
 					throw IOException(FunctionInfoViolation(worker_path, info.name, "parameter_default_values"), "Function '%s' defaults must form a trailing parameter sequence", info.name);
 				}
 			}
@@ -3441,7 +3369,7 @@ static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret 
 	kv_pairs["name"] = Value(kv_secret.GetName());
 	// Add all custom key-value entries
 	for (const auto &[k, v] : kv_secret.secret_map) {
-		kv_pairs[k] = v;
+		kv_pairs[k.GetIdentifierName()] = v;
 	}
 	// Add the secret's scope prefixes (newline-joined), set AFTER the secret_map
 	// loop so it is reliable for worker-side scope matching. Lets a worker that
@@ -3467,7 +3395,7 @@ static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret 
 // type to avoid an empty key colliding.)
 static void InsertResolvedSecret(std::map<std::string, std::map<std::string, Value>> &result,
                                  const std::string &secret_type, const KeyValueSecret &kv_secret) {
-	std::string key = kv_secret.GetName();
+	std::string key = kv_secret.GetName().GetIdentifierName();
 	if (key.empty()) {
 		key = secret_type;
 	}

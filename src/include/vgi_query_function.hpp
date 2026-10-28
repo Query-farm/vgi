@@ -3,16 +3,13 @@
 
 #include <memory>
 
-namespace arrow {
-class RecordBatch;
-class Schema;
-}
+#include "vgi_arrow.hpp"
 
 namespace duckdb {
 class ExtensionLoader;
 namespace vgi {
 void RegisterVgiQueryFunction(ExtensionLoader &loader);
-void ValidateVgiQueryResultBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                 const std::shared_ptr<arrow::Schema> &expected);
+void ValidateVgiQueryResultBatch(const VgiBatchPtr &batch,
+                                 const VgiSchemaPtr &expected);
 } // namespace vgi
 } // namespace duckdb

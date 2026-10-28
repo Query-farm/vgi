@@ -22,7 +22,7 @@ struct VgiCatalogContentsData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> VgiCatalogContentsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto data = make_uniq<VgiCatalogContentsData>();
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("vgi_catalog_contents: catalog name must not be NULL");
@@ -45,7 +45,7 @@ void VgiCatalogContentsScan(ClientContext &context, TableFunctionInput &data_p, 
 	}
 	data.finished = true;
 
-	auto &catalog = Catalog::GetCatalog(context, data.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(data.catalog_name));
 	if (catalog.GetCatalogType() != "vgi") {
 		throw InvalidInputException("vgi_catalog_contents: '%s' is not a VGI catalog", data.catalog_name);
 	}
@@ -76,7 +76,7 @@ void VgiCatalogContentsScan(ClientContext &context, TableFunctionInput &data_p, 
 
 void RegisterVgiCatalogContentsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_catalog_contents", {LogicalType::VARCHAR}, VgiCatalogContentsScan, VgiCatalogContentsBind);
-	func.named_parameters["if_none_match"] = LogicalType::VARCHAR;
+	vgi::AddVgiFunctionOption(func, Identifier("if_none_match"), LogicalType::VARCHAR);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "Issue one catalog_contents RPC against an attached VGI catalog and return the answer: the snapshot's "

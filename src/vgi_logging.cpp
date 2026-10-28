@@ -5,8 +5,6 @@
 #include "vgi_ifunction_connection.hpp"
 #include "yyjson.hpp"
 
-#include <arrow/api.h> // full Arrow definitions for HandleBatchLogMessage (forward-declared in the header)
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -205,15 +203,14 @@ string VgiLogType::ConstructLogMessage(const string &event, const vector<pair<st
 }
 
 // ============================================================================
-// Log Message Handling from Arrow RecordBatch Metadata
+// Log Message Handling from batch custom metadata
 // ============================================================================
 
 // Check if a batch contains a log message (zero rows with vgi.log_* metadata).
 // If it's an EXCEPTION, throws IOException with the message, traceback, and worker context.
 // For other log levels, logs to DuckDB if context is provided.
 // Returns true if the batch was a log message, false otherwise.
-bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
-                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
+bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadataPtr &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid, const std::string &execution_id_hex,
                            const std::string &attach_opaque_data_digest, const std::string &transaction_opaque_data_digest,
                            const std::string &conn_id_hex,
@@ -229,8 +226,8 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 
 	// Look for vgi_rpc.log_level and vgi_rpc.log_message (new protocol)
 	// Also check legacy vgi.log_level for backwards compatibility during migration
-	int level_idx = custom_metadata->FindKey("vgi_rpc.log_level");
-	int message_idx = custom_metadata->FindKey("vgi_rpc.log_message");
+	int64_t level_idx = custom_metadata->FindKey("vgi_rpc.log_level");
+	int64_t message_idx = custom_metadata->FindKey("vgi_rpc.log_message");
 	if (level_idx < 0) {
 		level_idx = custom_metadata->FindKey("vgi.log_level");
 	}
@@ -255,7 +252,7 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 	std::string exception_type;
 	std::string extra_error_kind;
 	std::string extra_error_code;
-	int extra_idx = custom_metadata->FindKey("vgi_rpc.log_extra");
+	int64_t extra_idx = custom_metadata->FindKey("vgi_rpc.log_extra");
 	if (extra_idx < 0) {
 		extra_idx = custom_metadata->FindKey("vgi.log_extra");
 	}
@@ -293,7 +290,7 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 	// substring-searching the message text. Mirrors vgi-rpc Python's
 	// metadata.ERROR_KIND_KEY (see vgi-rpc commit adding MethodNotImplementedError).
 	std::string error_kind;
-	int kind_idx = custom_metadata->FindKey("vgi_rpc.error_kind");
+	int64_t kind_idx = custom_metadata->FindKey("vgi_rpc.error_kind");
 	if (kind_idx >= 0) {
 		error_kind = custom_metadata->value(kind_idx);
 	} else {
@@ -302,7 +299,7 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 	// Canonical code (gRPC code name, e.g. UNIMPLEMENTED): top-level key first,
 	// then the log_extra mirror.
 	std::string error_code;
-	int code_idx = custom_metadata->FindKey("vgi_rpc.error_code");
+	int64_t code_idx = custom_metadata->FindKey("vgi_rpc.error_code");
 	if (code_idx >= 0) {
 		error_code = custom_metadata->value(code_idx);
 	} else {

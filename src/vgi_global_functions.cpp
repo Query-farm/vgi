@@ -28,7 +28,7 @@ VgiGlobalBinding ResolveVgiGlobalBinding(ClientContext &context, const std::stri
 	// API to unregister a function, so the entry survives DETACH — resolving
 	// live here is what makes a re-ATTACH refresh the connection and a DETACH
 	// produce a clear error instead of a stale-worker call.
-	auto db = DatabaseManager::Get(context).GetDatabase(context, catalog_name);
+	auto db = DatabaseManager::Get(context).GetDatabase(context, Identifier(catalog_name));
 	if (!db) {
 		throw InvalidInputException(
 		    "VGI function '%s' was published globally by catalog '%s', which is no longer attached. "

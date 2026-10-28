@@ -1,5 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "catch.hpp"
+#include "../support/vgi_contract_fixtures.hpp"
 #include "duckdb.hpp"
 #include "vgi_bind_protocol.hpp"
 #include "vgi_catalog_metadata.hpp"
@@ -8,6 +9,8 @@
 #include "vgi_rpc_types.hpp"
 
 using namespace duckdb;
+using namespace duckdb::vgi;
+using namespace duckdb::vgi_test;
 
 TEST_CASE("Prepared query binding cannot negotiate external secrets", "[query-rpc]") {
 	DuckDB db(nullptr);
@@ -35,23 +38,21 @@ TEST_CASE("Prepared query binding cannot negotiate external secrets", "[query-rp
 }
 
 TEST_CASE("Prepared query output validates empty schemas and nested required values", "[query-rpc]") {
-	auto schema = arrow::schema({arrow::field("value", arrow::int64())},
-	                            arrow::key_value_metadata({"owner"}, {"prepared"}));
-	auto empty = arrow::MakeArrayOfNull(arrow::int64(), 0).ValueOrDie();
-	CHECK_NOTHROW(vgi::ValidateVgiQueryResultBatch(arrow::RecordBatch::Make(schema, 0, {empty}), schema));
-	CHECK_THROWS(vgi::ValidateVgiQueryResultBatch(
-	    arrow::RecordBatch::Make(schema->RemoveMetadata(), 0, {empty}), schema));
+	auto schema = MakeSchema({type::Int64().Named("value")}, Metadata({"owner"}, {"prepared"}));
+	CHECK_NOTHROW(ValidateVgiQueryResultBatch(VgiBatch::MakeEmpty(schema), schema));
+	CHECK_THROWS(ValidateVgiQueryResultBatch(VgiBatch::MakeEmpty(schema->WithMetadata({})), schema));
 
-	auto nulls = arrow::MakeArrayOfNull(arrow::int64(), 1).ValueOrDie();
-	auto child = arrow::field("required", arrow::int64(), false);
-	auto nested = arrow::StructArray::Make({nulls}, {child}).ValueOrDie();
-	auto nested_schema = arrow::schema({arrow::field("outer", nested->type())});
-	CHECK_THROWS(vgi::ValidateVgiQueryResultBatch(
-	    arrow::RecordBatch::Make(nested_schema, 1, {nested}), nested_schema));
+	auto nested_schema = MakeSchema({type::Struct({type::Int64().Named("required", false)}).Named("outer")});
+	VgiBatchBuilder nested(nested_schema);
+	append::Null(nested.column(0)->children[0]);
+	append::FinishElement(nested.column(0));
+	nested.FinishRow();
+	CHECK_THROWS(ValidateVgiQueryResultBatch(nested.Finish(), nested_schema));
 
-	auto index = arrow::MakeArrayFromScalar(arrow::Int8Scalar(0), 1).ValueOrDie();
-	auto dictionary = arrow::DictionaryArray::FromArrays(index, nulls).ValueOrDie();
-	auto dictionary_schema = arrow::schema({arrow::field("required", dictionary->type(), false)});
-	CHECK_THROWS(vgi::ValidateVgiQueryResultBatch(
-	    arrow::RecordBatch::Make(dictionary_schema, 1, {dictionary}), dictionary_schema));
+	auto dictionary_schema = MakeSchema({type::Dictionary(type::Int8(), type::Int64()).Named("required", false)});
+	VgiBatchBuilder dictionary(dictionary_schema);
+	append::Null(dictionary.column(0)->dictionary);
+	append::Int(dictionary.column(0), 0);
+	dictionary.FinishRow();
+	CHECK_THROWS(ValidateVgiQueryResultBatch(dictionary.Finish(), dictionary_schema));
 }

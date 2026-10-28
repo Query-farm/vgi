@@ -1,7 +1,6 @@
 // © Copyright 2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 #include "catch.hpp"
-#include <arrow/api.h>
 #include <filesystem>
 #include "vgi_arrow_ipc.hpp"
 #include "duckdb.hpp"
@@ -32,7 +31,7 @@ std::string Setting(Connection &con, const std::string &name) {
 		INFO(result->GetError());
 		REQUIRE_FALSE(result->HasError());
 	}
-	return result->GetValue(0, 0).ToString();
+	return result->Collection().GetValue(0, 0).ToString();
 }
 std::shared_ptr<VgiResultCacheEntry> Entry(const std::string &name, int64_t bytes) {
 	auto entry = std::make_shared<VgiResultCacheEntry>();
@@ -77,7 +76,7 @@ TEST_CASE("VGI settings validate at SET and leave previous values intact", "[set
 	auto names = con.Query("SELECT name FROM duckdb_settings()");
 	REQUIRE_FALSE(names->HasError());
 	for (idx_t i = 0; i < names->RowCount(); i++) {
-		auto name = names->GetValue(0, i).ToString();
+		auto name = names->Collection().GetValue(0, i).ToString();
 		if (name.compare(0, 4, "vgi_") != 0) {
 			continue;
 		}
@@ -188,10 +187,10 @@ TEST_CASE("VGI disk replay does not exceed retained memory budget", "[settings][
 	settings.disk_dir = dir.string();
 	settings.disk_max_bytes = 1024 * 1024;
 	cache.Configure(settings);
-	arrow::Int64Builder builder;
-	REQUIRE(builder.Append(42).ok());
-	auto array = builder.Finish().ValueOrDie();
-	auto batch = arrow::RecordBatch::Make(arrow::schema({arrow::field("value", arrow::int64())}), 1, {array});
+	VgiBatchBuilder builder(MakeSchema({type::Int64().Named("value")}));
+	append::Int(builder.column(0), 42);
+	builder.FinishRow();
+	auto batch = builder.Finish();
 	auto ipc = SerializeRecordBatch(batch);
 	auto entry = Entry("disk", ipc->size());
 	entry->key.identity_scope = "settings-test";

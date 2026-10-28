@@ -1,7 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
-#include <arrow/api.h>
+#include "vgi_ipc.hpp"
+
 #include <memory>
 #include <string>
 
@@ -19,11 +20,11 @@ namespace vgi {
 //   e.g. bind's output_schema is per-function, or response is raw IPC bytes
 //   that are not a standard result envelope).
 struct ResponseSchema {
-	std::shared_ptr<arrow::Schema> schema;
+	VgiSchemaPtr schema;
 	// For methods whose response is `{items: List<Binary>}`: the schema each
 	// inner IPC-serialized item decodes to. null when the method's response
 	// doesn't follow that pattern.
-	std::shared_ptr<arrow::Schema> item_schema = nullptr;
+	VgiSchemaPtr item_schema = nullptr;
 	bool dynamic = false;
 	// For dynamic methods: human-readable reason the registry doesn't strictly
 	// validate this method's response, and which component owns validation
@@ -32,7 +33,7 @@ struct ResponseSchema {
 	// Outer wire schema for this method's request batch (what C++ writes to
 	// the worker's stdin). Matches the `params_schema` vgi-rpc expects.
 	// Empty schema for parameter-less methods.
-	std::shared_ptr<arrow::Schema> request_schema = nullptr;
+	VgiSchemaPtr request_schema = nullptr;
 };
 
 // Look up a method's registered response contract. Returns nullptr when the
@@ -44,7 +45,7 @@ const ResponseSchema *LookupResponseSchema(const std::string &method_name);
 // `method_name`. Throws IOException with a readable expected-vs-actual diff on
 // mismatch, method missing from the registry, or void/non-void inversion.
 // Passing a null batch is legal when the registered contract is void.
-void ValidateResponseSchema(const std::shared_ptr<arrow::RecordBatch> &batch,
+void ValidateResponseSchema(const VgiBatchPtr &batch,
                             const std::string &method_name,
                             const std::string &worker_path);
 
@@ -53,7 +54,7 @@ void ValidateResponseSchema(const std::shared_ptr<arrow::RecordBatch> &batch,
 // registered `item_schema` for `method_name`. No-op if the method has no
 // item_schema registered (e.g. method isn't a list-of-items response, or the
 // registry deliberately leaves inner items unvalidated).
-void ValidateItemSchema(const std::shared_ptr<arrow::RecordBatch> &item_batch,
+void ValidateItemSchema(const VgiBatchPtr &item_batch,
                         const std::string &method_name,
                         const std::string &worker_path,
                         size_t item_index);
@@ -66,7 +67,7 @@ void ValidateItemSchema(const std::shared_ptr<arrow::RecordBatch> &item_batch,
 // `batch` may be null for methods that take no params (e.g. catalog_catalogs,
 // whose request has an empty schema). If `method_name` has no registered
 // params schema, throws — every invoked method must be registered.
-void ValidateRequestSchema(const std::shared_ptr<arrow::RecordBatch> &batch,
+void ValidateRequestSchema(const VgiBatchPtr &batch,
                            const std::string &method_name,
                            const std::string &worker_path);
 

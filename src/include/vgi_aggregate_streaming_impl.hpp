@@ -1,11 +1,12 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
 
 #include "duckdb/main/client_context.hpp"
 
@@ -50,18 +51,18 @@ struct VgiStreamingSession {
 VgiStreamingSession VgiAggregateStreamingOpen(
     ClientContext &context,
     const VgiAggregateBindData &bind_data,
-    const std::shared_ptr<arrow::Schema> &input_schema,
+    const VgiSchemaPtr &input_schema,
     int64_t partition_key_count,
     int64_t order_key_count);
 
 // Process one chunk through the streaming session. Sends
 // AggregateStreamingChunkRequest with input_batch (Arrow IPC bytes) and
 // returns the deserialised one-column RecordBatch with one row per input row.
-std::shared_ptr<arrow::RecordBatch> VgiAggregateStreamingChunk(
+VgiBatchPtr VgiAggregateStreamingChunk(
     ClientContext &context,
     const VgiAggregateBindData &bind_data,
     const VgiStreamingSession &session,
-    const std::shared_ptr<arrow::RecordBatch> &input_batch);
+    const VgiBatchPtr &input_batch);
 
 // End the session and free the worker-side state. Idempotent — calling
 // against a closed/unknown execution_id is a no-op on the worker side.

@@ -1,5 +1,7 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #pragma once
+
+#include "vgi_ipc.hpp"
 //
 // Arrow IPC byte streams over a SAB duplex slot — the transport analog of
 // FdInputStream/FdOutputStream (vgi_arrow_ipc.hpp), but backed by the ring stubs
@@ -9,9 +11,6 @@
 //
 // SabOutputStream::Write  -> vgi_wasm_slot_write   (blocking, c2w ring)
 // SabInputStream::Read    -> vgi_wasm_slot_read    (blocking, w2c ring; 0 = EOS)
-#include <arrow/io/interfaces.h>
-#include <arrow/result.h>
-#include <arrow/status.h>
 
 #include <cstdint>
 #include <chrono>
@@ -23,17 +22,18 @@ class ClientContext; // fwd: timeout/cancel polling (parity with FdInputStream)
 namespace vgi {
 
 // Non-owning input stream reading the worker->client (w2c) ring of `slot`.
-class SabInputStream : public arrow::io::InputStream {
+class SabInputStream : public VgiInputStream {
 public:
 	explicit SabInputStream(int region_offset, int slot, ClientContext *context = nullptr,
 	                        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 	~SabInputStream() override;
 
-	arrow::Status Close() override;
+	void Close() override;
 	bool closed() const override;
-	arrow::Result<int64_t> Tell() const override;
-	arrow::Result<int64_t> Read(int64_t nbytes, void *out) override;
-	arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override;
+	int64_t Tell() const {
+		return position_;
+	}
+	int64_t Read(int64_t nbytes, void *out) override;
 
 private:
 	int slot_;
@@ -45,16 +45,17 @@ private:
 };
 
 // Non-owning output stream writing the client->worker (c2w) ring of `slot`.
-class SabOutputStream : public arrow::io::OutputStream {
+class SabOutputStream : public VgiOutputStream {
 public:
 	explicit SabOutputStream(int region_offset, int slot);
 	~SabOutputStream() override = default;
 
-	arrow::Status Close() override;
+	void Close() override;
 	bool closed() const override;
-	arrow::Result<int64_t> Tell() const override;
-	arrow::Status Write(const void *data, int64_t nbytes) override;
-	arrow::Status Flush() override;
+	int64_t Tell() const override {
+		return position_;
+	}
+	void Write(const void *data, int64_t nbytes) override;
 
 private:
 	int slot_;

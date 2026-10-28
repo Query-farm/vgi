@@ -6,9 +6,7 @@
 #include <string>
 #include <vector>
 
-#include <arrow/api.h>
-#include <arrow/builder.h>
-#include <arrow/status.h>
+#include "vgi_arrow.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -22,44 +20,6 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
-// Arrow Status / Builder Helpers
-// ============================================================================
-
-// Throw an IOException if an Arrow Status is not OK.
-// Use at RPC/IPC boundaries where an arrow::Status must not silently fail.
-inline void ThrowOnArrowError(const arrow::Status &status) {
-	if (!status.ok()) {
-		throw IOException("Arrow error in VGI: %s", status.ToString());
-	}
-}
-
-// Append a byte vector to a BinaryBuilder, or AppendNull if empty.
-// Throws IOException on builder failure.
-inline void AppendBytesOrNull(arrow::BinaryBuilder &builder, const std::vector<uint8_t> &bytes) {
-	if (bytes.empty()) {
-		ThrowOnArrowError(builder.AppendNull());
-	} else {
-		ThrowOnArrowError(builder.Append(bytes.data(), static_cast<int32_t>(bytes.size())));
-	}
-}
-
-// Build a single-row arrow::StringArray holding the given value.
-// Throws IOException on builder failure.
-std::shared_ptr<arrow::Array> MakeSingleStringArray(const std::string &value);
-
-// Build a single-row arrow::StringArray; null if the value is empty. Mirrors
-// the "empty string serialises as null" convention used by
-// BuildNullableStringScalar in vgi_rpc_types.cpp — the wire form the Python
-// dataclasses read back as ``None``.
-std::shared_ptr<arrow::Array> MakeSingleStringArrayOrNull(const std::string &value);
-
-// Build a single-row arrow::BinaryArray holding the given bytes (always non-null).
-std::shared_ptr<arrow::Array> MakeSingleBinaryArray(const std::vector<uint8_t> &bytes);
-
-// Build a single-row arrow::BinaryArray; null if bytes is empty.
-std::shared_ptr<arrow::Array> MakeSingleBinaryArrayOrNull(const std::vector<uint8_t> &bytes);
-
-// ============================================================================
 // Settings Extraction
 // ============================================================================
 
@@ -68,20 +28,14 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
                                                 const std::vector<std::string> &setting_names);
 
 // ============================================================================
-// Schema Conversions (Arrow C++ -> Arrow C ABI)
+// C ABI exports
 // ============================================================================
 
-// Export Arrow C++ Schema to C ABI format
-// Populates the output wrapper which will own and release the schema
-void ExportSchema(const std::shared_ptr<arrow::Schema> &schema, ArrowSchemaWrapper &out);
+// Export a schema to C ABI format (deep copy, owned by `out`; a previous export is released).
+void ExportSchema(const VgiSchemaPtr &schema, ArrowSchemaWrapper &out);
 
-// ============================================================================
-// RecordBatch Conversions (Arrow C++ -> Arrow C ABI)
-// ============================================================================
-
-// Export Arrow C++ RecordBatch to C ABI format
-// Populates the output wrapper which will own and release the array
-void ExportRecordBatch(const std::shared_ptr<arrow::RecordBatch> &batch, ArrowArrayWrapper &out);
+// Export a batch to C ABI format; the array keeps the batch's buffers alive.
+void ExportRecordBatch(const VgiBatchPtr &batch, ArrowArrayWrapper &out);
 
 // ============================================================================
 // DuckDB Type Extraction
@@ -96,41 +50,45 @@ void GetDuckDBTypesFromArrowTable(const ArrowTableSchema &arrow_table, const Arr
 // High-Level Conversion Utilities
 // ============================================================================
 
-// Full conversion: Arrow C++ Schema -> DuckDB types
+// Full conversion: schema -> DuckDB types
 // This combines:
-//   1. Export C++ schema to C ABI
+//   1. Export schema to C ABI
 //   2. Populate ArrowTableSchema via DuckDB's built-in conversion
 //   3. Extract DuckDB types and names
 //
 // Parameters:
 //   context: DuckDB client context (needed for DBConfig)
-//   schema: Arrow C++ schema to convert
+//   schema: schema to convert
 //   c_schema_out: Output C ABI schema wrapper (for later use with ArrowToDuckDB)
 //   arrow_table_out: Output ArrowTableSchema (for later use with ArrowToDuckDB)
 //   types: Output DuckDB logical types
 //   names: Output column names
-void ArrowSchemaToDuckDBTypes(ClientContext &context, const std::shared_ptr<arrow::Schema> &schema,
+void ArrowSchemaToDuckDBTypes(ClientContext &context, const VgiSchemaPtr &schema,
                               ArrowSchemaWrapper &c_schema_out, ArrowTableSchema &arrow_table_out,
                               vector<LogicalType> &types, vector<string> &names);
 
-// Simplified conversion: Arrow C++ Schema -> DuckDB ColumnList
+// Simplified conversion: schema -> DuckDB ColumnList
 // Use this when you only need column definitions (e.g., for CreateTableInfo)
 // and don't need to keep the ArrowTableSchema for data conversion.
-void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow::Schema> &schema, ColumnList &columns);
+void ArrowSchemaToDuckDBTypes(ClientContext &context, const VgiSchemaPtr &schema,
+                             ArrowSchemaWrapper &c_schema_out, ArrowTableSchema &arrow_table_out,
+                             vector<LogicalType> &types, vector<Identifier> &names);
+
+void ArrowSchemaToColumnList(ClientContext &context, const VgiSchemaPtr &schema, ColumnList &columns);
 
 // Convert DuckDB ColumnList to Arrow Schema
 // This is the inverse of ArrowSchemaToColumnList: takes DuckDB column definitions
 // and produces an Arrow schema using DuckDB's ArrowConverter via the C ABI bridge.
-std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns,
-                                                          const std::string &owner_schema = "");
+VgiSchemaPtr DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns,
+                                       const std::string &owner_schema = "");
 
 // ============================================================================
 // DuckDB DataChunk / Type to Arrow Conversion
 // ============================================================================
 
-// Convert DuckDB DataChunk to Arrow RecordBatch using the given schema
-std::shared_ptr<arrow::RecordBatch> DataChunkToArrow(ClientContext &context, DataChunk &chunk,
-                                                      const std::shared_ptr<arrow::Schema> &schema);
+// Convert DuckDB DataChunk to a batch named after `schema`'s fields (types are DuckDB's
+// ArrowConverter output for the chunk's types; a 0-row chunk yields an empty batch of `schema`)
+VgiBatchPtr DataChunkToArrow(ClientContext &context, DataChunk &chunk, const VgiSchemaPtr &schema);
 
 // Cached-input version of DataChunkToArrow for hot-path scalar-style callers
 // where every batch shares the same logical types, names, extension types, and
@@ -146,17 +104,19 @@ std::shared_ptr<arrow::RecordBatch> DataChunkToArrow(ClientContext &context, Dat
 // The caller is responsible for ensuring the cached vectors match `chunk`'s
 // column layout. Calls with mismatched shapes are undefined behaviour (no
 // runtime check — this is the cost of the fast path).
-std::shared_ptr<arrow::RecordBatch> DataChunkToArrowCached(
+VgiBatchPtr DataChunkToArrowCached(
     ClientContext &context, DataChunk &chunk,
-    const std::shared_ptr<arrow::Schema> &schema,
+    const VgiSchemaPtr &schema,
     const vector<LogicalType> &cached_types,
     const vector<string> &cached_names,
     const ClientProperties &cached_client_props,
     const unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> &cached_extension_types);
 
-// Build Arrow C++ Schema from DuckDB logical types and names
-std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
-                                                            const vector<string> &names);
+// Build a schema from DuckDB logical types and names
+VgiSchemaPtr BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
+                                        const vector<string> &names);
+VgiSchemaPtr BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
+                                      const vector<Identifier> &names);
 
 // ============================================================================
 // Schema Reconciliation
@@ -172,30 +132,35 @@ std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context
 //   * decimal precision/scale shifts in some narrow cases
 //
 // This helper takes a batch DataChunkToArrow produced and returns a new batch
-// whose schema is bit-for-bit equal to ``target_schema`` — recasting columns
-// where Arrow types differ (via arrow::compute::Cast) and reshaping fields
-// (nullability/metadata) where only field flags differ. Recurses into struct,
-// list, list-of-struct, fixed-size-list, large-list, and map types so child
-// fields' nullability is reconciled too.
+// whose schema is ``target_schema``:
+//   * where every node has the same physical layout (only names, nullability flags,
+//     metadata or a timestamp's timezone differ) the batch is relabeled zero-copy;
+//   * otherwise the batch is rebuilt, converting the leaves that differ: timestamp /
+//     time / duration unit rescale, integer width changes, string <-> large_string,
+//     binary <-> large_binary, dictionary -> its value type, decimal width change.
 //
-// Fast path: when batch->schema()->Equals(*target_schema, /*check_metadata=*/false)
-// returns true (nested structure included), the input batch is returned
-// unchanged — zero allocations, zero kernel calls.
+// Fast path: when the schemas are equal (ignoring metadata) the input batch is
+// returned unchanged.
 //
-// Throws IOException if a column's Arrow type cannot be cast to the target
-// type (e.g., genuinely incompatible logical types).
-std::shared_ptr<arrow::RecordBatch> ReconcileBatchToSchema(
-    const std::shared_ptr<arrow::RecordBatch> &batch,
-    const std::shared_ptr<arrow::Schema> &target_schema);
+// Throws IOException if a column cannot be converted to the target type (e.g.,
+// genuinely incompatible logical types).
+VgiBatchPtr ReconcileBatchToSchema(const VgiBatchPtr &batch, const VgiSchemaPtr &target_schema);
 
 // ============================================================================
 // DuckDB Value to Arrow Conversion
 // ============================================================================
 
-// Result of building function arguments as Arrow
+// Function arguments for the bind call: a one-row batch whose single column "args" is
+// a struct with positional_0, positional_1, ..., named_<name> fields.
 struct ArrowArguments {
-	std::shared_ptr<arrow::DataType> type;   // Struct type with positional_0, positional_1, etc.
-	std::shared_ptr<arrow::Array> array;     // Single-row struct array
+	VgiBatchPtr batch;
+	//! Rows of the arguments batch (1), or 0 when there are none.
+	int64_t length() const {
+		return batch ? batch->num_rows() : 0;
+	}
+	explicit operator bool() const {
+		return batch != nullptr;
+	}
 };
 
 // Convert DuckDB Values to Arrow arguments struct using ArrowAppender
@@ -207,8 +172,7 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 // Build a settings RecordBatch from a map of setting name → DuckDB Value
 // Creates a single-row RecordBatch where each field preserves its DuckDB type as Arrow type
 // Uses DataChunk + ArrowAppender to ensure proper type conversion (same pattern as BuildArgumentsFromValues)
-std::shared_ptr<arrow::RecordBatch> BuildSettingsBatch(ClientContext &context,
-                                                        const std::map<std::string, Value> &settings);
+VgiBatchPtr BuildSettingsBatch(ClientContext &context, const std::map<std::string, Value> &settings);
 
 // Build a secrets RecordBatch from a map of secret_type → {key → Value}
 // Creates a single-row RecordBatch where each column is a struct containing the secret's key-value pairs
@@ -245,7 +209,7 @@ struct FunctionArgumentTypes {
 // Parse function argument schema, distinguishing positional from named arguments
 // Arguments with metadata "vgi_arg: named" are placed in named_parameters
 // Others are treated as positional arguments in schema field order
-FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const std::shared_ptr<arrow::Schema> &schema);
+FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const VgiSchemaPtr &schema);
 
 } // namespace vgi
 } // namespace duckdb

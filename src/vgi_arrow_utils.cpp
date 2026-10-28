@@ -5,9 +5,9 @@
 #include "vgi_protocol_constants.hpp"
 #include "vgi_rpc_types.hpp"
 
-#include <arrow/c/bridge.h>
-#include <arrow/compute/cast.h>
-#include <arrow/extension_type.h>
+#include "nanoarrow/nanoarrow.h"
+
+#include <cstring>
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -29,120 +29,54 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
 	std::map<std::string, Value> settings;
 	for (const auto &name : setting_names) {
 		Value value;
-		if (context.TryGetCurrentSetting(name, value)) {
+		if (context.TryGetCurrentSetting(Identifier(name), value)) {
 			settings[name] = value;
 		}
 	}
 	return settings;
 }
 
-std::shared_ptr<arrow::Array> MakeSingleStringArray(const std::string &value) {
-	arrow::StringBuilder builder;
-	ThrowOnArrowError(builder.Append(value));
-	std::shared_ptr<arrow::Array> arr;
-	ThrowOnArrowError(builder.Finish(&arr));
-	return arr;
-}
-
-std::shared_ptr<arrow::Array> MakeSingleStringArrayOrNull(const std::string &value) {
-	arrow::StringBuilder builder;
-	if (value.empty()) {
-		ThrowOnArrowError(builder.AppendNull());
-	} else {
-		ThrowOnArrowError(builder.Append(value));
-	}
-	std::shared_ptr<arrow::Array> arr;
-	ThrowOnArrowError(builder.Finish(&arr));
-	return arr;
-}
-
-std::shared_ptr<arrow::Array> MakeSingleBinaryArray(const std::vector<uint8_t> &bytes) {
-	arrow::BinaryBuilder builder;
-	ThrowOnArrowError(builder.Append(bytes.data(), static_cast<int32_t>(bytes.size())));
-	std::shared_ptr<arrow::Array> arr;
-	ThrowOnArrowError(builder.Finish(&arr));
-	return arr;
-}
-
-std::shared_ptr<arrow::Array> MakeSingleBinaryArrayOrNull(const std::vector<uint8_t> &bytes) {
-	arrow::BinaryBuilder builder;
-	AppendBytesOrNull(builder, bytes);
-	std::shared_ptr<arrow::Array> arr;
-	ThrowOnArrowError(builder.Finish(&arr));
-	return arr;
-}
-
 // ============================================================================
 // Schema Conversions
 // ============================================================================
 
-static void RejectUnsupportedLogicalType(const std::shared_ptr<arrow::DataType> &type);
-
-static void RejectUnsupportedLogicalField(const std::shared_ptr<arrow::Field> &field) {
-	if (auto metadata = field->metadata()) {
-		for (int64_t i = 0; i < metadata->size(); ++i) {
-			const auto &key = metadata->key(i);
-			if (key.compare(0, 19, "vgi.column.default.") == 0 ||
-			    key.compare(0, 21, "vgi.column.generated.") == 0 ||
-			    key.compare(0, 22, "vgi.column.generation.") == 0) {
-				throw NotImplementedException(
-				    "VGI column expressions require a qualified native adapter; field '%s' is unsupported",
-				    field->name());
-			}
-			if (key.compare(0, 17, "vgi.logical_type.") == 0 ||
-			    (key == "ARROW:extension:name" && metadata->value(i) == "arrow.parquet.variant")) {
-				throw NotImplementedException(
-				    "VGI logical type annotations require a qualified native adapter; field '%s' is unsupported",
-				    field->name());
-			}
+static void RejectUnsupportedLogicalField(const ArrowSchema &field) {
+	const auto metadata = VgiMetadata::FromC(field.metadata);
+	for (const auto &item : metadata.pairs()) {
+		const auto &key = item.first;
+		if (key.compare(0, 19, "vgi.column.default.") == 0 ||
+		    key.compare(0, 21, "vgi.column.generated.") == 0 ||
+		    key.compare(0, 22, "vgi.column.generation.") == 0) {
+			throw NotImplementedException(
+			    "VGI column expressions require a qualified native adapter; field '%s' is unsupported",
+			    field.name ? field.name : "");
+		}
+		if (key.compare(0, 17, "vgi.logical_type.") == 0 ||
+		    (key == "ARROW:extension:name" && item.second == "arrow.parquet.variant")) {
+			throw NotImplementedException(
+			    "VGI logical type annotations require a qualified native adapter; field '%s' is unsupported",
+			    field.name ? field.name : "");
 		}
 	}
-	RejectUnsupportedLogicalType(field->type());
-}
-
-static void RejectUnsupportedLogicalType(const std::shared_ptr<arrow::DataType> &type) {
-	if (type->id() == arrow::Type::DICTIONARY) {
-		RejectUnsupportedLogicalType(std::static_pointer_cast<arrow::DictionaryType>(type)->value_type());
-	} else if (type->id() == arrow::Type::EXTENSION) {
-		auto extension = std::static_pointer_cast<arrow::ExtensionType>(type);
-		if (extension->extension_name() == "arrow.parquet.variant") {
-			throw NotImplementedException("VGI VARIANT requires a qualified native adapter");
-		}
-		RejectUnsupportedLogicalType(extension->storage_type());
+	if (field.dictionary) {
+		RejectUnsupportedLogicalField(*field.dictionary);
 	}
-	for (const auto &child : type->fields()) {
-		RejectUnsupportedLogicalField(child);
+	for (int64_t i = 0; i < field.n_children; ++i) {
+		RejectUnsupportedLogicalField(*field.children[i]);
 	}
 }
 
-void ExportSchema(const std::shared_ptr<arrow::Schema> &schema, ArrowSchemaWrapper &out) {
-	// Every Arrow-to-DuckDB path exports through this helper, including statistics,
-	// secrets and function arguments. Never silently discard new logical type or
-	// column-expression semantics while the pinned native adapter is unqualified.
-	for (const auto &field : schema->fields()) {
-		RejectUnsupportedLogicalField(field);
+void ExportSchema(const VgiSchemaPtr &schema, ArrowSchemaWrapper &out) {
+	// Preserve protocol semantic guards on every Arrow-to-DuckDB conversion.
+	for (int i = 0; i < schema->num_fields(); ++i) {
+		RejectUnsupportedLogicalField(schema->field(i));
 	}
-	// A wrapper can be reused while draining a multi-batch stream. Arrow's
-	// exporter initializes the C struct; it does not release a previous export.
-	// Release that ownership before its callback/private_data are overwritten.
-	if (out.arrow_schema.release) {
-		out.arrow_schema.release(&out.arrow_schema);
-	}
-	auto status = arrow::ExportSchema(*schema, &out.arrow_schema);
-	if (!status.ok()) {
-		throw IOException("Failed to export Arrow schema to C ABI: %s", status.ToString());
-	}
+	// ExportTo releases a previous export before replacing its ownership.
+	schema->ExportTo(out);
 }
 
-// ============================================================================
-// RecordBatch Conversions
-// ============================================================================
-
-void ExportRecordBatch(const std::shared_ptr<arrow::RecordBatch> &batch, ArrowArrayWrapper &out) {
-	auto status = arrow::ExportRecordBatch(*batch, &out.arrow_array);
-	if (!status.ok()) {
-		throw IOException("Failed to export Arrow RecordBatch to C ABI: %s", status.ToString());
-	}
+void ExportRecordBatch(const VgiBatchPtr &batch, ArrowArrayWrapper &out) {
+	batch->ExportTo(out);
 }
 
 // ============================================================================
@@ -172,89 +106,86 @@ void GetDuckDBTypesFromArrowTable(const ArrowTableSchema &arrow_table, const Arr
 // High-Level Conversion Utilities
 // ============================================================================
 
-void ArrowSchemaToDuckDBTypes(ClientContext &context, const std::shared_ptr<arrow::Schema> &schema,
-                              ArrowSchemaWrapper &c_schema_out, ArrowTableSchema &arrow_table_out,
-                              vector<LogicalType> &types, vector<string> &names) {
-	// Step 1: Export C++ schema to C ABI
+void ArrowSchemaToDuckDBTypes(ClientContext &context, const VgiSchemaPtr &schema, ArrowSchemaWrapper &c_schema_out,
+                              ArrowTableSchema &arrow_table_out, vector<LogicalType> &types, vector<string> &names) {
 	ExportSchema(schema, c_schema_out);
-
-	// Step 2: Populate ArrowTableSchema using DuckDB's built-in conversion
 	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table_out, c_schema_out.arrow_schema);
-
-	// Step 3: Extract DuckDB types and names
 	GetDuckDBTypesFromArrowTable(arrow_table_out, c_schema_out.arrow_schema, types, names);
 }
 
-void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow::Schema> &schema,
-                             ColumnList &columns) {
+void ArrowSchemaToDuckDBTypes(ClientContext &context, const VgiSchemaPtr &schema, ArrowSchemaWrapper &c_schema_out,
+                             ArrowTableSchema &arrow_table_out, vector<LogicalType> &types, vector<Identifier> &names) {
+	vector<string> raw_names;
+	ArrowSchemaToDuckDBTypes(context, schema, c_schema_out, arrow_table_out, types, raw_names);
+	names = StringsToIdentifiers(raw_names);
+}
+
+VgiSchemaPtr BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
+                                      const vector<Identifier> &names) {
+	return BuildArrowSchemaFromDuckDB(context, types, IdentifiersToStrings(names));
+}
+
+void ArrowSchemaToColumnList(ClientContext &context, const VgiSchemaPtr &schema, ColumnList &columns) {
 	ValidateNativeColumnMetadata(schema);
-	// Use temporary structures for the conversion
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> types;
 	vector<string> names;
 
 	ArrowSchemaToDuckDBTypes(context, schema, c_schema, arrow_table, types, names);
-
-	// Populate the ColumnList
 	for (idx_t i = 0; i < types.size(); i++) {
-		ColumnDefinition column(names[i], types[i]);
+		ColumnDefinition column(Identifier(names[i]), types[i]);
 		auto metadata = ReadNativeColumnMetadata(schema->field(static_cast<int>(i)));
 		if (metadata.comment)
 			column.SetComment(Value(*metadata.comment));
-		// Pinned 1.5 exposes no public column-tags API. The authoritative Arrow
-		// schema retains tags; reconstructing only a ColumnList cannot carry them.
+		// DuckDB's column tag map is case-insensitive; VGI tags preserve raw
+		// keys, including distinct "A" and "a". Keep the authoritative tags
+		// on the Arrow schema until a lossless native mapping is qualified.
 		columns.AddColumn(std::move(column));
 	}
 }
 
-std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns,
-                                                          const std::string &owner_schema) {
+VgiSchemaPtr DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns,
+                                       const std::string &owner_schema) {
 	vector<LogicalType> types;
 	vector<string> names;
-
 	for (auto &col : columns.Logical()) {
 		types.push_back(col.GetType());
-		names.push_back(col.GetName());
+		names.push_back(col.GetName().GetIdentifierName());
 	}
-
 	auto schema = BuildArrowSchemaFromDuckDB(context, types, names);
-	arrow::FieldVector fields;
+	ArrowSchemaWrapper result_schema;
+	schema->ExportTo(result_schema);
 	idx_t index = 0;
 	for (auto &col : columns.Logical()) {
 		if (col.CompressionType() != CompressionType::COMPRESSION_AUTO) {
 			throw NotImplementedException("VGI does not support non-default column compression");
 		}
-		auto field = schema->field(static_cast<int>(index++));
+		auto &field = *result_schema.arrow_schema.children[index++];
+		auto metadata = VgiMetadata::FromC(field.metadata);
 		if (!col.Comment().IsNull()) {
 			if (col.Comment().type() != LogicalType::VARCHAR) {
 				throw InvalidInputException("VGI column metadata: native column comment must be a string");
 			}
-			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
-			metadata->Append("comment", col.Comment().GetValue<std::string>());
-			field = field->WithMetadata(metadata);
+			metadata.Append("comment", col.Comment().GetValue<std::string>());
 		}
 		if (col.Generated()) {
-			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
-			// Pinned ColumnDefinition stores its declared/inferred output cast
-			// in this SQL. Keep it: the canonical record itself must have the
-			// Arrow field's exact result type, before discovery adds any cast.
 			auto expression = BuildNativeGeneratedExpression(col.GeneratedExpression().ToString(), owner_schema,
 			                                                 NativeColumnEvaluationContext(context));
-			metadata->Append(VGI_COLUMN_GENERATED, EncodeNativeColumnDefaultMetadata(expression));
-			metadata->Append(VGI_COLUMN_GENERATION, "virtual");
-			field = field->WithMetadata(metadata);
+			metadata.Append(VGI_COLUMN_GENERATED, EncodeNativeColumnDefaultMetadata(expression));
+			metadata.Append(VGI_COLUMN_GENERATION, "virtual");
 		}
 		if (col.HasDefaultValue()) {
-			auto metadata = field->metadata() ? field->metadata()->Copy() : std::make_shared<arrow::KeyValueMetadata>();
 			auto expression = BuildNativeColumnExpression(col.DefaultValue().ToString(), owner_schema,
 			                                              NativeColumnEvaluationContext(context), false);
-			metadata->Append(VGI_COLUMN_DEFAULT, EncodeNativeColumnDefaultMetadata(expression));
-			field = field->WithMetadata(metadata);
+			metadata.Append(VGI_COLUMN_DEFAULT, EncodeNativeColumnDefaultMetadata(expression));
 		}
-		fields.push_back(field);
+		auto encoded_metadata = metadata.ToC();
+		if (ArrowSchemaSetMetadata(&field, encoded_metadata.empty() ? nullptr : encoded_metadata.data())) {
+			throw InternalException("VGI failed to copy column metadata");
+		}
 	}
-	auto result = arrow::schema(fields, schema->metadata());
+	auto result = VgiSchema::Adopt(&result_schema.arrow_schema);
 	ValidateNativeColumnMetadata(result);
 	ColumnList validated;
 	idx_t validated_index = 0;
@@ -275,227 +206,197 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 // DuckDB DataChunk / Type to Arrow Conversion
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> DataChunkToArrow(ClientContext &context, DataChunk &chunk,
-                                                     const std::shared_ptr<arrow::Schema> &schema) {
-	if (chunk.size() == 0) {
-		// Create empty batch with schema
-		std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
-		for (int i = 0; i < schema->num_fields(); i++) {
-			auto builder_result = arrow::MakeBuilder(schema->field(i)->type());
-			if (!builder_result.ok()) {
-				throw IOException("Failed to create Arrow builder: %s", builder_result.status().ToString());
-			}
-			auto array_result = builder_result.ValueUnsafe()->Finish();
-			if (!array_result.ok()) {
-				throw IOException("Failed to finish Arrow array: %s", array_result.status().ToString());
-			}
-			empty_arrays.push_back(array_result.ValueUnsafe());
+namespace {
+VgiBatchPtr AppendChunk(DataChunk &chunk, const vector<LogicalType> &types, const vector<string> &names,
+                        ClientProperties &props,
+                        const unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> &extension_types) {
+	ArrowAppender appender(types, chunk.size(), props, extension_types);
+	appender.Append(chunk, 0, chunk.size(), chunk.size());
+	ArrowArray arr = appender.Finalize();
+	ArrowSchema c_schema;
+	ArrowConverter::ToArrowSchema(&c_schema, types, names, props);
+	VgiSchemaPtr schema;
+	try {
+		schema = VgiSchema::Adopt(&c_schema);
+	} catch (...) {
+		if (arr.release) {
+			arr.release(&arr);
 		}
-		return arrow::RecordBatch::Make(schema, 0, empty_arrays);
+		throw;
 	}
+	return VgiBatch::Adopt(std::move(schema), &arr);
+}
+} // namespace
 
-	// Use ArrowAppender to convert the DataChunk
+VgiBatchPtr DataChunkToArrow(ClientContext &context, DataChunk &chunk, const VgiSchemaPtr &schema) {
+	if (chunk.size() == 0) {
+		return VgiBatch::MakeEmpty(schema);
+	}
 	vector<LogicalType> types;
 	vector<string> names;
 	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
 		types.push_back(chunk.data[i].GetType());
-		names.push_back(schema->field(i)->name());
+		names.push_back(schema->field_name(static_cast<int>(i)));
 	}
-
 	ClientProperties client_props = context.GetClientProperties();
-	ArrowAppender appender(types, chunk.size(), client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
-	appender.Append(chunk, 0, chunk.size(), chunk.size());
-	ArrowArray arr = appender.Finalize();
-
-	// Get the Arrow schema for the chunk
-	ArrowSchema c_schema;
-	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-	// Import to Arrow C++
-	auto import_result = arrow::ImportRecordBatch(&arr, &c_schema);
-	if (!import_result.ok()) {
-		if (c_schema.release) {
-			c_schema.release(&c_schema);
-		}
-		throw IOException("Failed to import Arrow batch: %s", import_result.status().ToString());
-	}
-
-	return import_result.ValueUnsafe();
+	return AppendChunk(chunk, types, names, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
 }
 
 // Cached-input fast path: see header for contract.
-std::shared_ptr<arrow::RecordBatch> DataChunkToArrowCached(
-    ClientContext &context, DataChunk &chunk,
-    const std::shared_ptr<arrow::Schema> &schema,
-    const vector<LogicalType> &cached_types,
-    const vector<string> &cached_names,
-    const ClientProperties &cached_client_props,
+VgiBatchPtr DataChunkToArrowCached(
+    ClientContext &context, DataChunk &chunk, const VgiSchemaPtr &schema, const vector<LogicalType> &cached_types,
+    const vector<string> &cached_names, const ClientProperties &cached_client_props,
     const unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> &cached_extension_types) {
+	(void)context;
 	if (chunk.size() == 0) {
-		// Same empty-batch path as DataChunkToArrow.
-		std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
-		for (int i = 0; i < schema->num_fields(); i++) {
-			auto builder_result = arrow::MakeBuilder(schema->field(i)->type());
-			if (!builder_result.ok()) {
-				throw IOException("Failed to create Arrow builder: %s", builder_result.status().ToString());
-			}
-			auto array_result = builder_result.ValueUnsafe()->Finish();
-			if (!array_result.ok()) {
-				throw IOException("Failed to finish Arrow array: %s", array_result.status().ToString());
-			}
-			empty_arrays.push_back(array_result.ValueUnsafe());
-		}
-		return arrow::RecordBatch::Make(schema, 0, empty_arrays);
+		return VgiBatch::MakeEmpty(schema);
 	}
-
-	// Skip the per-batch types/names push-back, ClientProperties copy, and
-	// extension-type lookup: caller has pre-built and cached these.
-	ArrowAppender appender(cached_types, chunk.size(), cached_client_props, cached_extension_types);
-	appender.Append(chunk, 0, chunk.size(), chunk.size());
-	ArrowArray arr = appender.Finalize();
-
-	// Schema export still happens per batch — the C-ABI ArrowSchema is consumed
-	// by ImportRecordBatch (its release callback is invoked), so we cannot share
-	// a single instance across calls. ArrowConverter::ToArrowSchema takes its
-	// ClientProperties by non-const reference; copy from the cached const ref
-	// (small struct, free copy).
-	ArrowSchema c_schema;
+	// ArrowConverter::ToArrowSchema takes its ClientProperties by non-const reference.
 	ClientProperties props_copy = cached_client_props;
-	ArrowConverter::ToArrowSchema(&c_schema, cached_types, cached_names, props_copy);
-
-	auto import_result = arrow::ImportRecordBatch(&arr, &c_schema);
-	if (!import_result.ok()) {
-		if (c_schema.release) {
-			c_schema.release(&c_schema);
-		}
-		throw IOException("Failed to import Arrow batch: %s", import_result.status().ToString());
-	}
-
-	return import_result.ValueUnsafe();
+	return AppendChunk(chunk, cached_types, cached_names, props_copy, cached_extension_types);
 }
 
-std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
-                                                            const vector<string> &names) {
-	// Use DuckDB's converter to get Arrow schema
+VgiSchemaPtr BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
+                                        const vector<string> &names) {
 	ArrowSchema c_schema;
 	ClientProperties client_props = context.GetClientProperties();
 	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-	auto import_result = arrow::ImportSchema(&c_schema);
-	if (!import_result.ok()) {
-		if (c_schema.release) {
-			c_schema.release(&c_schema);
-		}
-		throw IOException("Failed to import Arrow schema: %s", import_result.status().ToString());
-	}
-
-	return import_result.ValueUnsafe();
+	return VgiSchema::Adopt(&c_schema);
 }
 
 // ============================================================================
-// DuckDB Value Settings to Arrow RecordBatch
+// DuckDB Value Settings to a batch
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> BuildSettingsBatch(ClientContext &context,
-                                                        const std::map<std::string, Value> &settings) {
+VgiBatchPtr BuildSettingsBatch(ClientContext &context, const std::map<std::string, Value> &settings) {
 	vector<LogicalType> field_types;
 	vector<string> field_names;
-
 	for (const auto &[name, value] : settings) {
 		field_names.push_back(name);
 		field_types.push_back(value.type());
 	}
 
-	// Create a single-row DataChunk with the setting values
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), field_types);
 	chunk.SetCardinality(1);
-
 	idx_t col_idx = 0;
 	for (const auto &[name, value] : settings) {
 		chunk.SetValue(col_idx++, 0, value);
 	}
 
-	// Convert to Arrow RecordBatch using the existing utilities
 	auto schema = BuildArrowSchemaFromDuckDB(context, field_types, field_names);
 	return DataChunkToArrow(context, chunk, schema);
 }
 
 // ============================================================================
-// DuckDB Value Secrets to Arrow RecordBatch
+// DuckDB Value Secrets to a batch
 // ============================================================================
 
+namespace {
+
+void ReleaseStructOfChildren(ArrowArray *array) {
+	for (int64_t i = 0; i < array->n_children; i++) {
+		if (array->children[i]->release) {
+			array->children[i]->release(array->children[i]);
+		}
+		delete array->children[i];
+	}
+	delete[] array->children;
+	delete[] array->buffers;
+	array->release = nullptr;
+}
+
+//! A struct ArrowArray of `length` rows whose children are moved out of `children`.
+ArrowArray StructOfChildren(int64_t length, std::vector<ArrowArray> children) {
+	ArrowArray out;
+	std::memset(&out, 0, sizeof(out));
+	out.length = length;
+	out.n_buffers = 1;
+	out.buffers = new const void *[1] {nullptr};
+	out.n_children = static_cast<int64_t>(children.size());
+	out.children = new ArrowArray *[children.size()];
+	for (size_t i = 0; i < children.size(); i++) {
+		out.children[i] = new ArrowArray(children[i]);
+		children[i].release = nullptr;
+	}
+	out.release = &ReleaseStructOfChildren;
+	return out;
+}
+
+//! Move a batch's columns out as a struct ArrowArray (the batch's buffers stay shared).
+ArrowArray BatchAsStruct(const VgiBatchPtr &batch) {
+	ArrowArray exported;
+	batch->ExportTo(&exported);
+	return exported; // a struct array: the batch's columns are its children
+}
+
+//! A one-row-per-batch schema: struct field `name` holding `schema`'s fields.
+void StructFieldFromSchema(const VgiSchema &schema, const std::string &name, bool nullable, ArrowSchema *out) {
+	schema.ExportTo(out);
+	ArrowSchemaSetName(out, name.c_str());
+	out->flags = nullable ? ARROW_FLAG_NULLABLE : 0;
+}
+
+} // namespace
+
 std::vector<uint8_t> BuildSecretsBatch(ClientContext &context,
-                                        const std::map<std::string, std::map<std::string, Value>> &secrets) {
+                                       const std::map<std::string, std::map<std::string, Value>> &secrets) {
 	if (secrets.empty()) {
 		return {};
 	}
 
-	std::vector<std::shared_ptr<arrow::Field>> outer_fields;
-	std::vector<std::shared_ptr<arrow::Array>> outer_arrays;
+	ArrowSchema outer_schema;
+	ArrowSchemaInit(&outer_schema);
+	std::vector<ArrowSchema> fields;
+	std::vector<ArrowArray> columns;
 
 	for (const auto &[secret_type, kv_pairs] : secrets) {
 		if (kv_pairs.empty()) {
 			continue;
 		}
-
-		// Build DuckDB types and values for this secret's key-value pairs
 		vector<LogicalType> field_types;
 		vector<string> field_names;
-
 		for (const auto &[key, value] : kv_pairs) {
 			field_names.push_back(key);
 			field_types.push_back(value.type());
 		}
-
-		// Create a single-row DataChunk with the key-value pairs
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), field_types);
 		chunk.SetCardinality(1);
-
 		idx_t col_idx = 0;
 		for (const auto &[key, value] : kv_pairs) {
 			chunk.SetValue(col_idx++, 0, value);
 		}
 
-		// Convert to Arrow RecordBatch (preserves DuckDB types as Arrow types)
+		// One struct column per secret (preserves DuckDB types as Arrow types).
 		auto inner_schema = BuildArrowSchemaFromDuckDB(context, field_types, field_names);
 		auto inner_batch = DataChunkToArrow(context, chunk, inner_schema);
-
-		// Convert RecordBatch columns into a StructArray
-		std::vector<std::shared_ptr<arrow::Field>> struct_fields;
-		std::vector<std::shared_ptr<arrow::Array>> struct_arrays;
-		for (int i = 0; i < inner_batch->num_columns(); i++) {
-			struct_fields.push_back(inner_batch->schema()->field(i));
-			struct_arrays.push_back(inner_batch->column(i));
-		}
-
-		auto struct_type = arrow::struct_(struct_fields);
-		auto struct_result = arrow::StructArray::Make(struct_arrays, struct_fields);
-		if (!struct_result.ok()) {
-			throw IOException("Failed to create struct array for secret '%s': %s",
-			                  secret_type, struct_result.status().ToString());
-		}
-
-		outer_fields.push_back(arrow::field(secret_type, struct_type, true));
-		outer_arrays.push_back(struct_result.ValueUnsafe());
+		ArrowSchema field;
+		StructFieldFromSchema(*inner_batch->schema(), secret_type, true, &field);
+		fields.push_back(field);
+		columns.push_back(BatchAsStruct(inner_batch));
 	}
 
-	if (outer_fields.empty()) {
+	if (fields.empty()) {
+		outer_schema.release(&outer_schema);
 		return {};
 	}
 
-	auto outer_schema = arrow::schema(outer_fields);
-	auto outer_batch = arrow::RecordBatch::Make(outer_schema, 1, outer_arrays);
-	return SerializeToIpcBytes(outer_batch);
+	ArrowSchemaSetTypeStruct(&outer_schema, static_cast<int64_t>(fields.size()));
+	for (size_t i = 0; i < fields.size(); i++) {
+		outer_schema.children[i]->release(outer_schema.children[i]);
+		*outer_schema.children[i] = fields[i];
+	}
+	auto schema = VgiSchema::Adopt(&outer_schema);
+	auto batch = VgiBatch::FromColumns(std::move(schema), 1, std::move(columns));
+	return SerializeToIpcBytes(batch);
 }
 
 // ============================================================================
 // Function Argument Schema Parsing
 // ============================================================================
 
-FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
-                                                  const std::shared_ptr<arrow::Schema> &schema) {
+FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const VgiSchemaPtr &schema) {
 	FunctionArgumentTypes result;
 
 	if (!schema) {
@@ -511,7 +412,7 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 	auto &columns = arrow_table.GetColumns();
 	int num_fields = schema->num_fields();
 	for (int field_idx = 0; field_idx < num_fields; field_idx++) {
-		auto field = schema->field(field_idx);
+		auto metadata = schema->field_metadata(field_idx);
 		auto &child = c_schema.arrow_schema.children[field_idx];
 
 		// Get column name
@@ -527,36 +428,31 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 		bool is_table_input = false;
 		bool is_any_type = false;
 		bool is_const = false;
-		if (field->HasMetadata()) {
-			auto metadata = field->metadata();
-
+		if (!metadata.empty()) {
 			// Check for named argument marker
-			auto named_idx = metadata->FindKey(VGI_ARG_METADATA_KEY);
+			auto named_idx = metadata.FindKey(VGI_ARG_METADATA_KEY);
 			if (named_idx >= 0) {
-				auto value = metadata->value(named_idx);
-				is_named = (value == VGI_ARG_NAMED_VALUE);
+				is_named = (metadata.value(named_idx) == VGI_ARG_NAMED_VALUE);
 			}
 
 			// Check for varargs marker (on field, not schema)
-			auto varargs_idx = metadata->FindKey(VGI_VARARGS_METADATA_KEY);
+			auto varargs_idx = metadata.FindKey(VGI_VARARGS_METADATA_KEY);
 			if (varargs_idx >= 0) {
-				auto value = metadata->value(varargs_idx);
-				is_varargs = (value == VGI_VARARGS_TRUE_VALUE);
+				is_varargs = (metadata.value(varargs_idx) == VGI_VARARGS_TRUE_VALUE);
 			}
 
 			// Check for vgi_type metadata (table input or any type)
-			auto type_idx = metadata->FindKey(VGI_TYPE_METADATA_KEY);
+			auto type_idx = metadata.FindKey(VGI_TYPE_METADATA_KEY);
 			if (type_idx >= 0) {
-				auto value = metadata->value(type_idx);
+				auto &value = metadata.value(type_idx);
 				is_table_input = (value == VGI_TYPE_TABLE_VALUE);
 				is_any_type = (value == VGI_TYPE_ANY_VALUE);
 			}
 
 			// Check for const parameter marker
-			auto const_idx = metadata->FindKey(VGI_CONST_METADATA_KEY);
+			auto const_idx = metadata.FindKey(VGI_CONST_METADATA_KEY);
 			if (const_idx >= 0) {
-				auto value = metadata->value(const_idx);
-				is_const = (value == VGI_CONST_TRUE_VALUE);
+				is_const = (metadata.value(const_idx) == VGI_CONST_TRUE_VALUE);
 			}
 		}
 
@@ -618,17 +514,14 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 		field_types.push_back(value.type());
 	}
 
-	// Handle empty arguments case - create a struct array with 1 row but no fields
-	// This happens for table-in-out functions that only have a TABLE argument
+	// Handle empty arguments case - a null struct<> row: table-in-out functions that only
+	// have a TABLE argument.
 	if (field_types.empty()) {
-		std::vector<std::shared_ptr<arrow::Field>> empty_fields;
-		auto empty_struct_type = arrow::struct_(empty_fields);
-		// Use MakeArrayOfNull to create a struct array with explicit length
-		auto empty_result = arrow::MakeArrayOfNull(empty_struct_type, 1);
-		if (!empty_result.ok()) {
-			throw IOException("Failed to create empty struct array: %s", empty_result.status().ToString());
-		}
-		return ArrowArguments {empty_struct_type, empty_result.ValueUnsafe()};
+		auto schema = MakeSchema({type::Struct({}).Named("args")});
+		VgiBatchBuilder builder(schema);
+		append::Null(builder.column(0));
+		builder.FinishRow();
+		return ArrowArguments {builder.Finish()};
 	}
 
 	// Create a single-row DataChunk with the values
@@ -636,54 +529,38 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 	chunk.Initialize(Allocator::DefaultAllocator(), field_types);
 	chunk.SetCardinality(1);
 
-	// Set positional argument values
 	idx_t col_idx = 0;
 	for (idx_t i = 0; i < positional_args.size(); i++) {
 		chunk.SetValue(col_idx++, 0, positional_args[i]);
 	}
-
-	// Set named argument values
 	for (auto &[name, value] : named_args) {
 		chunk.SetValue(col_idx++, 0, value);
 	}
 
-	// Use ArrowAppender to convert the DataChunk to Arrow
+	// ArrowAppender gives a struct array of the fields; it becomes the "args" column.
 	ClientProperties client_props = context.GetClientProperties();
-	ArrowAppender appender(field_types, 1, client_props,
-	                       ArrowTypeExtensionData::GetExtensionTypes(context, field_types));
+	ArrowAppender appender(field_types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, field_types));
 	appender.Append(chunk, 0, 1, 1);
-	ArrowArray arr = appender.Finalize();
+	std::vector<ArrowArray> columns;
+	columns.push_back(appender.Finalize());
 
-	// Get the Arrow schema for the struct
-	ArrowSchema schema;
-	ArrowConverter::ToArrowSchema(&schema, field_types, field_names, client_props);
-
-	// Import the C ABI arrays into Arrow C++ for struct wrapping
-	auto import_result = arrow::ImportRecordBatch(&arr, &schema);
-	if (!import_result.ok()) {
-		if (schema.release) {
-			schema.release(&schema);
-		}
-		throw IOException("Failed to import Arrow array: %s", import_result.status().ToString());
+	// nanoarrow's ArrowSchemaSet* may only touch schemas nanoarrow allocated: rename a copy.
+	ArrowSchema duck_schema;
+	ArrowConverter::ToArrowSchema(&duck_schema, field_types, field_names, client_props);
+	ArrowSchema args_field;
+	ArrowErrorCode copied = ArrowSchemaDeepCopy(&duck_schema, &args_field);
+	duck_schema.release(&duck_schema);
+	if (copied != NANOARROW_OK) {
+		throw InternalException("VGI: failed to copy the arguments schema");
 	}
-	auto record_batch = import_result.ValueUnsafe();
-
-	// Convert the RecordBatch columns to a struct array
-	std::vector<std::shared_ptr<arrow::Field>> struct_fields;
-	std::vector<std::shared_ptr<arrow::Array>> struct_arrays;
-
-	for (int i = 0; i < record_batch->num_columns(); i++) {
-		struct_fields.push_back(record_batch->schema()->field(i));
-		struct_arrays.push_back(record_batch->column(i));
-	}
-
-	auto struct_type = arrow::struct_(struct_fields);
-	auto struct_result = arrow::StructArray::Make(struct_arrays, struct_fields);
-	if (!struct_result.ok()) {
-		throw IOException("Failed to create struct array: %s", struct_result.status().ToString());
-	}
-
-	return ArrowArguments {struct_type, struct_result.ValueUnsafe()};
+	ArrowSchemaSetName(&args_field, "args");
+	args_field.flags = ARROW_FLAG_NULLABLE;
+	ArrowSchema outer;
+	ArrowSchemaInit(&outer);
+	ArrowSchemaSetTypeStruct(&outer, 1);
+	outer.children[0]->release(outer.children[0]);
+	*outer.children[0] = args_field;
+	return ArrowArguments {VgiBatch::FromColumns(VgiSchema::Adopt(&outer), 1, std::move(columns))};
 }
 
 // ============================================================================
@@ -692,133 +569,278 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 
 namespace {
 
-// Forward decl — recursion target.
-std::shared_ptr<arrow::ArrayData> ReshapeArrayData(const std::shared_ptr<arrow::ArrayData> &source,
-                                                    const std::shared_ptr<arrow::Field> &target_field);
-
-// Cast a leaf primitive Array to target_type, returning the underlying ArrayData.
-// Caller has already verified that source.type != target_type.
-std::shared_ptr<arrow::ArrayData> CastPrimitive(const std::shared_ptr<arrow::ArrayData> &source,
-                                                 const std::shared_ptr<arrow::DataType> &target_type) {
-	auto array = arrow::MakeArray(source);
-	auto result = arrow::compute::Cast(*array, target_type);
-	if (!result.ok()) {
-		throw IOException("VGI schema reconciliation: failed to cast %s -> %s: %s",
-		                  array->type()->ToString(), target_type->ToString(), result.status().ToString());
+ArrowSchemaView ViewOf(const ArrowSchema &schema) {
+	ArrowSchemaView view;
+	std::memset(&view, 0, sizeof(view));
+	ArrowError error;
+	ArrowErrorInit(&error);
+	if (ArrowSchemaViewInit(&view, &schema, &error) != NANOARROW_OK) {
+		throw IOException("VGI schema reconciliation: unsupported Arrow type '%s': %s",
+		                  schema.format ? schema.format : "", error.message);
 	}
-	return result.ValueOrDie()->data();
+	return view;
 }
 
-// Build a new ArrayData with the same buffers/length/null_count as `source`
-// but using `target_type` and the reshaped child ArrayData list.
-// Used for nested-type reshape paths where children change but the parent
-// layout (offsets, null bitmap) is preserved verbatim.
-std::shared_ptr<arrow::ArrayData> RewrapArrayData(const std::shared_ptr<arrow::ArrayData> &source,
-                                                   const std::shared_ptr<arrow::DataType> &target_type,
-                                                   std::vector<std::shared_ptr<arrow::ArrayData>> reshaped_children) {
-	auto out = arrow::ArrayData::Make(target_type, source->length, source->buffers, std::move(reshaped_children),
-	                                  source->null_count, source->offset);
-	if (source->dictionary) {
-		out->dictionary = source->dictionary;
-	}
-	return out;
+bool HasUnit(::ArrowType type) {
+	return type == NANOARROW_TYPE_TIMESTAMP || type == NANOARROW_TYPE_TIME32 || type == NANOARROW_TYPE_TIME64 ||
+	       type == NANOARROW_TYPE_DURATION;
 }
 
-std::shared_ptr<arrow::ArrayData> ReshapeStruct(const std::shared_ptr<arrow::ArrayData> &source,
-                                                 const std::shared_ptr<arrow::DataType> &target_type) {
-	const auto &target_struct = arrow::internal::checked_cast<const arrow::StructType &>(*target_type);
-	if (NumericCast<int>(source->child_data.size()) != target_struct.num_fields()) {
-		throw IOException("VGI schema reconciliation: struct child count mismatch (source=%d target=%d)",
-		                  static_cast<int>(source->child_data.size()), target_struct.num_fields());
+// Whether `src`'s buffers can be read as `dst` unchanged: everything but names,
+// nullability flags, metadata, a timestamp's timezone and a decimal's precision may differ.
+bool SameLayout(const ArrowSchema &src, const ArrowSchema &dst) {
+	if ((src.dictionary == nullptr) != (dst.dictionary == nullptr) || src.n_children != dst.n_children) {
+		return false;
 	}
-	std::vector<std::shared_ptr<arrow::ArrayData>> reshaped;
-	reshaped.reserve(source->child_data.size());
-	for (size_t i = 0; i < source->child_data.size(); i++) {
-		reshaped.push_back(ReshapeArrayData(source->child_data[i], target_struct.field(NumericCast<int>(i))));
+	auto sv = ViewOf(src);
+	auto dv = ViewOf(dst);
+	if (sv.type != dv.type || sv.storage_type != dv.storage_type) {
+		return false;
 	}
-	return RewrapArrayData(source, target_type, std::move(reshaped));
+	if (HasUnit(sv.type) && sv.time_unit != dv.time_unit) {
+		return false;
+	}
+	if ((sv.type == NANOARROW_TYPE_DECIMAL128 || sv.type == NANOARROW_TYPE_DECIMAL256) &&
+	    sv.decimal_scale != dv.decimal_scale) {
+		return false;
+	}
+	if (sv.fixed_size != dv.fixed_size) {
+		return false;
+	}
+	for (int64_t i = 0; i < src.n_children; i++) {
+		if (!SameLayout(*src.children[i], *dst.children[i])) {
+			return false;
+		}
+	}
+	return !src.dictionary || SameLayout(*src.dictionary, *dst.dictionary);
 }
 
-std::shared_ptr<arrow::ArrayData> ReshapeListLike(const std::shared_ptr<arrow::ArrayData> &source,
-                                                   const std::shared_ptr<arrow::DataType> &target_type,
-                                                   const std::shared_ptr<arrow::Field> &target_value_field) {
-	if (source->child_data.size() != 1) {
-		throw IOException("VGI schema reconciliation: list-like ArrayData expected 1 child, got %d",
-		                  static_cast<int>(source->child_data.size()));
+int64_t UnitsPerSecond(ArrowTimeUnit unit) {
+	switch (unit) {
+	case NANOARROW_TIME_UNIT_SECOND:
+		return 1;
+	case NANOARROW_TIME_UNIT_MILLI:
+		return 1000;
+	case NANOARROW_TIME_UNIT_MICRO:
+		return 1000000;
+	case NANOARROW_TIME_UNIT_NANO:
+		return 1000000000;
 	}
-	std::vector<std::shared_ptr<arrow::ArrayData>> reshaped;
-	reshaped.reserve(1);
-	reshaped.push_back(ReshapeArrayData(source->child_data[0], target_value_field));
-	return RewrapArrayData(source, target_type, std::move(reshaped));
+	return 1;
 }
 
-std::shared_ptr<arrow::ArrayData> ReshapeArrayData(const std::shared_ptr<arrow::ArrayData> &source,
-                                                    const std::shared_ptr<arrow::Field> &target_field) {
-	const auto &target_type = target_field->type();
-	const bool same_type = source->type->Equals(*target_type);
+int64_t Rescale(int64_t value, ArrowTimeUnit from, ArrowTimeUnit to) {
+	int64_t f = UnitsPerSecond(from);
+	int64_t t = UnitsPerSecond(to);
+	if (f == t) {
+		return value;
+	}
+	if (t > f) {
+		return value * (t / f);
+	}
+	// Truncate toward negative infinity, as Arrow's cast does for safe=false.
+	int64_t d = f / t;
+	int64_t q = value / d;
+	if ((value % d) != 0 && value < 0) {
+		q--;
+	}
+	return q;
+}
 
-	switch (target_type->id()) {
-	case arrow::Type::STRUCT: {
-		// Even if the struct types compare unequal at the top level (e.g.,
-		// child nullability flags differ), the data layout matches; rebuild
-		// the struct with reshaped children. If they're already equal we
-		// still need to descend in case child fields' metadata differs at
-		// deeper levels — the source.type->Equals check above catches the
-		// fully-equal case at this exact node and short-circuits via
-		// `same_type` below; struct children always need a recursive walk.
-		return ReshapeStruct(source, target_type);
+[[noreturn]] void CannotReconcile(const ArrowSchema &src, const ArrowSchema &dst) {
+	throw IOException("VGI schema reconciliation: failed to cast %s -> %s", TypeToString(src), TypeToString(dst));
+}
+
+// Append element `i` of `src` to `dst` (built from `dst_schema`), converting leaves.
+void AppendConverted(ArrowArray *dst, const ArrowSchema &dst_schema, const VgiColumn &src, int64_t i) {
+	if (src.IsNull(i)) {
+		append::Null(dst);
+		return;
 	}
-	case arrow::Type::LIST:
-	case arrow::Type::LARGE_LIST:
-	case arrow::Type::FIXED_SIZE_LIST: {
-		const auto &list_type = arrow::internal::checked_cast<const arrow::BaseListType &>(*target_type);
-		return ReshapeListLike(source, target_type, list_type.value_field());
+	if (dst_schema.dictionary) {
+		CannotReconcile(src.schema(), dst_schema);
 	}
-	case arrow::Type::MAP: {
-		// Map is List<Struct<key, value>> — recurse into the entries struct.
-		const auto &map_type = arrow::internal::checked_cast<const arrow::MapType &>(*target_type);
-		return ReshapeListLike(source, target_type, map_type.value_field());
+	auto dv = ViewOf(dst_schema);
+	switch (dv.type) {
+	case NANOARROW_TYPE_STRUCT:
+		if (src.num_children() != dst_schema.n_children) {
+			CannotReconcile(src.schema(), dst_schema);
+		}
+		for (int64_t k = 0; k < dst_schema.n_children; k++) {
+			AppendConverted(dst->children[k], *dst_schema.children[k], src.child(k), i);
+		}
+		append::FinishElement(dst);
+		return;
+	case NANOARROW_TYPE_LIST:
+	case NANOARROW_TYPE_LARGE_LIST:
+	case NANOARROW_TYPE_MAP:
+	case NANOARROW_TYPE_FIXED_SIZE_LIST: {
+		int st = src.is_dictionary() ? -1 : src.type().type;
+		if (st != NANOARROW_TYPE_LIST && st != NANOARROW_TYPE_LARGE_LIST && st != NANOARROW_TYPE_MAP &&
+		    st != NANOARROW_TYPE_FIXED_SIZE_LIST) {
+			CannotReconcile(src.schema(), dst_schema);
+		}
+		int64_t begin = 0;
+		int64_t end = 0;
+		src.ListRange(i, begin, end);
+		auto child = src.child(0);
+		for (int64_t k = begin; k < end; k++) {
+			AppendConverted(dst->children[0], *dst_schema.children[0], child, k);
+		}
+		append::FinishElement(dst);
+		return;
 	}
 	default:
 		break;
 	}
 
-	if (same_type) {
-		// Leaf primitive whose type already matches: reuse buffers verbatim.
-		// (The caller's RecordBatch::Make will pick up the target field's
-		// nullable/metadata flags from the schema we hand it.)
-		return source;
+	// A leaf. A dictionary source reads through its dictionary.
+	VgiColumn values = src;
+	int64_t row = i;
+	if (src.is_dictionary()) {
+		values = src.dictionary();
+		row = src.GetInt(i);
 	}
-
-	// Leaf primitive whose Arrow type differs (e.g., timestamp[us, tz=session]
-	// vs target timestamp[ms, tz=UTC]) — invoke the Arrow cast kernel.
-	return CastPrimitive(source, target_type);
+	auto sv = ViewOf(values.schema());
+	switch (dv.type) {
+	case NANOARROW_TYPE_BOOL:
+	case NANOARROW_TYPE_INT8:
+	case NANOARROW_TYPE_INT16:
+	case NANOARROW_TYPE_INT32:
+	case NANOARROW_TYPE_INT64:
+	case NANOARROW_TYPE_DATE32:
+	case NANOARROW_TYPE_DATE64:
+		switch (sv.type) {
+		case NANOARROW_TYPE_UINT8:
+		case NANOARROW_TYPE_UINT16:
+		case NANOARROW_TYPE_UINT32:
+		case NANOARROW_TYPE_UINT64:
+			append::Int(dst, static_cast<int64_t>(values.GetUInt(row)));
+			return;
+		case NANOARROW_TYPE_BOOL:
+		case NANOARROW_TYPE_INT8:
+		case NANOARROW_TYPE_INT16:
+		case NANOARROW_TYPE_INT32:
+		case NANOARROW_TYPE_INT64:
+			append::Int(dst, values.GetInt(row));
+			return;
+		case NANOARROW_TYPE_DATE32:
+		case NANOARROW_TYPE_DATE64:
+			if (sv.type != dv.type) {
+				CannotReconcile(values.schema(), dst_schema);
+			}
+			append::Int(dst, values.GetInt(row));
+			return;
+		default:
+			CannotReconcile(values.schema(), dst_schema);
+		}
+	case NANOARROW_TYPE_UINT8:
+	case NANOARROW_TYPE_UINT16:
+	case NANOARROW_TYPE_UINT32:
+	case NANOARROW_TYPE_UINT64:
+		switch (sv.type) {
+		case NANOARROW_TYPE_UINT8:
+		case NANOARROW_TYPE_UINT16:
+		case NANOARROW_TYPE_UINT32:
+		case NANOARROW_TYPE_UINT64:
+			append::UInt(dst, values.GetUInt(row));
+			return;
+		case NANOARROW_TYPE_INT8:
+		case NANOARROW_TYPE_INT16:
+		case NANOARROW_TYPE_INT32:
+		case NANOARROW_TYPE_INT64:
+			append::UInt(dst, static_cast<uint64_t>(values.GetInt(row)));
+			return;
+		default:
+			CannotReconcile(values.schema(), dst_schema);
+		}
+	case NANOARROW_TYPE_HALF_FLOAT:
+	case NANOARROW_TYPE_FLOAT:
+	case NANOARROW_TYPE_DOUBLE:
+		switch (sv.type) {
+		case NANOARROW_TYPE_HALF_FLOAT:
+		case NANOARROW_TYPE_FLOAT:
+		case NANOARROW_TYPE_DOUBLE:
+			append::Double(dst, values.GetDouble(row));
+			return;
+		case NANOARROW_TYPE_INT8:
+		case NANOARROW_TYPE_INT16:
+		case NANOARROW_TYPE_INT32:
+		case NANOARROW_TYPE_INT64:
+			append::Double(dst, static_cast<double>(values.GetInt(row)));
+			return;
+		default:
+			CannotReconcile(values.schema(), dst_schema);
+		}
+	case NANOARROW_TYPE_STRING:
+	case NANOARROW_TYPE_LARGE_STRING:
+	case NANOARROW_TYPE_STRING_VIEW:
+	case NANOARROW_TYPE_BINARY:
+	case NANOARROW_TYPE_LARGE_BINARY:
+	case NANOARROW_TYPE_BINARY_VIEW:
+	case NANOARROW_TYPE_FIXED_SIZE_BINARY:
+		switch (sv.type) {
+		case NANOARROW_TYPE_STRING:
+		case NANOARROW_TYPE_LARGE_STRING:
+		case NANOARROW_TYPE_STRING_VIEW:
+		case NANOARROW_TYPE_BINARY:
+		case NANOARROW_TYPE_LARGE_BINARY:
+		case NANOARROW_TYPE_BINARY_VIEW:
+		case NANOARROW_TYPE_FIXED_SIZE_BINARY: {
+			auto view = values.GetView(row);
+			append::Bytes(dst, view.data(), static_cast<int64_t>(view.size()));
+			return;
+		}
+		default:
+			CannotReconcile(values.schema(), dst_schema);
+		}
+	case NANOARROW_TYPE_TIMESTAMP:
+	case NANOARROW_TYPE_TIME32:
+	case NANOARROW_TYPE_TIME64:
+	case NANOARROW_TYPE_DURATION:
+		if (sv.type != dv.type && !(sv.type == NANOARROW_TYPE_TIME32 && dv.type == NANOARROW_TYPE_TIME64) &&
+		    !(sv.type == NANOARROW_TYPE_TIME64 && dv.type == NANOARROW_TYPE_TIME32)) {
+			CannotReconcile(values.schema(), dst_schema);
+		}
+		append::Int(dst, Rescale(values.GetInt(row), sv.time_unit, dv.time_unit));
+		return;
+	default:
+		CannotReconcile(values.schema(), dst_schema);
+	}
 }
 
 } // namespace
 
-std::shared_ptr<arrow::RecordBatch> ReconcileBatchToSchema(
-    const std::shared_ptr<arrow::RecordBatch> &batch,
-    const std::shared_ptr<arrow::Schema> &target_schema) {
+VgiBatchPtr ReconcileBatchToSchema(const VgiBatchPtr &batch, const VgiSchemaPtr &target_schema) {
 	if (!batch || !target_schema) {
 		return batch;
 	}
-	// Fast path: schemas already equal (excluding metadata, since
-	// ArrowConverter doesn't preserve it).
-	if (batch->schema()->Equals(*target_schema, /*check_metadata=*/false)) {
+	// Fast path: schemas already equal (excluding metadata, since ArrowConverter
+	// doesn't preserve it).
+	if (batch->schema().get() == target_schema.get() || batch->schema()->Equals(*target_schema)) {
 		return batch;
 	}
 	if (batch->num_columns() != target_schema->num_fields()) {
 		throw IOException("VGI schema reconciliation: column count mismatch (batch=%d target=%d)",
 		                  batch->num_columns(), target_schema->num_fields());
 	}
-	std::vector<std::shared_ptr<arrow::ArrayData>> columns;
-	columns.reserve(NumericCast<size_t>(batch->num_columns()));
-	for (int i = 0; i < batch->num_columns(); i++) {
-		const auto &target_field = target_schema->field(i);
-		columns.push_back(ReshapeArrayData(batch->column_data(i), target_field));
+	bool relabel = true;
+	for (int i = 0; i < batch->num_columns() && relabel; i++) {
+		relabel = SameLayout(batch->schema()->field(i), target_schema->field(i));
 	}
-	return arrow::RecordBatch::Make(target_schema, batch->num_rows(), std::move(columns));
+	if (relabel) {
+		return batch->WithSchema(target_schema);
+	}
+	VgiBatchBuilder builder(target_schema);
+	for (int c = 0; c < batch->num_columns(); c++) {
+		auto column = batch->column(c);
+		const auto &field = target_schema->field(c);
+		for (int64_t r = 0; r < batch->num_rows(); r++) {
+			AppendConverted(builder.column(c), field, column, r);
+		}
+	}
+	builder.SetRows(batch->num_rows());
+	return builder.Finish(batch->metadata());
 }
 
 } // namespace vgi

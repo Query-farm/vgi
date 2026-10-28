@@ -4,7 +4,7 @@
 #include <mutex>
 #include <unordered_map>
 
-#include <arrow/api.h>
+#include "nanoarrow/nanoarrow.h"
 
 #include "duckdb.hpp"
 #include "storage/vgi_catalog.hpp"
@@ -28,32 +28,50 @@ namespace {
 	                  REFLECTION_PROTOCOL_NAME, what, detail, worker_path);
 }
 
+// A column with its type parsed once (VgiColumn::type() parses the format string).
+struct TypedColumn {
+	TypedColumn() = default;
+	explicit TypedColumn(VgiColumn column_p) : column(column_p), type(column_p ? column_p.type().type : 0) {
+	}
+	VgiColumn column;
+	int type = 0;
+};
+
+// The child of struct `parent` called `name`; empty when there is none.
+VgiColumn ChildByName(const VgiColumn &parent, const char *name) {
+	for (int64_t k = 0; k < parent.num_children(); k++) {
+		auto child = parent.child(k);
+		if (child.name() == name) {
+			return child;
+		}
+	}
+	return VgiColumn();
+}
+
 // The string at `i`, or nullopt for a null or an absent column. Accepts every
 // Arrow string layout a port may emit.
-std::optional<std::string> StringAt(const std::shared_ptr<arrow::Array> &array, int64_t i) {
-	if (!array || array->IsNull(i)) {
+std::optional<std::string> StringAt(const TypedColumn &array, int64_t i) {
+	if (!array.column || array.column.IsNull(i)) {
 		return std::nullopt;
 	}
-	switch (array->type_id()) {
-	case arrow::Type::STRING:
-		return std::static_pointer_cast<arrow::StringArray>(array)->GetString(i);
-	case arrow::Type::LARGE_STRING:
-		return std::static_pointer_cast<arrow::LargeStringArray>(array)->GetString(i);
-	case arrow::Type::STRING_VIEW:
-		return std::string(std::static_pointer_cast<arrow::StringViewArray>(array)->GetView(i));
+	switch (array.type) {
+	case NANOARROW_TYPE_STRING:
+	case NANOARROW_TYPE_LARGE_STRING:
+	case NANOARROW_TYPE_STRING_VIEW:
+		return array.column.GetString(i);
 	default:
 		return std::nullopt;
 	}
 }
 
-std::optional<bool> BoolAt(const std::shared_ptr<arrow::Array> &array, int64_t i) {
-	if (!array || array->IsNull(i) || array->type_id() != arrow::Type::BOOL) {
+std::optional<bool> BoolAt(const TypedColumn &array, int64_t i) {
+	if (!array.column || array.column.IsNull(i) || array.type != NANOARROW_TYPE_BOOL) {
 		return std::nullopt;
 	}
-	return std::static_pointer_cast<arrow::BooleanArray>(array)->Value(i);
+	return array.column.GetBool(i);
 }
 
-std::string RequiredString(const std::shared_ptr<arrow::Array> &array, int64_t i, const char *field, const char *what,
+std::string RequiredString(const TypedColumn &array, int64_t i, const char *field, const char *what,
                            const std::string &worker_path) {
 	auto value = StringAt(array, i);
 	if (!value) {
@@ -63,50 +81,40 @@ std::string RequiredString(const std::shared_ptr<arrow::Array> &array, int64_t i
 	return std::move(*value);
 }
 
-VgiProtocolListing DecodeProtocolList(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                      const std::string &worker_path) {
+VgiProtocolListing DecodeProtocolList(const VgiBatchPtr &batch, const std::string &worker_path) {
 	const char *what = "protocol listing";
 	if (!batch || batch->num_rows() < 1) {
 		DecodeFailure(what, "the payload carries no rows", worker_path);
 	}
+	auto column = [&](const char *name) {
+		return TypedColumn(batch->GetColumnByName(name));
+	};
 	VgiProtocolListing listing;
-	listing.server_id = RequiredString(batch->GetColumnByName("server_id"), 0, "server_id", what, worker_path);
-	listing.server_version =
-	    RequiredString(batch->GetColumnByName("server_version"), 0, "server_version", what, worker_path);
-	listing.request_version =
-	    RequiredString(batch->GetColumnByName("request_version"), 0, "request_version", what, worker_path);
+	listing.server_id = RequiredString(column("server_id"), 0, "server_id", what, worker_path);
+	listing.server_version = RequiredString(column("server_version"), 0, "server_version", what, worker_path);
+	listing.request_version = RequiredString(column("request_version"), 0, "request_version", what, worker_path);
 
-	auto protocols = batch->GetColumnByName("protocols");
-	if (!protocols) {
+	auto protocols = column("protocols");
+	if (!protocols.column) {
 		DecodeFailure(what, "the payload has no 'protocols' column", worker_path);
 	}
-	if (protocols->IsNull(0)) {
+	if (protocols.column.IsNull(0)) {
 		DecodeFailure(what, "its 'protocols' column is null", worker_path);
 	}
-	std::shared_ptr<arrow::Array> values;
-	int64_t start = 0, end = 0;
-	if (protocols->type_id() == arrow::Type::LIST) {
-		auto list = std::static_pointer_cast<arrow::ListArray>(protocols);
-		values = list->values();
-		start = list->value_offset(0);
-		end = list->value_offset(1);
-	} else if (protocols->type_id() == arrow::Type::LARGE_LIST) {
-		auto list = std::static_pointer_cast<arrow::LargeListArray>(protocols);
-		values = list->values();
-		start = list->value_offset(0);
-		end = list->value_offset(1);
-	} else {
+	if (protocols.type != NANOARROW_TYPE_LIST && protocols.type != NANOARROW_TYPE_LARGE_LIST) {
 		DecodeFailure(what, "its 'protocols' column is not a list", worker_path);
 	}
-	if (!values || values->type_id() != arrow::Type::STRUCT) {
+	int64_t start = 0, end = 0;
+	protocols.column.ListRange(0, start, end);
+	auto summaries = protocols.column.child(0);
+	if (!summaries || summaries.type().type != NANOARROW_TYPE_STRUCT) {
 		DecodeFailure(what, "its 'protocols' elements are not structs", worker_path);
 	}
-	auto summaries = std::static_pointer_cast<arrow::StructArray>(values);
-	auto name_col = summaries->GetFieldByName("protocol");
-	auto version_col = summaries->GetFieldByName("protocol_version");
-	auto hash_col = summaries->GetFieldByName("protocol_hash");
-	auto deprecated_col = summaries->GetFieldByName("deprecated");
-	auto message_col = summaries->GetFieldByName("deprecation_message");
+	const TypedColumn name_col(ChildByName(summaries, "protocol"));
+	const TypedColumn version_col(ChildByName(summaries, "protocol_version"));
+	const TypedColumn hash_col(ChildByName(summaries, "protocol_hash"));
+	const TypedColumn deprecated_col(ChildByName(summaries, "deprecated"));
+	const TypedColumn message_col(ChildByName(summaries, "deprecation_message"));
 	// `features` is reserved and MUST be ignored by clients.
 	for (int64_t i = start; i < end; i++) {
 		VgiHostedProtocol p;
@@ -147,7 +155,7 @@ bool IsReflectionNotHostedError(const std::exception &e) {
 
 VgiProtocolListing InvokeListProtocols(const CatalogRpcContext &ctx, ClientContext &context,
                                        bool tolerate_pre_reflection) {
-	std::shared_ptr<arrow::RecordBatch> payload;
+	VgiBatchPtr payload;
 	try {
 		payload = InvokeReflectionListProtocols(ctx, context);
 	} catch (const std::exception &e) {

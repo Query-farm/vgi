@@ -7,11 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace arrow {
-class Array;
-class RecordBatch;
-class Schema;
-}
+#include "vgi_arrow.hpp"
 namespace duckdb {
 class ClientContext;
 namespace vgi {
@@ -49,7 +45,7 @@ struct VgiQueryPrepareResult {
 	std::string reason_code;
 	std::string reason_detail;
 	std::vector<uint8_t> prepared_query_token;
-	std::shared_ptr<arrow::Schema> output_schema;
+	VgiSchemaPtr output_schema;
 	std::vector<uint8_t> output_schema_ipc;
 	std::string result_ordering;
 	int64_t expires_at_epoch_ms = 0;
@@ -62,20 +58,20 @@ struct VgiQueryPrepareResult {
 bool IsVgiQueryEnabled(ClientContext &context);
 int64_t QueryEpochMillisNow();
 std::vector<uint8_t> QueryEvaluationContextDigest(const VgiQueryEvaluationContext &context);
-std::shared_ptr<arrow::Array> BuildClientQueryCapabilities();
-std::optional<VgiQueryCapabilities> ParseVgiQueryCapabilities(const std::shared_ptr<arrow::Array> &array,
+VgiBatchPtr BuildClientQueryCapabilities();
+std::optional<VgiQueryCapabilities> ParseVgiQueryCapabilities(const VgiColumn &array,
                                                             bool offered, const std::string &worker_path);
-std::shared_ptr<arrow::RecordBatch> BuildVgiQueryPrepareRequest(
+VgiBatchPtr BuildVgiQueryPrepareRequest(
     const CatalogRpcContext &ctx, const VgiQueryCapabilities &capabilities, const std::string &sql,
-    const std::shared_ptr<arrow::Schema> &parameter_schema, const std::string &required_ordering = "query_order");
-std::shared_ptr<arrow::RecordBatch> DeserializeVgiQueryRecord(const std::vector<uint8_t> &bytes);
-VgiQueryPrepareResult ParseVgiQueryPrepareResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+    const VgiSchemaPtr &parameter_schema, const std::string &required_ordering = "query_order");
+VgiBatchPtr DeserializeVgiQueryRecord(const std::vector<uint8_t> &bytes);
+VgiQueryPrepareResult ParseVgiQueryPrepareResult(const VgiBatchPtr &batch,
                                               const VgiQueryCapabilities &capabilities,
                                               const std::string &required_ordering, int64_t now_epoch_ms,
                                               const std::string &worker_path);
 VgiQueryPrepareResult InvokeCatalogQueryPrepare(const CatalogRpcContext &ctx,
                                               const VgiQueryCapabilities &capabilities, const std::string &sql,
-                                              const std::shared_ptr<arrow::Schema> &parameter_schema,
+                                              const VgiSchemaPtr &parameter_schema,
                                               ClientContext &context,
                                               const std::string &required_ordering = "query_order");
 void InvokeCatalogQueryRelease(const CatalogRpcContext &ctx, const std::vector<uint8_t> &prepared_query_token,

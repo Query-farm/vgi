@@ -1,5 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "storage/vgi_table_entry.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
@@ -39,13 +41,12 @@ namespace {
 // Backstop only (bind refuses via RequireVgiOptimizerExtensions); an ordinary
 // error because an InternalException would invalidate the database.
 void NativeDelegationMarkerExecute(ClientContext &, TableFunctionInput &, DataChunk &) {
-	throw InvalidInputException(
-	    "VgiRequiredFiltersOptimizer did not fire — native-delegation placeholder "
-	    "reached execution. Check that the optimizer is enabled and that 'extension' "
-	    "is not in disabled_optimizers.");
+	throw InvalidInputException("VgiRequiredFiltersOptimizer did not fire — native-delegation placeholder "
+	                            "reached execution. Check that the optimizer is enabled and that 'extension' "
+	                            "is not in disabled_optimizers.");
 }
 
-}  // namespace
+} // namespace
 
 TableFunction MakeNativeDelegationMarkerFunction() {
 	TableFunction fn("vgi_native_delegation_marker", {}, NativeDelegationMarkerExecute);
@@ -61,7 +62,8 @@ TableFunction MakeNativeDelegationMarkerFunction() {
 
 VgiTableEntry::VgiTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                              const vgi::VgiTableInfo &table_info)
-    : TableCatalogEntry(catalog, schema, info), table_info_(table_info), catalog_(catalog) {
+    : TableCatalogEntry(catalog, schema, info), columns_(info.columns.Copy()), table_info_(table_info),
+      catalog_(catalog) {
 	if (table_info_.row_id_column >= 0) {
 		rowid_type_ = table_info_.rowid_type;
 	}
@@ -93,7 +95,7 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 		return nullptr;
 	}
 	auto &col_def = columns.GetColumn(PhysicalIndex(column_id));
-	auto column_name = col_def.GetName();
+	auto column_name = col_def.GetName().GetIdentifierName();
 
 	// Two-phase: decide whether *this* call has to fetch, drop the mutex,
 	// run the RPC, then re-acquire to publish + look up. Holding the mutex
@@ -103,7 +105,7 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 	bool must_fetch = false;
 	bool concurrent_wait = false;
 	double wait_ms = 0.0;
-	auto qualifier = ParentSchema().name + "." + name;
+	auto qualifier = ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName();
 	{
 		std::unique_lock<std::mutex> lk(stats_cache_.mutex);
 		// Wait out a concurrent fetch. The waiter then sees the freshly
@@ -138,7 +140,7 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 	}
 
 	std::string outcome = must_fetch ? "fetched" : (concurrent_wait ? "concurrent_wait" : "fresh_hit");
-	vector<pair<string, string>> info{
+	vector<pair<string, string>> info {
 	    {"qualifier", qualifier},
 	    {"column", column_name},
 	    {"outcome", outcome},
@@ -193,17 +195,17 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 		for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
 			auto &col = columns.GetColumn(PhysicalIndex(i));
 			col_types.push_back(col.GetType());
-			col_names.push_back(col.GetName());
+			col_names.push_back(col.GetName().GetIdentifierName());
 		}
 
 		auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result_data->attach_opaque_data,
+		vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result_data->attach_opaque_data,
 		                                vgi_tx.GetTransactionOpaqueData()};
 		rpc_ctx.entity_kind = "table";
-		rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
+		rpc_ctx.entity_qualifier = ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName();
 
 		auto rpc_result = vgi::InvokeCatalogTableColumnStatisticsGet(
-		    rpc_ctx, ParentSchema().name, name, col_types, col_names, context);
+		    rpc_ctx, ParentSchema().name.GetIdentifierName(), name.GetIdentifierName(), col_types, col_names, context);
 
 		fetched_entries = std::move(rpc_result.stats);
 		fetched_max_age = rpc_result.cache_max_age_seconds;
@@ -216,7 +218,7 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 			auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 			VGI_LOG(context, "column_statistics.fetch_error",
 			        {{"worker_path", vgi_catalog.attach_parameters()->worker_path()},
-			         {"table", ParentSchema().name + "." + name},
+			         {"table", ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName()},
 			         {"error", e.what()}});
 		} catch (...) {
 			// swallow
@@ -267,16 +269,15 @@ void VgiTableEntry::PopulateStatsCacheFromInline(ClientContext &context) const {
 		for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
 			auto &col = columns.GetColumn(PhysicalIndex(i));
 			col_types.push_back(col.GetType());
-			col_names.push_back(col.GetName());
+			col_names.push_back(col.GetName().GetIdentifierName());
 		}
 
 		const auto &bytes = *table_info_.column_statistics;
 		auto batch = vgi::DeserializeFromIpcBytes(bytes.data(), bytes.size());
 		if (batch && batch->num_rows() > 0) {
 			parsed_entries = vgi::ParseColumnStatisticsBatch(
-			    batch, col_types, col_names,
-			    vgi_catalog.attach_parameters()->worker_path(),
-			    "table", ParentSchema().name + "." + name, context);
+			    batch, col_types, col_names, vgi_catalog.attach_parameters()->worker_path(), "table",
+			    ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName(), context);
 		}
 		ok = true;
 	} catch (const std::exception &e) {
@@ -284,7 +285,7 @@ void VgiTableEntry::PopulateStatsCacheFromInline(ClientContext &context) const {
 			auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 			VGI_LOG(context, "column_statistics.inline_parse_error",
 			        {{"worker_path", vgi_catalog.attach_parameters()->worker_path()},
-			         {"table", ParentSchema().name + "." + name},
+			         {"table", ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName()},
 			         {"error", e.what()}});
 		} catch (...) {
 			// swallow
@@ -318,12 +319,13 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	return GetScanFunctionImpl(context, bind_data, "", "");
 }
 
-TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data, const EntryLookupInfo &lookup) {
+TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+                                             const EntryLookupInfo &lookup) {
 	string at_unit;
 	string at_value;
 	auto at = lookup.GetAtClause();
 	if (at) {
-		at_unit = at->Unit();
+		at_unit = at->Unit().GetIdentifierName();
 		at_value = at->GetValue().ToString();
 	}
 	return GetScanFunctionImpl(context, bind_data, at_unit, at_value);
@@ -349,7 +351,7 @@ void VgiTableEntry::RecordMultiBranchHintNoAT(bool is_multi_branch) const {
 }
 
 vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &context, const std::string &at_unit,
-                                                              const std::string &at_value) {
+                                                            const std::string &at_value) {
 	// Fresh RPC per call. branches[] can vary with AT(...) — e.g.,
 	// versioned_data tables return different function args per version.
 	// Capability cache on VgiAttachParameters (A8) avoids the doomed-RPC
@@ -358,11 +360,12 @@ vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &conte
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data,
+	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
 	                                vgi_tx_scan.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "table";
-	rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
-	auto result = vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name, name, context, at_unit, at_value);
+	rpc_ctx.entity_qualifier = ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName();
+	auto result = vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name.GetIdentifierName(),
+	                                                     name.GetIdentifierName(), context, at_unit, at_value);
 	// Populate the multi-branch hint for the no-AT case so subsequent
 	// write-refusal helpers can short-circuit without an RPC. AT-carrying
 	// fetches don't populate the hint because the count COULD differ
@@ -387,7 +390,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		int physical = 0;
 		for (int i = 0; i < declared_index; ++i) {
 			const auto &field = table_info_.arrow_schema->field(i);
-			if (!field->metadata() || field->metadata()->FindKey(vgi::VGI_COLUMN_GENERATED) < 0)
+			if (!vgi::VgiMetadata::FromC(field.metadata).Contains(vgi::VGI_COLUMN_GENERATED))
 				physical++;
 		}
 		return physical;
@@ -412,7 +415,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		scan_result = *table_info_.scan_function;
 		used_inline = true;
 		VGI_LOG(context, "vgi.scan_function.inlined",
-		        {{"schema", ParentSchema().name}, {"table", name}, {"function", scan_result.function_name}});
+		        {{"schema", ParentSchema().name.GetIdentifierName()},
+		         {"table", name.GetIdentifierName()},
+		         {"function", scan_result.function_name}});
 	} else {
 		// Fetch branches fresh — branches[] varies with AT (e.g. versioned_data
 		// returns different args per VERSION). Capability cache on the attach
@@ -428,14 +433,15 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		if (!at_unit.empty() &&
 		    (branches_result.branches.size() > 1 || !branches_result.branches[0].branch_filter.empty() ||
 		     branches_result.branches[0].IsCatalogTable() || branches_result.branches[0].IsFormatBranch())) {
-			throw BinderException(
-			    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
-			        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
-			        .Set(vgi::error_key::kOperation, "AT"),
-			    StringUtil::Format("AT (...) clauses are not supported on multi-branch VGI tables. "
-			                       "Query a specific branch's underlying function directly. "
-			                       "[table: %s.%s, branches: %d]",
-			                       ParentSchema().name, name, static_cast<int>(branches_result.branches.size())));
+			throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+			                          .Set(vgi::error_key::kTable,
+			                               ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName())
+			                          .Set(vgi::error_key::kOperation, "AT"),
+			                      StringUtil::Format("AT (...) clauses are not supported on multi-branch VGI tables. "
+			                                         "Query a specific branch's underlying function directly. "
+			                                         "[table: %s.%s, branches: %d]",
+			                                         ParentSchema().name.GetIdentifierName(), name.GetIdentifierName(),
+			                                         static_cast<int>(branches_result.branches.size())));
 		}
 
 		// A SINGLE branch still needs the rewriter when it carries anything the
@@ -458,22 +464,24 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			// BinderException rather than returning the marker and reaching
 			// the internal-error safety net at execute time.
 			Value mb_enabled;
-			if (!context.TryGetCurrentSetting("vgi_multi_branch_scans", mb_enabled) ||
-			    mb_enabled.IsNull() || !mb_enabled.GetValue<bool>()) {
+			if (!context.TryGetCurrentSetting("vgi_multi_branch_scans", mb_enabled) || mb_enabled.IsNull() ||
+			    !mb_enabled.GetValue<bool>()) {
 				throw BinderException(
 				    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
-				        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+				        .Set(vgi::error_key::kTable,
+				             ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName())
 				        .Set(vgi::error_key::kOperation, "SCAN")
 				        .Set(vgi::error_key::kSetting, "vgi_multi_branch_scans"),
 				    StringUtil::Format("Multi-branch VGI table scan disabled via vgi_multi_branch_scans=false. "
 				                       "Re-enable the setting or query a specific branch directly. "
 				                       "[table: %s.%s, branches: %d]",
-				                       ParentSchema().name, name,
+				                       ParentSchema().name.GetIdentifierName(), name.GetIdentifierName(),
 				                       static_cast<int>(branches_result.branches.size())));
 			}
 
-			vgi::RequireVgiOptimizerExtensions(
-			    context, StringUtil::Format("Multi-branch VGI table %s.%s", ParentSchema().name, name));
+			vgi::RequireVgiOptimizerExtensions(context, StringUtil::Format("Multi-branch VGI table %s.%s",
+			                                                               ParentSchema().name.GetIdentifierName(),
+			                                                               name.GetIdentifierName()));
 
 			// Return the marker placeholder TableFunction. VgiMultiScanRewriter
 			// (pre_optimize_function in vgi_extension.cpp) detects the marker
@@ -484,9 +492,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			auto marker_bd = make_uniq<vgi::VgiMultiBranchMarkerBindData>();
 			marker_bd->branches = std::move(branches_result.branches);
 			marker_bd->required_extensions = std::move(branches_result.required_extensions);
-			marker_bd->table_catalog_name = catalog_.GetName();
-			marker_bd->table_schema_name = ParentSchema().name;
-			marker_bd->default_schema = attach_result->default_schema;
+			marker_bd->table_catalog_name = catalog_.GetName().GetIdentifierName();
+			marker_bd->table_schema_name = ParentSchema().name.GetIdentifierName();
+			marker_bd->default_schema = attach_result->default_schema.value_or("");
 			// Canonical column list comes from the table's declared columns
 			// (GetColumns() inherited from TableCatalogEntry). The rewriter's
 			// per-arm projection layer reorders each branch's raw output to
@@ -495,13 +503,13 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			marker_bd->canonical_column_names.reserve(cols.LogicalColumnCount());
 			marker_bd->canonical_column_types.reserve(cols.LogicalColumnCount());
 			for (auto &col : cols.Logical()) {
-				marker_bd->canonical_column_names.push_back(col.Name());
+				marker_bd->canonical_column_names.push_back(col.Name().GetIdentifierName());
 				marker_bd->canonical_column_types.push_back(col.Type());
 			}
 
 			VGI_LOG(context, "vgi.multi_scan.marker_returned",
-			        {{"schema", ParentSchema().name},
-			         {"table", name},
+			        {{"schema", ParentSchema().name.GetIdentifierName()},
+			         {"table", name.GetIdentifierName()},
 			         {"branches", std::to_string(marker_bd->branches.size())}});
 
 			bind_data = std::move(marker_bd);
@@ -562,7 +570,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	optional_ptr<TableFunctionCatalogEntry> func_entry;
 	// `default_schema` is read regardless of which branch below needs it: the
 	// worker-provided path also checks against it (see the comment there).
-	auto &default_schema = vgi_catalog.attach_result()->default_schema;
+	const auto default_schema = vgi_catalog.attach_result()->default_schema.value_or("");
 	// A worker-claimed schema equal to one we already have a stable, live
 	// reference to (the table's own schema, or the catalog's default) is
 	// resolved through the EXACT SAME call as the pre-1.5.0 heuristic below —
@@ -575,7 +583,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// path — genuinely new territory the pre-1.5.0 heuristic never
 	// reached — for a schema that names neither of those two.
 	bool worker_schema_is_third_schema = !scan_result.schema_name.empty() &&
-	                                     scan_result.schema_name != ParentSchema().name &&
+	                                     scan_result.schema_name != ParentSchema().name.GetIdentifierName() &&
 	                                     scan_result.schema_name != default_schema;
 	if (worker_schema_is_third_schema) {
 		// Worker-provided through VGI 2.0 schema_path, naming a schema other than the
@@ -585,8 +593,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// matching VGI-registered function falls through to the
 		// system-catalog lookup below, same as the fallback path does for a
 		// genuinely native DuckDB function.
-		func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
-		    context, scan_result.schema_name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+		func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(context, Identifier(scan_result.schema_name),
+		                                                          Identifier(scan_result.function_name),
+		                                                          OnEntryNotFound::RETURN_NULL);
 		if (func_entry) {
 			scan_function_schema = scan_result.schema_name;
 		}
@@ -600,14 +609,15 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// the table's own schema, then the catalog's default schema — is
 		// still required to resolve those, not just kept for compatibility.
 		func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
-		    context, ParentSchema().name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+		    context, ParentSchema().name, Identifier(scan_result.function_name), OnEntryNotFound::RETURN_NULL);
 		if (func_entry) {
-			scan_function_schema = ParentSchema().name;
+			scan_function_schema = ParentSchema().name.GetIdentifierName();
 		} else {
 			// Function may be in a different schema (e.g., main) than the table's schema (e.g., data)
-			if (default_schema != ParentSchema().name) {
-				func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
-				    context, default_schema, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+			if (!default_schema.empty() && default_schema != ParentSchema().name.GetIdentifierName()) {
+				func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(context, Identifier(default_schema),
+				                                                          Identifier(scan_result.function_name),
+				                                                          OnEntryNotFound::RETURN_NULL);
 				if (func_entry) {
 					scan_function_schema = default_schema;
 				}
@@ -622,9 +632,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// (vgi_multi_scan_rewriter.cpp:203) already does this fallback —
 		// mirror it for the single-branch path so workers can delegate scans
 		// to native DuckDB functions without going through a UNION ALL.
-		EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, scan_result.function_name);
-		auto sys_entry = Catalog::GetEntry(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, lookup,
-		                                   OnEntryNotFound::RETURN_NULL);
+		EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(Identifier(scan_result.function_name)));
+		auto sys_entry =
+		    Catalog::GetEntry(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL);
 		if (sys_entry) {
 			func_entry = &sys_entry->Cast<TableFunctionCatalogEntry>();
 			from_system_catalog = true;
@@ -634,8 +644,10 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	if (from_system_catalog && func_entry) {
 		if (generated_columns)
 			throw NotImplementedException("VGI generated columns require a worker function scan");
-		vgi::RequireVgiOptimizerExtensions(context, StringUtil::Format("VGI table %s.%s (native delegation to '%s')",
-		                                                          ParentSchema().name, name, scan_result.function_name));
+		vgi::RequireVgiOptimizerExtensions(context,
+		                                   StringUtil::Format("VGI table %s.%s (native delegation to '%s')",
+		                                                      ParentSchema().name.GetIdentifierName(),
+		                                                      name.GetIdentifierName(), scan_result.function_name));
 		// Native delegation: bind the system function eagerly here, then return
 		// a marker carrying the bound function + bind_data + return shapes.
 		// VgiRequiredFiltersOptimizer (vgi_extension.cpp) enforces this table's
@@ -644,27 +656,32 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// place to the stashed native ones. Subsequent passes see a vanilla
 		// native scan. Matches VgiMultiScanRewriter's per-arm binding shape
 		// (vgi_multi_scan_rewriter.cpp:219-247) but for the single-branch path.
-		vector<LogicalType> arg_types;
-		arg_types.reserve(scan_result.positional_arguments.size());
-		for (const auto &v : scan_result.positional_arguments) {
-			arg_types.push_back(v.type());
-		}
-		TableFunction native_tf =
-		    func_entry->functions.GetFunctionByArguments(context, arg_types);
-		vector<Value> parameters(scan_result.positional_arguments.begin(),
-		                          scan_result.positional_arguments.end());
-		named_parameter_map_t named_parameters;
-		for (auto &kv : scan_result.named_arguments) {
-			named_parameters.emplace(kv.first, kv.second);
-		}
+		vector<unique_ptr<Expression>> positional_arguments;
+		for (const auto &value : scan_result.positional_arguments)
+			positional_arguments.push_back(make_uniq<BoundConstantExpression>(value));
+		vector<pair<Identifier, unique_ptr<Expression>>> named_arguments;
+		for (const auto &item : scan_result.named_arguments)
+			named_arguments.emplace_back(Identifier(item.first), make_uniq<BoundConstantExpression>(item.second));
+		vector<Value> parameters;
+		named_argument_map_t named_parameters;
+		FunctionBinder binder(context);
+		ErrorData error;
+		auto overload = binder.BindFunction(func_entry->name, func_entry->functions, positional_arguments,
+		                                    named_arguments, parameters, named_parameters, error);
+		if (!overload.IsValid())
+			error.Throw();
+		BoundTableFunction native_tf(func_entry->functions.GetFunctionByOffset(overload.GetIndex()));
+		native_tf.GetSignature().FillNamedDefaults(context, named_parameters);
+		native_tf.SetCallArguments(parameters, named_parameters);
 		vector<LogicalType> input_table_types;
-		vector<string> input_table_names;
+		vector<Identifier> input_table_names;
 		TableFunctionRef ref;
-		TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types,
-		                                   input_table_names, native_tf.function_info.get(),
-		                                   nullptr, native_tf, ref);
+		TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types, input_table_names,
+		                                  native_tf.function_info.get(), nullptr, native_tf, ref);
 		vector<LogicalType> return_types;
-		vector<string> return_names;
+		vector<Identifier> return_names;
+		if (!native_tf.bind)
+			throw NotImplementedException("VGI native scan delegation requires a table-function bind callback");
 		auto native_bind = native_tf.bind(context, bind_input, return_types, return_names);
 		virtual_column_map_t native_virtual_columns;
 		if (native_tf.get_virtual_columns) {
@@ -690,8 +707,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			if (decl_count != return_names.size()) {
 				throw BinderException(
 				    vgi::ErrorInfo(vgi::error_subtype::kSchemaMismatch)
-				        .Set(vgi::error_key::kCatalog, catalog_.GetName())
-				        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+				        .Set(vgi::error_key::kCatalog, catalog_.GetName().GetIdentifierName())
+				        .Set(vgi::error_key::kTable,
+				             ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName())
 				        .Set(vgi::error_key::kFunctionName, scan_result.function_name)
 				        .Worker(attach_params->worker_path())
 				        .ExpectedActual(std::to_string(decl_count), std::to_string(return_names.size())),
@@ -700,57 +718,60 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 				                       "must match exactly what the native function emits at scan time (positions "
 				                       "+ names). Common cause: Hive-partition columns that read_parquet appends "
 				                       "but the worker's schema source omitted.",
-				                       catalog_.GetName(), ParentSchema().name, name, scan_result.function_name,
+				                       catalog_.GetName().GetIdentifierName(), ParentSchema().name.GetIdentifierName(),
+				                       name.GetIdentifierName(), scan_result.function_name,
 				                       static_cast<unsigned long long>(decl_count),
 				                       static_cast<unsigned long long>(return_names.size())));
 			}
 			for (idx_t i = 0; i < decl_count; ++i) {
-				const auto &decl_name = decl_columns.GetColumn(LogicalIndex(i)).Name();
-				if (decl_name != return_names[i]) {
+				const auto &decl_name = decl_columns.GetColumn(LogicalIndex(i)).Name().GetIdentifierName();
+				if (decl_name != return_names[i].GetIdentifierName()) {
 					throw BinderException(
 					    vgi::ErrorInfo(vgi::error_subtype::kSchemaMismatch)
-					        .Set(vgi::error_key::kCatalog, catalog_.GetName())
-					        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+					        .Set(vgi::error_key::kCatalog, catalog_.GetName().GetIdentifierName())
+					        .Set(vgi::error_key::kTable,
+					             ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName())
 					        .Set(vgi::error_key::kFunctionName, scan_result.function_name)
 					        .Worker(attach_params->worker_path())
 					        .Set(vgi::error_key::kColumnIndex, static_cast<int64_t>(i))
-					        .ExpectedActual(decl_name, return_names[i]),
+					        .ExpectedActual(decl_name, return_names[i].GetIdentifierName()),
 					    StringUtil::Format("VGI native delegation for '%s.%s.%s' (function '%s'): catalog "
 					                       "declared column %llu as '%s' but the native bind returned '%s'. "
 					                       "Names must match by position.",
-					                       catalog_.GetName(), ParentSchema().name, name, scan_result.function_name,
-					                       static_cast<unsigned long long>(i), decl_name, return_names[i]));
+					                       catalog_.GetName().GetIdentifierName(),
+					                       ParentSchema().name.GetIdentifierName(), name.GetIdentifierName(),
+					                       scan_result.function_name, static_cast<unsigned long long>(i), decl_name,
+					                       return_names[i]));
 				}
 			}
 		}
 
 		auto function_name_log = scan_result.function_name;
 		bind_data = make_uniq<VgiNativeDelegationMarkerBindData>(
-		    *this, std::move(native_tf), std::move(native_bind), std::move(return_types),
-		    std::move(return_names), std::move(native_virtual_columns), std::move(scan_result),
-		    attach_params->worker_path());
+		    *this, std::move(native_tf), std::move(native_bind), std::move(return_types), std::move(return_names),
+		    std::move(native_virtual_columns), std::move(scan_result), attach_params->worker_path());
 
 		VGI_LOG(context, "vgi.scan_function.native_delegation_marker",
-		        {{"schema", ParentSchema().name},
-		         {"table", name},
+		        {{"schema", ParentSchema().name.GetIdentifierName()},
+		         {"table", name.GetIdentifierName()},
 		         {"function", function_name_log}});
 		return MakeNativeDelegationMarkerFunction();
 	}
 	if (func_entry) {
 		for (auto &tf : func_entry->functions.functions) {
-			has_projection_pushdown = has_projection_pushdown || tf.projection_pushdown;
-			has_filter_pushdown = has_filter_pushdown || tf.filter_pushdown;
-			has_sampling_pushdown = has_sampling_pushdown || tf.sampling_pushdown;
+			has_projection_pushdown = has_projection_pushdown || tf->projection_pushdown;
+			has_filter_pushdown = has_filter_pushdown || tf->filter_pushdown;
+			has_sampling_pushdown = has_sampling_pushdown || tf->sampling_pushdown;
 			// First overload's order_preservation_type wins. Different overloads
 			// of one function name share the same row-ordering semantics in
 			// practice — the field is per-FunctionInfo, not per-overload.
 			if (!order_preservation_set) {
-				resolved_order_preservation = tf.order_preservation_type;
+				resolved_order_preservation = tf->order_preservation_type;
 				order_preservation_set = true;
 			}
 			// Extract required_secrets from the VgiTableFunctionInfo
-			if (tf.function_info) {
-				auto &vgi_tf_info = tf.function_info->Cast<vgi::VgiTableFunctionInfo>();
+			if (tf->function_info) {
+				auto &vgi_tf_info = tf->function_info->Cast<vgi::VgiTableFunctionInfo>();
 				scan_required_secrets = vgi_tf_info.function_info().required_secrets;
 				scan_filter_semantic_profiles = vgi_tf_info.function_info().filter_semantic_profiles;
 				scan_additional_filter_functions = vgi_tf_info.function_info().additional_filter_functions;
@@ -777,7 +798,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// Empty when the scan resolved to a built-in DuckDB function from the
 	// system catalog — those never reach a VGI worker.
 	scan_bind_data->schema_name = scan_function_schema;
-	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
+	scan_bind_data->arguments =
+	    vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
 	scan_bind_data->projection_pushdown = has_projection_pushdown;
 	scan_bind_data->filter_semantic_profiles = scan_filter_semantic_profiles;
 	scan_bind_data->additional_filter_functions = scan_additional_filter_functions;
@@ -810,13 +832,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	}
 	if (scan_partition_kind != vgi::VgiPartitionKind::NotPartitioned && table_info_.arrow_schema) {
 		for (int i = 0; i < table_info_.arrow_schema->num_fields(); ++i) {
-			const auto &field = table_info_.arrow_schema->field(i);
-			const auto &meta = field->metadata();
-			if (!meta) {
-				continue;
-			}
-			int idx = meta->FindKey("vgi.partition_column");
-			if (idx >= 0 && meta->value(idx) == "true") {
+			auto meta = table_info_.arrow_schema->field_metadata(i);
+			auto idx = meta.FindKey("vgi.partition_column");
+			if (idx >= 0 && meta.value(idx) == "true") {
 				scan_bind_data->partition_column_indices.push_back(static_cast<idx_t>(i));
 			}
 		}
@@ -838,7 +856,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 
 	// Perform bind handshake with the worker (discovers output schema)
 	vector<LogicalType> return_types;
-	vector<string> names;
+	vector<Identifier> names;
 	vgi::PerformVgiTableFunctionBind(context, *scan_bind_data, return_types, names);
 
 	// Validate the worker's bind output_schema against the catalog's declared
@@ -872,8 +890,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		if (names.size() < scannable_count) {
 			throw BinderException(
 			    vgi::ErrorInfo(vgi::error_subtype::kSchemaMismatch)
-			        .Set(vgi::error_key::kCatalog, catalog_.GetName())
-			        .Set(vgi::error_key::kTable, ParentSchema().name + "." + name)
+			        .Set(vgi::error_key::kCatalog, catalog_.GetName().GetIdentifierName())
+			        .Set(vgi::error_key::kTable,
+			             ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName())
 			        .Set(vgi::error_key::kFunctionName, scan_result.function_name)
 			        .Worker(attach_params->worker_path())
 			        .ExpectedActual(std::to_string(scannable_count), std::to_string(names.size())),
@@ -882,8 +901,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			                       "cover every column the table exposes. A mismatch usually means the worker's table "
 			                       "listing and its scan bind disagree — e.g. a proxy narrowed one but not the other.",
 			                       static_cast<unsigned long long>(names.size()),
-			                       static_cast<unsigned long long>(scannable_count), catalog_.GetName(),
-			                       ParentSchema().name, name, scan_result.function_name));
+			                       static_cast<unsigned long long>(scannable_count),
+			                       catalog_.GetName().GetIdentifierName(), ParentSchema().name.GetIdentifierName(),
+			                       name.GetIdentifierName(), scan_result.function_name));
 		}
 	}
 
@@ -904,8 +924,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// Mark fetched so VgiTableFunctionCardinality skips the RPC.
 		scan_bind_data->cardinality_fetched = true;
 		VGI_LOG(context, "vgi.cardinality.inlined",
-		        {{"schema", ParentSchema().name},
-		         {"table", name},
+		        {{"schema", ParentSchema().name.GetIdentifierName()},
+		         {"table", name.GetIdentifierName()},
 		         {"estimate", std::to_string(scan_bind_data->cardinality_estimate)},
 		         {"max", std::to_string(scan_bind_data->cardinality_max)}});
 	}
@@ -913,8 +933,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	bind_data = std::move(scan_bind_data);
 
 	// Wire up the shared table function implementation
-	TableFunction func("vgi_table_scan", {}, vgi::VgiTableFunctionScan, nullptr,
-	                   vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
+	TableFunction func("vgi_table_scan", {}, vgi::VgiTableFunctionScan, nullptr, vgi::VgiTableFunctionInitGlobal,
+	                   vgi::VgiTableFunctionInitLocal);
 	// DuckDB must project away generated fields even when the worker cannot.
 	// The shared init callbacks translate logical IDs to compact physical IDs.
 	func.projection_pushdown = generated_columns || has_projection_pushdown;
@@ -938,8 +958,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;
-	func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
+	func.get_metrics = vgi::VgiTableFunctionGetMetrics;
 	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
+	func.get_table_entry = vgi::VgiTableScanGetTableEntry;
 	if (!generated_columns) {
 		func.set_scan_order = vgi::VgiSetScanOrder;
 		func.statistics = vgi::VgiTableFunctionStatistics;
@@ -998,7 +1019,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 }
 
 void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                                          const TableFunction &function) {
+                                          const BoundTableFunction &function) {
 	// Rebuild the scan from its catalog identity and AT clause. Accepted
 	// projections and query-scoped snapshots additionally retain their exact
 	// bind identity, so a copy cannot silently switch provider state.
@@ -1010,9 +1031,9 @@ void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional
 		throw SerializationException("vgi_table_scan cannot be serialized without an originating table entry");
 	}
 	auto &table = *bind_data.table_entry;
-	serializer.WriteProperty(100, "catalog", table.ParentCatalog().GetName());
-	serializer.WriteProperty(101, "schema", table.ParentSchema().name);
-	serializer.WriteProperty(102, "table", table.name);
+	serializer.WriteProperty(100, "catalog", table.ParentCatalog().GetName().GetIdentifierName());
+	serializer.WriteProperty(101, "schema", table.ParentSchema().name.GetIdentifierName());
+	serializer.WriteProperty(102, "table", table.name.GetIdentifierName());
 	serializer.WriteProperty(103, "at_unit", bind_data.at_unit);
 	serializer.WriteProperty(104, "at_value", bind_data.at_value);
 	serializer.WritePropertyWithDefault(
@@ -1036,7 +1057,8 @@ void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional
 	                                           : vector<uint8_t>());
 }
 
-unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &deserializer,
+                                                                BoundTableFunction &function) {
 	auto catalog = deserializer.ReadProperty<string>(100, "catalog");
 	auto schema = deserializer.ReadProperty<string>(101, "schema");
 	auto table = deserializer.ReadProperty<string>(102, "table");
@@ -1048,7 +1070,8 @@ unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &de
 	auto repeatable_result = deserializer.ReadPropertyWithDefault<vector<uint8_t>>(108, "repeatable_bind_result");
 	auto &context = deserializer.Get<ClientContext &>();
 
-	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table);
+	auto &catalog_entry =
+	    Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema), Identifier(table));
 	auto &vgi_entry = catalog_entry.Cast<VgiTableEntry>();
 
 	// Re-run the bind to produce a fully-configured TableFunction (pushdown
@@ -1058,7 +1081,7 @@ unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &de
 	// `function.get_virtual_columns` from the reassigned function after this
 	// callback returns, so the copy ends up identical to a fresh bind.
 	unique_ptr<FunctionData> bind_data;
-	function = vgi_entry.GetScanFunctionImpl(context, bind_data, at_unit, at_value);
+	function = BoundTableFunction(vgi_entry.GetScanFunctionImpl(context, bind_data, at_unit, at_value));
 	if (!projection_request.empty() || !projection_response.empty()) {
 		vgi::RestoreProjectionAcceptance(context, bind_data->Cast<vgi::VgiTableFunctionBindData>(), function,
 		                                 projection_request, projection_response);
@@ -1116,7 +1139,7 @@ TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 			auto adjusted = (table_info_.row_id_column >= 0 && col > table_info_.row_id_column) ? col - 1 : col;
 			if (adjusted < 0) {
 				throw InvalidInputException("VGI: %s constraint on table '%s' references column index %d",
-				                            is_primary ? "PRIMARY KEY" : "UNIQUE", name, col);
+				                            is_primary ? "PRIMARY KEY" : "UNIQUE", name.GetIdentifierName(), col);
 			}
 			idx_info.column_set.insert(NumericCast<column_t>(adjusted));
 		}

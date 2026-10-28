@@ -22,8 +22,8 @@ std::vector<uint8_t> BuildBindRequestBytes(
     ClientContext &context,
     const std::string &function_name,
     const std::string &function_type,
-    const std::shared_ptr<arrow::Array> &arguments_array,
-    const std::shared_ptr<arrow::Schema> &input_schema,
+    const VgiBatchPtr &arguments_batch,
+    const VgiSchemaPtr &input_schema,
     const std::vector<uint8_t> &attach_opaque_data,
     const std::vector<uint8_t> &transaction_opaque_data,
     const std::map<std::string, Value> &settings,
@@ -37,22 +37,15 @@ std::vector<uint8_t> BuildBindRequestBytes(
     const std::string &schema_name,
     const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
 
-	// 1. Convert arguments to IPC bytes (Python expects a struct column "args")
+	// 1. Convert arguments to IPC bytes (Python expects a struct column "args";
+	// ArrowArguments::batch already is that one-row {args: struct} batch).
 	std::vector<uint8_t> arguments_bytes;
-	if (arguments_array) {
-		auto args_schema = arrow::schema({arrow::field("args", arguments_array->type())});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, arguments_array->length(), {arguments_array});
-		arguments_bytes = SerializeToIpcBytes(args_batch);
+	if (arguments_batch) {
+		arguments_bytes = SerializeToIpcBytes(arguments_batch);
 	} else {
-		auto empty_struct_type = arrow::struct_({});
-		auto empty_struct_result = arrow::MakeEmptyArray(empty_struct_type);
-		if (!empty_struct_result.ok()) {
-			throw IOException("Failed to create empty struct array: %s [worker: %s]",
-			                  empty_struct_result.status().ToString(), worker_label);
-		}
-		auto args_schema = arrow::schema({arrow::field("args", empty_struct_type)});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, 0, {empty_struct_result.ValueUnsafe()});
-		arguments_bytes = SerializeToIpcBytes(args_batch);
+		static const VgiBatchPtr empty_args =
+		    VgiBatch::MakeEmpty(MakeSchema({type::Struct({}).Named("args")}));
+		arguments_bytes = SerializeToIpcBytes(empty_args);
 	}
 
 	// 2. Serialize settings if non-empty
@@ -122,8 +115,8 @@ BindResult PerformBindProtocol(
     ClientContext &context,
     const std::string &function_name,
     const std::string &function_type,
-    const std::shared_ptr<arrow::Array> &arguments_array,
-    const std::shared_ptr<arrow::Schema> &input_schema,
+    const VgiBatchPtr &arguments_batch,
+    const VgiSchemaPtr &input_schema,
     const std::vector<uint8_t> &attach_opaque_data,
     const std::vector<uint8_t> &transaction_opaque_data,
     const std::map<std::string, Value> &settings,
@@ -148,7 +141,7 @@ BindResult PerformBindProtocol(
 
 	// First-attempt request bytes (resolved_secrets_provided=false).
 	auto bind_request_bytes = BuildBindRequestBytes(
-	    context, function_name, function_type, arguments_array, input_schema,
+	    context, function_name, function_type, arguments_batch, input_schema,
 	    attach_opaque_data, transaction_opaque_data, settings, secrets,
 	    /*resolved_secrets_provided=*/false, worker_label, at_unit, at_value, copy_from, copy_to, schema_name,
 	    argument_names);
@@ -181,7 +174,7 @@ BindResult PerformBindProtocol(
 		}
 
 		bind_request_bytes = BuildBindRequestBytes(
-		    context, function_name, function_type, arguments_array, input_schema,
+		    context, function_name, function_type, arguments_batch, input_schema,
 		    attach_opaque_data, transaction_opaque_data, settings, secrets,
 		    /*resolved_secrets_provided=*/true, worker_label, at_unit, at_value, copy_from, copy_to, schema_name,
 		    argument_names);

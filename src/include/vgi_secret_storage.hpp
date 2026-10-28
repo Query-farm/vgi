@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -14,10 +16,6 @@
 
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/main/secret/secret_storage.hpp"
-
-namespace arrow {
-class RecordBatch;
-}
 
 namespace duckdb {
 
@@ -56,7 +54,7 @@ public:
 	//! The one allowed throw: a `CREATE SECRET (STORAGE <ours>)` is not supported.
 	unique_ptr<SecretEntry> StoreSecret(unique_ptr<const BaseSecret> secret, OnCreateConflict on_conflict,
 	                                    optional_ptr<CatalogTransaction> transaction = nullptr) override;
-	void DropSecretByName(const string &name, OnEntryNotFound on_entry_not_found,
+	void DropSecretByName(const Identifier &name, OnEntryNotFound on_entry_not_found,
 	                      optional_ptr<CatalogTransaction> transaction = nullptr) override;
 	bool IncludeInLookups() override {
 		return active_.load();
@@ -153,7 +151,7 @@ private:
 	std::unique_ptr<const KeyValueSecret> Synthesize(ClientContext &context, const string &type,
 	                                                 const std::string &provider, const std::string &name,
 	                                                 const std::vector<std::string> &scope,
-	                                                 const std::shared_ptr<arrow::RecordBatch> &values_batch,
+	                                                 const VgiBatchPtr &values_batch,
 	                                                 const std::vector<std::string> &redact_keys);
 
 	DatabaseInstance &db_;

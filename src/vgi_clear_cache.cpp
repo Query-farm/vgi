@@ -22,7 +22,7 @@ struct VgiClearCacheData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> VgiClearCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
 	return make_uniq<VgiClearCacheData>();
@@ -54,7 +54,7 @@ static void VgiClearCacheScan(ClientContext &context, TableFunctionInput &data_p
 			vgi_catalog.attach_parameters()->hosted_protocols().Invalidate();
 		}
 		VGI_LOG(context, "catalog.cache_clear",
-		        {{"catalog", catalog.GetName()}, {"trigger", "vgi_clear_cache"}});
+		        {{"catalog", catalog.GetName().GetIdentifierName()}, {"trigger", "vgi_clear_cache"}});
 		++catalogs_cleared;
 	}
 	VGI_LOG(context, "catalog.cache_clear_summary",

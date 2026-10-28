@@ -21,7 +21,8 @@ namespace {
 class LifetimeEntry : public CatalogEntry {
 public:
 	LifetimeEntry(Catalog &catalog, string name, std::shared_ptr<unsigned> destroyed)
-	    : CatalogEntry(CatalogType::SCHEMA_ENTRY, catalog, std::move(name)), destroyed(std::move(destroyed)) {
+	    : CatalogEntry(CatalogType::SCHEMA_ENTRY, catalog, Identifier(std::move(name))),
+	      destroyed(std::move(destroyed)) {
 	}
 	~LifetimeEntry() override {
 		++*destroyed;
@@ -75,13 +76,13 @@ void Execute(Connection &connection, const string &sql) {
 
 string ReadLabel(PreparedStatement &statement) {
 	vector<Value> parameters;
-	auto result = statement.Execute(parameters, false);
+	auto result = statement.Execute(parameters);
 	INFO((result->HasError() ? result->GetError() : "ok"));
 	REQUIRE_FALSE(result->HasError());
-	auto &materialized = result->Cast<MaterializedQueryResult>();
+	auto &materialized = *result;
 	REQUIRE(materialized.RowCount() == 1);
-	REQUIRE(materialized.GetValue(0, 0).GetValue<int64_t>() == 1);
-	return materialized.GetValue(1, 0).ToString();
+	REQUIRE(materialized.Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
+	return materialized.Collection().GetValue(1, 0).ToString();
 }
 
 void CheckRetired(const LifetimeObservation &observation) {
@@ -136,15 +137,16 @@ void RunCompletionCase(const string &operation, const string &mode) {
 				control << "{\"" << operation << "\":\"" << mode << "\"}\n";
 				REQUIRE(control.good());
 				std::ofstream expected(directory / "expected.jsonl", std::ios::app);
-				expected << "{\"token\":\"" << completed.token << "\",\"operation\":\"" << operation
-				         << "\",\"mode\":\"" << mode << "\"}\n";
+				expected << "{\"token\":\"" << completed.token << "\",\"operation\":\"" << operation << "\",\"mode\":\""
+				         << mode << "\"}\n";
 				REQUIRE(expected.good());
 			}
 			auto result = connection.Query(operation);
 			INFO((result->HasError() ? result->GetError() : "ok"));
 			CHECK(result->HasError() == (mode != "success"));
 			if (mode != "success" && result->HasError()) {
-				const auto suffix = mode == "reject" ? " rejected before completion" : " response error after completion";
+				const auto suffix =
+				    mode == "reject" ? " rejected before completion" : " response error after completion";
 				CHECK(result->GetError().find("transaction_cleanup_probe: " + operation + suffix) != string::npos);
 			}
 			CheckRetired(completed);
@@ -177,7 +179,8 @@ void RunCompletionCase(const string &operation, const string &mode) {
 
 } // namespace
 
-TEST_CASE("Transaction completion releases local ownership on success and provider errors", "[transaction-cleanup][.]") {
+TEST_CASE("Transaction completion releases local ownership on success and provider errors",
+          "[transaction-cleanup][.]") {
 	for (const auto &operation : {"commit", "rollback"}) {
 		for (const auto &mode : {"success", "reject", "after_completion_error"}) {
 			DYNAMIC_SECTION(operation << " " << mode) {

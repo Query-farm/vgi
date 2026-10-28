@@ -12,7 +12,9 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/exception.hpp"
-#include <arrow/util/byte_size.h>
+#include "vgi_ipc.hpp"
+#include "generated/vgi_protocol_records.hpp"
+#include "nanoarrow/nanoarrow.h"
 #include <chrono>
 #include <set>
 
@@ -59,95 +61,79 @@ void Ordering(const std::string &ordering) {
 	Require(ordering == "unspecified" || ordering == "query_order", "unknown result ordering");
 }
 
-void StrictBatch(const std::shared_ptr<arrow::RecordBatch> &batch, const std::shared_ptr<arrow::Schema> &schema) {
+void StrictBatch(const VgiBatchPtr &batch, const VgiSchemaPtr &schema) {
 	Require(batch && batch->num_rows() == 1 && batch->schema()->Equals(*schema, false), "record schema or row count mismatch");
-	Require(batch->ValidateFull().ok(), "invalid Arrow record buffers");
-	Require(arrow::util::TotalBufferSize(*batch) <= VGI_QUERY_MAX_RECORD_BYTES, "query record is too large");
+	ValidateBatch(*batch, VgiValidation::FULL);
+	Require(batch->TotalBufferSize() <= VGI_QUERY_MAX_RECORD_BYTES, "query record is too large");
 	for (int i = 0; i < schema->num_fields(); ++i) {
-		Require(schema->field(i)->nullable() || !batch->column(i)->IsNull(0), "required query field is NULL");
+		Require(schema->field_nullable(i) || !batch->column(i).IsNull(0), "required query field is NULL");
 	}
 }
 
-std::shared_ptr<arrow::RecordBatch> StructBatch(const std::shared_ptr<arrow::Array> &array,
-                                             const std::shared_ptr<arrow::Schema> &schema) {
-	Require(array && array->length() == 1 && array->type()->Equals(arrow::struct_(schema->fields())) && !array->IsNull(0),
-	        "invalid inline query record");
-	auto fields = std::static_pointer_cast<arrow::StructArray>(array);
-	std::vector<std::shared_ptr<arrow::Array>> columns;
-	for (int i = 0; i < schema->num_fields(); ++i) columns.push_back(fields->field(i));
-	auto batch = arrow::RecordBatch::Make(schema, 1, std::move(columns));
+bool StructShape(const VgiColumn &column, const VgiSchemaPtr &schema) {
+	if (!column || column.length() != 1 || column.type().type != NANOARROW_TYPE_STRUCT ||
+	    column.num_children() != schema->num_fields()) return false;
+	for (int i = 0; i < schema->num_fields(); ++i) {
+		if (!TypesEqual(column.child(i).schema(), schema->field(i), true, false)) return false;
+	}
+	return true;
+}
+
+VgiBatchPtr StructBatch(const VgiColumn &column, const VgiSchemaPtr &schema) {
+	Require(StructShape(column, schema) && !column.IsNull(0), "invalid inline query record");
+	VgiBatchBuilder builder(schema);
+	for (int i = 0; i < schema->num_fields(); ++i) AppendElement(builder.column(i), column.child(i), 0);
+	builder.FinishRow();
+	auto batch = builder.Finish();
 	StrictBatch(batch, schema);
 	return batch;
 }
 
-std::shared_ptr<arrow::Array> Struct(const std::shared_ptr<arrow::Schema> &schema,
-                                   const std::vector<std::shared_ptr<arrow::Array>> &columns) {
-	auto result = arrow::StructArray::Make(columns, schema->fields());
-	Require(result.ok(), "could not construct inline query record");
-	return result.ValueOrDie();
-}
-
-std::shared_ptr<arrow::Array> EvaluationContext(const VgiQueryEvaluationContext &context) {
-	Context(context);
-	return Struct(generated::QueryEvaluationContextSchema(),
-	              {BuildStringScalar(context.timezone), BuildStringScalar(context.collation),
-	               BuildStringScalar(context.default_order), BuildStringScalar(context.default_null_order),
-	               BuildBoolScalar(context.preserve_insertion_order)});
-}
-
-void Metadata(const std::shared_ptr<const arrow::KeyValueMetadata> &metadata) {
-	if (!metadata) return;
+void Metadata(const VgiMetadata &metadata) {
 	std::set<std::string> names;
-	for (int64_t i = 0; i < metadata->size(); ++i) {
-		Require(names.insert(metadata->key(i)).second, "duplicate schema or field metadata key");
+	for (int64_t i = 0; i < metadata.size(); ++i) {
+		Require(names.insert(metadata.key(i)).second, "duplicate schema or field metadata key");
 	}
 }
 
-void FieldMetadata(const std::shared_ptr<arrow::Field> &field, size_t depth) {
+void FieldMetadata(const ArrowSchema &field, size_t depth) {
 	Require(depth <= 64, "query schema nesting is too deep");
-	Metadata(field->metadata());
-	for (const auto &child : field->type()->fields()) FieldMetadata(child, depth + 1);
-	if (field->type()->id() == arrow::Type::DICTIONARY) {
-		auto type = std::static_pointer_cast<arrow::DictionaryType>(field->type());
-		FieldMetadata(arrow::field("dictionary", type->value_type()), depth + 1);
-	}
+	Metadata(VgiMetadata::FromC(field.metadata));
+	for (int64_t i = 0; i < field.n_children; ++i) FieldMetadata(*field.children[i], depth + 1);
+	if (field.dictionary) FieldMetadata(*field.dictionary, depth + 1);
 }
 
-std::shared_ptr<arrow::Schema> ReadSchema(const std::vector<uint8_t> &bytes) {
+VgiSchemaPtr ReadSchema(const std::vector<uint8_t> &bytes) {
 	Require(!bytes.empty() && bytes.size() <= VGI_QUERY_MAX_SCHEMA_BYTES, "invalid query schema size");
-	arrow::io::BufferReader reader(arrow::Buffer::Wrap(bytes.data(), bytes.size()));
-	arrow::ipc::DictionaryMemo memo;
-	auto result = arrow::ipc::ReadSchema(&reader, &memo);
-	Require(result.ok(), "invalid query schema IPC");
-	auto position = reader.Tell();
-	Require(position.ok() && position.ValueOrDie() == static_cast<int64_t>(bytes.size()), "query schema has trailing data");
-	auto schema = result.ValueOrDie();
+	auto source = std::make_shared<VgiBufferReader>(VgiBuffer::Wrap(bytes.data(), bytes.size()));
+	auto reader = VgiIpcReader::Open(source);
+	Require(source->remaining() == 0, "query schema has trailing data");
+	auto schema = reader->schema();
 	Metadata(schema->metadata());
-	for (const auto &field : schema->fields()) FieldMetadata(field, 0);
+	for (int i = 0; i < schema->num_fields(); ++i) FieldMetadata(schema->field(i), 0);
 	return schema;
 }
 
-void Parameters(const std::shared_ptr<arrow::Schema> &schema) {
+void Parameters(const VgiSchemaPtr &schema) {
 	Require(schema && schema->num_fields() <= 1024, "too many query parameters");
 	Metadata(schema->metadata());
-	Require(schema->metadata() != nullptr, "query parameter mapping metadata is missing");
-	auto metadata = schema->metadata();
-	auto index = metadata->FindKey("vgi.query.parameters.v1");
+	const auto &metadata = schema->metadata();
+	auto index = metadata.FindKey("vgi.query.parameters.v1");
 	Require(index >= 0, "query parameter mapping metadata is missing");
-	auto mode = metadata->value(index);
+	auto mode = metadata.value(index);
 	Require(mode == "named" || mode == "positional", "invalid query parameter mapping mode");
 	std::set<std::string> names;
 	for (int i = 0; i < schema->num_fields(); ++i) {
-		auto field = schema->field(i);
-		Text(field->name(), "query parameter name");
-		Require(names.insert(field->name()).second, "duplicate query parameter name");
-		if (mode == "positional") Require(field->name() == std::to_string(i + 1), "positional names must be 1 through N");
+		auto name = schema->field_name(i);
+		Text(name, "query parameter name");
+		Require(names.insert(name).second, "duplicate query parameter name");
+		if (mode == "positional") Require(name == std::to_string(i + 1), "positional names must be 1 through N");
 		else {
-			Require(std::string("$:@?").find(field->name()[0]) == std::string::npos &&
-			            field->name().find_first_not_of("0123456789") != std::string::npos,
+			Require(std::string("$:@?").find(name[0]) == std::string::npos &&
+			            name.find_first_not_of("0123456789") != std::string::npos,
 			        "named parameters must use unprefixed, nonnumeric names");
 		}
-		FieldMetadata(field, 0);
+		FieldMetadata(schema->field(i), 0);
 	}
 }
 
@@ -178,25 +164,30 @@ std::vector<uint8_t> QueryEvaluationContextDigest(const VgiQueryEvaluationContex
 	return std::vector<uint8_t>(digest.begin(), digest.end());
 }
 
-std::shared_ptr<arrow::Array> BuildClientQueryCapabilities() {
-	return Struct(generated::ClientQueryCapabilitiesSchema(),
-	              {BuildStringListScalar({VGI_QUERY_ENCODING}), BuildStringListScalar({VGI_QUERY_EXPLICIT_PROFILE}),
-	               BuildStringScalar(DuckDB::LibraryVersion()), BuildInt64Scalar(VGI_QUERY_MAX_SQL_BYTES)});
+VgiBatchPtr BuildClientQueryCapabilities() {
+	generated::ClientQueryCapabilities value;
+	value.encodings = {VGI_QUERY_ENCODING};
+	value.semantic_profiles = {VGI_QUERY_EXPLICIT_PROFILE};
+	value.engine_version = DuckDB::LibraryVersion();
+	value.max_query_bytes = VGI_QUERY_MAX_SQL_BYTES;
+	return generated::ToBatch(value);
 }
 
-std::optional<VgiQueryCapabilities> ParseVgiQueryCapabilities(const std::shared_ptr<arrow::Array> &array,
+std::optional<VgiQueryCapabilities> ParseVgiQueryCapabilities(const VgiColumn &array,
                                                             bool offered, const std::string &worker_path) {
 	if (!array) return std::nullopt;
-	Require(array->length() == 1 && array->type()->Equals(arrow::struct_(generated::QueryCapabilitiesSchema()->fields())),
+	Require(StructShape(array, generated::QueryCapabilitiesSchema()),
 	        "invalid query capability field shape");
-	if (array->IsNull(0)) return std::nullopt;
+	if (array.IsNull(0)) return std::nullopt;
 	Require(offered, "worker selected query support without a client offer");
 	auto batch = StructBatch(array, generated::QueryCapabilitiesSchema());
 	// The generic catalog accessor skips NULL list entries. A negotiation must
 	// retain the exact wire selection, including rejecting malformed elements.
 	for (const auto *name : {"semantic_profiles", "execution_modes"}) {
-		auto list = std::static_pointer_cast<arrow::ListArray>(batch->GetColumnByName(name));
-		Require(list->value_length(0) == 1 && !list->values()->IsNull(list->value_offset(0)),
+		auto list = batch->GetColumnByName(name);
+		int64_t begin, end;
+		list.ListRange(0, begin, end);
+		Require(end - begin == 1 && !list.child(0).IsNull(begin),
 		        "query agreement requires one non-NULL explicit profile and mode");
 	}
 	RecordBatchSingleRow row(batch, 0, "QueryCapabilities", worker_path);
@@ -220,9 +211,9 @@ std::optional<VgiQueryCapabilities> ParseVgiQueryCapabilities(const std::shared_
 	return capabilities;
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildVgiQueryPrepareRequest(
+VgiBatchPtr BuildVgiQueryPrepareRequest(
     const CatalogRpcContext &ctx, const VgiQueryCapabilities &capabilities, const std::string &sql,
-    const std::shared_ptr<arrow::Schema> &parameter_schema, const std::string &required_ordering) {
+    const VgiSchemaPtr &parameter_schema, const std::string &required_ordering) {
 	Capabilities(capabilities);
 	Ordering(required_ordering);
 	Token(ctx.attach_opaque_data, "query attachment");
@@ -231,41 +222,37 @@ std::shared_ptr<arrow::RecordBatch> BuildVgiQueryPrepareRequest(
 	Parameters(parameter_schema);
 	auto parameter_bytes = SerializeSchemaToIpcBytes(parameter_schema);
 	Require(parameter_bytes.size() <= VGI_QUERY_MAX_SCHEMA_BYTES, "query parameter schema is too large");
-	auto schema = generated::CatalogQueryPrepareRequestSchema();
-	std::unique_ptr<arrow::ArrayBuilder> references;
-	auto status = arrow::MakeBuilder(arrow::default_memory_pool(), schema->field(11)->type(), &references);
-	Require(status.ok(), "could not construct empty query object manifest");
-	Require(static_cast<arrow::ListBuilder *>(references.get())->Append().ok(), "could not append query object manifest");
-	std::shared_ptr<arrow::Array> reference_array;
-	Require(references->Finish(&reference_array).ok(), "could not finish query object manifest");
-	auto transaction = ctx.transaction_opaque_data.empty() ? std::nullopt
-	                    : std::optional<std::vector<uint8_t>>(ctx.transaction_opaque_data);
-	auto batch = arrow::RecordBatch::Make(schema, 1,
-	    {BuildBinaryScalarRequired(ctx.attach_opaque_data), BuildStringScalar(capabilities.encoding),
-	     BuildStringScalar(VGI_QUERY_EXPLICIT_PROFILE), BuildStringScalar("explicit"),
-	     BuildStringScalar(capabilities.capability_revision), BuildStringScalar(sql), BuildBinaryScalarRequired(parameter_bytes),
-	     EvaluationContext(capabilities.default_evaluation_context), BuildOptionalBinaryScalar(transaction),
-	     BuildOptionalInt64Scalar(std::nullopt), BuildOptionalStringScalar(std::nullopt), reference_array,
-	     BuildOptionalBinaryScalar(std::nullopt), BuildStringScalar(required_ordering)});
-	StrictBatch(batch, schema);
+	generated::CatalogQueryPrepareRequest value;
+	value.attach_opaque_data = ctx.attach_opaque_data;
+	value.encoding = capabilities.encoding;
+	value.semantic_profile = VGI_QUERY_EXPLICIT_PROFILE;
+	value.mode = "explicit";
+	value.capability_revision = capabilities.capability_revision;
+	value.query = sql;
+	value.parameter_schema = std::move(parameter_bytes);
+	const auto &evaluation = capabilities.default_evaluation_context;
+	Context(evaluation);
+	value.evaluation_context = {evaluation.timezone, evaluation.collation, evaluation.default_order,
+	                            evaluation.default_null_order, evaluation.preserve_insertion_order};
+	if (!ctx.transaction_opaque_data.empty()) value.transaction_opaque_data = ctx.transaction_opaque_data;
+	value.required_ordering = required_ordering;
+	auto batch = generated::ToBatch(value);
+	StrictBatch(batch, generated::CatalogQueryPrepareRequestSchema());
 	return batch;
 }
 
-std::shared_ptr<arrow::RecordBatch> DeserializeVgiQueryRecord(const std::vector<uint8_t> &bytes) {
+VgiBatchPtr DeserializeVgiQueryRecord(const std::vector<uint8_t> &bytes) {
 	Require(!bytes.empty() && bytes.size() <= VGI_QUERY_MAX_RECORD_BYTES, "invalid query record size");
-	auto source = std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromVector(bytes));
-	auto opened = arrow::ipc::RecordBatchStreamReader::Open(source);
-	Require(opened.ok(), "invalid query record IPC");
-	auto reader = opened.ValueOrDie();
-	std::shared_ptr<arrow::RecordBatch> batch, extra;
-	Require(reader->ReadNext(&batch).ok() && batch != nullptr, "query record has no batch");
-	Require(reader->ReadNext(&extra).ok() && extra == nullptr, "query record must contain exactly one batch");
-	auto position = source->Tell();
-	Require(position.ok() && position.ValueOrDie() == static_cast<int64_t>(bytes.size()), "query record has trailing data");
+	auto source = std::make_shared<VgiBufferReader>(VgiBuffer::FromVector(bytes));
+	auto reader = VgiIpcReader::Open(source);
+	auto batch = reader->ReadNext();
+	Require(batch != nullptr, "query record has no batch");
+	Require(reader->ReadNext() == nullptr, "query record must contain exactly one batch");
+	Require(source->remaining() == 0, "query record has trailing data");
 	return batch;
 }
 
-VgiQueryPrepareResult ParseVgiQueryPrepareResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiQueryPrepareResult ParseVgiQueryPrepareResult(const VgiBatchPtr &batch,
                                               const VgiQueryCapabilities &capabilities,
                                               const std::string &required_ordering, int64_t now_epoch_ms,
                                               const std::string &worker_path) {
@@ -283,7 +270,7 @@ VgiQueryPrepareResult ParseVgiQueryPrepareResult(const std::shared_ptr<arrow::Re
 		        "invalid query decline reason code");
 		result.reason_detail = row["reason_detail"].value_or("");
 		Text(result.reason_detail, "query decline detail", 4096, true);
-		for (int i = 3; i < batch->num_columns(); ++i) Require(batch->column(i)->IsNull(0), "declined query contains acceptance fields");
+		for (int i = 3; i < batch->num_columns(); ++i) Require(batch->column(i).IsNull(0), "declined query contains acceptance fields");
 		return result;
 	}
 	Require(status == "accepted", "unknown preparation status");

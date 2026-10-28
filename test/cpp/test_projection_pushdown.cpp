@@ -14,62 +14,65 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "../../src/generated/vgi_protocol_schemas.hpp"
 #include <cstdlib>
+#include "nanoarrow/nanoarrow.h"
 
 using namespace duckdb;
 namespace {
-using Batch = std::shared_ptr<arrow::RecordBatch>;
-using Schema = std::shared_ptr<arrow::Schema>;
+using Batch = vgi::VgiBatchPtr;
+using Schema = vgi::VgiSchemaPtr;
 using Bytes = std::vector<uint8_t>;
 Schema Source() {
-	return arrow::schema({arrow::field("n", arrow::int32(), true, arrow::key_value_metadata({"raw"}, {"source"})),
-	                      arrow::field("other", arrow::int32())},
-	                     arrow::key_value_metadata({"table"}, {"metadata"}));
+	return vgi::MakeSchema({vgi::type::Int32().Named("n").WithMetadata(vgi::VgiMetadata({{"raw", "source"}})),
+	                        vgi::type::Int32().Named("other")},
+	                       vgi::VgiMetadata({{"table", "metadata"}}));
 }
 Schema Results() {
-	return arrow::schema({arrow::field("wide", arrow::int64()), arrow::field("wide_other", arrow::int64())});
+	return vgi::MakeSchema({vgi::type::Int64().Named("wide"), vgi::type::Int64().Named("wide_other")});
 }
 Batch Bind(const Schema &schema, const std::vector<std::string> &profiles = {vgi::VGI_CONSTRAINT_SCALAR_READ},
            const std::string &repeatability = "UNKNOWN") {
-	return arrow::RecordBatch::Make(
+	return vgi::VgiBatch::FromColumns(
 	    vgi::generated::BindResultSchema(), 1,
 	    {vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(schema)), vgi::BuildBinaryScalarRequired({1, 2}),
 	     vgi::BuildStringListScalar({}), vgi::BuildStringListScalar({}), vgi::BuildStringListScalar({}),
 	     vgi::BuildStringListScalar(profiles), vgi::BuildEnumArray(repeatability, {"UNKNOWN", "STABLE_WITHIN_QUERY"})});
 }
-Batch Replace(const Batch &batch, const std::string &name, const std::shared_ptr<arrow::Array> &value) {
-	auto columns = batch->columns();
-	columns[batch->schema()->GetFieldIndex(name)] = value;
-	return arrow::RecordBatch::Make(batch->schema(), 1, columns);
+Batch Replace(const Batch &batch, const std::string &name, ArrowArray value) {
+	ArrowArrayWrapper exported;
+	batch->ExportTo(exported);
+	auto column = exported.arrow_array.children[batch->schema()->GetFieldIndex(name)];
+	column->release(column);
+	ArrowArrayMove(&value, column);
+	return vgi::VgiBatch::Adopt(batch->schema(), &exported.arrow_array);
 }
 Bytes Request(const std::string &repeatability = "UNKNOWN") {
-	auto value = std::make_shared<arrow::LargeBinaryBuilder>();
-	arrow::ListBuilder expressions(arrow::default_memory_pool(), value);
-	vgi::ThrowOnArrowError(expressions.Append());
+	auto call = vgi::SerializeToIpcBytes(
+	    Replace(vgi::BuildBindRequest("scan", {}, "TABLE"), "schema_path", vgi::BuildStringListScalar({"main"})));
+	auto bind = vgi::SerializeToIpcBytes(Bind(Source(), {vgi::VGI_CONSTRAINT_SCALAR_READ}, repeatability));
+	vgi::VgiBatchBuilder builder(vgi::generated::TableFunctionProjectionRequestSchema());
+	vgi::append::Bytes(builder.column(0), call.data(), call.size());
+	vgi::append::Bytes(builder.column(1), bind.data(), bind.size());
 	for (auto sql : {"CAST(n AS BIGINT)", "CAST(other AS BIGINT)"}) {
 		auto expression = vgi::BuildNativeColumnExpression(sql, "main", {}, true);
-		vgi::ThrowOnArrowError(value->Append(expression.data(), expression.size()));
+		vgi::append::Bytes(builder.column(2)->children[0], expression.data(), expression.size());
 	}
-	std::shared_ptr<arrow::Array> values;
-	vgi::ThrowOnArrowError(expressions.Finish(&values));
-	return vgi::SerializeToIpcBytes(arrow::RecordBatch::Make(
-	    vgi::generated::TableFunctionProjectionRequestSchema(), 1,
-	    {vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(
-	         Replace(vgi::BuildBindRequest("scan", {}, "TABLE"), "schema_path", vgi::BuildStringListScalar({"main"})))),
-	     vgi::BuildBinaryScalarRequired(
-	         vgi::SerializeToIpcBytes(Bind(Source(), {vgi::VGI_CONSTRAINT_SCALAR_READ}, repeatability))),
-	     values, vgi::BuildBinaryScalarRequired(vgi::SerializeSchemaToIpcBytes(Results()))}));
+	vgi::append::FinishElement(builder.column(2));
+	auto result_schema = vgi::SerializeSchemaToIpcBytes(Results());
+	vgi::append::Bytes(builder.column(3), result_schema.data(), result_schema.size());
+	builder.FinishRow();
+	return vgi::SerializeToIpcBytes(builder.Finish());
 }
 Batch Response(const std::vector<int64_t> &indices, const Batch &bind = nullptr) {
 	auto result = bind ? vgi::BuildBinaryScalarRequired(vgi::SerializeToIpcBytes(bind))
-	                   : arrow::MakeArrayOfNull(arrow::binary(), 1).ValueOrDie();
-	return arrow::RecordBatch::Make(vgi::generated::TableFunctionProjectionResultSchema(), 1,
-	                                {vgi::BuildInt64ListScalar(indices), result});
+	                   : vgi::BuildOptionalBinaryScalar(std::nullopt);
+	return vgi::VgiBatch::FromColumns(vgi::generated::TableFunctionProjectionResultSchema(), 1,
+	                                  {vgi::BuildInt64ListScalar(indices), result});
 }
 Schema Expanded(const std::vector<int64_t> &indices) {
-	auto fields = Source()->fields();
+	auto schema = Source();
 	for (auto index : indices)
-		fields.push_back(Results()->field(index));
-	return arrow::schema(fields, Source()->metadata());
+		schema = schema->AddField(schema->num_fields(), Results()->field(index));
+	return schema;
 }
 LogicalGet *FindScan(LogicalOperator &op) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET &&
@@ -114,14 +117,11 @@ TEST_CASE("Projection acceptance preserves the source repeatability claim", "[pr
 TEST_CASE("Projection acceptance rejects type nullability metadata and envelope drift", "[projection-contract]") {
 	auto request = Request();
 	auto expected = Expanded({0});
-	for (auto bad :
-	     {arrow::schema(expected->fields()),
-	      arrow::schema({arrow::field("n", arrow::int32()), expected->field(1), expected->field(2)},
-	                    expected->metadata()),
-	      arrow::schema({expected->field(0), expected->field(1), arrow::field("wide", arrow::int64(), false)},
-	                    expected->metadata()),
-	      arrow::schema({expected->field(0), expected->field(1), arrow::field("wide", arrow::int32())},
-	                    expected->metadata())}) {
+	auto plain = vgi::MakeSchema({vgi::type::Int32().Named("n")});
+	auto nonnull = vgi::MakeSchema({vgi::type::Int64().Named("wide", false)});
+	auto wrong = vgi::MakeSchema({vgi::type::Int32().Named("wide")});
+	for (auto bad : {expected->WithMetadata(vgi::VgiMetadata()), expected->SetField(0, plain->field(0)),
+	                 expected->SetField(2, nonnull->field(0)), expected->SetField(2, wrong->field(0))}) {
 		CHECK_THROWS(vgi::ValidateProjectionAcceptance(request, Response({0}, Bind(bad))));
 	}
 	auto bytes = vgi::SerializeToIpcBytes(Bind(expected));
@@ -144,7 +144,13 @@ TEST_CASE("Projection acceptance rejects type nullability metadata and envelope 
 		    request,
 		    Response({0}, Replace(Bind(expected), "output_schema", vgi::BuildBinaryScalarRequired(schema_bytes)))));
 	}
-	auto null_indices = arrow::MakeArrayOfNull(arrow::list(arrow::int64()), 1).ValueOrDie();
+	vgi::VgiBatchBuilder null_builder(vgi::MakeSchema({vgi::type::List(vgi::type::Int64()).Named("accepted_indices")}));
+	vgi::append::Null(null_builder.column(0));
+	null_builder.FinishRow();
+	ArrowArrayWrapper null_export;
+	null_builder.Finish()->ExportTo(null_export);
+	ArrowArray null_indices;
+	ArrowArrayMove(null_export.arrow_array.children[0], &null_indices);
 	CHECK_THROWS(vgi::ValidateProjectionAcceptance(request, Replace(Response({}), "accepted_indices", null_indices)));
 }
 
@@ -157,7 +163,7 @@ TEST_CASE("Bind projection offers are bounded distinct semantic identifiers", "[
 	                      std::vector<std::string>(65, "x.v1"),
 	                      {std::string(257, 'a') + ".v1"}})
 		CHECK_THROWS(vgi::ParseBindResponse(Bind(Source(), profiles)));
-	auto missing = Bind(Source())->RemoveColumn(5).ValueOrDie();
+	auto missing = Bind(Source())->SelectColumns({0, 1, 2, 3, 4, 6});
 	CHECK_THROWS(vgi::ParseBindResponse(missing));
 }
 
@@ -211,7 +217,7 @@ TEST_CASE("Accepted projections survive bind copies and table scan serialization
 	// A serialized proposal may not reuse provider state from a different bind.
 	auto proposal = vgi::DeserializeVgiQueryRecord(data.projection_request_bytes);
 	auto original_bytes =
-	    std::static_pointer_cast<arrow::BinaryArray>(proposal->GetColumnByName("bind_result"))->GetView(0);
+	    proposal->GetColumnByName("bind_result").GetView(0);
 	auto original = vgi::DeserializeVgiQueryRecord(Bytes(original_bytes.begin(), original_bytes.end()));
 	auto changed = Replace(original, "opaque_data", vgi::BuildBinaryScalarRequired({9, 9}));
 	data.projection_request_bytes = vgi::SerializeToIpcBytes(

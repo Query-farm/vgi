@@ -1,13 +1,14 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_ipc.hpp"
+
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 #include <map>
 
-#include <arrow/api.h>
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -63,7 +64,7 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	const std::string &implementation_version() const { return attach_params->implementation_version(); }
 
 	// Schema info from catalog registration
-	std::shared_ptr<arrow::Schema> output_schema;  // Single "result" column
+	vgi::VgiSchemaPtr output_schema;  // Single "result" column
 
 	// Whether this function has a dynamic return type (vgi:any) that needs bind-time resolution
 	bool has_dynamic_return_type = false;
@@ -103,10 +104,10 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	const std::string &implementation_version() const { return attach_params->implementation_version(); }
 
 	// Actual output schema resolved during bind (with concrete types)
-	std::shared_ptr<arrow::Schema> resolved_output_schema;
+	vgi::VgiSchemaPtr resolved_output_schema;
 
 	// Input schema built from argument types during bind (after const params erased)
-	std::shared_ptr<arrow::Schema> input_schema;
+	vgi::VgiSchemaPtr input_schema;
 	std::optional<std::vector<std::optional<std::string>>> argument_names;
 
 	// DuckDB-side input types corresponding to `input_schema`, captured at
@@ -163,7 +164,7 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	bool initialized = false;
 
 	// Cached input schema (built from DataChunk column types on first call)
-	std::shared_ptr<arrow::Schema> input_schema;
+	vgi::VgiSchemaPtr input_schema;
 
 	// Pool setting captured during initialization (for use in destructor)
 	bool use_pool = false;
@@ -231,8 +232,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 
 // Bind function for scalar functions with dynamic return types
 // Connects to the worker to determine actual return type based on argument types
-unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFunction &bound_function,
-                                                vector<unique_ptr<Expression>> &arguments);
+unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input);
 
 } // namespace vgi
 } // namespace duckdb

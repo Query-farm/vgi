@@ -1,6 +1,9 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
 #include "vgi_table_function_impl.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/function/scalar/struct_utils.hpp"
 #include "vgi_platform.hpp" // VGI_ASYNC_INIT_ENABLED
 #ifdef __EMSCRIPTEN__
 #include <pthread.h>
@@ -27,7 +30,6 @@
 #include "vgi_query_function.hpp"
 #include "vgi_worker_pool.hpp"
 
-#include "arrow/util/byte_size.h" // TotalBufferSize (batch-shape stats)
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -36,15 +38,11 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/table/arrow.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/function/partition_stats.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/common/types/blob.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
-#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -59,11 +57,8 @@
 
 #include "yyjson.hpp"
 
-#include <arrow/c/bridge.h>
-#include <arrow/io/memory.h>
-#include <arrow/ipc/writer.h>
-
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <limits>
 
@@ -167,7 +162,7 @@ VgiTableFunctionLocalState::~VgiTableFunctionLocalState() noexcept {
 static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBindData &bind_data,
                                        BindResult bind_result, const std::string &conn_id,
                                        int worker_pid, vector<LogicalType> &return_types,
-                                       vector<string> &names) {
+                                       vector<Identifier> &names) {
 	bind_data.max_processes = 1;
 	bind_data.cardinality_estimate = -1;
 	bind_data.secret_dependent = bind_data.secret_dependent || bind_result.secret_dependent;
@@ -193,13 +188,13 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
 			// name so the worker can match/apply it. all_column_names below has
 			// the rowid removed, so indexing it by rowid_worker_col_index would
 			// resolve to the wrong (shifted) column.
-			bind_data.rowid_column_name = names[idx];
+			bind_data.rowid_column_name = names[idx].GetIdentifierName();
 			return_types.erase(return_types.begin() + idx);
 			names.erase(names.begin() + idx);
 		}
 	}
 
-	bind_data.all_column_names = names;
+	bind_data.all_column_names = IdentifiersToStrings(names);
 	bind_data.all_column_types = return_types;
 
 	{
@@ -295,15 +290,16 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 }
 
 void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindData &bind_data,
-                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	// Log the invocation
 	VGI_LOG(context, "table_function.bind",
 	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
-	         {"num_args", bind_data.arguments.array ? std::to_string(bind_data.arguments.array->length()) : "0"}});
+	         {"num_args", bind_data.arguments ? std::to_string(bind_data.arguments.length()) : "0"}});
 
 	// Validate that arguments type is a struct (defensive check)
-	D_ASSERT(!bind_data.arguments.type || bind_data.arguments.type->id() == arrow::Type::STRUCT);
+	D_ASSERT(!bind_data.arguments || (bind_data.arguments.batch->num_columns() == 1 &&
+	                                  std::strcmp(bind_data.arguments.batch->schema()->field(0).format, "+s") == 0));
 
 	// Inline-bind short-circuit: when the catalog-routed scan has a
 	// `bind_result` carried on TableInfo (worker pre-bound at
@@ -318,7 +314,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 				auto resolved_secrets = vgi::ExtractVgiSecrets(context, bind_data.required_secrets);
 				auto bind_request_bytes = vgi::BuildBindRequestBytes(
 				    context, bind_data.function_name, "TABLE",
-				    bind_data.arguments.array, /*input_schema=*/nullptr,
+				    bind_data.arguments.batch, /*input_schema=*/nullptr,
 				    bind_data.attach_opaque_data, bind_data.transaction_opaque_data,
 				    bind_data.settings, resolved_secrets,
 				    /*resolved_secrets_provided=*/false,
@@ -420,22 +416,22 @@ bool HasFilterFunctionCapability(const std::vector<VgiFilterFunctionCapability> 
 
 bool IsIntersectsExtentFunction(const BoundFunctionExpression &function,
                                 const std::vector<VgiFilterFunctionCapability> &additional_functions) {
-	auto name = StringUtil::Lower(function.function.name);
-	return (name == "&&" || name == "st_intersects_extent") && function.children.size() == 2 &&
-	       function.return_type.id() == LogicalTypeId::BOOLEAN &&
-	       function.children[0]->return_type.id() == LogicalTypeId::GEOMETRY &&
-	       function.children[1]->return_type.id() == LogicalTypeId::GEOMETRY &&
+	auto name = StringUtil::Lower(function.Function().GetName().GetIdentifierName());
+	return (name == "&&" || name == "st_intersects_extent") && function.GetChildren().size() == 2 &&
+	       function.GetReturnType().id() == LogicalTypeId::BOOLEAN &&
+	       function.GetChildren()[0]->GetReturnType().id() == LogicalTypeId::GEOMETRY &&
+	       function.GetChildren()[1]->GetReturnType().id() == LogicalTypeId::GEOMETRY &&
 	       HasFilterFunctionCapability(additional_functions, "duckdb.spatial", "intersects_extent", 1);
 }
 
 const char *StandardFilterFunctionName(const BoundFunctionExpression &function) {
-	if (function.children.size() != 2 || function.return_type.id() != LogicalTypeId::BOOLEAN ||
-	    function.function.catalog_name != "system" || function.function.schema_name != "main") {
+	if (function.GetChildren().size() != 2 || function.GetReturnType().id() != LogicalTypeId::BOOLEAN ||
+	    function.Function().GetCatalogName() != "system" || function.Function().GetSchemaName() != "main") {
 		return nullptr;
 	}
-	auto name = StringUtil::Lower(function.function.name);
-	auto &first_type = function.children[0]->return_type;
-	auto &second_type = function.children[1]->return_type;
+	auto name = StringUtil::Lower(function.Function().GetName().GetIdentifierName());
+	auto &first_type = function.GetChildren()[0]->GetReturnType();
+	auto &second_type = function.GetChildren()[1]->GetReturnType();
 	auto has_collation = [](const LogicalType &type) {
 		return TypeVisitor::Contains(type, [](const LogicalType &nested_type) {
 			return nested_type.id() == LogicalTypeId::VARCHAR && !StringType::GetCollation(nested_type).empty();
@@ -462,54 +458,63 @@ const char *StandardFilterFunctionName(const BoundFunctionExpression &function) 
 }
 
 //! Pure eligibility check shared by the pushdown callback and v2 serializer.
-//! DuckDB 1.5 calls this before replacing the sole BoundColumnRef with a
+//! DuckDB calls this before replacing the sole BoundColumnRef with a
 //! BoundReferenceExpression, so both forms are accepted as the same root.
 bool ExpressionTreeIsSupported(const Expression &expr,
                                const std::vector<VgiFilterFunctionCapability> &additional_functions) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_REF:
-		return expr.Cast<BoundReferenceExpression>().index == 0;
+		return expr.Cast<BoundReferenceExpression>().Index() == 0;
 	case ExpressionClass::BOUND_COLUMN_REF:
 	case ExpressionClass::BOUND_CONSTANT:
 		return true;
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &function = expr.Cast<BoundFunctionExpression>();
+		idx_t struct_index;
+		if (TryGetStructExtractChildIndex(function, struct_index) && !function.GetChildren().empty()) {
+			return ExpressionTreeIsSupported(*function.GetChildren()[0], additional_functions);
+		}
+		if (BoundComparisonExpression::IsComparison(function)) {
+			switch (function.GetExpressionType()) {
+			case ExpressionType::COMPARE_EQUAL:
+			case ExpressionType::COMPARE_NOTEQUAL:
+			case ExpressionType::COMPARE_GREATERTHAN:
+			case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			case ExpressionType::COMPARE_LESSTHAN:
+			case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+			case ExpressionType::COMPARE_DISTINCT_FROM:
+			case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+				return ExpressionTreeIsSupported(BoundComparisonExpression::Left(function), additional_functions) &&
+				       ExpressionTreeIsSupported(BoundComparisonExpression::Right(function), additional_functions);
+			default:
+				return false;
+			}
+		}
+		if (BoundCastExpression::IsCast(function)) {
+			// vgi.none.v1 supports only context-independent numeric coercions.
+			return BoundCastExpression::HasValidBindData(function) && !BoundCastExpression::IsTryCast(function) &&
+			       BoundCastExpression::SourceType(function).IsNumeric() && function.GetReturnType().IsNumeric() &&
+			       ExpressionTreeIsSupported(BoundCastExpression::Child(function), additional_functions);
+		}
 		auto standard_name = StandardFilterFunctionName(function);
 		if (!standard_name && !IsIntersectsExtentFunction(function, additional_functions)) {
 			return false;
 		}
-		for (const auto &child : function.children) {
+		for (const auto &child : function.GetChildren()) {
 			if (!ExpressionTreeIsSupported(*child, additional_functions)) {
 				return false;
 			}
 		}
 		return true;
 	}
-	case ExpressionClass::BOUND_COMPARISON: {
-		auto &comp_expr = expr.Cast<BoundComparisonExpression>();
-		switch (comp_expr.GetExpressionType()) {
-		case ExpressionType::COMPARE_EQUAL:
-		case ExpressionType::COMPARE_NOTEQUAL:
-		case ExpressionType::COMPARE_GREATERTHAN:
-		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		case ExpressionType::COMPARE_LESSTHAN:
-		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		case ExpressionType::COMPARE_DISTINCT_FROM:
-		case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
-			return ExpressionTreeIsSupported(*comp_expr.left, additional_functions) &&
-			       ExpressionTreeIsSupported(*comp_expr.right, additional_functions);
-		default:
-			return false;
-		}
-	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conj_expr = expr.Cast<BoundConjunctionExpression>();
 		if ((conj_expr.GetExpressionType() != ExpressionType::CONJUNCTION_AND &&
 		     conj_expr.GetExpressionType() != ExpressionType::CONJUNCTION_OR) ||
-		    conj_expr.children.size() < 2) {
+		    conj_expr.GetChildren().size() < 2) {
 			return false;
 		}
-		for (auto &child : conj_expr.children) {
+		for (auto &child : conj_expr.GetChildren()) {
 			if (!ExpressionTreeIsSupported(*child, additional_functions)) {
 				return false;
 			}
@@ -522,14 +527,14 @@ bool ExpressionTreeIsSupported(const Expression &expr,
 		case ExpressionType::OPERATOR_IS_NULL:
 		case ExpressionType::OPERATOR_IS_NOT_NULL:
 		case ExpressionType::OPERATOR_NOT:
-			return op.children.size() == 1 && ExpressionTreeIsSupported(*op.children[0], additional_functions);
+			return op.GetChildren().size() == 1 && ExpressionTreeIsSupported(*op.GetChildren()[0], additional_functions);
 		case ExpressionType::COMPARE_IN:
 		case ExpressionType::COMPARE_NOT_IN:
-			if (op.children.size() < 2 || !ExpressionTreeIsSupported(*op.children[0], additional_functions)) {
+			if (op.GetChildren().empty() || !ExpressionTreeIsSupported(*op.GetChildren()[0], additional_functions)) {
 				return false;
 			}
-			for (idx_t i = 1; i < op.children.size(); i++) {
-				if (op.children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			for (idx_t i = 1; i < op.GetChildren().size(); i++) {
+				if (op.GetChildren()[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 					return false;
 				}
 			}
@@ -537,14 +542,6 @@ bool ExpressionTreeIsSupported(const Expression &expr,
 		default:
 			return false;
 		}
-	}
-	case ExpressionClass::BOUND_CAST: {
-		auto &cast = expr.Cast<BoundCastExpression>();
-		// The initial 1.5 producer selects vgi.none.v1. Restrict casts to
-		// context-independent numeric coercions until session-profile capture is
-		// available from generated capability metadata.
-		return !cast.try_cast && cast.child->return_type.IsNumeric() && cast.return_type.IsNumeric() &&
-		       ExpressionTreeIsSupported(*cast.child, additional_functions);
 	}
 	default:
 		return false;
@@ -606,13 +603,12 @@ const char *ExpressionTypeToOp(ExpressionType type) {
 }
 
 //! Info about a join key column to be serialized as a flat Arrow batch.
-//! Holds a non-owning pointer to the InFilter::values vector.
-//! Lifetime contract: the TableFilterSet passed to VgiSerializeFilters must outlive the FilterSerializer.
+//! Owns constant values until their external-set batch has been serialized.
 struct JoinKeysInfo {
 	string column_name;
 	idx_t column_index;
 	LogicalType type;
-	const vector<Value> *values; // borrowed from InFilter::values
+	vector<Value> values; // owned while the external-set batch is built
 };
 
 } // namespace (anonymous) — break out so VgiContainsDynamicFilter gets
@@ -628,68 +624,22 @@ struct JoinKeysInfo {
 //! drop rows that were supposed to flow. The dynamic-filter mechanism in
 //! TickFilterPushdown re-pushes the filter at tick time once Top-N has
 //! established its threshold.
-bool VgiContainsDynamicFilter(const TableFilter &filter) {
-	switch (filter.filter_type) {
-	case TableFilterType::DYNAMIC_FILTER:
-		return true;
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conj = filter.Cast<ConjunctionAndFilter>();
-		for (auto &child : conj.child_filters) {
-			if (VgiContainsDynamicFilter(*child)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conj = filter.Cast<ConjunctionOrFilter>();
-		for (auto &child : conj.child_filters) {
-			if (VgiContainsDynamicFilter(*child)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &opt = filter.Cast<OptionalFilter>();
-		return opt.child_filter && VgiContainsDynamicFilter(*opt.child_filter);
-	}
-	case TableFilterType::STRUCT_EXTRACT: {
-		auto &sf = filter.Cast<StructFilter>();
-		return sf.child_filter && VgiContainsDynamicFilter(*sf.child_filter);
-	}
-	default:
-		return false;
-	}
+static bool ContainsVgiDynamicExpression(const Expression &expr) {
+	return ExpressionFilter::ContainsInternalFunction(expr, DynamicFilterScalarFun::NAME) ||
+	       ExpressionFilter::ContainsInternalFunction(expr, BloomFilterScalarFun::NAME) ||
+	       ExpressionFilter::ContainsInternalFunction(expr, PrefixRangeScalarFun::NAME);
 }
 
-static bool VgiAdvisoryFilterCanThrow(const TableFilter &filter) {
-	switch (filter.filter_type) {
-	case TableFilterType::EXPRESSION_FILTER:
-		return filter.Cast<ExpressionFilter>().expr->CanThrow();
-	case TableFilterType::CONJUNCTION_AND:
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conjunction = filter.filter_type == TableFilterType::CONJUNCTION_AND
-		                        ? static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionAndFilter>())
-		                        : static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionOrFilter>());
-		for (auto &child : conjunction.child_filters) {
-			if (VgiAdvisoryFilterCanThrow(*child)) {
-				return true;
-			}
-		}
-		return false;
+bool VgiContainsDynamicFilter(const TableFilter &filter) {
+	const auto &expression = ExpressionFilter::GetExpressionFilter(filter, "VGI dynamic filter detection");
+	return ContainsVgiDynamicExpression(*expression.expr);
+}
+
+static bool VgiAdvisoryFilterCanThrow(const Expression &expr) {
+	if (auto child = ExpressionFilter::GetOptionalFilterChild(expr)) {
+		return VgiAdvisoryFilterCanThrow(*child);
 	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &optional = filter.Cast<OptionalFilter>();
-		return optional.child_filter && VgiAdvisoryFilterCanThrow(*optional.child_filter);
-	}
-	case TableFilterType::STRUCT_EXTRACT: {
-		auto &structure = filter.Cast<StructFilter>();
-		return structure.child_filter && VgiAdvisoryFilterCanThrow(*structure.child_filter);
-	}
-	default:
-		return false;
-	}
+	return expr.CanThrow();
 }
 
 namespace { // reopen anonymous namespace for the file-local FilterSerializer.
@@ -758,122 +708,23 @@ private:
 		return obj;
 	}
 
-	yyjson_mut_val *SerializeFilterExpression(const TableFilter &filter, yyjson_mut_val *input, idx_t column_index,
+	yyjson_mut_val *SerializeFilterExpression(const TableFilter &filter, yyjson_mut_val *, idx_t column_index,
 	                                          const string &column_name, bool &advisory) {
-		switch (filter.filter_type) {
-		case TableFilterType::CONSTANT_COMPARISON: {
-			auto &constant = filter.Cast<ConstantFilter>();
-			auto op = ExpressionTypeToOp(constant.comparison_type);
-			if (string(op) == "unknown") {
-				throw InvalidInputException("Unsupported VGI constant comparison operator");
-			}
-			auto obj = yyjson_mut_obj(doc_);
-			yyjson_mut_obj_add_str(doc_, obj, "node", "comparison");
-			yyjson_mut_obj_add_str(doc_, obj, "op", op);
-			yyjson_mut_obj_add_val(doc_, obj, "left", input);
-			yyjson_mut_obj_add_val(doc_, obj, "right", Literal(constant.constant));
-			return obj;
-		}
-		case TableFilterType::IS_NULL:
-		case TableFilterType::IS_NOT_NULL: {
-			auto obj = yyjson_mut_obj(doc_);
-			yyjson_mut_obj_add_str(doc_, obj, "node", "is_null");
-			yyjson_mut_obj_add_val(doc_, obj, "expression", input);
-			yyjson_mut_obj_add_bool(doc_, obj, "negated", filter.filter_type == TableFilterType::IS_NOT_NULL);
-			return obj;
-		}
-		case TableFilterType::IN_FILTER: {
-			auto &in_filter = filter.Cast<InFilter>();
-			if (in_filter.values.empty()) {
-				// An empty exact set is always FALSE. Encoding a Boolean literal
-				// preserves that meaning without needing an unavailable element type.
-				return Literal(Value::BOOLEAN(false));
-			}
-			auto estimated_bytes = EstimateJoinKeyBytes(in_filter.values);
-			if (join_keys_max_bytes_ > 0 && estimated_bytes > join_keys_max_bytes_) {
-				return nullptr;
-			}
-			auto obj = yyjson_mut_obj(doc_);
-			yyjson_mut_obj_add_str(doc_, obj, "node", "in");
-			yyjson_mut_obj_add_val(doc_, obj, "expression", input);
-			auto set = yyjson_mut_obj(doc_);
-			if (!allow_external_sets_ || estimated_bytes <= INLINE_SET_MAX_BYTES) {
-				yyjson_mut_obj_add_str(doc_, set, "kind", "literal");
-				yyjson_mut_obj_add_uint(doc_, set, "value_ref",
-				                        AddValue(Value::LIST(in_filter.values[0].type(), in_filter.values)));
-			} else {
-				auto batch_index = join_key_columns_.size();
-				yyjson_mut_obj_add_str(doc_, set, "kind", "external");
-				yyjson_mut_obj_add_uint(doc_, set, "batch_index", batch_index);
-				yyjson_mut_obj_add_uint(doc_, set, "column_index", 0);
-				yyjson_mut_obj_add_strcpy(doc_, set, "column_name", column_name.c_str());
-				join_key_columns_.push_back({column_name, column_index, in_filter.values[0].type(), &in_filter.values});
-			}
-			yyjson_mut_obj_add_val(doc_, obj, "set", set);
-			yyjson_mut_obj_add_bool(doc_, obj, "negated", false);
-			return obj;
-		}
-		case TableFilterType::CONJUNCTION_AND:
-		case TableFilterType::CONJUNCTION_OR: {
-			auto &conjunction = filter.filter_type == TableFilterType::CONJUNCTION_AND
-			                        ? static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionAndFilter>())
-			                        : static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionOrFilter>());
-			auto children = yyjson_mut_arr(doc_);
-			for (auto &child : conjunction.child_filters) {
-				auto child_advisory = advisory;
-				auto child_expr = SerializeFilterExpression(*child, ColumnRef(column_index, column_name), column_index,
-				                                            column_name, child_advisory);
-				if (!child_expr) {
-					return nullptr;
-				}
-				advisory = advisory || child_advisory;
-				yyjson_mut_arr_append(children, child_expr);
-			}
-			if (yyjson_mut_arr_size(children) < 2) {
-				return nullptr;
-			}
-			auto obj = yyjson_mut_obj(doc_);
-			yyjson_mut_obj_add_str(doc_, obj, "node",
-			                       filter.filter_type == TableFilterType::CONJUNCTION_AND ? "and" : "or");
-			yyjson_mut_obj_add_val(doc_, obj, "children", children);
-			return obj;
-		}
-		case TableFilterType::STRUCT_EXTRACT: {
-			auto &struct_filter = filter.Cast<StructFilter>();
-			if (!struct_filter.child_filter) {
-				return nullptr;
-			}
-			auto field = yyjson_mut_obj(doc_);
-			yyjson_mut_obj_add_str(doc_, field, "node", "field_ref");
-			yyjson_mut_obj_add_val(doc_, field, "expression", input);
-			yyjson_mut_obj_add_uint(doc_, field, "field_index", struct_filter.child_idx);
-			yyjson_mut_obj_add_strcpy(doc_, field, "field_name", struct_filter.child_name.c_str());
-			return SerializeFilterExpression(*struct_filter.child_filter, field, column_index, column_name, advisory);
-		}
-		case TableFilterType::EXPRESSION_FILTER: {
-			auto &expr_filter = filter.Cast<ExpressionFilter>();
-			if (!ExpressionTreeIsSupported(*expr_filter.expr, additional_functions_)) {
-				throw InvalidInputException("VGI required expression filter is not eligible for v2 serialization");
-			}
-			return SerializeExpression(*expr_filter.expr, column_index, column_name);
-		}
-		case TableFilterType::OPTIONAL_FILTER: {
-			auto &optional_filter = filter.Cast<OptionalFilter>();
+		const auto &expression = ExpressionFilter::GetExpressionFilter(filter, "VGI filter serialization");
+		const Expression *expr = expression.expr.get();
+		if (ExpressionFilter::IsOptionalExpression(*expr)) {
 			advisory = true;
-			if (!optional_filter.child_filter || VgiContainsDynamicFilter(*optional_filter.child_filter)) {
+			if (ContainsVgiDynamicExpression(*expr)) {
 				return nullptr;
 			}
-			return SerializeFilterExpression(*optional_filter.child_filter, input, column_index, column_name, advisory);
 		}
-		case TableFilterType::DYNAMIC_FILTER:
-		case TableFilterType::BLOOM_FILTER:
-			// DuckDB 1.5 exposes neither immutable runtime artifact on the wire.
-			return nullptr;
-		default:
-			throw InvalidInputException(
-			    "VGI filter pushdown failed for worker '%s': unknown filter type %d cannot be serialized", worker_path_,
-			    static_cast<int>(filter.filter_type));
+		while (auto child = ExpressionFilter::GetOptionalFilterChild(*expr)) {
+			expr = child.get();
 		}
+		if (!ExpressionTreeIsSupported(*expr, additional_functions_)) {
+			throw InvalidInputException("VGI required expression filter is not eligible for v2 serialization");
+		}
+		return SerializeExpression(*expr, column_index, column_name);
 	}
 
 	idx_t AddValue(const Value &value) {
@@ -897,15 +748,52 @@ private:
 		switch (expr.GetExpressionClass()) {
 		case ExpressionClass::BOUND_REF: {
 			auto &ref = expr.Cast<BoundReferenceExpression>();
-			if (ref.index != 0) {
-				throw InvalidInputException("VGI DuckDB 1.5 filter references more than one column");
+			if (ref.Index() != 0) {
+				throw InvalidInputException("VGI expression filter references more than one column");
 			}
 			return ColumnRef(column_index, column_name);
 		}
 		case ExpressionClass::BOUND_CONSTANT:
-			return Literal(expr.Cast<BoundConstantExpression>().value);
+			return Literal(expr.Cast<BoundConstantExpression>().GetValue());
 		case ExpressionClass::BOUND_FUNCTION: {
 			auto &function = expr.Cast<BoundFunctionExpression>();
+			idx_t struct_index;
+			if (TryGetStructExtractChildIndex(function, struct_index) && !function.GetChildren().empty()) {
+				const auto &source = function.GetChildren()[0]->GetReturnType();
+				if (source.id() != LogicalTypeId::STRUCT || struct_index >= StructType::GetChildCount(source)) {
+					throw InvalidInputException("Invalid VGI struct field reference");
+				}
+				yyjson_mut_obj_add_str(doc_, obj, "node", "field_ref");
+				yyjson_mut_obj_add_val(doc_, obj, "expression",
+				    SerializeExpression(*function.GetChildren()[0], column_index, column_name));
+				yyjson_mut_obj_add_uint(doc_, obj, "field_index", struct_index);
+				yyjson_mut_obj_add_strcpy(doc_, obj, "field_name", StructType::GetChildName(source, struct_index).c_str());
+				return obj;
+			}
+			if (BoundComparisonExpression::IsComparison(function)) {
+				auto op = ExpressionTypeToOp(function.GetExpressionType());
+				if (string(op) == "unknown") {
+					throw InvalidInputException("Unsupported VGI comparison operator");
+				}
+				yyjson_mut_obj_add_str(doc_, obj, "node", "comparison");
+				yyjson_mut_obj_add_str(doc_, obj, "op", op);
+				yyjson_mut_obj_add_val(doc_, obj, "left",
+				    SerializeExpression(BoundComparisonExpression::Left(function), column_index, column_name));
+				yyjson_mut_obj_add_val(doc_, obj, "right",
+				    SerializeExpression(BoundComparisonExpression::Right(function), column_index, column_name));
+				return obj;
+			}
+			if (BoundCastExpression::IsCast(function)) {
+				if (!BoundCastExpression::HasValidBindData(function) || BoundCastExpression::IsTryCast(function) ||
+				    !BoundCastExpression::SourceType(function).IsNumeric() || !function.GetReturnType().IsNumeric()) {
+					break;
+				}
+				yyjson_mut_obj_add_str(doc_, obj, "node", "cast");
+				yyjson_mut_obj_add_val(doc_, obj, "expression",
+				    SerializeExpression(BoundCastExpression::Child(function), column_index, column_name));
+				yyjson_mut_obj_add_uint(doc_, obj, "type_ref", AddType(function.GetReturnType()));
+				return obj;
+			}
 			yyjson_mut_obj_add_str(doc_, obj, "node", "call");
 			if (auto standard_name = StandardFilterFunctionName(function)) {
 				yyjson_mut_obj_add_str(doc_, obj, "function", standard_name);
@@ -919,34 +807,21 @@ private:
 				break;
 			}
 			auto arguments = yyjson_mut_arr(doc_);
-			for (const auto &child : function.children) {
+			for (const auto &child : function.GetChildren()) {
 				yyjson_mut_arr_append(arguments, SerializeExpression(*child, column_index, column_name));
 			}
 			yyjson_mut_obj_add_val(doc_, obj, "arguments", arguments);
 			return obj;
 		}
-		case ExpressionClass::BOUND_COMPARISON: {
-			auto &comparison = expr.Cast<BoundComparisonExpression>();
-			auto op = ExpressionTypeToOp(comparison.GetExpressionType());
-			if (string(op) == "unknown") {
-				throw InvalidInputException("Unsupported VGI comparison operator");
-			}
-			yyjson_mut_obj_add_str(doc_, obj, "node", "comparison");
-			yyjson_mut_obj_add_str(doc_, obj, "op", op);
-			yyjson_mut_obj_add_val(doc_, obj, "left", SerializeExpression(*comparison.left, column_index, column_name));
-			yyjson_mut_obj_add_val(doc_, obj, "right",
-			                       SerializeExpression(*comparison.right, column_index, column_name));
-			return obj;
-		}
 		case ExpressionClass::BOUND_CONJUNCTION: {
 			auto &conjunction = expr.Cast<BoundConjunctionExpression>();
-			if (conjunction.children.size() < 2) {
+			if (conjunction.GetChildren().size() < 2) {
 				throw InvalidInputException("VGI boolean conjunction requires at least two children");
 			}
 			yyjson_mut_obj_add_str(doc_, obj, "node",
 			                       conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or");
 			auto children = yyjson_mut_arr(doc_);
-			for (auto &child : conjunction.children) {
+			for (auto &child : conjunction.GetChildren()) {
 				yyjson_mut_arr_append(children, SerializeExpression(*child, column_index, column_name));
 			}
 			yyjson_mut_obj_add_val(doc_, obj, "children", children);
@@ -956,54 +831,58 @@ private:
 			auto &op = expr.Cast<BoundOperatorExpression>();
 			if ((op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
 			     op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) &&
-			    op.children.size() == 1) {
+			    op.GetChildren().size() == 1) {
 				yyjson_mut_obj_add_str(doc_, obj, "node", "is_null");
 				yyjson_mut_obj_add_val(doc_, obj, "expression",
-				                       SerializeExpression(*op.children[0], column_index, column_name));
+				                       SerializeExpression(*op.GetChildren()[0], column_index, column_name));
 				yyjson_mut_obj_add_bool(doc_, obj, "negated",
 				                        op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL);
 				return obj;
 			}
-			if (op.GetExpressionType() == ExpressionType::OPERATOR_NOT && op.children.size() == 1) {
+			if (op.GetExpressionType() == ExpressionType::OPERATOR_NOT && op.GetChildren().size() == 1) {
 				yyjson_mut_obj_add_str(doc_, obj, "node", "not");
 				yyjson_mut_obj_add_val(doc_, obj, "expression",
-				                       SerializeExpression(*op.children[0], column_index, column_name));
+				                       SerializeExpression(*op.GetChildren()[0], column_index, column_name));
 				return obj;
 			}
 			if ((op.GetExpressionType() == ExpressionType::COMPARE_IN ||
+			     op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) && op.GetChildren().size() == 1) {
+				return Literal(Value::BOOLEAN(op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN));
+			}
+			if ((op.GetExpressionType() == ExpressionType::COMPARE_IN ||
 			     op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) &&
-			    op.children.size() > 1) {
+			    op.GetChildren().size() > 1) {
 				vector<Value> values;
-				for (idx_t i = 1; i < op.children.size(); i++) {
-					if (op.children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+				for (idx_t i = 1; i < op.GetChildren().size(); i++) {
+					if (op.GetChildren()[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 						throw InvalidInputException("VGI IN expression candidates must be constants");
 					}
-					values.push_back(op.children[i]->Cast<BoundConstantExpression>().value);
+					values.push_back(op.GetChildren()[i]->Cast<BoundConstantExpression>().GetValue());
 				}
 				yyjson_mut_obj_add_str(doc_, obj, "node", "in");
 				yyjson_mut_obj_add_val(doc_, obj, "expression",
-				                       SerializeExpression(*op.children[0], column_index, column_name));
+				                       SerializeExpression(*op.GetChildren()[0], column_index, column_name));
 				auto set = yyjson_mut_obj(doc_);
-				yyjson_mut_obj_add_str(doc_, set, "kind", "literal");
 				auto value_type = values[0].type();
-				yyjson_mut_obj_add_uint(doc_, set, "value_ref",
-				                        AddValue(Value::LIST(value_type, std::move(values))));
+				auto estimated_bytes = EstimateJoinKeyBytes(values);
+				if (join_keys_max_bytes_ > 0 && estimated_bytes > join_keys_max_bytes_) {
+					throw InvalidInputException("VGI IN filter exceeds vgi_join_keys_max_bytes");
+				}
+				if (!allow_external_sets_ || estimated_bytes <= INLINE_SET_MAX_BYTES) {
+					yyjson_mut_obj_add_str(doc_, set, "kind", "literal");
+					yyjson_mut_obj_add_uint(doc_, set, "value_ref", AddValue(Value::LIST(value_type, std::move(values))));
+				} else {
+					yyjson_mut_obj_add_str(doc_, set, "kind", "external");
+					yyjson_mut_obj_add_uint(doc_, set, "batch_index", join_key_columns_.size());
+					yyjson_mut_obj_add_uint(doc_, set, "column_index", 0);
+					yyjson_mut_obj_add_strcpy(doc_, set, "column_name", column_name.c_str());
+					join_key_columns_.push_back({column_name, column_index, value_type, std::move(values)});
+				}
 				yyjson_mut_obj_add_val(doc_, obj, "set", set);
 				yyjson_mut_obj_add_bool(doc_, obj, "negated", op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN);
 				return obj;
 			}
 			break;
-		}
-		case ExpressionClass::BOUND_CAST: {
-			auto &cast = expr.Cast<BoundCastExpression>();
-			if (cast.try_cast || !cast.child->return_type.IsNumeric() || !cast.return_type.IsNumeric()) {
-				break;
-			}
-			yyjson_mut_obj_add_str(doc_, obj, "node", "cast");
-			yyjson_mut_obj_add_val(doc_, obj, "expression",
-			                       SerializeExpression(*cast.child, column_index, column_name));
-			yyjson_mut_obj_add_uint(doc_, obj, "type_ref", AddType(cast.return_type));
-			return obj;
 		}
 		default:
 			break;
@@ -1058,6 +937,81 @@ private:
 // Serialize Filters - Convert TableFilterSet to Arrow IPC bytes for worker
 // ============================================================================
 
+//! DuckDB's Arrow export of `chunk` (all rows) as a batch with fields `names`.
+static VgiBatchPtr AppendChunkToBatch(ClientContext &context, DataChunk &chunk, const vector<LogicalType> &types,
+                                      const vector<string> &names, ClientProperties &client_props) {
+	const idx_t count = chunk.size();
+	ArrowAppender appender(types, count, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
+	appender.Append(chunk, 0, count, count);
+	ArrowArray arr = appender.Finalize();
+	VgiSchemaPtr schema;
+	try {
+		ArrowSchema c_schema;
+		ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
+		schema = VgiSchema::Adopt(&c_schema);
+	} catch (...) {
+		if (arr.release) {
+			arr.release(&arr);
+		}
+		throw;
+	}
+	return VgiBatch::Adopt(std::move(schema), &arr);
+}
+
+//! A one-row filter batch: `chunk` (filter_spec VARCHAR + value columns) exported by
+//! DuckDB, with column 0 as the required `filter_spec: utf8 not null` and the V2
+//! schema-level metadata. Import failures throw IOException("<import_error>: ...").
+static VgiBatchPtr MakeFilterSpecBatch(ClientContext &context, DataChunk &chunk, const vector<LogicalType> &types,
+                                       const vector<string> &names, ClientProperties &client_props,
+                                       const char *import_error) {
+	VgiBatchPtr batch;
+	try {
+		batch = AppendChunkToBatch(context, chunk, types, names, client_props);
+	} catch (const std::exception &e) {
+		throw IOException("%s: %s", import_error, ErrorData(e).RawMessage());
+	}
+	// V2 metadata is schema-level. The filter_spec cell itself is required.
+	static const VgiMetadata kFilterMetadata {{"vgi_filter_encoding", "vgi.filters.v2"},
+	                                          {"vgi_filter_version", "2"},
+	                                          {"vgi_evaluation_context", "vgi.none.v1"}};
+	ArrowSchema spec_field;
+	BuildSchema(type::Utf8().Named("filter_spec", /*is_nullable=*/false), &spec_field);
+	VgiSchemaPtr target;
+	try {
+		target = batch->schema()->SetField(0, spec_field)->WithMetadata(kFilterMetadata);
+	} catch (...) {
+		spec_field.release(&spec_field);
+		throw;
+	}
+	spec_field.release(&spec_field);
+	// Zero-copy relabel when DuckDB exported VARCHAR as utf8 (the default); converts a
+	// large_utf8 export (arrow_large_buffer_size) instead of mislabeling its buffers.
+	return ReconcileBatchToSchema(batch, target);
+}
+
+//! `batch` as a complete IPC stream (schema, the batch, EOS), uncompressed.
+static VgiBufferPtr SerializeIpcStream(const VgiBatch &batch, const char *open_error, const char *write_error,
+                                       const char *close_error) {
+	auto sink = std::make_shared<VgiBufferOutputStream>();
+	std::unique_ptr<VgiIpcWriter> writer;
+	try {
+		writer = VgiIpcWriter::Open(sink, batch.schema());
+	} catch (const std::exception &e) {
+		throw IOException("%s: %s", open_error, ErrorData(e).RawMessage());
+	}
+	try {
+		writer->Write(batch);
+	} catch (const std::exception &e) {
+		throw IOException("%s: %s", write_error, ErrorData(e).RawMessage());
+	}
+	try {
+		writer->Close();
+	} catch (const std::exception &e) {
+		throw IOException("%s: %s", close_error, ErrorData(e).RawMessage());
+	}
+	return sink->Finish();
+}
+
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
                                       optional_ptr<TableFilterSet> filters, const vector<string> &column_names,
                                       const string &worker_path, const string &rowid_column_name,
@@ -1065,8 +1019,12 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
                                       VgiFilterColumnIndexDomain index_domain,
                                       const std::vector<VgiFilterFunctionCapability> &additional_functions) {
 	// Return empty if no filters
-	if (!filters || filters->filters.empty()) {
+	if (!filters || !filters->HasFilters()) {
 		return {nullptr, {}};
+	}
+
+	if (filters->HasMultiColumnFilters()) {
+		throw InvalidInputException("VGI multi-column filter serialization is not supported");
 	}
 
 	// Read byte size limit for join keys from settings
@@ -1076,7 +1034,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		join_keys_max_bytes = max_bytes_val.GetValue<idx_t>();
 	}
 
-	// Build a v2 snapshot. DuckDB 1.5 table filters are single-column, but
+	// Build a v2 snapshot. This adapter accepts single-column filters, and
 	// every reference still names the unprojected bind-schema field.
 	FilterSerializer serializer(worker_path, join_keys_max_bytes, true, additional_functions);
 	auto document = yyjson_mut_obj(serializer.GetDoc());
@@ -1086,9 +1044,9 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	auto predicates = yyjson_mut_arr(serializer.GetDoc());
 	idx_t predicate_index = 0;
 
-	for (auto &entry : filters->filters) {
-		idx_t col_idx = entry.first;
-		auto &filter = *entry.second;
+	for (auto &entry : *filters) {
+		idx_t col_idx = entry.GetIndex().GetIndex();
+		auto &filter = entry.Filter();
 
 		// Residual serialization (per-partition cache): skip the partition-column
 		// predicate keys so the residual filter reflects only non-partition constraints.
@@ -1137,9 +1095,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		}
 
 		auto append_filter = [&](const TableFilter &candidate, bool inherited_advisory) {
-			bool advisory = inherited_advisory || candidate.filter_type == TableFilterType::OPTIONAL_FILTER ||
-			                candidate.filter_type == TableFilterType::DYNAMIC_FILTER ||
-			                candidate.filter_type == TableFilterType::BLOOM_FILTER;
+			bool advisory = inherited_advisory || ExpressionFilter::IsOptionalFilter(candidate);
 			try {
 				auto expression = serializer.SerializeFilter(candidate, worker_col_idx, col_name, advisory);
 				if (!expression) {
@@ -1164,32 +1120,26 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 			}
 		};
 
-		if (filter.filter_type != TableFilterType::CONJUNCTION_AND) {
+		const auto &expression = ExpressionFilter::GetExpressionFilter(filter, "VGI conjunct serialization");
+		if (expression.expr->GetExpressionType() != ExpressionType::CONJUNCTION_AND) {
 			append_filter(filter, false);
 			continue;
 		}
-
-		// Keep required conjuncts in one expression so DuckDB's evaluation and
-		// error ordering are not weakened. Explicit advisory children may be
-		// separated only when they cannot throw; DuckDB retains their residual.
-		auto &conjunction = filter.Cast<ConjunctionAndFilter>();
-		auto required = make_uniq<ConjunctionAndFilter>();
-		for (auto &child : conjunction.child_filters) {
-			bool advisory = child->filter_type == TableFilterType::OPTIONAL_FILTER ||
-			                child->filter_type == TableFilterType::DYNAMIC_FILTER ||
-			                child->filter_type == TableFilterType::BLOOM_FILTER;
-			if (advisory) {
+		// Keep required conjuncts together, preserving their evaluation/error order.
+		vector<unique_ptr<Expression>> required;
+		for (const auto &child : expression.expr->Cast<BoundConjunctionExpression>().GetChildren()) {
+			if (ExpressionFilter::IsOptionalExpression(*child)) {
 				if (!VgiAdvisoryFilterCanThrow(*child)) {
-					append_filter(*child, true);
+					ExpressionFilter advisory(child->Copy());
+					append_filter(advisory, true);
 				}
 			} else {
-				required->child_filters.push_back(child->Copy());
+				required.push_back(child->Copy());
 			}
 		}
-		if (required->child_filters.size() == 1) {
-			append_filter(*required->child_filters[0], false);
-		} else if (!required->child_filters.empty()) {
-			append_filter(*required, false);
+		if (!required.empty()) {
+			ExpressionFilter mandatory(BoundConjunctionExpression::Create(ExpressionType::CONJUNCTION_AND, std::move(required)));
+			append_filter(mandatory, false);
 		}
 	}
 	yyjson_mut_obj_add_val(serializer.GetDoc(), document, "predicates", predicates);
@@ -1226,75 +1176,22 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		chunk.SetValue(i + 1, 0, values[i]);
 	}
 
-	// Convert to Arrow via ArrowAppender
 	ClientProperties client_props = context.GetClientProperties();
-	ArrowAppender appender(types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
-	appender.Append(chunk, 0, 1, 1);
-	ArrowArray arr = appender.Finalize();
-
-	// Build Arrow schema via C API
-	ArrowSchema c_schema;
-	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-	// Import to Arrow C++ RecordBatch
-	auto import_result = arrow::ImportRecordBatch(&arr, &c_schema);
-	if (!import_result.ok()) {
-		throw IOException("Failed to import filter RecordBatch: %s", import_result.status().ToString());
-	}
-	auto record_batch = import_result.ValueUnsafe();
-
-	// V2 metadata is schema-level. The filter_spec cell itself is required.
-	auto metadata =
-	    arrow::KeyValueMetadata::Make({"vgi_filter_encoding", "vgi_filter_version", "vgi_evaluation_context"},
-	                                  {"vgi.filters.v2", "2", "vgi.none.v1"});
-	std::vector<std::shared_ptr<arrow::Field>> new_fields;
-	new_fields.push_back(arrow::field("filter_spec", arrow::utf8(), /*nullable=*/false));
-	for (int i = 1; i < record_batch->schema()->num_fields(); i++) {
-		new_fields.push_back(record_batch->schema()->field(i));
-	}
-	auto new_schema = arrow::schema(new_fields, metadata);
-
-	// Create new RecordBatch with updated schema
-	record_batch = arrow::RecordBatch::Make(new_schema, record_batch->num_rows(), record_batch->columns());
+	auto record_batch = MakeFilterSpecBatch(context, chunk, types, names, client_props, "Failed to import filter RecordBatch");
 
 	// Serialize to Arrow IPC stream format (schema + record batch)
-	auto buffer_result = arrow::io::BufferOutputStream::Create();
-	if (!buffer_result.ok()) {
-		throw IOException("Failed to create buffer for filter IPC: %s", buffer_result.status().ToString());
-	}
-	auto buffer_stream = buffer_result.ValueUnsafe();
-
-	auto writer_result = arrow::ipc::MakeStreamWriter(buffer_stream, record_batch->schema());
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create IPC stream writer: %s", writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
-
-	auto write_status = writer->WriteRecordBatch(*record_batch);
-	if (!write_status.ok()) {
-		throw IOException("Failed to write filter RecordBatch to IPC stream: %s", write_status.ToString());
-	}
-
-	auto close_status = writer->Close();
-	if (!close_status.ok()) {
-		throw IOException("Failed to close IPC stream writer: %s", close_status.ToString());
-	}
-
-	auto finish_result = buffer_stream->Finish();
-	if (!finish_result.ok()) {
-		throw IOException("Failed to finish filter IPC buffer: %s", finish_result.status().ToString());
-	}
-
-	auto filter_bytes = finish_result.ValueUnsafe();
+	auto filter_bytes = SerializeIpcStream(*record_batch, "Failed to create IPC stream writer",
+	                                       "Failed to write filter RecordBatch to IPC stream",
+	                                       "Failed to close IPC stream writer");
 
 	// Build one IPC buffer per join key column (each is a single-column batch).
 	// Each IN filter gets its own batch, so different cardinalities are supported.
-	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	std::vector<VgiBufferPtr> join_keys_buffers;
 	if (serializer.HasJoinKeys()) {
 		auto &key_columns = serializer.GetJoinKeyColumns();
 
 		for (auto &kc : key_columns) {
-			idx_t count = kc.values->size();
+			idx_t count = kc.values.size();
 
 			// Build single-column DataChunk
 			vector<LogicalType> types = {kc.type};
@@ -1303,55 +1200,25 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 			chunk.Initialize(Allocator::DefaultAllocator(), types, count);
 			chunk.SetCardinality(count);
 			for (idx_t row = 0; row < count; row++) {
-				chunk.SetValue(0, row, (*kc.values)[row]);
+				chunk.SetValue(0, row, kc.values[row]);
 			}
 
 			// Convert to Arrow via ArrowAppender
-			ArrowAppender appender(types, count, client_props,
-			                       ArrowTypeExtensionData::GetExtensionTypes(context, types));
-			appender.Append(chunk, 0, count, count);
-			ArrowArray arr = appender.Finalize();
-
-			ArrowSchema c_schema;
-			ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-			auto import_res = arrow::ImportRecordBatch(&arr, &c_schema);
-			if (!import_res.ok()) {
+			VgiBatchPtr key_batch;
+			try {
+				key_batch = AppendChunkToBatch(context, chunk, types, names, client_props);
+			} catch (const std::exception &e) {
 				throw IOException("Failed to import join keys RecordBatch for '%s': %s", kc.column_name,
-				                  import_res.status().ToString());
+				                  ErrorData(e).RawMessage());
 			}
-			auto key_batch = import_res.ValueUnsafe();
 
 			// Add version metadata
-			auto metadata = arrow::KeyValueMetadata::Make({"vgi_join_keys_version"}, {"2"});
-			key_batch = key_batch->ReplaceSchemaMetadata(metadata);
+			key_batch = key_batch->WithSchema(key_batch->schema()->WithMetadata(VgiMetadata {{"vgi_join_keys_version", "2"}}));
 
 			// Serialize to Arrow IPC
-			auto buf_result = arrow::io::BufferOutputStream::Create();
-			if (!buf_result.ok()) {
-				throw IOException("Failed to create buffer for join keys IPC: %s", buf_result.status().ToString());
-			}
-			auto buf_stream = buf_result.ValueUnsafe();
-
-			auto writer_res = arrow::ipc::MakeStreamWriter(buf_stream, key_batch->schema());
-			if (!writer_res.ok()) {
-				throw IOException("Failed to create IPC writer for join keys: %s", writer_res.status().ToString());
-			}
-			auto writer = writer_res.ValueUnsafe();
-
-			auto write_status = writer->WriteRecordBatch(*key_batch);
-			if (!write_status.ok()) {
-				throw IOException("Failed to write join keys RecordBatch: %s", write_status.ToString());
-			}
-			auto close_status = writer->Close();
-			if (!close_status.ok()) {
-				throw IOException("Failed to close join keys IPC writer: %s", close_status.ToString());
-			}
-			auto finish_res = buf_stream->Finish();
-			if (!finish_res.ok()) {
-				throw IOException("Failed to finish join keys IPC buffer: %s", finish_res.status().ToString());
-			}
-			join_keys_buffers.push_back(finish_res.ValueUnsafe());
+			join_keys_buffers.push_back(SerializeIpcStream(*key_batch, "Failed to create IPC writer for join keys",
+			                                               "Failed to write join keys RecordBatch",
+			                                               "Failed to close join keys IPC writer"));
 		}
 	}
 
@@ -1450,7 +1317,7 @@ static bool ResolvePartitionColumns(const VgiTableFunctionBindData &bind_data,
 		if (static_cast<int>(pi) >= out_schema->num_fields()) {
 			return false;
 		}
-		const std::string nm = out_schema->field(static_cast<int>(pi))->name();
+		const std::string nm = out_schema->field_name(static_cast<int>(pi));
 		bool found = false;
 		for (idx_t c = 0; c < bind_data.all_column_names.size(); c++) {
 			if (bind_data.all_column_names[c] == nm) {
@@ -1471,49 +1338,41 @@ static bool ResolvePartitionColumns(const VgiTableFunctionBindData &bind_data,
 //! of constants — an `=`, an `IN`, or an `OR` of those — appending the constants to
 //! `out`. Returns false for any range / NULL / AND / other shape (not enumerable). A
 //! TableFilterSet entry is per-column, so an OR here is `col=a OR col=b` on one column.
+static bool ExtractPartitionEqualityExpression(const Expression &expr, std::vector<Value> &out) {
+	if (auto child = ExpressionFilter::GetOptionalFilterChild(expr)) {
+		return ExtractPartitionEqualityExpression(*child, out);
+	}
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		auto comparison = expr.GetExpressionType();
+		auto constant = ExpressionFilter::TryGetColumnConstantComparison(expr.Cast<BoundFunctionExpression>(), comparison);
+		if (constant && comparison == ExpressionType::COMPARE_EQUAL) {
+			out.push_back(constant->GetValue());
+			return true;
+		}
+		return false;
+	}
+	if (expr.GetExpressionType() == ExpressionType::COMPARE_IN && expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		const auto &children = expr.Cast<BoundOperatorExpression>().GetChildren();
+		if (children.size() < 2 || !ExpressionFilter::IsSimpleFilterColumnRef(*children[0])) return false;
+		for (idx_t i = 1; i < children.size(); i++) {
+			if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) return false;
+			out.push_back(children[i]->Cast<BoundConstantExpression>().GetValue());
+		}
+		return true;
+	}
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
+		const auto &children = expr.Cast<BoundConjunctionExpression>().GetChildren();
+		if (children.empty()) return false;
+		for (const auto &child : children) {
+			if (!ExtractPartitionEqualityExpression(*child, out)) return false;
+		}
+		return true;
+	}
+	return false;
+}
+
 static bool ExtractPartitionEqualityValues(const TableFilter &filter, std::vector<Value> &out) {
-	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &cf = filter.Cast<ConstantFilter>();
-		if (cf.comparison_type != ExpressionType::COMPARE_EQUAL) {
-			return false;
-		}
-		out.push_back(cf.constant);
-		return true;
-	}
-	case TableFilterType::IN_FILTER: {
-		auto &inf = filter.Cast<InFilter>();
-		if (inf.values.empty()) {
-			return false;
-		}
-		for (auto &v : inf.values) {
-			out.push_back(v);
-		}
-		return true;
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &orf = filter.Cast<ConjunctionOrFilter>();
-		if (orf.child_filters.empty()) {
-			return false;
-		}
-		for (auto &c : orf.child_filters) {
-			if (!ExtractPartitionEqualityValues(*c, out)) {
-				return false;
-			}
-		}
-		return true;
-	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		// DuckDB wraps a pushed `col IN (...)` in an OptionalFilter ("not required for
-		// query correctness" — enforced above the scan too). Its child is the real IN/=.
-		// Any dynamic filter was already rejected upstream (VgiContainsDynamicFilter →
-		// cache-ineligible), so an optional reaching here is static and safe to unwrap.
-		auto &opt = filter.Cast<OptionalFilter>();
-		return opt.child_filter && ExtractPartitionEqualityValues(*opt.child_filter, out);
-	}
-	default:
-		return false; // range / IS NULL / AND → not enumerable
-	}
+	return ExtractPartitionEqualityExpression(*ExpressionFilter::GetExpressionFilter(filter, "VGI partition cache").expr, out);
 }
 
 //! Classify the pushed filter for per-partition caching, filling the partition_* fields
@@ -1558,9 +1417,9 @@ static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunct
 	bool any_partition_pred = false;
 
 	if (input.filters) {
-		for (auto &entry : input.filters->filters) {
-			const idx_t col_idx = entry.first;
-			auto &filter = *entry.second;
+		for (auto &entry : *input.filters) {
+			const idx_t col_idx = entry.GetIndex().GetIndex();
+			auto &filter = entry.Filter();
 			const idx_t original_col_idx =
 			    col_idx < input.column_ids.size() ? input.column_ids[col_idx] : col_idx;
 			std::string col_name;
@@ -1602,8 +1461,8 @@ static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunct
 	// match. So only serialize when a NON-excluded filter remains.
 	bool has_residual_filter = false;
 	if (input.filters) {
-		for (auto &entry : input.filters->filters) {
-			if (!exclude_keys.count(entry.first)) {
+		for (auto &entry : *input.filters) {
+			if (!exclude_keys.count(entry.GetIndex().GetIndex())) {
 				has_residual_filter = true;
 				break;
 			}
@@ -1794,13 +1653,13 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	//   - unseeded TABLESAMPLE: non-deterministic, must not be frozen.
 	std::string filter_key;
 	if (input.filters) {
-		for (auto &kv : input.filters->filters) {
-			if (VgiContainsDynamicFilter(*kv.second)) {
+		for (auto &kv : *input.filters) {
+			if (VgiContainsDynamicFilter(kv.Filter())) {
 				e.ineligible_reason = "dynamic_filter";
 				return e;
 			}
 		}
-		if (!input.filters->filters.empty()) {
+		if (input.filters->HasFilters()) {
 			// Serialize the STATIC filters deterministically for the key. If the
 			// serializer can't represent a filter, fail closed (skip caching).
 			try {
@@ -1846,7 +1705,7 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	e.key.worker_path = bind_data.worker_path();
 	e.key.function_name = bind_data.function_name;
 	e.key.schema_name = bind_data.schema_name;
-	e.key.canonical_arguments = bind_data.arguments.array ? bind_data.arguments.array->ToString() : "";
+	e.key.canonical_arguments = SerializeArgumentsForKey(bind_data.arguments.batch);
 	e.key.canonical_settings = SerializeSettingsForKey(bind_data.settings);
 	e.key.attach_options = bind_data.attach_params->attach_options_canonical();
 	e.key.projection = SerializeProjectionForKey(projection_ids);
@@ -2403,52 +2262,68 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	auto &join_keys_buffers = serialized_filters.join_keys_buffers;
 
 	// Capture DynamicFilter references for tick-based pushdown.
-	// Walk the filter set looking for OptionalFilter → DynamicFilter (from Top-N)
-	// or OptionalFilter → ConjunctionOrFilter → DynamicFilter (nulls_first case).
-	// Also traverse into ConjunctionAndFilter children, since DuckDB may combine
-	// a regular filter with an OptionalFilter(DynamicFilter) on the same column.
+	// Recognize optional dynamic comparisons and optional OR(IS NULL, dynamic)
+	// expressions from Top-N, including those inside a conjunction with ordinary
+	// predicates. Other expression shapes cannot be reduced to a threshold.
 	vector<VgiDynamicFilterInfo> dynamic_filters;
 	if (input.filters) {
-		// Helper: try to capture a DynamicFilter from an OptionalFilter entry
-		auto try_capture_from_optional = [&](idx_t original_col_idx, const string &col_name,
-		                                     const OptionalFilter &opt) {
-			if (!opt.child_filter) {
-				return;
-			}
-			if (opt.child_filter->filter_type == TableFilterType::DYNAMIC_FILTER) {
-				auto &df = opt.child_filter->Cast<DynamicFilter>();
-				if (df.filter_data && df.filter_data->filter) {
-					VgiDynamicFilterInfo info;
-					info.filter_data = df.filter_data;
-					info.column_index = original_col_idx;
-					info.column_name = col_name;
-					info.comparison_type = df.filter_data->filter->comparison_type;
-					info.nulls_first = false;
-					dynamic_filters.push_back(std::move(info));
+		auto capture = [&](idx_t column_index, const string &column_name, const Expression &root) {
+			std::function<void(const Expression &, bool, bool)> visit;
+			visit = [&](const Expression &expr, bool optional, bool nulls_first) {
+				if (auto child = ExpressionFilter::GetOptionalFilterChild(expr)) {
+					visit(*child, true, nulls_first);
+					return;
 				}
-			} else if (opt.child_filter->filter_type == TableFilterType::CONJUNCTION_OR) {
-				// NULLS_FIRST case: OptionalFilter(ConjunctionOr(IsNull, DynamicFilter))
-				auto &conj = opt.child_filter->Cast<ConjunctionOrFilter>();
-				for (auto &child : conj.child_filters) {
-					if (child->filter_type == TableFilterType::DYNAMIC_FILTER) {
-						auto &df = child->Cast<DynamicFilter>();
-						if (df.filter_data && df.filter_data->filter) {
+				if (optional && expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+					const auto &function = expr.Cast<BoundFunctionExpression>();
+					if (function.Function().GetName() == DynamicFilterScalarFun::NAME && function.BindInfo() &&
+					    function.GetChildren().size() == 1 && ExpressionFilter::IsSimpleFilterColumnRef(*function.GetChildren()[0])) {
+						auto data = function.BindInfo()->Cast<DynamicFilterFunctionData>().filter_data;
+						if (data) {
 							VgiDynamicFilterInfo info;
-							info.filter_data = df.filter_data;
-							info.column_index = original_col_idx;
-							info.column_name = col_name;
-							info.comparison_type = df.filter_data->filter->comparison_type;
-							info.nulls_first = true;
+							info.filter_data = std::move(data);
+							info.column_index = column_index;
+							info.column_name = column_name;
+							info.comparison_type = info.filter_data->comparison_type;
+							info.nulls_first = nulls_first;
 							dynamic_filters.push_back(std::move(info));
 						}
+						return;
 					}
 				}
-			}
+				if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
+					const auto &children = expr.Cast<BoundConjunctionExpression>().GetChildren();
+					// Only OR(IS NULL, dynamic) is a representable Top-N threshold.
+					if (!optional || children.size() != 2) {
+						return;
+					}
+					for (idx_t i = 0; i < children.size(); i++) {
+						if (children[i]->GetExpressionType() != ExpressionType::OPERATOR_IS_NULL) {
+							continue;
+						}
+						const auto &null_children = children[i]->Cast<BoundOperatorExpression>().GetChildren();
+						const auto &threshold = *children[1 - i];
+						if (null_children.size() == 1 &&
+						    ExpressionFilter::IsSimpleFilterColumnRef(*null_children[0]) &&
+						    threshold.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+						    threshold.Cast<BoundFunctionExpression>().Function().GetName() == DynamicFilterScalarFun::NAME) {
+							visit(threshold, true, true);
+						}
+					}
+					return;
+				}
+				if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+					for (const auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+						visit(*child, optional, nulls_first);
+					}
+				}
+			};
+			visit(root, false, false);
 		};
 
-		for (auto &entry : input.filters->filters) {
-			auto col_idx = entry.first;
-			auto &filter = *entry.second;
+		for (auto &entry : *input.filters) {
+			idx_t col_idx = entry.GetIndex().GetIndex();
+			auto &filter = entry.Filter();
 
 			idx_t original_col_idx = col_idx < input.column_ids.size() ? input.column_ids[col_idx] : col_idx;
 			// Same rowid-sentinel remap as VgiSerializeFilters: name the rowid
@@ -2477,18 +2352,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 				}
 			}
 
-			if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
-				try_capture_from_optional(worker_col_idx, col_name, filter.Cast<OptionalFilter>());
-			} else if (filter.filter_type == TableFilterType::CONJUNCTION_AND) {
-				// DuckDB may combine ConstantFilter + OptionalFilter(DynamicFilter)
-				// on the same column into a ConjunctionAndFilter
-				auto &conj = filter.Cast<ConjunctionAndFilter>();
-				for (auto &child : conj.child_filters) {
-					if (child->filter_type == TableFilterType::OPTIONAL_FILTER) {
-						try_capture_from_optional(worker_col_idx, col_name, child->Cast<OptionalFilter>());
-					}
-				}
-			}
+			capture(worker_col_idx, col_name, *ExpressionFilter::GetExpressionFilter(filter, "VGI dynamic capture").expr);
 		}
 	}
 
@@ -3012,7 +2876,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 // Helper: Get next batch from worker and convert to Arrow C ABI
 // ============================================================================
 
-std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
+VgiBufferPtr VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
                                                               const vector<VgiDynamicFilterDeltaUpdate> &updates) {
 	FilterSerializer serializer(worker_path, 0, /*allow_external_sets=*/false);
 	auto document = yyjson_mut_obj(serializer.GetDoc());
@@ -3066,46 +2930,9 @@ std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &con
 	}
 
 	auto client_props = context.GetClientProperties();
-	ArrowAppender appender(types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
-	appender.Append(chunk, 0, 1, 1);
-	auto array = appender.Finalize();
-	ArrowSchema c_schema;
-	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-	auto imported = arrow::ImportRecordBatch(&array, &c_schema);
-	if (!imported.ok()) {
-		throw IOException("Failed to import dynamic filter delta: %s", imported.status().ToString());
-	}
-	auto batch = imported.ValueUnsafe();
-	auto metadata =
-	    arrow::KeyValueMetadata::Make({"vgi_filter_encoding", "vgi_filter_version", "vgi_evaluation_context"},
-	                                  {"vgi.filters.v2", "2", "vgi.none.v1"});
-	auto fields = batch->schema()->fields();
-	fields[0] = arrow::field("filter_spec", arrow::utf8(), /*nullable=*/false);
-	batch = arrow::RecordBatch::Make(arrow::schema(fields, metadata), 1, batch->columns());
-
-	auto output_result = arrow::io::BufferOutputStream::Create();
-	if (!output_result.ok()) {
-		throw IOException("Failed to create dynamic filter delta buffer: %s", output_result.status().ToString());
-	}
-	auto output = output_result.ValueUnsafe();
-	auto writer_result = arrow::ipc::MakeStreamWriter(output, batch->schema());
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create dynamic filter delta writer: %s", writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
-	auto status = writer->WriteRecordBatch(*batch);
-	if (!status.ok()) {
-		throw IOException("Failed to write dynamic filter delta: %s", status.ToString());
-	}
-	status = writer->Close();
-	if (!status.ok()) {
-		throw IOException("Failed to close dynamic filter delta: %s", status.ToString());
-	}
-	auto finished = output->Finish();
-	if (!finished.ok()) {
-		throw IOException("Failed to finish dynamic filter delta: %s", finished.status().ToString());
-	}
-	return finished.ValueUnsafe();
+	auto batch = MakeFilterSpecBatch(context, chunk, types, names, client_props, "Failed to import dynamic filter delta");
+	return SerializeIpcStream(*batch, "Failed to create dynamic filter delta writer",
+	                          "Failed to write dynamic filter delta", "Failed to close dynamic filter delta");
 }
 
 //! Update the TickFilterState with current DynamicFilter values.
@@ -3156,9 +2983,9 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 		ExpressionType comparison;
 		Value constant;
 		{
-			lock_guard<mutex> l(df.filter_data->lock);
-			comparison = df.filter_data->filter->comparison_type;
-			constant = df.filter_data->filter->constant;
+			annotated_shared_lock<annotated_shared_mutex> l(df.filter_data->lock);
+			comparison = df.filter_data->comparison_type;
+			constant = df.filter_data->constant;
 		}
 		if (!df.active || comparison != df.emitted_comparison ||
 		    !Value::NotDistinctFrom(constant, df.emitted_constant)) {
@@ -3169,13 +2996,14 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 			changed = true;
 		}
 
-		auto filter_copy = make_uniq<ConstantFilter>(df.emitted_comparison, df.emitted_constant);
+		auto filter_copy = ExpressionFilter::CreateComparisonFilter(df.emitted_comparison, df.emitted_constant);
 		unique_ptr<TableFilter> pushed;
 		if (df.nulls_first) {
-			auto or_filter = make_uniq<ConjunctionOrFilter>();
-			or_filter->child_filters.push_back(make_uniq<IsNullFilter>());
-			or_filter->child_filters.push_back(std::move(filter_copy));
-			pushed = std::move(or_filter);
+			vector<unique_ptr<Expression>> children;
+			children.push_back(ExpressionFilter::CreateNullCheckExpression(
+			    make_uniq<BoundReferenceExpression>(df.emitted_constant.type(), 0), ExpressionType::OPERATOR_IS_NULL));
+			children.push_back(std::move(filter_copy->expr));
+			pushed = make_uniq<ExpressionFilter>(BoundConjunctionExpression::Create(ExpressionType::CONJUNCTION_OR, std::move(children)));
 		} else {
 			pushed = std::move(filter_copy);
 		}
@@ -3214,7 +3042,28 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 //! DuckDB internal error.
 static constexpr idx_t VGI_BATCH_INDEX_CAP = 10000000000000ULL;  // 10^13
 
-//! Convert a 2-row ``arrow::RecordBatch`` carrying ``(min, max)`` per
+//! Type equality with Arrow C++ ``DataType::Equals`` semantics: a node's own
+//! nullability belongs to its field, not its type, so only nested children compare it.
+static bool SameDataType(const ArrowSchema &a, const ArrowSchema &b) {
+	if (std::strcmp(a.format, b.format) != 0 || a.n_children != b.n_children) {
+		return false;
+	}
+	const int64_t type_flags = ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED;
+	if ((a.flags & type_flags) != (b.flags & type_flags)) {
+		return false;
+	}
+	for (int64_t c = 0; c < a.n_children; c++) {
+		if (!TypesEqual(*a.children[c], *b.children[c])) {
+			return false;
+		}
+	}
+	if ((a.dictionary == nullptr) != (b.dictionary == nullptr)) {
+		return false;
+	}
+	return !a.dictionary || SameDataType(*a.dictionary, *b.dictionary);
+}
+
+//! Convert a 2-row batch carrying ``(min, max)`` per
 //! partition column into a ``vector<ColumnPartitionData>`` via the
 //! established VGI Arrow-conversion machinery (the same path
 //! ``VgiTableFunctionScan`` uses for data batches —
@@ -3229,7 +3078,7 @@ static constexpr idx_t VGI_BATCH_INDEX_CAP = 10000000000000ULL;  // 10^13
 //! handle) any exception bubbles up.
 static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
     ClientContext &context,
-    const std::shared_ptr<arrow::RecordBatch> &pv_batch) {
+    const VgiBatchPtr &pv_batch) {
 	// Build an ArrowTableSchema + DuckDB LogicalTypes for the
 	// partition_values schema. ``names`` is filled too but unused.
 	ArrowSchemaWrapper c_schema;
@@ -3276,18 +3125,18 @@ static bool DecodePartitionMinTuple(ClientContext &context, const std::string &p
 	if (pv_bytes.empty()) {
 		return false;
 	}
-	auto buf = arrow::Buffer::FromString(pv_bytes);
-	auto input = std::make_shared<arrow::io::BufferReader>(buf);
-	auto rr = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!rr.ok()) {
+	// Borrowed: pv_bytes outlives the decode, and the batch never escapes this call.
+	VgiBatchPtr pv_batch;
+	try {
+		auto reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(
+		    VgiBuffer::Wrap(pv_bytes.data(), static_cast<int64_t>(pv_bytes.size()))));
+		pv_batch = reader->ReadNext();
+	} catch (const std::exception &) {
 		return false;
 	}
-	auto reader = rr.ValueUnsafe();
-	auto nr = reader->ReadNext();
-	if (!nr.ok() || !nr.ValueUnsafe().batch) {
+	if (!pv_batch) {
 		return false;
 	}
-	auto pv_batch = nr.ValueUnsafe().batch;
 	if (pv_batch->num_rows() != 2) {
 		return false;
 	}
@@ -3389,7 +3238,7 @@ static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCt
 static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                          VgiTableFunctionGlobalState &global_state,
                          VgiTableFunctionLocalState &local_state,
-                         std::shared_ptr<arrow::RecordBatch> arrow_batch) {
+                         VgiBatchPtr arrow_batch) {
 	if (!arrow_batch) {
 		local_state.done = true;
 		// Result-cache capture: this local state fully drained its stream. The
@@ -3466,25 +3315,30 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			                  "non-empty data batch without vgi_partition_values metadata",
 			                  bind_data.function_name);
 		}
-		auto buf = arrow::Buffer::FromString(pv_bytes);
-		auto input = std::make_shared<arrow::io::BufferReader>(buf);
-		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-		if (!reader_result.ok()) {
+		// Borrowed: pv_bytes (the connection's last partition values) outlives this
+		// decode, and pv_batch is converted to Values before InstallBatch returns.
+		std::unique_ptr<VgiIpcReader> reader;
+		try {
+			reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(
+			    VgiBuffer::Wrap(pv_bytes.data(), static_cast<int64_t>(pv_bytes.size()))));
+		} catch (const std::exception &e) {
 			throw IOException(metadata_violation("vgi_partition_values#b64"),
 			                  "VGI function '%s' emitted invalid Arrow IPC payload in "
 			                  "vgi_partition_values#b64: %s",
-			                  bind_data.function_name,
-			                  reader_result.status().ToString());
+			                  bind_data.function_name, ErrorData(e).RawMessage());
 		}
-		auto reader = reader_result.ValueUnsafe();
-		auto next_result = reader->ReadNext();
-		if (!next_result.ok() || !next_result.ValueUnsafe().batch) {
+		VgiBatchPtr pv_batch;
+		try {
+			pv_batch = reader->ReadNext();
+		} catch (const std::exception &) {
+			pv_batch = nullptr;
+		}
+		if (!pv_batch) {
 			throw IOException(metadata_violation("vgi_partition_values#b64"),
 			                  "VGI function '%s' emitted empty IPC stream in "
 			                  "vgi_partition_values#b64",
 			                  bind_data.function_name);
 		}
-		auto pv_batch = next_result.ValueUnsafe().batch;
 		try {
 			ValidateWorkerBatch(&context, pv_batch.get(),
 			                    StringUtil::Format("function '%s' vgi_partition_values", bind_data.function_name));
@@ -3519,27 +3373,30 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		// column rather than surfacing from deep inside ArrowToDuckDB.
 		const auto &bind_schema = bind_data.bind_result.output_schema;
 		for (idx_t i = 0; i < declared_indices.size(); ++i) {
-			const auto &declared_field = bind_schema->field(declared_indices[i]);
+			const int declared_idx = static_cast<int>(declared_indices[i]);
+			const auto &declared_field = bind_schema->field(declared_idx);
 			const auto &pv_field = pv_batch->schema()->field(static_cast<int>(i));
-			if (pv_field->name() != declared_field->name()) {
+			const std::string declared_name = bind_schema->field_name(declared_idx);
+			const std::string pv_name = pv_batch->schema()->field_name(static_cast<int>(i));
+			if (pv_name != declared_name) {
 				throw IOException(metadata_violation("vgi_partition_values#b64")
 				                      .Set(error_key::kColumnIndex, static_cast<int64_t>(i))
-				                      .ExpectedActual(declared_field->name(), pv_field->name()),
+				                      .ExpectedActual(declared_name, pv_name),
 				                  "VGI function '%s' vgi_partition_values column %llu name "
 				                  "mismatch: declared '%s', got '%s'",
 				                  bind_data.function_name, static_cast<unsigned long long>(i),
-				                  declared_field->name(), pv_field->name());
+				                  declared_name, pv_name);
 			}
-			if (!pv_field->type()->Equals(*declared_field->type())) {
+			if (!SameDataType(pv_field, declared_field)) {
+				const std::string declared_type = TypeToString(declared_field);
+				const std::string pv_type = TypeToString(pv_field);
 				throw IOException(metadata_violation("vgi_partition_values#b64")
 				                      .Set(error_key::kColumnIndex, static_cast<int64_t>(i))
-				                      .Set(error_key::kColumnName, declared_field->name())
-				                      .ExpectedActual(declared_field->type()->ToString(), pv_field->type()->ToString()),
+				                      .Set(error_key::kColumnName, declared_name)
+				                      .ExpectedActual(declared_type, pv_type),
 				                  "VGI function '%s' vgi_partition_values column '%s' type "
 				                  "mismatch: declared %s, got %s",
-				                  bind_data.function_name, declared_field->name(),
-				                  declared_field->type()->ToString(),
-				                  pv_field->type()->ToString());
+				                  bind_data.function_name, declared_name, declared_type, pv_type);
 			}
 		}
 
@@ -3560,12 +3417,13 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				const auto &entry = local_state.current_partition_data[i];
 				if (!Value::NotDistinctFrom(entry.min_val, entry.max_val)) {
 					throw IOException(metadata_violation("vgi_partition_values#b64")
-					                      .Set(error_key::kColumnName, bind_schema->field(declared_indices[i])->name())
+					                      .Set(error_key::kColumnName,
+					                           bind_schema->field_name(static_cast<int>(declared_indices[i])))
 					                      .ExpectedActual(entry.min_val.ToString(), entry.max_val.ToString()),
 					                  "VGI function '%s' SINGLE_VALUE_PARTITIONS contract "
 					                  "violated on column '%s': min (%s) != max (%s)",
 					                  bind_data.function_name,
-					                  bind_schema->field(declared_indices[i])->name(),
+					                  bind_schema->field_name(static_cast<int>(declared_indices[i])),
 					                  entry.min_val.ToString(), entry.max_val.ToString());
 				}
 			}
@@ -3625,7 +3483,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// batch's buffer list (O(columns), not O(rows)), so this is cheap enough to
 	// run unconditionally — unlike the log below, it has no sink to check.
 	const auto batch_rows = static_cast<idx_t>(arrow_batch->num_rows());
-	const auto batch_bytes = static_cast<idx_t>(arrow::util::TotalBufferSize(*arrow_batch));
+	const auto batch_bytes = static_cast<idx_t>(arrow_batch->TotalBufferSize());
 	global_state.RecordBatchStats(batch_rows, batch_bytes);
 
 	if (VgiInfoLogActive(context)) {
@@ -3666,7 +3524,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				std::lock_guard<std::mutex> lk(cap.mu);
 				not_cacheable = cap.cc_seen && !cap.cc.Cacheable();
 			}
-			auto spill_append = [&](const std::shared_ptr<arrow::Buffer> &ipc, int64_t logical_len) -> bool {
+			auto spill_append = [&](const VgiBufferPtr &ipc, int64_t logical_len) -> bool {
 				idx_t bi = conn->GetLastBatchIndex();
 				bool has_bi = bi != DConstants::INVALID_INDEX;
 				return cap.disk_writer->AppendBatch(
@@ -3706,8 +3564,9 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					// transcode round-trip on the multi-GB spill path. logical_len is the
 					// uncompressed IPC size (cheap, no extra serialize).
 					//
-					// NOTE (bytes= unit): this uses GetRecordBatchSize (the RecordBatch IPC
-					// message size) whereas the memory-capture path (and the pre-threshold
+					// NOTE (bytes= unit): this uses the batch's buffer bytes (batch_bytes,
+					// already computed above for the batch-shape stats — the IPC body size
+					// minus padding and the message header) whereas the memory-capture path (and the pre-threshold
 					// spill drain) uses SerializeRecordBatch(uncompressed)->size(), which also
 					// counts any IPC stream framing. So the ref's logical bytes= can differ by
 					// a few hundred bytes/batch of framing between a spilled-live entry and a
@@ -3716,10 +3575,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					// every memory entry — not worth it for a sub-batch-of-framing delta. The
 					// disk byte CAP uses the on-disk COMPRESSED size (consistent), so only the
 					// advisory logical bytes= / materialize-vs-stream threshold is affected.
-					int64_t logical_len = 0;
-					if (!arrow::ipc::GetRecordBatchSize(*arrow_batch, &logical_len).ok()) {
-						logical_len = 0;
-					}
+					const int64_t logical_len = static_cast<int64_t>(batch_bytes);
 					auto ipc = SerializeRecordBatch(arrow_batch, nullptr, cap.disk_writer->CodecName(),
 					                                cap.disk_writer->Level());
 					if (!spill_append(ipc, logical_len)) {
@@ -3991,7 +3847,7 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	while (true) {
 		// Empty batches and split claims loop here without returning to DuckDB,
 		// whose own interrupt check runs only between chunks.
-		if (context.interrupted) {
+		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
 		// Update dynamic filter state before each tick is sent
@@ -4071,13 +3927,13 @@ void VgiPrefetchTask::Execute() {
 	try {
 		// Skip 0-row batches here so the consumer always sees either EOS or a
 		// non-empty batch, matching the sync path's invariant.
-		std::shared_ptr<arrow::RecordBatch> batch;
+		VgiBatchPtr batch;
 		while (true) {
 			// Thrown into the catch below: the consumer rethrows it from the
 			// ERROR slot, and a torn-down consumer never reads it. Either way
 			// this task returns now instead of after the next RPC — DuckDB
 			// waits for every executor task before an interrupted query ends.
-			if (context_.interrupted) {
+			if (context_.IsInterrupted()) {
 				throw InterruptException();
 			}
 			batch = slot_->connection->ReadDataBatch();
@@ -4401,7 +4257,7 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 // the user keys reflect whatever the user persisted up to that thread's
 // FinishSource (the *last* finisher will have the most complete view).
 
-InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctionDynamicToStringInput &input) {
+static InsertionOrderPreservingMap<string> CollectVgiTableFunctionMetrics(TableFunctionGetMetricsInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	if (!input.bind_data || !input.global_state) {
 		return result;
@@ -4485,16 +4341,24 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 	return result;
 }
 
+void VgiTableFunctionGetMetrics(TableFunctionGetMetricsInput &input) {
+	for (const auto &entry : CollectVgiTableFunctionMetrics(input)) {
+		input.operator_metrics.AddExtraInfo(entry.first, entry.second);
+	}
+}
+
 // ============================================================================
 // Virtual Column Callbacks for Row ID Support
 // ============================================================================
 
-BindInfo VgiTableScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+BindInfo VgiTableScanGetBindInfo(TableFunctionGetBindInfoInput &input) {
+	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
+	return BindInfo(bind_data.table_entry ? ScanType::TABLE : ScanType::EXTERNAL);
+}
+
+optional_ptr<TableCatalogEntry> VgiTableScanGetTableEntry(optional_ptr<const FunctionData> bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
-	if (bind_data.table_entry) {
-		return BindInfo(const_cast<TableCatalogEntry &>(*bind_data.table_entry));
-	}
-	return BindInfo(ScanType::EXTERNAL);
+	return bind_data.table_entry;
 }
 
 virtual_column_map_t VgiTableScanGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p) {

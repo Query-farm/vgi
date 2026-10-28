@@ -4,10 +4,6 @@
 #include <algorithm>
 #include <chrono>
 
-#include <arrow/api.h>
-#include <arrow/io/api.h>
-#include <arrow/ipc/api.h>
-
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp" // FileSystem positioned reads (disk-tier serve)
@@ -62,17 +58,31 @@ std::string SerializeProjectionForKey(const std::vector<int32_t> &projection_ids
 	return out;
 }
 
+std::string SerializeArgumentsForKey(const VgiBatchPtr &arguments_batch) {
+	if (!arguments_batch) {
+		return "";
+	}
+	// Deterministic: the same argument values/types always serialize to the same bytes.
+	// nanoarrow's encoding (not Arrow C++'s ToString text), so keys changed once with the
+	// nanoarrow migration.
+	return Sha256Hex(SerializeRecordBatch(arguments_batch)->ToString());
+}
+
 // ----------------------------------------------------------------------------
 // Input hashing
 // ----------------------------------------------------------------------------
 
-std::string HashInputBatchOrdered(const std::shared_ptr<arrow::RecordBatch> &input_batch) {
+std::string HashInputBatchOrdered(const VgiBatchPtr &input_batch) {
 	if (!input_batch) {
 		return "";
 	}
-	auto buffer = SerializeRecordBatch(input_batch); // deterministic IPC-stream framing
-	std::string bytes(reinterpret_cast<const char *>(buffer->data()), static_cast<size_t>(buffer->size()));
-	return Sha256Hex(bytes);
+	// Deterministic IPC-stream framing: the same batch always serializes to the same
+	// bytes (no message custom_metadata is written). These bytes are nanoarrow's IPC
+	// encoding, which can differ byte-wise from the Arrow C++ writer's, so keys
+	// persisted by an Arrow C++ build changed once with the nanoarrow migration (old
+	// entries simply miss and age out).
+	auto buffer = SerializeRecordBatch(input_batch);
+	return Sha256Hex(buffer->ToString());
 }
 
 std::string HashInputChunkUnordered(ClientContext & /*context*/, DataChunk &chunk) {
@@ -309,7 +319,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	std::string identity_scope;
 	const std::string &cat = attach_params->catalog_name();
 	if (!cat.empty()) {
-		auto catalog = Catalog::GetCatalogEntry(context, cat);
+		auto catalog = Catalog::GetCatalogEntry(context, Identifier(cat));
 		if (catalog && catalog->GetCatalogType() == "vgi") {
 			auto &vcat = catalog->Cast<VgiCatalog>();
 			catalog_version = vcat.GetKnownCatalogVersion();
@@ -361,7 +371,7 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
                                  std::string &catalog_name, int64_t &catalog_version, const char *&reason,
                                  const std::string &operator_kind) {
 	return BuildExchangeCacheKeyStaticFields(context, bd.attach_params, bd.function_name, bd.schema_name,
-	                                         bd.arguments.array ? bd.arguments.array->ToString() : "", bd.settings,
+	                                         SerializeArgumentsForKey(bd.arguments.batch), bd.settings,
 	                                         projection_ids, bd.secret_dependent, bd.bind_result.secret_scope, key,
 	                                         catalog_name, catalog_version, reason, operator_kind);
 }
@@ -380,39 +390,45 @@ FileSystem &ExchangeReplayFs() {
 }
 } // namespace
 
-std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiResultCacheEntry &entry,
+VgiBatchPtr DeserializeCachedRecordBatch(const VgiResultCacheEntry &entry,
                                                                  const VgiCachedBatch &cached) {
 	// In-RAM (memory tier or a materialized disk entry) uses cached.ipc directly. A
 	// disk-STREAMING entry (Lookup returned it TOC-only for a payload > max_entry_bytes)
 	// has ipc==nullptr; positioned-read just this batch's bytes from the blob file.
-	std::shared_ptr<arrow::Buffer> ipc = cached.ipc;
+	VgiBufferPtr ipc = cached.ipc;
 	if (!ipc && cached.disk_ipc_offset >= 0) {
 		auto handle = ExchangeReplayFs().OpenFile(entry.disk_path, FileFlags::FILE_FLAGS_READ);
-		auto buf_result = arrow::AllocateBuffer(cached.disk_ipc_length);
-		if (!buf_result.ok()) {
+		uint8_t *dst = nullptr;
+		VgiBufferPtr b;
+		try {
+			b = VgiBuffer::Allocate(cached.disk_ipc_length, &dst);
+		} catch (const std::bad_alloc &) {
 			throw IOException("VGI exchange cache: failed to allocate %lld bytes for disk batch",
 			                  static_cast<long long>(cached.disk_ipc_length));
 		}
-		std::shared_ptr<arrow::Buffer> b = std::move(buf_result.ValueUnsafe());
-		ExchangeReplayFs().Read(*handle, b->mutable_data(), cached.disk_ipc_length,
-		                        static_cast<idx_t>(cached.disk_ipc_offset));
-		ipc = b;
+		ExchangeReplayFs().Read(*handle, dst, cached.disk_ipc_length, static_cast<idx_t>(cached.disk_ipc_offset));
+		ipc = std::move(b);
 	}
 	if (!ipc) {
 		throw IOException("VGI exchange cache: cached batch has neither in-memory nor on-disk IPC bytes");
 	}
-	auto input = std::make_shared<arrow::io::BufferReader>(ipc);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		throw IOException("VGI exchange cache: failed to open cached batch IPC stream: %s",
-		                  reader_result.status().ToString());
+	std::unique_ptr<VgiIpcReader> reader;
+	try {
+		reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(ipc)); // zero-copy over `ipc`
+	} catch (const std::exception &e) {
+		ErrorData error(e);
+		throw IOException("VGI exchange cache: failed to open cached batch IPC stream: %s", error.RawMessage());
 	}
-	auto reader = reader_result.ValueUnsafe();
-	auto next_result = reader->ReadNext();
-	if (!next_result.ok() || !next_result.ValueUnsafe().batch) {
+	VgiBatchPtr batch;
+	try {
+		batch = reader->ReadNext();
+	} catch (const std::exception &) {
+		batch = nullptr;
+	}
+	if (!batch) {
 		throw IOException("VGI exchange cache: cached batch IPC stream was empty");
 	}
-	return next_result.ValueUnsafe().batch;
+	return batch;
 }
 
 void SlideRevalidatedExchangeEntry(VgiResultCache &cache, const VgiResultCacheEntry &entry, const VgiCacheControl &cc,
@@ -449,7 +465,7 @@ void SlideRevalidatedExchangeEntry(VgiResultCache &cache, const VgiResultCacheEn
 
 ExchangeStoreResult StoreExchangeMemoEntry(VgiResultCache &cache, const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
-                                           const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
+                                           const std::vector<VgiBatchPtr> &out_batches,
                                            bool allow_disk, bool allow_immediately_stale) {
 	ExchangeStoreResult res;
 	auto skip = [&](const char *r) {

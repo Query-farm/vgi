@@ -1,5 +1,6 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #include "catch.hpp"
+#include "../support/vgi_contract_fixtures.hpp"
 #include "duckdb.hpp"
 #include "core_functions_extension.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -14,50 +15,33 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_catalog_rpc.hpp"
-#include <arrow/extension_type.h>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
 
 using namespace duckdb;
 namespace {
-std::shared_ptr<arrow::Field> MetadataField(const std::string &key, const std::string &value) {
-	return arrow::field("a.b", arrow::int32(), true, arrow::key_value_metadata({key}, {value}));
+vgi::VgiField MetadataField(const std::string &key, const std::string &value) {
+	return vgi_test::Field("a.b", vgi::type::Int32(), true, vgi_test::Metadata({key}, {value}));
 }
-class MetadataExtension final : public arrow::ExtensionType {
-public:
-	explicit MetadataExtension(std::shared_ptr<arrow::DataType> storage) : ExtensionType(std::move(storage)) {
-	}
-	std::string extension_name() const override {
-		return "test.column_metadata";
-	}
-	bool ExtensionEquals(const arrow::ExtensionType &other) const override {
-		return extension_name() == other.extension_name() && storage_type()->Equals(other.storage_type());
-	}
-	std::shared_ptr<arrow::Array> MakeArray(std::shared_ptr<arrow::ArrayData> data) const override {
-		return std::make_shared<arrow::ExtensionArray>(std::move(data));
-	}
-	arrow::Result<std::shared_ptr<arrow::DataType>> Deserialize(std::shared_ptr<arrow::DataType> storage,
-	                                                            const std::string &) const override {
-		return std::shared_ptr<arrow::DataType>(std::make_shared<MetadataExtension>(std::move(storage)));
-	}
-	std::string Serialize() const override {
-		return "";
-	}
-};
-unique_ptr<MaterializedQueryResult> Execute(Connection &con, const std::string &sql) {
+vgi::NativeColumnMetadata ReadMetadata(const vgi::VgiField &field) {
+	return vgi::ReadNativeColumnMetadata(vgi::MakeSchema({field})->field(0));
+}
+vgi::NativeColumnMetadata ReadMetadata(const ArrowSchema &field) {
+	return vgi::ReadNativeColumnMetadata(field);
+}
+unique_ptr<QueryResult> Execute(Connection &con, const std::string &sql) {
 	auto result = con.Query(sql);
 	INFO(sql);
 	INFO((result->HasError() ? result->GetError() : "ok"));
 	REQUIRE_FALSE(result->HasError());
 	return result;
 }
-unique_ptr<MaterializedQueryResult> Create(Connection &con, const std::string &name,
-                                           const std::optional<std::string> &comment) {
+unique_ptr<QueryResult> Create(Connection &con, const std::string &name, const std::optional<std::string> &comment) {
 	auto info = make_uniq<CreateTableInfo>();
-	info->catalog = "metadata";
-	info->schema = "main";
-	info->table = name;
+	info->SetCatalog("metadata");
+	info->SetSchema("main");
+	info->SetTableName(Identifier(name));
 	ColumnDefinition column("a.b", LogicalType::INTEGER);
 	if (comment)
 		column.SetComment(Value(*comment));
@@ -66,39 +50,38 @@ unique_ptr<MaterializedQueryResult> Create(Connection &con, const std::string &n
 	statement->info = std::move(info);
 	return con.Query(std::move(statement));
 }
-unique_ptr<MaterializedQueryResult> Add(Connection &con, const std::string &name,
-                                        const std::optional<std::string> &comment) {
-	ColumnDefinition column(name, LogicalType::INTEGER);
+unique_ptr<QueryResult> Add(Connection &con, const std::string &name, const std::optional<std::string> &comment) {
+	ColumnDefinition column(Identifier(name), LogicalType::INTEGER);
 	if (comment)
 		column.SetComment(Value(*comment));
 	auto statement = make_uniq<AlterStatement>();
 	statement->info = make_uniq<AddColumnInfo>(
-	    AlterEntryData("metadata", "main", "created", OnEntryNotFound::THROW_EXCEPTION), std::move(column), false);
+	    AlterEntryData(QualifiedName("metadata", "main", "created"), OnEntryNotFound::THROW_EXCEPTION),
+	    std::move(column), false, AddColumnConstraints {});
 	return con.Query(std::move(statement));
 }
 } // namespace
 
 TEST_CASE("Column metadata preserves presence and raw Unicode JSON strings", "[column-metadata]") {
-	auto absent = vgi::ReadNativeColumnMetadata(arrow::field("x", arrow::int32()));
+	auto absent = ReadMetadata(vgi_test::Field("x", vgi::type::Int32()));
 	CHECK_FALSE(absent.comment);
 	CHECK_FALSE(absent.tags);
 	auto empty =
-	    arrow::field("x", arrow::int32(), true,
-	                 arrow::key_value_metadata({"comment", "tags", "opaque"}, {"", "{}", std::string("\xff\0", 2)}));
-	auto decoded = vgi::ReadNativeColumnMetadata(empty);
+	    vgi_test::Field("x", vgi::type::Int32(), true,
+	                    vgi_test::Metadata({"comment", "tags", "opaque"}, {"", "{}", std::string("\xff\0", 2)}));
+	auto decoded = ReadMetadata(empty);
 	REQUIRE(decoded.comment);
 	CHECK(decoded.comment->empty());
 	REQUIRE(decoded.tags);
 	CHECK(decoded.tags->empty());
-	CHECK(empty->metadata()->value(2) == std::string("\xff\0", 2));
+	CHECK(empty.metadata.value(2) == std::string("\xff\0", 2));
 	auto field =
 	    MetadataField("tags", R"({"":"", "a.b":"雪", "a/b":"raw", "A":"upper", "a":"lower", "\u0000":"x\u0000y"})");
-	auto tags = *vgi::ReadNativeColumnMetadata(field).tags;
+	auto tags = *ReadMetadata(field).tags;
 	CHECK(tags.size() == 6);
 	CHECK(tags.at("a.b") == "雪");
 	CHECK(tags.at(std::string(1, '\0')) == std::string("x\0y", 3));
-	CHECK(vgi::ReadNativeColumnMetadata(MetadataField("comment", std::string("snow 雪\0tail", 13))).comment->size() ==
-	      13);
+	CHECK(ReadMetadata(MetadataField("comment", std::string("snow 雪\0tail", 13))).comment->size() == 13);
 }
 
 TEST_CASE("Column metadata rejects malformed JSON UTF8 and duplicate keys recursively", "[column-metadata]") {
@@ -108,26 +91,28 @@ TEST_CASE("Column metadata rejects malformed JSON UTF8 and duplicate keys recurs
 	      std::string("{\"x\":\"a\",\"\\u0078\":\"b\"}"), std::string("{\"x\":\"\\ud800\"}"), std::string("{} {}"),
 	      std::string("{\"x\":\"\xff\"}")}) {
 		INFO(invalid);
-		CHECK_THROWS(vgi::ReadNativeColumnMetadata(MetadataField("tags", invalid)));
+		CHECK_THROWS(ReadMetadata(MetadataField("tags", invalid)));
 	}
 	auto bad = MetadataField("comment", std::string("\xc0\xaf", 2));
-	CHECK_THROWS(vgi::ReadNativeColumnMetadata(bad));
+	CHECK_THROWS(ReadMetadata(bad));
 	for (const auto &key : {"comment", "tags"}) {
-		auto duplicate =
-		    arrow::field("x", arrow::int32(), true,
-		                 arrow::key_value_metadata({key, key}, {key == std::string("tags") ? "{}" : "", ""}));
-		CHECK_THROWS(vgi::ReadNativeColumnMetadata(duplicate));
+		auto duplicate = vgi_test::Field("x", vgi::type::Int32(), true,
+		                                 vgi_test::Metadata({key, key}, {key == std::string("tags") ? "{}" : "", ""}));
+		CHECK_THROWS(ReadMetadata(duplicate));
 	}
-	auto nested = arrow::struct_({bad});
-	std::vector<std::shared_ptr<arrow::DataType>> containers = {nested,
-	                                                            arrow::list(bad),
-	                                                            arrow::large_list(bad),
-	                                                            arrow::fixed_size_list(bad, 2),
-	                                                            arrow::map(arrow::utf8(), nested),
-	                                                            arrow::dictionary(arrow::int32(), nested),
-	                                                            std::make_shared<MetadataExtension>(nested)};
+	auto nested = vgi::type::Struct({bad});
+	auto fixed = vgi::type::List(bad);
+	fixed.format = "+w:2";
+	std::vector<vgi::VgiField> containers = {
+	    nested,
+	    vgi::type::List(bad),
+	    vgi::type::LargeList(bad),
+	    fixed,
+	    vgi::type::Map(vgi::type::Utf8(), nested),
+	    vgi::type::Dictionary(vgi::type::Int32(), nested),
+	    nested.WithMetadata(vgi_test::Metadata({"ARROW:extension:name"}, {"test.column_metadata"}))};
 	for (auto type : containers) {
-		auto schema = arrow::schema({arrow::field("outer", type)});
+		auto schema = vgi::MakeSchema({vgi_test::Field("outer", type)});
 		CHECK_THROWS(vgi::ValidateNativeColumnMetadata(schema));
 	}
 }
@@ -142,16 +127,17 @@ TEST_CASE("Native CREATE ADD and discovery share metadata validation before disp
 	columns.AddColumn(std::move(empty));
 	ColumnDefinition comment("a.b", LogicalType::INTEGER);
 	comment.SetComment(Value("雪"));
-	comment.SetDefaultValue(make_uniq<ConstantExpression>(Value(7)));
+	comment.SetDefaultValue(ConstantExpression::Integer(7));
 	columns.AddColumn(std::move(comment));
 	auto schema = vgi::DuckDBColumnsToArrowSchema(*con.context, columns, "main");
-	CHECK_FALSE(vgi::ReadNativeColumnMetadata(schema->field(0)).comment);
-	CHECK(vgi::ReadNativeColumnMetadata(schema->field(1)).comment == std::optional<std::string>(""));
-	CHECK(vgi::ReadNativeColumnMetadata(schema->field(2)).comment == std::optional<std::string>("雪"));
-	CHECK(schema->field(2)->metadata()->FindKey(vgi::VGI_COLUMN_DEFAULT) >= 0);
-	auto tagged = schema->field(1)->WithMetadata(
-	    arrow::key_value_metadata({"comment", "tags", "opaque"}, {"", "{}", "retained"}));
-	auto authoritative = arrow::schema({schema->field(0), tagged, schema->field(2)});
+	CHECK_FALSE(ReadMetadata(schema->field(0)).comment);
+	CHECK(ReadMetadata(schema->field(1)).comment == std::optional<std::string>(""));
+	CHECK(ReadMetadata(schema->field(2)).comment == std::optional<std::string>("雪"));
+	CHECK(schema->field_metadata(2).FindKey(vgi::VGI_COLUMN_DEFAULT) >= 0);
+	auto tagged = vgi_test::CopyField(schema->field(1))
+	                  .WithMetadata(vgi_test::Metadata({"comment", "tags", "opaque"}, {"", "{}", "retained"}));
+	auto authoritative =
+	    vgi::MakeSchema({vgi_test::CopyField(schema->field(0)), tagged, vgi_test::CopyField(schema->field(2))});
 	vgi::VgiTableInfo table;
 	table.name = "t";
 	table.schema_name = "main";
@@ -161,8 +147,8 @@ TEST_CASE("Native CREATE ADD and discovery share metadata validation before disp
 	CHECK(create.columns.GetColumn(LogicalIndex(1)).Comment() == Value(""));
 	CHECK(create.columns.GetColumn(LogicalIndex(2)).Comment() == Value("雪"));
 	CHECK(table.arrow_schema->Equals(*authoritative, true));
-	CHECK(vgi::ReadNativeColumnMetadata(table.arrow_schema->field(1)).tags->empty());
-	auto bad = arrow::schema({MetadataField("tags", "{\"x\":1}")});
+	CHECK(ReadMetadata(table.arrow_schema->field(1)).tags->empty());
+	auto bad = vgi::MakeSchema({MetadataField("tags", "{\"x\":1}")});
 	vgi::CatalogRpcContext unavailable {nullptr, {}, {}};
 	CHECK_THROWS_WITH(vgi::InvokeCatalogTableCreate(unavailable, "main", "bad", bad, "ERROR", {}, *con.context),
 	                  Catch::Contains("tag values must be strings"));
@@ -220,14 +206,15 @@ TEST_CASE("Native column comment CREATE ADD COPY and Arrow discovery retain meta
 	auto comments = Execute(con, "SELECT column_name, comment FROM duckdb_columns() WHERE database_name='metadata' AND "
 	                             "table_name='created' ORDER BY column_index");
 	REQUIRE(comments->RowCount() == 4);
-	CHECK(comments->GetValue(1, 0) == Value(""));
-	CHECK(comments->GetValue(1, 1).IsNull());
-	CHECK(comments->GetValue(1, 2) == Value(""));
-	CHECK(comments->GetValue(1, 3) == Value("snow 雪"));
+	CHECK(comments->Collection().GetValue(1, 0) == Value(""));
+	CHECK(comments->Collection().GetValue(1, 1).IsNull());
+	CHECK(comments->Collection().GetValue(1, 2) == Value(""));
+	CHECK(comments->Collection().GetValue(1, 3) == Value("snow 雪"));
 	Execute(con, "CALL vgi_clear_cache()");
 	CHECK(Execute(con, "SELECT comment FROM duckdb_columns() WHERE database_name='metadata' AND table_name='created' "
 	                   "AND column_name='a.b'")
-	          ->GetValue(0, 0) == Value(""));
+	          ->Collection()
+	          .GetValue(0, 0) == Value(""));
 	Execute(con, "ATTACH ':memory:' AS source");
 	Execute(con, "CREATE TABLE source.main.copied (x INTEGER, y INTEGER)");
 	Execute(con, "COMMENT ON COLUMN source.main.copied.x IS ''");
@@ -236,8 +223,8 @@ TEST_CASE("Native column comment CREATE ADD COPY and Arrow discovery retain meta
 	auto copied = Execute(con, "SELECT comment FROM duckdb_columns() WHERE database_name='metadata' AND "
 	                           "table_name='copied' ORDER BY column_index");
 	REQUIRE(copied->RowCount() == 2);
-	CHECK(copied->GetValue(0, 0) == Value(""));
-	CHECK(copied->GetValue(0, 1) == Value("copy 雪"));
+	CHECK(copied->Collection().GetValue(0, 0) == Value(""));
+	CHECK(copied->Collection().GetValue(0, 1) == Value("copy 雪"));
 	for (bool bulk : {true, false}) {
 		Execute(con, std::string("SET vgi_catalog_contents = ") + (bulk ? "true" : "false"));
 		Execute(con, "CALL vgi_clear_cache()");
@@ -245,13 +232,13 @@ TEST_CASE("Native column comment CREATE ADD COPY and Arrow discovery retain meta
 		auto &entry =
 		    Catalog::GetEntry<TableCatalogEntry>(*con.context, "metadata", "main", "seeded").Cast<VgiTableEntry>();
 		auto schema = entry.GetTableInfo().arrow_schema;
-		CHECK_FALSE(vgi::ReadNativeColumnMetadata(schema->field(0)).tags);
-		CHECK(vgi::ReadNativeColumnMetadata(schema->field(1)).tags->empty());
-		CHECK(vgi::ReadNativeColumnMetadata(schema->field(2)).tags->at("a.b") == "snow 雪");
-		CHECK(schema->field(2)->metadata()->Get("opaque").ValueOrDie() == std::string("\xff\0", 2));
-		auto child = schema->field(3)->type()->field(0);
-		CHECK(vgi::ReadNativeColumnMetadata(child).comment == std::optional<std::string>("nested"));
-		CHECK(vgi::ReadNativeColumnMetadata(child).tags->at("raw/key") == "value");
+		CHECK_FALSE(ReadMetadata(schema->field(0)).tags);
+		CHECK(ReadMetadata(schema->field(1)).tags->empty());
+		CHECK(ReadMetadata(schema->field(2)).tags->at("a.b") == "snow 雪");
+		CHECK(schema->field_metadata(2).Get("opaque").value() == std::string("\xff\0", 2));
+		const auto &child = *schema->field(3).children[0];
+		CHECK(ReadMetadata(child).comment == std::optional<std::string>("nested"));
+		CHECK(ReadMetadata(child).tags->at("raw/key") == "value");
 		Execute(con, "COMMIT");
 	}
 }
