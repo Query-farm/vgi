@@ -1,0 +1,26 @@
+{
+  "name": "nanoarrow",
+  "version-string": "0.10.0-vgi.20261028",
+  "description": "Pinned Query-farm nanoarrow IPC with external FlatCC",
+  "homepage": "https://github.com/Query-farm/arrow-nanoarrow",
+  "license": "Apache-2.0",
+  "dependencies": [
+    "flatcc",
+    {
+      "name": "zstd",
+      "platform": "!emscripten"
+    },
+    {
+      "name": "lz4",
+      "platform": "!emscripten"
+    },
+    {
+      "name": "vcpkg-cmake",
+      "host": true
+    },
+    {
+      "name": "vcpkg-cmake-config",
+      "host": true
+    }
+  ]
+}

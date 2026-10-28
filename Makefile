@@ -7,6 +7,15 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Auto-detect vcpkg toolchain if present in the project tree
 VCPKG_TOOLCHAIN_PATH ?= $(wildcard ${PROJ_DIR}vcpkg/scripts/buildsystems/vcpkg.cmake)
 
+# Compile packaged dependencies for shared WASM memory as well as the extension.
+# Keep a distinct triplet/cache from wasm_mvp and wasm_eh. CI supplies the ordinary
+# wasm triplet explicitly, so override that default while preserving custom ones.
+ifneq ($(filter wasm_threads,$(MAKECMDGOALS) $(DUCKDB_PLATFORM)),)
+ifeq ($(filter-out wasm32-emscripten,$(strip $(VCPKG_TARGET_TRIPLET))),)
+override VCPKG_TARGET_TRIPLET := wasm32-emscripten-threads
+endif
+endif
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 

@@ -1,0 +1,87 @@
+{
+  "date": "2026-10-28",
+  "status": "native_and_producer_qualified_transport_followup_interrupted",
+  "branch": "v2.0",
+  "base_native_commit": "4623aa387d943d20941823c344ccd22d2752855e",
+  "dependencies": {
+    "nanoarrow": {
+      "repository": "Query-farm/arrow-nanoarrow",
+      "commit": "f2aca3b4182e115745f1971e8d85a66594f28679",
+      "branch": "vgi/vcpkg-20261028",
+      "implementation_base": "a08358095fda6fec7d98691d69c3df72ab0a9274",
+      "changes_from_base": "CMake package dependencies and MSVC C11 atomics only"
+    },
+    "flatcc": {
+      "repository": "dvidelabs/flatcc",
+      "commit": "e3e44836c5f625b5532586ddce895f8b5e36a212",
+      "runtime_modified": false,
+      "overlay_patch": "CMake installation/export only",
+      "strict_verifier": true
+    }
+  },
+  "removed_vendor_files": 44,
+  "removed_vendor_lines": 53860,
+  "native": {
+    "platform": "Linux ARM64",
+    "compiler": "Clang 15.0.7",
+    "build_jobs": 48,
+    "package_build": "vcpkg overlay install; debug and release; post-build validation passed",
+    "targets": [
+      "vgi_unit_tests",
+      "vgi_loadable_extension",
+      "unittest",
+      "duckdb"
+    ],
+    "build_exit": 0,
+    "unit_cases": 179,
+    "unit_assertions": 2719,
+    "unit_exit": 0,
+    "regression": "Reject real malformed Go dictionary schema; accept corrected producer bytes with exact schema metadata.",
+    "extension_sha256": "5cddf10043a4b0b7449315a49650301a991ecc6416e9fdbf60b04d62c7d9f5ee",
+    "unit_sha256": "418a28d6c8eb6a0bbbddbde3a0dffab8df246308239c12630e3dea22badc3718",
+    "flatcc_archive_sha256": "0f13c0f544c647b8a72ec30afeec00b94dc86095b7e289432f0b592630cc0cef"
+  },
+  "go": {
+    "repository": "Query-farm/vgi-go",
+    "commit": "00fd1234064a02c39c8c8e40ae33c40dec1194ae",
+    "branch": "fix/flatbuffers-vtable-object-size",
+    "package_published": false,
+    "replacement": "github.com/rustyconover/flatbuffers v25.12.20-0.20261026151427-0acd09bcd1ff+incompatible",
+    "replacement_commit": "0acd09bcd1ff70ff970e699e7a291119c156bfaa",
+    "gates": [
+      "old producer regression fails as expected",
+      "fixed producer regression passes",
+      "independent consumer with upstream Arrow and SHM Arrow fork passes",
+      "go vet ./... passes",
+      "go test ./... passes",
+      "all five worker binaries build"
+    ],
+    "consumer_requirement": "Application-level replace required; dependency-module replacements do not propagate.",
+    "evidence": "qualification/go-flatbuffers-20261028",
+    "local_manifest_sha256": "a72915297bc019e6d0316ddd99ead0c26aa96f108cdd2b2ed3f8090a72b22a24"
+  },
+  "wasm": {
+    "triplet": "wasm32-emscripten-threads",
+    "make_dry_run_cases_passed": 8,
+    "runtime_build_tested": false
+  },
+  "evidence_root": "/home/ec2-user/vgi-duckdb2-20261013-UgAEHC/qualification/vcpkg-nanoarrow-20261028-root",
+  "evidence_files": [
+    "install.log",
+    "configure.log",
+    "native-build.log",
+    "native-units.log",
+    "python-http.log",
+    "python-http-invalid-system-python.log"
+  ],
+  "transport_followup": {
+    "python_http": "Existing make test_http started but fixture servers failed startup; SSH connectivity failed before those server logs could be inspected. Not qualified.",
+    "go": "Canonical launch and HTTP supervisor started; completion unconfirmed after SSH timeout. Results at qualification/go-flatbuffers-20261028/transports/{launch,http}/result.json.",
+    "host": "54.224.166.207:22 timed out; no replacement host assumed."
+  },
+  "limits": [
+    "No full WASM, Windows or macOS build in this checkpoint.",
+    "Affected existing Go binaries need the fixed producer and must be rebuilt before using the strict reader.",
+    "Existing broad HTTP/language matrix manifests describe earlier artifacts, not this package migration."
+  ]
+}

@@ -8,7 +8,8 @@ preparation remains on `codex/duckdb-2.0-protocol` in `vgi-duckdb2`.
 
 `~/Development/vgi` is the primary checkout for ongoing nanoarrow development
 and builds. The migration from `~/Development/vgi-nano` is incorporated here;
-the native extension links the vendored nanoarrow library from this repository.
+the native extension links pinned nanoarrow and FlatCC packages through vcpkg
+overlay ports; see [native dependencies](native-dependencies.md).
 
 **Build/test workflow:** edit locally, then synchronize
 source changes to `ec2-user@54.224.166.207` and build/test there (same instance, resumed October 27;
@@ -72,6 +73,25 @@ final cross-platform checks. Its Python 3.13 fixes pass the full run plus
 targeted reruns (4,656 unique passes, 145 skips, zero unresolved failures).
 All fixes are committed and pushed. Native development remains on `v2.0`;
 native main has not been merged and engine distribution has not been released.
+
+**Dependency packaging checkpoint (October 28):** replaced the 44-file,
+53,860-line bundled nanoarrow/FlatCC tree with checksum-pinned vcpkg overlay
+ports. The Query-farm nanoarrow pin preserves the previous IPC implementation
+and adds package support; FlatCC's runtime and strict verifier are unmodified.
+The Go producer fix is committed and pushed at `vgi-go` `00fd123` on
+`fix/flatbuffers-vtable-object-size`; it has not been released as a package.
+Go applications must apply the documented top-level dependency replacement and
+rebuild affected workers before using the strict reader.
+
+The new native Clang build passes **179 unit cases / 2,719 assertions**,
+including actual malformed/corrected Go schema fixtures. The Go producer's
+full unit suite, vet, independent consumers and worker builds pass. Eight Make
+dry-run cases verify selection of the separate pthread-enabled WASM triplet;
+no WASM runtime build is claimed. Python HTTP fixture startup failed and EC2
+SSH subsequently timed out, leaving that run and the Go launch/HTTP completion
+checks unresolved. See the [dependency qualification record](duckdb-2.0-dependency-qualification.json)
+for exact artifacts, evidence paths and limits; earlier broad matrices below
+remain historical results for the preceding build.
 
 **Published Rust fixture checkpoint (October 28):** `vgi`, `vgi-protocol`,
 and `vgi-client` 0.48.0 are published on crates.io. Native SAB fixtures now use

@@ -231,7 +231,7 @@ and projected into the URL (`{base}/{protocol}/{method}`) over HTTP. Reserved me
 The extension does not link Arrow C++. Batches, schemas and bytes are the types in
 `src/include/vgi_arrow.hpp` (`VgiBatch`/`VgiBatchPtr`, `VgiSchema`, `VgiColumn` views, `VgiBuffer`,
 `VgiMetadata`, schema/array builders, `TakeRows`/`ConcatBatches`), built on the Arrow C data
-interface and the vendored nanoarrow bundle (`third_party/nanoarrow`, see its `NANOARROW_SOURCE`).
+interface and pinned vcpkg nanoarrow/FlatCC packages (see `docs/native-dependencies.md`).
 IPC streams are `src/include/vgi_ipc.hpp` (`VgiIpcReader`/`VgiIpcWriter`, `VgiInputStream`/
 `VgiOutputStream`; errors throw). Do not reintroduce `arrow::` — `vcpkg.json` no longer has it.
 Worker batches reach DuckDB zero-copy through `VgiBatch::ExportTo(ArrowArrayWrapper&)`; DuckDB

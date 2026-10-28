@@ -289,10 +289,11 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# nanoarrow (vendored bundle): Arrow IPC encode/decode for the wire. Its own
-# directory scope keeps DuckDB's vendored zstd.h off its include path.
-add_subdirectory(third_party/nanoarrow)
-include_directories(third_party/nanoarrow/include)
+# IPC and its FlatCC runtime are pinned vcpkg packages. Building them separately
+# keeps DuckDB's private compression headers out of their include paths.
+find_package(nanoarrow CONFIG REQUIRED)
+include_directories(SYSTEM
+  $<TARGET_PROPERTY:nanoarrow::nanoarrow_static,INTERFACE_INCLUDE_DIRECTORIES>)
 
 include_directories(src/include)
 include_directories(duckdb/third_party/mbedtls/include)
@@ -430,15 +431,18 @@ endif()
 # DuckDB's WASM side-module post-link invokes emcc separately from the static
 # archive target, so target_link_libraries alone does not carry nanoarrow into it.
 if(EMSCRIPTEN)
-  set(DUCKDB_EXTENSION_VGI_LINKED_LIBS "$<TARGET_FILE:vgi_nanoarrow>")
+  set(DUCKDB_EXTENSION_VGI_LINKED_LIBS
+    "$<TARGET_FILE:nanoarrow::nanoarrow_ipc_static>"
+    "$<TARGET_FILE:nanoarrow::nanoarrow_static>"
+    "$<TARGET_FILE:flatcc::flatccrt>")
 endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # Link OpenSSL in both the static library as the loadable extension
-target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} vgi_nanoarrow)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} vgi_nanoarrow)
+target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} nanoarrow::nanoarrow_ipc_static)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} nanoarrow::nanoarrow_ipc_static)
 
 # POSIX shared memory lives in librt on the older glibc used by our Linux
 # distribution images. Arrow previously supplied this transitive dependency;
@@ -479,7 +483,7 @@ if(NOT EMSCRIPTEN)
 endif()
 
 install(
-  TARGETS ${EXTENSION_NAME} vgi_nanoarrow
+  TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -602,7 +606,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     ${EXTENSION_NAME}
     duckdb_static
     duckdb_mbedtls
-    vgi_nanoarrow
+    nanoarrow::nanoarrow_ipc_static
     ${SABFFI_LIB}
     ${SABTABLE_LIB})
   if(APPLE)

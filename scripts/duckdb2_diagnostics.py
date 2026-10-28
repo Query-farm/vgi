@@ -3,8 +3,8 @@
 
 Run on the Linux/Clang build host in a separate source checkout. This is an
 extension-only diagnostic lane, not an engine link or runtime qualification.
-The vendored nanoarrow bundle and existing OpenSSL/zstd/LZ4/SQLite installations
-are consumed without running vcpkg.
+Existing nanoarrow/FlatCC/OpenSSL/zstd/LZ4/SQLite package installations are
+consumed without running vcpkg. Install the pinned overlay ports first.
 """
 
 import argparse
@@ -91,7 +91,7 @@ def main():
         ).splitlines(),
     }
     source_files = sorted(
-        p for source_dir in (ROOT / "src", ROOT / "third_party/nanoarrow")
+        p for source_dir in (ROOT / "src", ROOT / "vcpkg_overlay_ports")
         for p in source_dir.rglob("*") if p.is_file()
     )
     source_files += [
