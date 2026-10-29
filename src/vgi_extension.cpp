@@ -3784,7 +3784,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		scan_func.deserialize = VgiTableEntry::VgiTableScanDeserialize;
 		scan_func.projection_pushdown = true;
 		scan_func.filter_pushdown = true;
-		scan_func.supports_complex_join_filters = false;
+		scan_func.runtime_filter_pushdown = false;
 		CreateTableFunctionInfo scan_info(scan_func);
 		scan_info.descriptions.push_back(vgi::MakeFunctionDescription(
 		    "Internal: the physical scan operator for tables in an attached VGI catalog. DuckDB binds it "

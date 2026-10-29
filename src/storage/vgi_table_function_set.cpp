@@ -398,7 +398,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// savings). Expression pushdown is intentionally
 			// skipped for the same reason.
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
-			table_func.supports_complex_join_filters = false;
+			table_func.runtime_filter_pushdown = false;
 			if (is_buffering) {
 				table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
 				if (table_func.filter_pushdown) {
@@ -433,7 +433,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			                         vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 			table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
-			table_func.supports_complex_join_filters = false;
+			table_func.runtime_filter_pushdown = false;
 			table_func.sampling_pushdown = func_info.sampling_pushdown.value_or(false);
 			table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 			if (table_func.filter_pushdown) {

@@ -117,11 +117,18 @@ qualification manifest's `registry_sab_checkpoint_2026_10_28` entry.
 now builds from Haybarn `19e399c22f53` plus the committed minimal HTTP parameter
 clone patch, `831cdbed22ea`. The patch provides request-private cancellation
 contexts while retaining HTTPFS parameters; two regression cases with 17
-assertions pass. The current engine pin is `54f8340a3ede`; it also includes a
-missing test include, a DELETE RETURNING virtual-column hook, and a scanner
-capability for declining engine-local Bloom/prefix-range join filters while
-retaining IN/min-max pushdown. The build
-retains its explicitly configured `831cdbed22ea`/dev88798 version string;
+assertions pass. The engine pin was `54f8340a3ede` for this checkpoint. On
+October 29 it moved to `927f673d7e63` (local branch `vgi-engine-rc9`):
+Haybarn `19e399c22f53` plus six commits — the HTTP parameter clone, a missing
+test include, a DELETE RETURNING virtual-column hook,
+`TableFunction::runtime_filter_pushdown` (scanners that hand filters to another
+system set it to false and receive IN-list and min/max filters, possibly wrapped
+in `optional_filter`, instead of engine-local Bloom/prefix-range filters; it
+replaces the earlier `supports_complex_join_filters` field), a bump of
+`HAYBARN_ABI_VERSION` to 2 marking those three engine APIs, and a separate
+HUGEINT comparison regression test. The rc9 build stamps
+`927f673d7e63`/`v2.0.0-dev88803`. The checkpoint build below
+retained its explicitly configured `831cdbed22ea`/dev88798 version string;
 qualification records the actual source and shared-engine hashes separately. All 113 VGI production
 translation units now compile, and the static/loadable
 extensions and `v2.0.0-dev88798` shell link. Loading the new extension succeeds.

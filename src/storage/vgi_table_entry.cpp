@@ -56,7 +56,7 @@ TableFunction MakeNativeDelegationMarkerFunction() {
 	// on this LogicalGet's table_filters; the rewriter then hands them off to
 	// the real native function on the rewritten LogicalGet.
 	fn.filter_pushdown = true;
-	fn.supports_complex_join_filters = false;
+	fn.runtime_filter_pushdown = false;
 	fn.projection_pushdown = true;
 	return fn;
 }
@@ -945,7 +945,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// Generated-table optimizer callbacks still use logical coordinates; keep
 	// those filters/order/statistics local until their remapping is qualified.
 	func.filter_pushdown = !generated_columns && has_filter_pushdown && supports_filter_v2;
-	func.supports_complex_join_filters = false;
+	func.runtime_filter_pushdown = false;
 	func.sampling_pushdown = has_sampling_pushdown;
 	// Propagate the worker's declared order preservation to the synthetic
 	// TableFunction so DuckDB's planner sees the right SourceOrder() for
