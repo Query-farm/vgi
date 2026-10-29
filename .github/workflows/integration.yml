@@ -42,7 +42,9 @@ jobs:
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref }}
+      # v2.0 speaks vgi.v3; vgi-python's default branch still hosts vgi.v2 until
+      # the 0.48.0 release (vgi-python#98) merges, so pin the v3 SDK release.
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.48.0' }}
       GEN: ninja
       BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"

@@ -36,26 +36,29 @@ jobs:
 
   duckdb-stable-build:
     name: Build extension binaries
-    uses: Query-farm-haybarn/haybarn-extension-ci-tools/.github/workflows/_extension_distribution.yml@haybarn
+    # The v2.0 branch builds against the Haybarn 2.0 engine with the 2.0 line of
+    # the Haybarn ci-tools fork, the same pairing as the community haybarn-2.0
+    # lane. Keep duckdb_version in lockstep with the duckdb submodule's tag.
+    uses: Query-farm-haybarn/haybarn-extension-ci-tools/.github/workflows/_extension_distribution.yml@haybarn-2.0
     secrets:
       vcpkg_token: ${{ secrets.HAYBARN_VCPKG_TOKEN }}
+      VCPKG_CACHING_AWS_ACCESS_KEY_ID: ${{ secrets.HAYBARN_BUILD_CACHE_R2_ACCESS_KEY_ID }}
+      VCPKG_CACHING_AWS_SECRET_ACCESS_KEY: ${{ secrets.HAYBARN_BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
+      VCPKG_CACHING_AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
     with:
-      duckdb_version: haybarn-v1.5.5-rc1
-      ci_tools_version: haybarn
+      duckdb_version: haybarn-v2.0.0-rc9
+      ci_tools_version: haybarn-2.0
+      override_duckdb_repository: 'https://github.com/Query-farm-haybarn/haybarn'
       override_ci_tools_repository: 'Query-farm-haybarn/haybarn-extension-ci-tools'
       extension_name: vgi
-      # This artifact is not consumed and is consistently the slowest matrix
-      # leg (roughly 20 minutes even with warm vcpkg and ccache state).
-      exclude_archs: 'windows_amd64_mingw'
-      use_prebuilt_images: true
-      use_prebuilt_wasm_image: true
+      # wasm_mvp, osx_amd64 and windows_arm64 are not built on the 2.0 line.
+      # windows_amd64_mingw is not consumed and is consistently the slowest
+      # matrix leg (roughly 20 minutes even with warm vcpkg and ccache state).
+      exclude_archs: 'wasm_mvp;osx_amd64;windows_arm64;windows_amd64_mingw'
+      # vcpkg release 2026.06.24, the 2.0-line pin.
+      vcpkg_commit: 'cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3'
       # The embedded Iroh connector is compiled from the pinned Rust source as
-      # part of the extension, so both native Linux and WASM builders need the
-      # prebuilt image variants that contain Cargo. `extra_toolchains` controls
-      # inline image builds, but does not alter an already-published image.
-      image_variant: rust
-      wasm_image_variant: rust
-      prebuilt_image_tag: v1.5.5
+      # part of the extension, so the builders need Cargo.
       extra_toolchains: parser_tools;rust
       # NOTE: this pipeline does NOT run the VGI integration suite.
       #
