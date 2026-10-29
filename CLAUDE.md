@@ -11,17 +11,65 @@ Reference implementations:
 
 Feature-level documentation lives in `docs/` — see *Feature reference* at the end of this file.
 
+## Current development baseline
+
+`~/Development/vgi` on **`v2.0`** is the primary DuckDB 2.0/nanoarrow checkout.
+The `vgi-nano` migration is incorporated here. The `duckdb` submodule pins Haybarn's
+2.0 engine at `54f8340a3ede`; `extension_config.cmake` pins its matching HTTPFS fork.
+Use the committed submodule revision, not `git submodule update --remote`.
+
+The wire contract is **`vgi.v3` / `3.0.0`**. Workers need matching SDK releases;
+older `vgi.v2` workers are incompatible. See `docs/duckdb-2.0-sdk-releases.json`
+for the coordinated releases and `docs/native-dependencies.md` for the Go 0.38.1 followup.
+
+The Clang Linux ARM64 build and configured suites pass. The latest dependency
+build, unit and Python/Go transport evidence is in
+`docs/duckdb-2.0-dependency-qualification.json`; earlier full language/HTTP matrices
+have their own artifact hashes. These results do not establish cross-platform release
+readiness. Automatic whole-query pushdown, nested schemas and broader 2.0 type/grammar
+coverage remain open in `docs/duckdb-2.0-plan.md`. Native changes remain on `v2.0`.
+
 ## Build
+
+Edit locally; build and test on EC2. The current host is `ec2-user@54.224.166.207`
+(48 CPUs), with owned workspace `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC`.
+The 2.0 lane is `vgi-native2-nano-20261027-1i9LOE` beneath that root:
+`native/` holds extension source, `engine/` holds the pinned engine, and
+`build-clang/` holds outputs (`native/build/release` points there).
+Keep this lane separate from the 1.5 builds and other users' jobs. Synchronize changed
+content with fresh timestamps and record revisions with test evidence.
+
+Use **Clang** for native 2.0 builds. Do not add a GCC workaround for the diagnosed
+ARM HUGEINT compiler bug. Reuse the existing Clang build/cache; use available host
+parallelism (`CMAKE_BUILD_PARALLEL_LEVEL=48` on this EC2 host) for builds.
 
 The Makefile auto-detects `VCPKG_TOOLCHAIN_PATH` from `vcpkg/` in the project tree. Set
 `USE_MERGED_VCPKG_MANIFEST=1` — the extension is built from multiple modules.
 
 ```bash
-USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make debug
-USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make release
+CC=clang CXX=clang++ USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make debug
+CC=clang CXX=clang++ USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make release
 ```
 
 No permission needed to run either build target.
+
+### nanoarrow and FlatCC
+
+`vcpkg_overlay_ports/` supplies checksum-pinned `Query-farm/arrow-nanoarrow` and
+upstream FlatCC. CMake links `nanoarrow::nanoarrow_ipc_static` and its transitive
+dependencies. Keep implementation sources out of VGI; `vgi-python` uses PyArrow.
+
+FlatCC is nanoarrow's C runtime for reading, validating and writing Arrow IPC's
+FlatBuffers metadata, used with every worker language. Its runtime/verifier are
+unmodified; `install-targets.patch` only exports/installs CMake targets. The former
+Go workaround is removed. `vgi-go` **0.38.1** selects the corrected Go writer;
+custom Go workers must copy the documented FlatBuffers `replace` into their own
+top-level `go.mod` and rebuild, because Go does not inherit dependency replacements.
+Keep the native `[vgi-ipc-validation]` regression strict.
+
+`make wasm_threads` selects the separate `wasm32-emscripten-threads` vcpkg triplet
+so dependencies also receive `-pthread`. Direct CMake/custom-triplet builds must
+provide matching flags. Exact pins and build details: `docs/native-dependencies.md`.
 
 ## Test
 
@@ -31,6 +79,7 @@ failures on the debug build to isolate them.
 **Always `tee` test output and analyze the log** — otherwise the tests get run twice.
 
 ```bash
+set -o pipefail
 # Default regression run: whole suite, release build, pooled launcher transport
 make test_launcher 2>&1 | tee /tmp/vgi-test.log
 grep -A 20 "FAILED" /tmp/vgi-test.log
@@ -45,8 +94,10 @@ cold-starts a worker per connection; use it only when testing the spawn path its
 `make test` / `make test_debug` also run the non-integration tests.
 
 `VGI_TEST_WORKER` selects the worker; it defaults to
-`uv run --project ~/Development/vgi-python vgi-fixture-worker`. **If it is unset every
-integration test SKIPs**, and the runner reports skips as passes.
+`uv run --project ~/Development/vgi-python vgi-fixture-worker` in the Makefile.
+When invoking `unittest` directly, set it explicitly: otherwise worker-gated tests
+skip. `scripts/run_tests.py` reports executed/skipped counts separately, parsing
+both stdout and stderr; a zero exit code alone does not prove coverage.
 
 `VGI_DATABASE_PACKAGE_WORKER` is the worker *command* that `database_worker/package.test`
 packages as a `database://` executable. It defaults to `VGI_TEST_WORKER` (minus `launch:`);
@@ -58,7 +109,8 @@ worker. Unset on such a lane, the packaged fixture fails with a message naming t
 
 ```bash
 VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-fixture-worker" \
-    ./build/release/test/unittest "test/sql/integration/scalar/double.test"   # or a glob: ".../scalar/*"
+    ./build/release/test/unittest --test-config test/configs/no_error_skip.json \
+    "test/sql/integration/scalar/double.test"   # or a glob: ".../scalar/*"
 
 ./test/run_http_integration.sh "test/sql/integration/scalar/double.test"      # over HTTP
 ```
@@ -73,20 +125,26 @@ For debugging, write standalone `.sql` files in `/tmp/` and run them with
 TypeScript, Java and C# workers.
 
 ```bash
-make test_languages          # every SDK, keeps going on failure
+make test_languages          # six SDK targets plus native references; keeps going on failure
 make test_rust               # one leg (also test_python/test_go/test_typescript/test_java/test_csharp)
 ```
 
+The C++ SDK lane runs separately; both TypeScript ArrowJS and Flechette backends
+also need qualification when claiming full language/backend coverage. Keep the
+existing execution floors and skip allowlists; record genuine passes separately
+from expected skips. See `docs/duckdb-2.0-native-qualification.json` and
+`docs/duckdb-2.0-http-qualification.json` for matrix commands and evidence.
+
 **Run it after touching anything on the wire.** Adding cases to the Python suite does not
 substitute: a bug in one SDK's serializer is invisible to tests that only run against Python.
-The first full run found 13 real bugs across four SDKs. It is not in CI, so running it locally
-is the guardrail.
+The first full run found 13 real bugs across four SDKs. Run the matrix on the build host;
+the native CI does not run it.
 
 ### Other transports and suites
 
 | Target | What it runs |
 |--------|--------------|
-| `make test_http` / `_debug` | Integration suite over HTTP (`test/run_http_integration.sh`; per-run server log, path printed as `server log:`; `VGI_HTTP_SERVER_LOG` pins it) |
+| `make test_http` / `_debug` | Integration suite over HTTP (`test/run_http_integration.sh`); a server per test file by default. `VGI_HTTP_SERVER_PER_TEST=0` selects one shared server with a per-run log (`VGI_HTTP_SERVER_LOG` overrides its path). |
 | `make test_http_no_compression` | HTTP against a server advertising an **empty** `VGI-Supported-Encodings` (speaks no compression; an *absent* header means a pre-update server that still speaks zstd) |
 | `make test_http_demo_storage` | HTTP against a server that externalizes every response to its demo object store; the only lane fetching externalized results from inside `VgiTransaction::Start` (duckdb#22258 secret-lookup deadlock). |
 | `make test_launcher_external_storage` | Launcher suite against the fixture worker externalizing every result over the byte transport (`test/support/external_storage_worker.py`) |
@@ -98,17 +156,20 @@ is the guardrail.
 
 ### HTTP test coverage pitfalls
 
-A skipped test reports as neither pass nor fail, so "it doesn't work over HTTP" is often a test
-that never ran. Three mechanisms turn skips into apparent passes:
-- `scripts/run_tests.py` classifies on exit code, and a skipped file exits 0. "325/325 passed"
-  means 325 files exited 0. Get real numbers by parsing unittest's skip banner per file.
-- DuckDB ignores errors whose message contains the substring `"HTTP"` or
-  `"Unable to connect"` (`sqllogic_test_runner.hpp`). A `.test` without `require httpfs` fails
-  its `ATTACH 'http://…'` with a message containing "HTTP" and silently vanishes. A test whose
-  *expected* error contains "HTTP" needs `set ignore_error_messages Unable to connect`.
-- The HTTP suite expects **five** servers (main, versioned, versioned_tables, attach_options,
-  bearer-auth), all started with cwd at the repo root (`copy_to`/`copy_from` paths resolve
-  against the server's cwd).
+A skipped test is not a pass. `scripts/run_tests.py` distinguishes skips and automatically
+uses `test/configs/no_error_skip.json` to prevent DuckDB's broad `"HTTP"` /
+`"Unable to connect"` error skips from hiding failures. Direct `unittest` invocations
+must select that config too. Preserve the lane's skip allowlist and execution floor.
+
+Use the existing `make test_http` target. Before a full run, check that the selected
+Python/fixture environment has the `vgi-rpc[http]` extra and run
+`./test/run_http_integration.sh "test/sql/integration/scalar/double.test"` as a preflight.
+Put the intended Python environment on `PATH`; server startup failures do not qualify
+the native adapter. For published RPC qualification, use `make test_http VGI_RPC_PYTHON_DIR=`
+to disable the Makefile's sibling RPC checkout override. Use `VGI_RUN_TESTS_JOBS` for
+file parallelism (the latest EC2 HTTP run used 24). HTTP servers run from the repository
+root because COPY paths resolve against their cwd. Versioned/attach/auth variants have
+separate targets; the default HTTP target alone does not cover every variant.
 
 **There are no known HTTP-only limitations.** Before recording one, measure it against at
 least two SDKs and date it. Every single-SDK failure investigated so far was a bug in that SDK,
@@ -122,7 +183,7 @@ time. It links two Rust staticlibs CMake does not build — `test/support/sabffi
 
 ```bash
 make unit_test_rust_libs
-BUILD_VGI_UNIT_TESTS=1 USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make release
+CC=clang CXX=clang++ BUILD_VGI_UNIT_TESTS=1 USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make release
 ./build/release/extension/vgi/vgi_unit_tests 2>&1 | tee /tmp/vgi-unit.log
 ./build/release/extension/vgi/vgi_unit_tests "[sab-conn]"   # one tag
 ```
@@ -171,6 +232,10 @@ vgi-python's `.venv/bin` first on `PATH`.
   follow vgi-python's **default branch** (`VGI_FIXTURES_REF`, overridable via the
   `fixtures_ref` workflow_dispatch input), so a protocol bump must land on both sides.
 - Not in CI: the cross-SDK matrix (`make test_languages`).
+
+The distribution workflow still selects `haybarn-v1.5.5-rc1` and `v1.5.5` images.
+It does not qualify DuckDB 2.0 distribution; the 2.0 Clang evidence above is from
+the EC2 lane. Updating the distribution/platform matrix remains release work.
 
 ## Debug Environment Variables
 
@@ -308,6 +373,11 @@ worker if a pooled one died (EPIPE); SIGPIPE is ignored via `sigaction()`. Pool 
 (`vgi_worker_pool*()`) cover only the subprocess pool — `launch:` / `unix://` workers are shared at
 the OS level and return no rows.
 
+Private subprocesses that have advertised SHM are excluded from generic process-pool
+reuse: later catalog/bind readers lack a SHM resolver for the worker's retained session.
+Those executions start a fresh process; within-execution SHM and retained batch leases
+remain supported. Preserve this rule when changing pool/connection cleanup.
+
 ### Logging
 
 1. `VGI_LOG(context, "event", {{"key", "val"}})` — DuckDB log manager.
@@ -337,6 +407,9 @@ the OS level and return no rows.
 
 | Topic | Doc |
 |-------|-----|
+| DuckDB 2.0 scope and remaining work | `docs/duckdb-2.0-plan.md` |
+| Native dependencies and Go producer compatibility | `docs/native-dependencies.md` |
+| Current dependency build/release evidence | `docs/duckdb-2.0-dependency-qualification.json` |
 | Settings, ATTACH options, LOCATION schemes, SQL diagnostic functions | `docs/reference.md` |
 | Structured error fields (`errors_as_json`, `error_subtype`, `extra_info` keys) | `docs/error_info.md` |
 | Source file / header map | `docs/source_map.md` |
