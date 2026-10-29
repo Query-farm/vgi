@@ -209,7 +209,12 @@ jobs:
           VGI_TEST_BRANCH_DIR: /tmp/vgi-branch
         run: |
           mkdir -p "$VGI_TEST_BRANCH_DIR"
-          python3 scripts/run_tests.py -j 4 \
+          # --isolate-launcher, as `make test_launcher` uses: DuckDB 2.0's unittest
+          # gives each run a temporary HOME and deletes it on exit. A launch: worker
+          # pooled across files inherits the first file's HOME, so its SQLite
+          # state under $HOME/.local/state/vgi vanishes and every later file fails
+          # with 'unable to open database file'. A per-file pool avoids that.
+          python3 scripts/run_tests.py -j 4 --isolate-launcher \
             --min-executed 280 \
             --allow-skip 'require spatial' \
             --allow-skip 'require-env VGI_DOCKER_IMAGE' \
