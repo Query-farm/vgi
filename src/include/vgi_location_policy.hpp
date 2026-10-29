@@ -23,7 +23,7 @@ namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
-class DBConfig;
+struct DBConfig;
 
 namespace vgi {
 

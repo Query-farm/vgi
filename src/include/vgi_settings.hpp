@@ -4,7 +4,7 @@
 
 namespace duckdb {
 class ClientContext;
-class DBConfig;
+struct DBConfig;
 class Value;
 enum class SetScope : unsigned char;
 namespace vgi {

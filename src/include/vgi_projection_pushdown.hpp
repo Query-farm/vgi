@@ -4,7 +4,7 @@
 #include "vgi_arrow.hpp"
 #include <vector>
 namespace duckdb {
-class DBConfig;
+struct DBConfig;
 class ClientContext;
 class BaseTableFunction;
 namespace vgi {

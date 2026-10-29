@@ -11,7 +11,7 @@
 
 namespace duckdb {
 
-class DBConfig;
+struct DBConfig;
 
 namespace vgi {
 

@@ -31,8 +31,8 @@ struct ArrowArrayView;
 struct ArrowSchemaView;
 
 namespace duckdb {
-struct ArrowArrayWrapper;
-struct ArrowSchemaWrapper;
+class ArrowArrayWrapper;
+class ArrowSchemaWrapper;
 
 namespace vgi {
 
