@@ -186,21 +186,13 @@ jobs:
           git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-rust.git /tmp/vgi-rpc-rust
           git -C /tmp/vgi-rpc-rust checkout 9e7dfb59686682be0ff4a46183988e2724416393
           cargo build --locked --release --manifest-path /tmp/vgi-rpc-rust/Cargo.toml -p vgi-iroh-bridge
-          git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-python.git /tmp/vgi-rpc-python
-          # This editable install REPLACES vgi-rpc in the fixture venv for the
-          # rest of the job, so the pin governs every later step -- not just the
-          # Iroh one. It must therefore stay at or above the version vgi-python
-          # itself requires (>=0.52.0 for Identity.v2 and nullable grant expiry).
-          # An older pin silently downgrades every later worker invocation.
-          # This commit is the published v0.52.0 release.
-          git -C /tmp/vgi-rpc-python checkout e04ddfa56c19b4cd7cc1e3729d165c763b0d98c7  # v0.52.0
-          uv pip install --python /tmp/vgi-python/.venv/bin/python --editable '/tmp/vgi-rpc-python[http]'
+          # vgi-rpc comes from the fixtures' own uv.lock (vgi-python v0.48.0 locks
+          # the published vgi-rpc 0.52.3), not from a source checkout.
 
       - name: Run native Iroh raw and HTTP integration
         env:
           BUILD_DIR: release
           VGI_PYTHON_DIR: /tmp/vgi-python
-          VGI_RPC_PYTHON_DIR: /tmp/vgi-rpc-python
           VGI_IROH_BRIDGE_BIN: /tmp/vgi-rpc-rust/target/release/vgi-iroh-bridge
         run: ./test/run_iroh_integration.sh
 

@@ -36,7 +36,7 @@ fi
 echo "==> syncing the fixture workspace"
 # HTTP auth qualification runs before the Iroh step installs an editable RPC
 # package. Install its transport dependencies here so these checks stand alone.
-uv sync --project "$DEST" --extra http >/dev/null
+uv sync --locked --project "$DEST" --extra http >/dev/null
 
 # Prove the worker is actually runnable BEFORE the suite starts. Without this a
 # broken install shows up as ~300 silently skipped tests reported as passing,

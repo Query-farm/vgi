@@ -5,7 +5,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-release}"
 VGI_PYTHON_DIR="${VGI_PYTHON_DIR:-$HOME/Development/vgi-python}"
-VGI_RPC_PYTHON_DIR="${VGI_RPC_PYTHON_DIR:-$HOME/Development/vgi-rpc-python}"
+# Optional: a vgi-rpc-python checkout to put ahead of the fixtures' locked
+# vgi-rpc release (for trying an unreleased vgi-rpc). Unset uses the release.
+VGI_RPC_PYTHON_DIR="${VGI_RPC_PYTHON_DIR:-}"
 VGI_IROH_BRIDGE_BIN="${VGI_IROH_BRIDGE_BIN:-$HOME/Development/vgi-rpc-rust/target/release/vgi-iroh-bridge}"
 HAYBARN="${ROOT_DIR}/build/${BUILD_DIR}/haybarn"
 
