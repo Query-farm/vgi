@@ -192,7 +192,7 @@ void VgiSendAttachEvent(ClientContext &context, const VgiAttachInfo &info) {
 		// DISALLOW: this runs on the ATTACH thread. Auto-loading httpfs is synchronous
 		// and can download an extension, which would make telemetry block the very
 		// path it must not perturb. If httpfs isn't already loaded, drop the event.
-		QueryFarmSendEventJson(context.db, kVgiAttachEndpoint, json, QueryFarmHttpfsAutoload::DISALLOW);
+		QueryFarmSendEventJson(*context.db, "vgi", kVgiAttachEndpoint, json, QueryFarmHttpfsAutoload::DISALLOW);
 	} catch (...) {
 		// Telemetry is strictly best-effort — never let it perturb ATTACH.
 	}

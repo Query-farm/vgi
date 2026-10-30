@@ -1,221 +1,315 @@
-// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "query_farm_telemetry.hpp"
-#include "query_farm_inflight.hpp"
-#include <thread>
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
-#include "yyjson.hpp"
-#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/storage/object_cache.hpp"
-#include <cstdint>
+#include "yyjson.hpp"
+#include <atomic>
 #include <cstdlib>
+#include <mutex>
+#include <thread>
+
 using namespace duckdb_yyjson; // NOLINT
 
-namespace duckdb
-{
+namespace duckdb {
 
-	namespace
-	{
+namespace {
 
-		// Synchronous POST of a JSON body to target_url. Errors ignored (best-effort).
-		void PostJson(DatabaseInstance &db, const string &target_url, const string &body)
-		{
-			HTTPHeaders headers;
-			headers.Insert("Content-Type", "application/json");
+const char *const TELEMETRY_URL = "https://duckdb-in.query-farm.services/";
 
-			auto &http_util = HTTPUtil::Get(db);
-			unique_ptr<HTTPParams> params = http_util.InitializeParameters(db, target_url);
-			// Telemetry is best-effort: bound the request, because closing the database
-			// waits for it (see TelemetryDrain). No retries -- a dropped ping is not worth one.
-			params->timeout = 5;
-			params->retries = 0;
+// Performs the POST with a client that was created on the calling thread. The
+// HTTPParams and the HTTPUtil they reference must outlive the call; the owner
+// below guarantees that by joining the worker before the database is torn down
+// and, failing that, before the process runs its exit handlers.
+void SendTelemetryRequest(HTTPParams &params, unique_ptr<HTTPClient> &client, const string &url, const string &body) {
+	try {
+		HTTPHeaders headers;
+		headers.Insert("Content-Type", "application/json");
+		PostRequestInfo post_request(url, headers, params, const_data_ptr_cast(body.data()), body.size());
+		auto response = params.http_util.Request(post_request, client);
+	} catch (...) {
+		// Telemetry is best-effort: ignore all errors.
+	}
+}
 
-			PostRequestInfo post_request(target_url, headers, *params, reinterpret_cast<const_data_ptr_t>(body.data()),
-																	 body.size());
-			try
-			{
-				auto response = http_util.Request(post_request);
-			}
-			catch (const std::exception &e)
-			{
-				// ignore all errors.
+#ifndef __EMSCRIPTEN__
+class QueryFarmTelemetryWorker;
+
+// Process-wide set of workers whose thread may still be running.
+//
+// The database join below covers every orderly shutdown, but a process can also
+// call exit() with the database still alive: the DuckDB shell does so on any
+// non-zero exit (a failing statement in `duckdb -f`, `.exit 1`, Ctrl-C x3), and
+// embedders may hold a global DuckDB object. exit() then runs the atexit
+// handlers -- including OpenSSL's OPENSSL_cleanup, registered by httpfs -- while
+// the worker is still inside the request, which is the crash from issue #4.
+//
+// So the registry also installs an atexit handler that joins every live worker.
+// atexit handlers run in reverse registration order, so ours must be registered
+// AFTER OpenSSL's to run BEFORE OPENSSL_cleanup. httpfs initialises OpenSSL
+// lazily when an HTTP client is first constructed; SendEvent therefore
+// constructs the client on the calling thread first and only then calls
+// EnsureAtExitHandler().
+//
+// The registry is heap-allocated and never freed on purpose: it has to outlive
+// every static destructor in the process.
+class QueryFarmTelemetryRegistry {
+public:
+	static QueryFarmTelemetryRegistry &Get() {
+		static QueryFarmTelemetryRegistry *instance = new QueryFarmTelemetryRegistry();
+		return *instance;
+	}
+
+	void Add(QueryFarmTelemetryWorker &worker) {
+		lock_guard<mutex> guard(lock);
+		workers.insert(&worker);
+	}
+
+	// Once this returns the atexit handler no longer references the worker.
+	void Remove(QueryFarmTelemetryWorker &worker) {
+		lock_guard<mutex> guard(lock);
+		workers.erase(&worker);
+	}
+
+	void EnsureAtExitHandler() {
+		std::call_once(atexit_once, []() { std::atexit(&QueryFarmTelemetryRegistry::JoinAllAtExit); });
+	}
+
+private:
+	QueryFarmTelemetryRegistry() = default;
+	static void JoinAllAtExit();
+
+	mutex lock;
+	unordered_set<QueryFarmTelemetryWorker *> workers;
+	std::once_flag atexit_once;
+};
+
+// Owns the background thread that sends one telemetry event.
+class QueryFarmTelemetryWorker {
+public:
+	QueryFarmTelemetryWorker(unique_ptr<HTTPParams> params, unique_ptr<HTTPClient> client, string url, string body)
+	    : params(std::move(params)), client(std::move(client)), url(std::move(url)), body(std::move(body)) {
+	}
+
+	~QueryFarmTelemetryWorker() {
+		// Unregister first: after this the atexit handler cannot touch us, so the
+		// join below cannot race it.
+		QueryFarmTelemetryRegistry::Get().Remove(*this);
+		Join();
+	}
+
+	void Start() {
+		QueryFarmTelemetryRegistry::Get().Add(*this);
+		try {
+			worker = std::thread([this]() {
+				SendTelemetryRequest(*params, client, url, body);
+				done = true;
+			});
+		} catch (...) {
+			// Could not spawn a thread; drop the event.
+			done = true;
+		}
+	}
+
+	void Join() {
+		if (worker.joinable()) {
+			worker.join();
+		}
+	}
+
+	bool Done() const {
+		return done;
+	}
+
+private:
+	unique_ptr<HTTPParams> params;
+	unique_ptr<HTTPClient> client;
+	string url;
+	string body;
+	std::atomic<bool> done {false};
+	std::thread worker;
+};
+
+void QueryFarmTelemetryRegistry::JoinAllAtExit() {
+	auto &registry = Get();
+	lock_guard<mutex> guard(registry.lock);
+	for (auto *worker : registry.workers) {
+		worker->Join();
+	}
+}
+
+// One extension's telemetry workers for one database.
+//
+// A plain detached thread could outlive the DuckDB instance that created it and
+// race the process teardown (issue #4). Storing the workers in the database's
+// ObjectCache ties them to the database instead: ~DatabaseInstance destroys the
+// cache before the scheduler, buffer manager, and log manager, so the join
+// happens while everything the request touches is still intact. The registry
+// above covers the remaining case where the process exits without ever
+// destroying the database.
+//
+// An extension may send several events per database (one per ATTACH, say), so
+// finished workers are reaped whenever a new one is added.
+class QueryFarmTelemetryWorkers : public ObjectCacheEntry {
+public:
+	void Add(unique_ptr<QueryFarmTelemetryWorker> worker) {
+		lock_guard<mutex> guard(lock);
+		for (idx_t i = 0; i < workers.size();) {
+			if (workers[i]->Done()) {
+				// Finished: the join in its destructor returns immediately.
+				workers[i] = std::move(workers.back());
+				workers.pop_back();
+			} else {
+				i++;
 			}
 		}
+		workers.push_back(std::move(worker));
+		workers.back()->Start();
+	}
 
-		// Lives in the database's object cache, so ~DatabaseInstance destroys it early in teardown, while
-		// HTTPUtil, the logger and the scheduler are still alive. Its destructor waits for this database's
-		// telemetry requests, so a request never outlives the database it borrows -- and, because hosts close
-		// their databases before returning from main, never runs into exit()'s static destructors.
-		//
-		// This file is compiled into several Query.Farm extensions, each with its own copy of this class, so
-		// the cache key carries an address that is unique to this copy.
-		class TelemetryDrain : public ObjectCacheEntry
-		{
-		public:
-			~TelemetryDrain() override
-			{
-				flights->Drain();
-			}
+	// Each extension compiles its own copy of this class, so the cache key is
+	// scoped by extension name: an entry is only ever read back by the copy that
+	// created it.
+	static string CacheKey(const string &extension_name) {
+		return "query_farm_telemetry-" + extension_name;
+	}
 
-			static string ObjectType()
-			{
-				static const string type = "query_farm_telemetry_drain@" +
-																	 std::to_string(reinterpret_cast<uintptr_t>(&TelemetryDrain::ObjectType));
-				return type;
-			}
-			string GetObjectType() override
-			{
-				return ObjectType();
-			}
-			// Not evictable: eviction would drain at an arbitrary time and drop the teardown guarantee.
-			optional_idx GetEstimatedCacheMemory() const override
-			{
-				return optional_idx();
-			}
+	static string ObjectType() {
+		return "query_farm_telemetry_workers";
+	}
 
-			shared_ptr<QueryFarmInFlight> flights = make_shared_ptr<QueryFarmInFlight>();
-		};
+	string GetObjectType() override {
+		return ObjectType();
+	}
 
-	} // namespace
+	// Not evictable: an eviction would destroy this entry (and join the threads)
+	// at an arbitrary moment. The entry must live exactly as long as the database.
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
 
-	// Generic transport: fire a pre-serialized JSON body, once, fire-and-forget, at
-	// `target_url`. Honors QUERY_FARM_TELEMETRY_OPT_OUT and requires httpfs — either
-	// already loaded, or auto-loaded here when `autoload` is ALLOW. Never throws —
-	// telemetry is best-effort and must not perturb the caller (ATTACH).
-	INTERNAL_FUNC void QueryFarmSendEventJson(shared_ptr<DatabaseInstance> db, const string &target_url,
-																						const string &json, QueryFarmHttpfsAutoload autoload)
-	{
-		const char *opt_out = std::getenv("QUERY_FARM_TELEMETRY_OPT_OUT");
-		if (opt_out != nullptr || !db || json.empty())
-		{
+private:
+	mutex lock;
+	vector<unique_ptr<QueryFarmTelemetryWorker>> workers;
+};
+#endif
+
+// Shared by the load ping and every other event: resolve the HTTP parameters and
+// client on the calling thread, then POST in the background.
+void SendEvent(DatabaseInstance &db, const string &extension_name, const string &target_url, const string &body,
+               QueryFarmHttpfsAutoload autoload) {
+	const char *opt_out = std::getenv("QUERY_FARM_TELEMETRY_OPT_OUT");
+	if (opt_out != nullptr || body.empty()) {
+		return;
+	}
+
+	// Auto-loading httpfs is synchronous and can download an extension, so it is
+	// only done where the caller can afford to block (extension load).
+	if (autoload == QueryFarmHttpfsAutoload::ALLOW) {
+		try {
+			ExtensionHelper::TryAutoLoadExtension(db, "httpfs");
+		} catch (...) {
 			return;
 		}
+	}
+	if (!db.ExtensionIsLoaded("httpfs")) {
+		return;
+	}
 
-		// Auto-loading httpfs is synchronous and can download an extension, so it is
-		// only safe where the caller can afford to block (extension load). On ATTACH
-		// the caller passes DISALLOW and we drop the event rather than stall it; only
-		// the POST below is backgrounded, so anything above it is on the critical path.
-		if (autoload == QueryFarmHttpfsAutoload::ALLOW)
-		{
-			try
-			{
-				ExtensionHelper::TryAutoLoadExtension(*db, "httpfs");
-			}
-			catch (...)
-			{
-				return;
-			}
-		}
+	// Everything from here on is best-effort. Resolving HTTP parameters can throw
+	// (for example, HTTPParams::Initialize rejects an http_proxy value it cannot
+	// parse); none of that may fail the caller.
+	try {
+		// Resolve settings, proxy, and secrets on the calling thread, so the worker
+		// touches nothing but the HTTP client. Bound the request so a stalled
+		// connection cannot hold up database shutdown (or process exit) for long,
+		// and never retry -- a dropped ping is not worth one. Note that the httplib
+		// client applies this separately to connect, write and read, so the real
+		// bound is a small multiple of it; curl applies it as a total.
+		auto &http_util = HTTPUtil::Get(db);
+		unique_ptr<HTTPParams> params = http_util.InitializeParameters(db, target_url);
+		params->timeout = 3;
+		params->timeout_usec = 0;
+		params->retries = 0;
 
-		if (!db->ExtensionIsLoaded("httpfs"))
-		{
+		// Construct the client on the calling thread as well. Besides keeping the
+		// worker minimal, this is what initialises curl/OpenSSL (and registers
+		// OpenSSL's atexit cleanup) before we register our own exit handler below,
+		// which is what guarantees ours runs first. No network I/O happens here.
+		string path, proto_host_port;
+		HTTPUtil::DecomposeURL(target_url, path, proto_host_port);
+		auto client = http_util.InitializeClient(*params, proto_host_port);
+		if (!client) {
 			return;
 		}
 
 #ifndef __EMSCRIPTEN__
-		// Backgrounded so the caller does not wait on the HTTP request. Deliberately
-		// not std::async: the future it returns has a blocking destructor.
-		//
-		// The thread borrows the database instead of owning it. Owning it kept the
-		// database alive past the host's close, so the host reached exit() with the
-		// request still in flight and static destructors ran underneath it. Instead the
-		// database's teardown waits for the request (TelemetryDrain).
-		shared_ptr<QueryFarmInFlight> flights;
-		try
-		{
-			auto drain = db->GetObjectCache().GetOrCreate<TelemetryDrain>(TelemetryDrain::ObjectType());
-			if (!drain)
-			{
-				return;
-			}
-			flights = drain->flights;
-		}
-		catch (...)
-		{
+		QueryFarmTelemetryRegistry::Get().EnsureAtExitHandler();
+
+		auto workers = db.GetObjectCache().GetOrCreate<QueryFarmTelemetryWorkers>(
+		    QueryFarmTelemetryWorkers::CacheKey(extension_name));
+		if (!workers) {
 			return;
 		}
-		if (!flights->TryBegin())
-		{
-			return;
-		}
-		DatabaseInstance *db_raw = db.get();
-		try
-		{
-			std::thread([db_raw, flights, url = target_url, body = json]()
-						{
-				try
-				{
-					PostJson(*db_raw, url, body);
-				}
-				catch (...)
-				{
-				}
-				flights->End(); })
-					.detach();
-		}
-		catch (...)
-		{
-			flights->End();
-		}
+		workers->Add(make_uniq<QueryFarmTelemetryWorker>(std::move(params), std::move(client), target_url, body));
 #else
-		PostJson(*db, target_url, json);
+		SendTelemetryRequest(*params, client, target_url, body);
 #endif
+	} catch (...) {
+		// Telemetry must never affect the caller.
 	}
+}
 
-	// Serialize `doc` (taking ownership — always freed) and hand off to the
-	// JSON transport above.
-	INTERNAL_FUNC void QueryFarmSendEventDoc(shared_ptr<DatabaseInstance> db, const string &target_url,
-																					 duckdb_yyjson::yyjson_mut_doc *doc, QueryFarmHttpfsAutoload autoload)
-	{
-		if (doc == nullptr)
-		{
-			return;
-		}
-		size_t len = 0;
-		auto data = yyjson_mut_val_write_opts(yyjson_mut_doc_get_root(doc), YYJSON_WRITE_ALLOW_INF_AND_NAN, NULL, &len,
-																					nullptr);
-		string body;
-		if (data != nullptr)
-		{
-			body.assign(data, len);
-			free(data);
-		}
-		yyjson_mut_doc_free(doc);
-		QueryFarmSendEventJson(std::move(db), target_url, body, autoload);
+string SerializeAndFree(yyjson_mut_doc *doc) {
+	size_t len = 0;
+	auto data = yyjson_mut_val_write_opts(yyjson_mut_doc_get_root(doc), YYJSON_WRITE_ALLOW_INF_AND_NAN, NULL, &len,
+	                                      nullptr);
+	yyjson_mut_doc_free(doc);
+	if (data == nullptr) {
+		throw SerializationException("Failed to serialize telemetry data.");
 	}
+	string body(data, len);
+	free(data);
+	return body;
+}
 
-	INTERNAL_FUNC void QueryFarmAddBaseEnvelope(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *obj,
-																							const string &extension_name, const string &extension_version)
-	{
-		// The 7 shared fields present on every Query.Farm telemetry event. Strings
-		// are referenced (not copied); callers must keep the sources alive until the
-		// doc is serialized (QueryFarmSendEventDoc serializes synchronously).
-		yyjson_mut_obj_add_strcpy(doc, obj, "extension_name", extension_name.c_str());
-		yyjson_mut_obj_add_strcpy(doc, obj, "extension_version", extension_version.c_str());
-		yyjson_mut_obj_add_str(doc, obj, "user_agent", "query-farm/20260201");
-		yyjson_mut_obj_add_strcpy(doc, obj, "duckdb_platform", DuckDB::Platform().c_str());
-		yyjson_mut_obj_add_str(doc, obj, "duckdb_library_version", DuckDB::LibraryVersion());
-		yyjson_mut_obj_add_str(doc, obj, "duckdb_release_codename", DuckDB::ReleaseCodename());
-		yyjson_mut_obj_add_str(doc, obj, "duckdb_source_id", DuckDB::SourceID());
-	}
+} // namespace
 
-	INTERNAL_FUNC void QueryFarmSendTelemetry(ExtensionLoader &loader, const string &extension_name,
-																						const string &extension_version)
-	{
-		// The extension-load ping: exactly the 7 base fields, unchanged. Transport,
-		// opt-out, and httpfs handling all live in QueryFarmSendEventDoc now.
+INTERNAL_FUNC void QueryFarmAddBaseEnvelope(yyjson_mut_doc *doc, yyjson_mut_val *obj, const string &extension_name,
+                                            const string &extension_version) {
+	yyjson_mut_obj_add_strcpy(doc, obj, "extension_name", extension_name.c_str());
+	yyjson_mut_obj_add_strcpy(doc, obj, "extension_version", extension_version.c_str());
+	yyjson_mut_obj_add_str(doc, obj, "user_agent", "query-farm/20260201");
+	yyjson_mut_obj_add_strcpy(doc, obj, "duckdb_platform", DuckDB::Platform().c_str());
+	yyjson_mut_obj_add_str(doc, obj, "duckdb_library_version", DuckDB::LibraryVersion());
+	yyjson_mut_obj_add_str(doc, obj, "duckdb_release_codename", DuckDB::ReleaseCodename());
+	yyjson_mut_obj_add_str(doc, obj, "duckdb_source_id", DuckDB::SourceID());
+}
+
+INTERNAL_FUNC void QueryFarmSendEventJson(DatabaseInstance &db, const string &extension_name,
+                                          const string &target_url, const string &json,
+                                          QueryFarmHttpfsAutoload autoload) {
+	SendEvent(db, extension_name, target_url, json, autoload);
+}
+
+INTERNAL_FUNC void QueryFarmSendTelemetry(ExtensionLoader &loader, const string &extension_name,
+                                          const string &extension_version) {
+	string body;
+	try {
 		auto doc = yyjson_mut_doc_new(nullptr);
-		auto result_obj = yyjson_mut_obj(doc);
-		yyjson_mut_doc_set_root(doc, result_obj);
-		QueryFarmAddBaseEnvelope(doc, result_obj, extension_name, extension_version);
-
-		// ALLOW: this is extension-load time, already an initialization path, so a
-		// one-time synchronous httpfs auto-load is acceptable here (and is how this
-		// ping has always reached httpfs). ATTACH makes the opposite choice.
-		const string TARGET_URL("https://duckdb-in.query-farm.services/");
-		QueryFarmSendEventDoc(loader.GetDatabaseInstance().shared_from_this(), TARGET_URL, doc,
-													QueryFarmHttpfsAutoload::ALLOW);
+		auto obj = yyjson_mut_obj(doc);
+		yyjson_mut_doc_set_root(doc, obj);
+		QueryFarmAddBaseEnvelope(doc, obj, extension_name, extension_version);
+		body = SerializeAndFree(doc);
+	} catch (...) {
+		return;
 	}
+	// ALLOW: extension load is already an initialization path, so a one-time
+	// synchronous httpfs auto-load is acceptable here.
+	SendEvent(loader.GetDatabaseInstance(), extension_name, TELEMETRY_URL, body, QueryFarmHttpfsAutoload::ALLOW);
+}
 
 } // namespace duckdb
