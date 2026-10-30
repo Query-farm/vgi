@@ -102,18 +102,6 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	}
 
 	if (eager_path) {
-		try {
-			vgi::NativeColumnEvaluationContext(context);
-		} catch (const InvalidInputException &) {
-			// Importing neighboring defaults/generated expressions can bind or
-			// evaluate them. In an unsupported context, fetch just the requested
-			// table so a plain scan does not depend on those unrelated columns.
-			// A requested expression-bearing table retains its normal guards.
-			eager_path = false;
-		}
-	}
-
-	if (eager_path) {
 		// Bulk fetch outside the lock. LoadEntries() is implemented to do
 		// the RPC + CreateEntryLocked() under the assumption it's already
 		// holding entry_lock_; here we re-implement that with explicit

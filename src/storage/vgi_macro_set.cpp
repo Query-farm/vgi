@@ -136,10 +136,9 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 }
 
 optional_ptr<CatalogEntry> VgiMacroSet::GetEntry(ClientContext &context, const std::string &name) {
-	auto entry = VgiCatalogSet::GetEntry(context, name);
-	if (entry)
-		vgi::RequireNativeMacroContext(context);
-	return entry;
+	// Macro bodies bind and run under the caller's session settings, exactly
+	// like native DuckDB macros; no session-context gate applies here.
+	return VgiCatalogSet::GetEntry(context, name);
 }
 
 } // namespace duckdb

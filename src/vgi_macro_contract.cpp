@@ -299,12 +299,6 @@ VgiMacroInfo ParseMacroInfo(const VgiBatchPtr &batch, const std::string &worker_
 	return info;
 }
 
-void RequireNativeMacroContext(ClientContext &context) {
-	// The same bounded context qualification is needed at invocation, including
-	// cache hits: macro bodies bind when called, not when their metadata arrives.
-	NativeColumnEvaluationContext(context);
-}
-
 LogicalType NativeMacroParameterType(ClientContext &context, const VgiMacroParameter &parameter) {
 	if (!parameter.declared_type)
 		return LogicalType::UNKNOWN;

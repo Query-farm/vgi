@@ -19,7 +19,11 @@ inline constexpr const char *VGI_COLUMN_GENERATION = "vgi.column.generation.v1";
 // Keep engine-generated literals and validated built-in casts independent of caller search paths.
 void QualifyNativeBuiltinType(TypeExpression &type);
 unique_ptr<ParsedExpression> NativeLiteralExpression(const Value &value);
-VgiQueryEvaluationContext NativeColumnEvaluationContext(ClientContext &context);
+// The session's evaluation context, when it equals the default context a worker
+// evaluates pushed-down expressions under; throws otherwise. Only work that runs
+// on the worker (projection pushdown) needs this: macros, defaults and generated
+// columns are bound and evaluated locally under the session, like native DuckDB.
+VgiQueryEvaluationContext PushdownEvaluationContext(ClientContext &context);
 std::vector<uint8_t> BuildNativeColumnExpression(const std::string &sql, const std::string &schema_name,
                                                  const VgiQueryEvaluationContext &context, bool using_expression);
 std::vector<uint8_t> BuildNativeGeneratedExpression(const std::string &sql, const std::string &schema_name,

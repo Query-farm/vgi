@@ -171,13 +171,13 @@ VgiSchemaPtr DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList
 		}
 		if (col.Generated()) {
 			auto expression = BuildNativeGeneratedExpression(col.GeneratedExpression().ToString(), owner_schema,
-			                                                 NativeColumnEvaluationContext(context));
+			                                                 VgiQueryEvaluationContext());
 			metadata.Append(VGI_COLUMN_GENERATED, EncodeNativeColumnDefaultMetadata(expression));
 			metadata.Append(VGI_COLUMN_GENERATION, "virtual");
 		}
 		if (col.HasDefaultValue()) {
 			auto expression = BuildNativeColumnExpression(col.DefaultValue().ToString(), owner_schema,
-			                                              NativeColumnEvaluationContext(context), false);
+			                                              VgiQueryEvaluationContext(), false);
 			metadata.Append(VGI_COLUMN_DEFAULT, EncodeNativeColumnDefaultMetadata(expression));
 		}
 		auto encoded_metadata = metadata.ToC();

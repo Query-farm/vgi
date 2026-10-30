@@ -11,8 +11,8 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-# Metadata import must not reject unrelated lookups in a nondefault context.
-# Invoking a provider macro still requires its declared evaluation context.
+# Provider macros bind and run under the caller's session settings, like native
+# DuckDB macros: a nondefault context must not reject them.
 statement ok
 PRAGMA default_collation='NOCASE';
 
@@ -22,10 +22,10 @@ WHERE database_name = 'example' AND function_type = 'macro';
 ----
 2
 
-statement error
+query I
 SELECT example.main.vgi_multiply(2, 3);
 ----
-native adapter supports only the default explicit evaluation context
+6
 
 statement ok
 PRAGMA default_collation='binary';

@@ -253,11 +253,12 @@ SELECT count(*) FROM v_echo WHERE s = 'ROW_5';
 ----
 1
 
-# Context-sensitive generated columns still reject an unsupported context.
-statement error
-SELECT * FROM example.data.generated_sequence;
+# Generated columns are evaluated locally under the session context.
+query IIT
+SELECT * FROM example.data.generated_sequence ORDER BY n LIMIT 2;
 ----
-native adapter supports only the default explicit evaluation context
+0	0	item_0
+1	2	item_1
 
 # ============================================================================
 # Cleanup

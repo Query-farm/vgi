@@ -384,8 +384,6 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	const bool generated_columns = GetColumns().PhysicalColumnCount() != GetColumns().LogicalColumnCount();
-	if (generated_columns)
-		vgi::NativeColumnEvaluationContext(context);
 	// The worker scan contains only physical fields, including any hidden rowid.
 	auto worker_column = [&](int declared_index) {
 		int physical = 0;

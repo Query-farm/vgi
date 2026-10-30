@@ -638,7 +638,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		}
 		if (change_type.expression && !ordinary_cast) {
 			expression = vgi::BuildNativeColumnExpression(change_type.expression->ToString(), schema_name,
-			                                              vgi::NativeColumnEvaluationContext(context), true);
+			                                              vgi::VgiQueryEvaluationContext(), true);
 		}
 		vgi::InvokeCatalogTableColumnTypeChange(rpc_ctx, schema_name, table_name, col_schema, expression, context);
 		break;
@@ -650,7 +650,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		if (set_def.expression) {
 			// SET DEFAULT
 			auto expression = vgi::BuildNativeColumnExpression(set_def.expression->ToString(), schema_name,
-			                                                   vgi::NativeColumnEvaluationContext(context), false);
+			                                                   vgi::VgiQueryEvaluationContext(), false);
 			vgi::InvokeCatalogTableColumnDefaultSet(rpc_ctx, schema_name, table_name,
 			                                        set_def.column_path[0].GetIdentifierName(), expression, context);
 		} else {

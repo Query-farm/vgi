@@ -195,17 +195,29 @@ SELECT id, temperature FROM w.main.expression_values ORDER BY id;
 2	NULL
 3	7
 
-# Unsupported context and effects must not replace the durable prior default.
+# A nondefault session context does not block DDL: the expression is recorded
+# under the default declared context.
 statement ok
 SET default_order='desc';
 
-statement error
+statement ok
 ALTER TABLE w.main.expression_values ALTER COLUMN temperature SET DEFAULT 99;
+
+statement ok
+INSERT INTO w.main.expression_values (id) VALUES (10);
+
+query II
+SELECT id, temperature FROM w.main.expression_values WHERE id = 10;
 ----
-default explicit evaluation context
+10	99
+
+statement ok
+ALTER TABLE w.main.expression_values ALTER COLUMN temperature SET DEFAULT abs(-7);
 
 statement ok
 SET default_order='asc';
+
+# Unsupported effects must not replace the durable prior default.
 
 statement error
 ALTER TABLE w.main.expression_values ALTER COLUMN temperature SET DEFAULT random();

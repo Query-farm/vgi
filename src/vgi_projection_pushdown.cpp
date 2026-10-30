@@ -175,7 +175,7 @@ private:
 		}
 		VgiQueryEvaluationContext context;
 		try {
-			context = NativeColumnEvaluationContext(input.context);
+			context = PushdownEvaluationContext(input.context);
 		} catch (const InvalidInputException &error) {
 			VGI_LOG(input.context, "projection.decline", {{"reason", "context"}, {"detail", error.what()}});
 			return;

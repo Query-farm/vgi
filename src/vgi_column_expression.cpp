@@ -239,7 +239,7 @@ unique_ptr<ParsedExpression> NativeLiteralExpression(const Value &value) {
 	return result;
 }
 
-VgiQueryEvaluationContext NativeColumnEvaluationContext(ClientContext &context) {
+VgiQueryEvaluationContext PushdownEvaluationContext(ClientContext &context) {
 	VgiQueryEvaluationContext result;
 	auto setting = [&](const char *name) {
 		Value value;
@@ -351,7 +351,6 @@ void ValidateNativeGeneratedColumns(ClientContext &context, const ColumnList &co
 		generated = generated || column.Generated();
 	if (!generated)
 		return;
-	NativeColumnEvaluationContext(context);
 	Require(columns.PhysicalColumnCount() > 0, "generated table requires a physical column");
 	ColumnDependencyManager dependencies;
 	vector<Identifier> names;
@@ -433,7 +432,6 @@ unique_ptr<ParsedExpression> BindNativeColumnDefault(ClientContext &context, con
 	auto expression = ReadNativeColumnDefault(field, schema_name);
 	if (!expression)
 		return nullptr;
-	NativeColumnEvaluationContext(context);
 	auto binder = Binder::CreateBinder(context);
 	ConstantBinder constants(*binder, context, "VGI column default");
 	constants.target_type = target_type;

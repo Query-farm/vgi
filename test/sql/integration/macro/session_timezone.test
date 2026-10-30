@@ -1,0 +1,63 @@
+# name: test/sql/integration/macro/session_timezone.test
+# description: Provider macros, generated columns and defaults work in a non-UTC session
+# group: [vgi_integration_macro]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require icu
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Regression: any non-UTC session (every desktop outside UTC) failed every
+# provider macro call with "native adapter supports only the default explicit
+# evaluation context". Macros, generated columns and defaults run locally under
+# the session's TimeZone, like native DuckDB objects.
+
+statement ok
+SET TimeZone='America/New_York';
+
+statement ok
+CALL vgi_clear_cache();
+
+query I
+SELECT example.main.vgi_multiply(2, 3);
+----
+6
+
+query IIT
+SELECT * FROM example.data.generated_sequence ORDER BY n LIMIT 3;
+----
+0	0	item_0
+1	2	item_1
+2	4	item_2
+
+query TT
+SELECT column_name, column_default
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'products'
+  AND column_default IS NOT NULL
+ORDER BY column_name;
+----
+name	'unknown'
+price	9.99
+quantity	0
+
+statement ok
+SET TimeZone='Asia/Kolkata';
+
+statement ok
+CALL vgi_clear_cache();
+
+query I
+SELECT example.main.vgi_multiply(4, 5);
+----
+20
+
+statement ok
+RESET TimeZone;

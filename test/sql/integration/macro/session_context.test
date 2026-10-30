@@ -1,0 +1,61 @@
+# name: test/sql/integration/macro/session_context.test
+# description: Provider macros, generated columns and defaults work under nondefault session settings
+# group: [vgi_integration_macro]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Regression: the native adapter refused every provider macro, generated column
+# and default unless the session matched the default evaluation context (UTC,
+# binary collation, ASC NULLS LAST). These bind locally under the session's
+# settings, like native DuckDB objects. session_timezone.test covers TimeZone.
+
+statement ok
+PRAGMA default_collation='NOCASE';
+
+statement ok
+SET default_order='desc';
+
+statement ok
+SET default_null_order='nulls_first';
+
+statement ok
+CALL vgi_clear_cache();
+
+query I
+SELECT example.main.vgi_multiply(4, 5);
+----
+20
+
+query I
+SELECT n FROM example.data.generated_sequence WHERE doubled > 10 ORDER BY n ASC LIMIT 2;
+----
+6
+7
+
+query TT
+SELECT column_name, column_default
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'products'
+  AND column_default IS NOT NULL
+ORDER BY column_name ASC;
+----
+name	'unknown'
+price	9.99
+quantity	0
+
+statement ok
+RESET default_null_order;
+
+statement ok
+RESET default_order;
+
+statement ok
+PRAGMA default_collation='binary';
