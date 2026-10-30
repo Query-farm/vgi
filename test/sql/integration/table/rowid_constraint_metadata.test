@@ -1,25 +1,76 @@
 # name: test/sql/integration/table/rowid_constraint_metadata.test
-# description: Worker constraint metadata naming the row_id column is bad input, not a fatal error
+# description: Only ENFORCED + ALL_ROWS constraint records attach; rowid keys and METADATA_ONLY records are bad input, not fatal errors
 # group: [vgi_integration_table]
 
-# test/support/rowid_constraint_worker.py declares:
-#   items               PRIMARY KEY (rowid)
-#   items_no_returning  PRIMARY KEY (id, rowid), UNIQUE (rowid, name)
-# The client used to raise an InternalException from GetStorageInfo for these,
-# and because duckdb_tables() calls it for every table, listing tables
-# invalidated the whole database.
+# test/support/rowid_constraint_worker.py serves the simple_writable tables with
+# a different set of constraint records per catalog name:
+#   enforced_keys       items PRIMARY KEY (id)
+#                       items_no_returning PRIMARY KEY (id), UNIQUE (name)
+#   rowid_keys          items PRIMARY KEY (rowid)
+#                       items_no_returning PRIMARY KEY (id, rowid), UNIQUE (rowid, name)
+#   metadata_only_keys  items PRIMARY KEY (id), METADATA_ONLY / UNVALIDATED
+# Every record except METADATA_ONLY is ENFORCED + ALL_ROWS. Informational
+# (METADATA_ONLY) constraints are not supported. The fixture serves its records
+# unvalidated so these assertions exercise the extension's own checks.
 
 require-env VGI_ROWID_CONSTRAINT_WORKER
 
 require vgi
 
-statement ok
-ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_ROWID_CONSTRAINT_WORKER}');
+# --- Supported: ENFORCED + ALL_ROWS keys over user columns ------------------
 
+statement ok
+ATTACH 'enforced_keys' AS e (TYPE vgi, LOCATION '${VGI_ROWID_CONSTRAINT_WORKER}');
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'e' ORDER BY 1;
+----
+items
+items_broken_returning
+items_insert_only
+items_no_returning
+
+query TTT
+SELECT table_name, constraint_type, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'e' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+ORDER BY 1, 2;
+----
+items	PRIMARY KEY	[id]
+items_no_returning	PRIMARY KEY	[id]
+items_no_returning	UNIQUE	[name]
+
+# The rowid pseudocolumn is not a user column, so no key can name it.
+query T
+SELECT column_name FROM duckdb_columns()
+WHERE database_name = 'e' AND table_name = 'items' ORDER BY column_index;
+----
+id
+name
+qty
+
+query I
+SELECT count(*) FROM e.main.items;
+----
+0
+
+query II
+SELECT count(rowid), count(id) FROM e.main.items_no_returning;
+----
+0	0
+
+# --- Keys naming the rowid column are rejected ------------------------------
+
+statement ok
+ATTACH 'rowid_keys' AS w (TYPE vgi, LOCATION '${VGI_ROWID_CONSTRAINT_WORKER}');
+
+# The client used to raise an InternalException from GetStorageInfo for these,
+# and because duckdb_tables() calls it for every table, listing tables
+# invalidated the whole database.
 statement error
 SELECT table_name FROM duckdb_tables() WHERE database_name = 'w' ORDER BY 1;
 ----
-constraint paths cannot address storage identities
+VGI constraint protocol: constraint references a missing, ambiguous, or synthetic column
 
 # Rejection is an ordinary input error and must not invalidate the database.
 query I
@@ -27,20 +78,35 @@ SELECT 42;
 ----
 42
 
-# Canonical constraints preserve their exact raw paths. Neither an all-rowid
-# key nor a mixed user-column/rowid key may become a partial SQL key.
+# Neither an all-rowid key nor a mixed user-column/rowid key may become a
+# partial SQL key.
 statement error
 SELECT * FROM w.main.items;
 ----
-constraint paths cannot address storage identities
+VGI constraint protocol: constraint references a missing, ambiguous, or synthetic column
 
 statement error
 SELECT * FROM w.main.items_no_returning;
 ----
-constraint paths cannot address storage identities
+VGI constraint protocol: constraint references a missing, ambiguous, or synthetic column
 
-# The database is still usable.
+# --- METADATA_ONLY (informational) records are rejected ---------------------
+
+statement ok
+ATTACH 'metadata_only_keys' AS m (TYPE vgi, LOCATION '${VGI_ROWID_CONSTRAINT_WORKER}');
+
+statement error
+SELECT * FROM m.main.items;
+----
+VGI constraint protocol: native constraints require ENFORCED + ALL_ROWS
+
+# The database, and the supported attachment, are still usable.
 query I
 SELECT 42;
 ----
 42
+
+query I
+SELECT count(*) FROM e.main.items;
+----
+0
