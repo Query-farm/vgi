@@ -8,6 +8,11 @@
 #include "catch.hpp"
 
 #include "vgi_telemetry.hpp"
+#include "query_farm_inflight.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 using duckdb::vgi::VgiClassifyTransport;
 using duckdb::vgi::VgiMapHostKind;
@@ -77,4 +82,31 @@ TEST_CASE("VgiMapHostKind buckets the duckdb_api value", "[telemetry]") {
 	CHECK(VgiMapHostKind("duckdb-java/1.0") == "jdbc");
 	CHECK(VgiMapHostKind("") == "other");
 	CHECK(VgiMapHostKind("something-else") == "other");
+}
+
+// Regression: telemetry POSTs ran on detached threads that owned the database, so a
+// host could reach exit() with one still inside curl and abort with "mutex lock
+// failed: Invalid argument". The database's teardown now drains them.
+TEST_CASE("QueryFarmInFlight drain waits for in-flight requests", "[telemetry]") {
+	duckdb::QueryFarmInFlight flights;
+	REQUIRE(flights.TryBegin());
+	REQUIRE(flights.InFlight() == 1);
+
+	std::atomic<bool> ended {false};
+	std::thread request([&] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		ended = true;
+		flights.End();
+	});
+	flights.Drain();
+	CHECK(ended.load());
+	CHECK(flights.InFlight() == 0);
+	request.join();
+}
+
+TEST_CASE("QueryFarmInFlight refuses requests once draining", "[telemetry]") {
+	duckdb::QueryFarmInFlight flights;
+	flights.Drain(); // nothing in flight: returns at once
+	CHECK_FALSE(flights.TryBegin());
+	CHECK(flights.InFlight() == 0);
 }

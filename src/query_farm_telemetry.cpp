@@ -1,11 +1,14 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "query_farm_telemetry.hpp"
+#include "query_farm_inflight.hpp"
 #include <thread>
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "yyjson.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/storage/object_cache.hpp"
+#include <cstdint>
 #include <cstdlib>
 using namespace duckdb_yyjson; // NOLINT
 
@@ -16,16 +19,16 @@ namespace duckdb
 	{
 
 		// Synchronous POST of a JSON body to target_url. Errors ignored (best-effort).
-		void PostJson(shared_ptr<DatabaseInstance> db, const string &target_url, const string &body)
+		void PostJson(DatabaseInstance &db, const string &target_url, const string &body)
 		{
 			HTTPHeaders headers;
 			headers.Insert("Content-Type", "application/json");
 
-			auto &http_util = HTTPUtil::Get(*db);
-			unique_ptr<HTTPParams> params = http_util.InitializeParameters(*db, target_url);
-			// Telemetry is best-effort: bound the request so a stalled connection cannot
-			// keep the detached thread alive. No retries -- a dropped ping is not worth one.
-			params->timeout = 10;
+			auto &http_util = HTTPUtil::Get(db);
+			unique_ptr<HTTPParams> params = http_util.InitializeParameters(db, target_url);
+			// Telemetry is best-effort: bound the request, because closing the database
+			// waits for it (see TelemetryDrain). No retries -- a dropped ping is not worth one.
+			params->timeout = 5;
 			params->retries = 0;
 
 			PostRequestInfo post_request(target_url, headers, *params, reinterpret_cast<const_data_ptr_t>(body.data()),
@@ -39,6 +42,40 @@ namespace duckdb
 				// ignore all errors.
 			}
 		}
+
+		// Lives in the database's object cache, so ~DatabaseInstance destroys it early in teardown, while
+		// HTTPUtil, the logger and the scheduler are still alive. Its destructor waits for this database's
+		// telemetry requests, so a request never outlives the database it borrows -- and, because hosts close
+		// their databases before returning from main, never runs into exit()'s static destructors.
+		//
+		// This file is compiled into several Query.Farm extensions, each with its own copy of this class, so
+		// the cache key carries an address that is unique to this copy.
+		class TelemetryDrain : public ObjectCacheEntry
+		{
+		public:
+			~TelemetryDrain() override
+			{
+				flights->Drain();
+			}
+
+			static string ObjectType()
+			{
+				static const string type = "query_farm_telemetry_drain@" +
+																	 std::to_string(reinterpret_cast<uintptr_t>(&TelemetryDrain::ObjectType));
+				return type;
+			}
+			string GetObjectType() override
+			{
+				return ObjectType();
+			}
+			// Not evictable: eviction would drain at an arbitrary time and drop the teardown guarantee.
+			optional_idx GetEstimatedCacheMemory() const override
+			{
+				return optional_idx();
+			}
+
+			shared_ptr<QueryFarmInFlight> flights = make_shared_ptr<QueryFarmInFlight>();
+		};
 
 	} // namespace
 
@@ -77,13 +114,52 @@ namespace duckdb
 		}
 
 #ifndef __EMSCRIPTEN__
-		// Fire-and-forget. Deliberately not std::async: the future it returns has a
-		// blocking destructor, which would make the caller wait on this HTTP request.
-		std::thread([db_ptr = std::move(db), url = target_url, body = json]() mutable
-					{ PostJson(std::move(db_ptr), url, body); })
-				.detach();
+		// Backgrounded so the caller does not wait on the HTTP request. Deliberately
+		// not std::async: the future it returns has a blocking destructor.
+		//
+		// The thread borrows the database instead of owning it. Owning it kept the
+		// database alive past the host's close, so the host reached exit() with the
+		// request still in flight and static destructors ran underneath it. Instead the
+		// database's teardown waits for the request (TelemetryDrain).
+		shared_ptr<QueryFarmInFlight> flights;
+		try
+		{
+			auto drain = db->GetObjectCache().GetOrCreate<TelemetryDrain>(TelemetryDrain::ObjectType());
+			if (!drain)
+			{
+				return;
+			}
+			flights = drain->flights;
+		}
+		catch (...)
+		{
+			return;
+		}
+		if (!flights->TryBegin())
+		{
+			return;
+		}
+		DatabaseInstance *db_raw = db.get();
+		try
+		{
+			std::thread([db_raw, flights, url = target_url, body = json]()
+						{
+				try
+				{
+					PostJson(*db_raw, url, body);
+				}
+				catch (...)
+				{
+				}
+				flights->End(); })
+					.detach();
+		}
+		catch (...)
+		{
+			flights->End();
+		}
 #else
-		PostJson(std::move(db), target_url, json);
+		PostJson(*db, target_url, json);
 #endif
 	}
 
