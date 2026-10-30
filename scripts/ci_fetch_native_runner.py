@@ -56,6 +56,12 @@ def package(source: Path, build: Path, output: Path, revision: str) -> None:
             raise RuntimeError(f"missing native build executable: {binary}")
         shutil.copy2(binary, output / name)
         hashes[name] = digest(output / name)
+        # The artifact is the bare executables: any shared library they need from
+        # the build tree (libhaybarn.so) is missing on the SDK runners, where the
+        # binary then fails to start and every test is silently skipped.
+        linked = command("ldd", str(output / name))
+        if "libhaybarn" in linked or "not found" in linked:
+            raise RuntimeError(f"{name} is not self-contained:\n{linked}")
     header = (source / "src/generated/vgi_protocol_version.hpp").read_text()
     version = re.search(r'VGI_PROTOCOL_VERSION\s*=\s*"([^"]+)"', header)
     if version is None:

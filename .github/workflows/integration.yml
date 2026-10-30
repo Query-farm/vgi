@@ -129,6 +129,10 @@ jobs:
           ./vcpkg/bootstrap-vcpkg.sh
 
       - name: Build the extension (release)
+        # The packaged SDK runner ships unittest alone, so it must not depend on
+        # libhaybarn.so (rc10 engine option; the shell already links statically).
+        env:
+          EXT_FLAGS: -DHAYBARN_STATIC_UNITTEST=1
         run: make release
 
       # SDKs changing the wire contract need the matching development client
