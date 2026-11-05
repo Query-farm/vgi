@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/v2.0' && github.sha || '' }}
   cancel-in-progress: true
 
 # jobs:
@@ -46,7 +46,7 @@ jobs:
       VCPKG_CACHING_AWS_SECRET_ACCESS_KEY: ${{ secrets.HAYBARN_BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
       VCPKG_CACHING_AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
     with:
-      duckdb_version: haybarn-v2.0.0-rc9
+      duckdb_version: haybarn-v2.0.0-rc10
       ci_tools_version: haybarn-2.0
       override_duckdb_repository: 'https://github.com/Query-farm-haybarn/haybarn'
       override_ci_tools_repository: 'Query-farm-haybarn/haybarn-extension-ci-tools'

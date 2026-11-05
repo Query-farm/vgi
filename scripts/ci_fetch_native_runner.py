@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 
 
 REPOSITORY = "Query-farm/vgi"
+DEFAULT_BRANCH = "v2.0"
 
 
 def command(*args: str) -> str:
@@ -81,7 +82,7 @@ def api(path: str) -> dict:
     return json.loads(command("gh", "api", path))
 
 
-def fetch(revision: str, output: Path, timeout: int, branch: str = "main") -> None:
+def fetch(revision: str, output: Path, timeout: int, branch: str = DEFAULT_BRANCH) -> None:
     artifact_name = "vgi-native-runner-" + platform_name()
     deadline = time.monotonic() + timeout
     run_id = None
@@ -153,8 +154,8 @@ def main() -> None:
     parser.add_argument("--build", type=Path, default=Path("build/release"))
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument(
-        "--branch", default=os.environ.get("VGI_NATIVE_RUNNER_BRANCH", "main"),
-        help="Branch that built the exact requested revision (default: main)",
+        "--branch", default=os.environ.get("VGI_NATIVE_RUNNER_BRANCH", DEFAULT_BRANCH),
+        help=f"Branch that built the exact requested revision (default: {DEFAULT_BRANCH})",
     )
     args = parser.parse_args()
     source = args.source.resolve()

@@ -21,7 +21,7 @@ class NativeArtifactTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.revision = "a" * 40
-        self.run = {"id": 7, "head_sha": self.revision, "head_branch": "main", "event": "push"}
+        self.run = {"id": 7, "head_sha": self.revision, "head_branch": "v2.0", "event": "push"}
         self.artifact = {"name": "vgi-native-runner-linux_amd64", "expired": False}
         self.bad_revision = False
         self.corrupt = False
@@ -46,14 +46,15 @@ class NativeArtifactTests(unittest.TestCase):
             (staging / "unittest").write_bytes(b"corrupt executable")
         return ""
 
-    def fetch(self, branch="main"):
+    def fetch(self, branch=None):
         with (
             patch.object(runner, "api", side_effect=self.api),
             patch.object(runner, "command", side_effect=self.download),
             patch.object(runner, "platform_name", return_value="linux_amd64"),
             patch.dict(os.environ, {"GITHUB_ENV": str(self.root / "environment")}),
         ):
-            runner.fetch(self.revision, self.root / "output", timeout=0, branch=branch)
+            options = {"branch": branch} if branch is not None else {}
+            runner.fetch(self.revision, self.root / "output", timeout=0, **options)
 
     def test_matching_build_exports_executable_paths(self):
         self.fetch()
