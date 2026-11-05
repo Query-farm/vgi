@@ -445,9 +445,15 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	//! ``vgi_split_scans`` setting, folded together at bind).
 	bool supports_splits = false;
 
-	//! Split tokens returned by ``plan()``, in the order the worker emitted them.
+	//! Splits returned by ``plan()``, in the order the worker emitted them.
 	//! Empty is legal and means "no work" — not an error.
-	std::vector<std::string> splits;
+	std::vector<VgiScanSplit> splits;
+
+	//! DuckDB SINGLE_VALUE_PARTITIONS data derived from protocol-3.1 split
+	//! key_value batches. Populated only after the plan grouping exactly matches
+	//! the bind-time annotated partition columns and every split value validates.
+	bool split_partition_data_enabled = false;
+	std::vector<duckdb::vector<ColumnPartitionData>> split_partition_data;
 
 	//! Next unclaimed split. Readers claim with ``fetch_add(1)``, which is what
 	//! makes greedy claiming self-balancing under unknown per-split cost: a fast
@@ -814,6 +820,9 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 	// (Uses ``duckdb::vector`` to match
 	// ``OperatorPartitionData::partition_data``'s type alias.)
 	duckdb::vector<ColumnPartitionData> current_partition_data;
+	//! True when current_partition_data came from this split's protocol-3.1
+	//! key_value rather than legacy per-data-batch metadata.
+	bool partition_data_from_split = false;
 
 	// Captured at init-local time; read by the destructor (which has no
 	// ClientContext available). Setting changes mid-query do not

@@ -8,6 +8,8 @@
 # handed to it, so one-split-per-partition is the common shape rather than a
 # contrived one.
 #
+# Protocol 3.1 carries the exact partition tuple once on ScanSplit.key_value;
+# this fixture deliberately omits legacy per-data-batch partition metadata.
 # What needs asserting is that the two survive each other. Splits are claimed
 # greedily, in an order nobody chose, by readers that each end up holding several
 # — so the association between a batch and the partition value it carries has to

@@ -1790,6 +1790,11 @@ static bool DrainSubstreamToWriter(CachedStream &s, VgiCaptureDiskWriter &w) {
 static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCtx &cap,
                                           const VgiResultCacheEntry &meta, bool allow_disk);
 
+static void InstallProtocolSplitPartitionData(ClientContext &context,
+                                              const VgiTableFunctionBindData &bind_data,
+                                              const VgiScanPlan &plan,
+                                              VgiTableFunctionGlobalState &global_state);
+
 // Commit a completed capture to the result cache. Called from the gstate
 // destructor. Enforces the never-partial invariant: only commits when the full
 // result was drained (every launched local state reached EOS) and the worker
@@ -2470,6 +2475,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		                                    bind_data.bind_result.opaque_data, projection_ids, filter_bytes_vec,
 		                                    min_splits, target_split_bytes, bind_data.function_name, context);
 
+		InstallProtocolSplitPartitionData(context, bind_data, plan, *global_state);
 		global_state->splits = std::move(plan.splits);
 		if (plan.max_workers > 0) {
 			global_state->max_processes = static_cast<idx_t>(plan.max_workers);
@@ -3088,7 +3094,7 @@ static bool SameDataType(const ArrowSchema &a, const ArrowSchema &b) {
 	return !a.dictionary || SameDataType(*a.dictionary, *b.dictionary);
 }
 
-//! Convert a 2-row batch carrying ``(min, max)`` per
+//! Convert a 1-row exact-value or 2-row ``(min, max)`` batch per
 //! partition column into a ``vector<ColumnPartitionData>`` via the
 //! established VGI Arrow-conversion machinery (the same path
 //! ``VgiTableFunctionScan`` uses for data batches —
@@ -3111,8 +3117,10 @@ static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
 	vector<LogicalType> types;
 	vector<string> names;
 	ArrowSchemaToDuckDBTypes(context, pv_batch->schema(), c_schema, arrow_table, types, names);
+	const idx_t row_count = static_cast<idx_t>(pv_batch->num_rows());
+	D_ASSERT(row_count == 1 || row_count == 2);
 
-	// Export the 2-row record batch to the Arrow C ABI and stash it on
+	// Export the record batch to the Arrow C ABI and stash it on
 	// a local scan state — the same shape ``VgiTableFunctionScan`` uses
 	// for the main data batch (vgi_table_function_impl.cpp:1757).
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
@@ -3121,25 +3129,112 @@ static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
 	ArrowScanLocalState local_scan_state(std::move(chunk_wrapper), context);
 	local_scan_state.chunk_offset = 0;
 
-	// Convert into a 2-row DataChunk via DuckDB's standard Arrow path.
+	// Convert into a DataChunk via DuckDB's standard Arrow path.
 	DataChunk chunk;
-	chunk.Initialize(Allocator::DefaultAllocator(), types, 2);
-	chunk.SetCardinality(2);
+	chunk.Initialize(Allocator::DefaultAllocator(), types, row_count);
+	chunk.SetCardinality(row_count);
 	ArrowTableFunction::ArrowToDuckDB(local_scan_state, arrow_table.GetColumns(), chunk,
 	                                  /*arrow_scan_is_projected=*/false,
 	                                  COLUMN_IDENTIFIER_ROW_ID);
 
-	// Row 0 = min, row 1 = max per column. Pull as ``Value`` and
+	// Row 0 = min; the last row is max. A one-row exact key therefore
+	// naturally becomes min == max. Pull as ``Value`` and
 	// build the ``ColumnPartitionData`` vector.
 	duckdb::vector<ColumnPartitionData> out;
 	out.reserve(chunk.ColumnCount());
 	for (idx_t col = 0; col < chunk.ColumnCount(); ++col) {
 		Value min_val = chunk.GetValue(col, 0);
-		Value max_val = chunk.GetValue(col, 1);
+		Value max_val = chunk.GetValue(col, row_count - 1);
 		out.emplace_back(std::move(min_val));
 		out.back().max_val = std::move(max_val);
 	}
 	return out;
+}
+
+//! Bridge protocol 3.1's exact split keys into DuckDB 2.0's bind-time
+//! SINGLE_VALUE_PARTITIONS interface. The optimizer declaration itself still
+//! comes only from Meta.partition_kind + annotated fields: PlanResponse arrives
+//! after physical planning and cannot safely introduce that declaration.
+static void InstallProtocolSplitPartitionData(ClientContext &context,
+                                              const VgiTableFunctionBindData &bind_data,
+                                              const VgiScanPlan &plan,
+                                              VgiTableFunctionGlobalState &global_state) {
+	if (bind_data.partition_kind != VgiPartitionKind::SingleValuePartitions ||
+	    !plan.identity_key_columns.has_value()) {
+		return;
+	}
+
+	const auto &declared_indices = bind_data.partition_column_indices;
+	const auto &bind_schema = bind_data.bind_result.output_schema;
+	const auto &grouping_columns = *plan.identity_key_columns;
+	if (grouping_columns.size() != declared_indices.size()) {
+		return;
+	}
+	for (idx_t i = 0; i < declared_indices.size(); ++i) {
+		if (grouping_columns[i] != bind_schema->field_name(static_cast<int>(declared_indices[i]))) {
+			return;
+		}
+	}
+
+	auto violation = [&]() {
+		return ErrorInfo(error_subtype::kProtocolViolation)
+		    .Rpc("table_function_plan")
+		    .Function(bind_data.function_name, "TABLE")
+		    .Worker(bind_data.worker_path());
+	};
+
+	std::vector<duckdb::vector<ColumnPartitionData>> values;
+	values.reserve(plan.splits.size());
+	for (idx_t split_index = 0; split_index < plan.splits.size(); ++split_index) {
+		const auto &split = plan.splits[split_index];
+		if (!split.key_value.has_value()) {
+			throw IOException(violation().Set(error_key::kField, "splits.key_value")
+			                      .Set(error_key::kColumnIndex, static_cast<int64_t>(split_index)),
+			                  "VGI function '%s' declared an exact key grouping but split %llu has no key_value",
+			                  bind_data.function_name, static_cast<unsigned long long>(split_index));
+		}
+
+		auto key_batch = DeserializeFromIpcBytes(*split.key_value, GetWorkerBatchValidation(&context));
+		if (!key_batch || key_batch->num_rows() != 1) {
+			const auto actual = key_batch ? key_batch->num_rows() : 0;
+			throw IOException(violation().Set(error_key::kField, "splits.key_value")
+			                      .Set(error_key::kColumnIndex, static_cast<int64_t>(split_index))
+			                      .ExpectedActual("1", std::to_string(actual)),
+			                  "VGI function '%s' split %llu key_value must contain exactly one row (got %lld)",
+			                  bind_data.function_name, static_cast<unsigned long long>(split_index),
+			                  static_cast<long long>(actual));
+		}
+		if (static_cast<idx_t>(key_batch->num_columns()) != declared_indices.size()) {
+			throw IOException(violation().Set(error_key::kField, "splits.key_value")
+			                      .Set(error_key::kColumnIndex, static_cast<int64_t>(split_index))
+			                      .ExpectedActual(std::to_string(declared_indices.size()),
+			                                      std::to_string(key_batch->num_columns())),
+			                  "VGI function '%s' split %llu key_value has %d columns; expected %llu",
+			                  bind_data.function_name, static_cast<unsigned long long>(split_index),
+			                  key_batch->num_columns(), static_cast<unsigned long long>(declared_indices.size()));
+		}
+		for (idx_t i = 0; i < declared_indices.size(); ++i) {
+			const int declared_idx = static_cast<int>(declared_indices[i]);
+			const auto &declared = bind_schema->field(declared_idx);
+			const auto &actual = key_batch->schema()->field(static_cast<int>(i));
+			const std::string declared_name = bind_schema->field_name(declared_idx);
+			if (!SameDataType(actual, declared)) {
+				const std::string declared_type = TypeToString(declared);
+				const std::string actual_type = TypeToString(actual);
+				throw IOException(violation().Set(error_key::kField, "splits.key_value")
+				                      .Set(error_key::kColumnIndex, static_cast<int64_t>(i))
+				                      .Set(error_key::kColumnName, declared_name)
+				                      .ExpectedActual(declared_type, actual_type),
+				                  "VGI function '%s' split %llu key_value column '%s' has type %s; expected %s",
+				                  bind_data.function_name, static_cast<unsigned long long>(split_index),
+				                  declared_name, actual_type, declared_type);
+			}
+		}
+		values.push_back(ConvertPartitionValuesBatch(context, key_batch));
+	}
+
+	global_state.split_partition_data = std::move(values);
+	global_state.split_partition_data_enabled = true;
 }
 
 //! Decode a captured batch's vgi_partition_values bytes to the per-column MIN values
@@ -3332,7 +3427,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// base64-decoded on the connection's reader thread; IPC decode +
 	// validation happen here on the consumer thread for uniform error
 	// reporting across transports).
-	if (bind_data.partition_kind != VgiPartitionKind::NotPartitioned) {
+	if (bind_data.partition_kind != VgiPartitionKind::NotPartitioned &&
+	    !local_state.partition_data_from_split) {
 		const std::string &pv_bytes = local_state.connection()->GetLastPartitionValuesBytes();
 		if (pv_bytes.empty()) {
 			throw IOException(metadata_violation("vgi_partition_values#b64"),
@@ -3768,6 +3864,17 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 	// monotonicity check downstream depends on it.
 	D_ASSERT(!local_state.has_split || idx > local_state.last_split_index);
 	local_state.last_split_index = idx;
+	if (global_state.split_partition_data_enabled) {
+		local_state.current_partition_data = global_state.split_partition_data[idx];
+		local_state.partition_data_from_split = true;
+		if (!bind_data.supports_batch_index) {
+			local_state.current_batch_index =
+			    global_state.synthetic_batch_index.fetch_add(1, std::memory_order_relaxed);
+		}
+	} else {
+		local_state.current_partition_data.clear();
+		local_state.partition_data_from_split = false;
+	}
 
 	// A pooled worker that died while idle surfaces HERE — this is the split
 	// path's first init — so absorb it exactly as the non-split path does, once,
@@ -3815,7 +3922,7 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 			                 std::nullopt,   // table_sample
 			                 global_state.init_opaque_data,
 			                 std::nullopt,                // finalize_state_id
-			                 {global_state.splits[idx]}); // one split per claim
+			                 {global_state.splits[idx].token}); // one split per claim
 		} catch (...) {
 			// Poison HERE. The comment used to claim this had already happened, and it
 			// had not: the only thing setting the flag was a failed input-writer close

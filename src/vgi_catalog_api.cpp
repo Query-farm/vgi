@@ -42,6 +42,7 @@
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 #include "generated/vgi_request_builders.hpp"
+#include "generated/vgi_protocol_records.hpp"
 #include "vgi_schema_registry.hpp"
 #include "vgi_wire_codec.hpp"
 #include "vgi_batch_validation.hpp"
@@ -1608,33 +1609,27 @@ VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
 				list.ListRange(0, start, end);
 				page.splits.reserve(static_cast<size_t>(end - start));
 				for (auto i = start; i < end; i++) {
-					// Each entry is a serialized ScanSplit. What gets redeemed is its
-					// ``token`` — the framework-stamped envelope — NOT the whole
-					// record and not the worker's raw payload, which is inside the
-					// envelope and unverifiable on its own.
-					//
-					// Sliced zero-copy rather than copied out: the blob carries the
-					// full ScanSplit record (estimates, partition bounds, statistics
-					// — everything a bin-packing engine reads), while this client
-					// needs only the token. Materializing it copied ~1.8 KB twice per
-					// split for ~100 bytes of payload, and that runs single-threaded
-					// at the head of every scan, so on a large plan it was hundreds of
-					// milliseconds of dead time before the first reader started.
+					// Decode the protocol-3.1 fields DuckDB consumes. The outer split
+					// cell remains zero-copy; generated decoding copies only the token
+					// and optional exact key tuple that survive planning.
 					auto split_batch = DeserializeFromIpcBytesZeroCopy(BinaryCell(batch, values, i));
 					if (!split_batch || split_batch->num_rows() == 0) {
 						throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
 						                  "VGI worker '%s' returned an unparseable ScanSplit", worker_path);
 					}
-					auto token_arr = split_batch->GetColumnByName("token");
-					if (!IsBinaryOrUtf8(token_arr) || token_arr.IsNull(0)) {
+					generated::ScanSplitWire wire;
+					generated::FromBatch(split_batch, 0, wire, worker_path);
+					if (wire.token.empty()) {
 						throw IOException(
 						    CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "token"),
 						    "VGI worker '%s' returned a ScanSplit with no token; the framework stamps this, "
 						    "so an absent token means the worker bypassed it.",
 						    worker_path);
 					}
-					auto tok = token_arr.GetView(0);
-					page.splits.emplace_back(tok.data(), tok.size());
+					VgiScanSplit split;
+					split.token.assign(reinterpret_cast<const char *>(wire.token.data()), wire.token.size());
+					split.key_value = std::move(wire.key_value);
+					page.splits.push_back(std::move(split));
 				}
 			}
 		}
@@ -1678,6 +1673,35 @@ VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
 	page.catalog_version = int_field("catalog_version");
 	page.execution_id = binary_field("execution_id");
 	page.init_opaque_data = binary_field("init_opaque_data");
+
+	// DuckDB can map the portable subset to SINGLE_VALUE_PARTITIONS:
+	// top-level vgi.identity/1 transforms without parameters. Other transforms
+	// remain valid protocol metadata but do not activate this adapter.
+	auto key_grouping = batch->GetColumnByName("key_grouping");
+	if (IsBinaryOrUtf8(key_grouping) && !key_grouping.IsNull(0)) {
+		auto view = key_grouping.GetView(0);
+		page.key_grouping = std::vector<uint8_t>(view.begin(), view.end());
+		auto grouping = DecodeIpcRecord<generated::KeyGrouping>(*page.key_grouping, worker_path);
+		std::vector<std::string> columns;
+		bool supported = true;
+		for (const auto &key_bytes : grouping.keys) {
+			auto transform = DecodeIpcRecord<generated::TransformSpec>(key_bytes, worker_path);
+			if (transform.id != "vgi.identity/1" || transform.parameters.has_value() ||
+			    transform.inputs.size() != 1) {
+				supported = false;
+				break;
+			}
+			auto path = DecodeIpcRecord<generated::FieldPath>(transform.inputs[0], worker_path);
+			if (path.components.size() != 1) {
+				supported = false;
+				break;
+			}
+			columns.push_back(path.components[0]);
+		}
+		if (supported && !columns.empty()) {
+			page.identity_key_columns = std::move(columns);
+		}
+	}
 
 	auto scope = batch->GetColumnByName("scope");
 	if (HasType(scope, NANOARROW_TYPE_STRING) && !scope.IsNull(0)) {
@@ -1752,6 +1776,8 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	// (deterministic sealing, or a plaintext split_id), enforcing this becomes
 	// cheap and uniform and is worth revisiting; until then it is the worker's.
 	idx_t pages = 0;
+	std::optional<std::vector<uint8_t>> first_key_grouping;
+	bool key_grouping_consistent = true;
 
 	while (true) {
 		if (context.IsInterrupted()) {
@@ -1794,9 +1820,13 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 			plan.scope = page.scope;
 			plan.execution_id = page.execution_id;
 			plan.init_opaque_data = page.init_opaque_data;
+			first_key_grouping = page.key_grouping;
+			plan.identity_key_columns = page.identity_key_columns;
+		} else if (page.key_grouping != first_key_grouping) {
+			key_grouping_consistent = false;
 		}
-		for (auto &token : page.splits) {
-			plan.splits.push_back(std::move(token));
+		for (auto &split : page.splits) {
+			plan.splits.push_back(std::move(split));
 		}
 
 		if (plan.splits.size() > kMaxSplits) {
@@ -1817,6 +1847,9 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 			break;
 		}
 		cursor = page.next_cursor;
+	}
+	if (!key_grouping_consistent) {
+		plan.identity_key_columns.reset();
 	}
 
 	return plan;

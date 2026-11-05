@@ -516,9 +516,16 @@ struct VgiCopyFromFormatInfo {
 // ============================================================================
 // Function metadata from the worker (matches Python FunctionInfo)
 //! One page of a scan plan, plus the plan-level facts carried on every page.
+struct VgiScanSplit {
+	//! Framework-stamped token redeemed by table_function_init.
+	std::string token;
+	//! Exact one-row tuple aligned positionally with key_grouping, when present.
+	std::optional<std::vector<uint8_t>> key_value;
+};
+
 struct VgiScanPlanPage {
-	//! Serialized ScanSplit blobs, in the order the worker emitted them.
-	std::vector<std::string> splits;
+	//! Decoded split facts needed by the DuckDB adapter, in worker order.
+	std::vector<VgiScanSplit> splits;
 	//! Continuation cursor; empty means enumeration is complete.
 	std::vector<uint8_t> next_cursor;
 	//! Normative cap on how many splits may be in flight at once.
@@ -529,16 +536,22 @@ struct VgiScanPlanPage {
 	std::string scope;
 	std::vector<uint8_t> execution_id;
 	std::vector<uint8_t> init_opaque_data;
+	//! Serialized KeyGrouping, retained so pagination can require one plan-wide value.
+	std::optional<std::vector<uint8_t>> key_grouping;
+	//! Top-level identity input names, or nullopt for an unsupported grouping profile.
+	std::optional<std::vector<std::string>> identity_key_columns;
 };
 
 //! A complete scan plan: every split, plus the plan-level facts.
 struct VgiScanPlan {
-	std::vector<std::string> splits;
+	std::vector<VgiScanSplit> splits;
 	int64_t max_workers = 0;
 	int64_t catalog_version = 0;
 	std::string scope;
 	std::vector<uint8_t> execution_id;
 	std::vector<uint8_t> init_opaque_data;
+	//! Set only when every page carries the same supported KeyGrouping.
+	std::optional<std::vector<std::string>> identity_key_columns;
 	//! Only for diagnostics in the bounds errors.
 	std::string function_name;
 	//! How many enumeration pages this plan took. A worker that paginates is
