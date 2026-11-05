@@ -58,9 +58,9 @@ VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python v
 VGI_ATTACH_OPTIONS_REQUIRED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-attach-options-worker
 VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-attach-options-worker
 
-# Worker that advertises an incompatible protocol_version (99.0.0) to drive
+# Worker that advertises the previous incompatible protocol minor (3.0.0) to drive
 # test/sql/integration/protocol_version/version_mismatch.test.
-VGI_BAD_PROTOCOL_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-bad-protocol-worker
+VGI_BAD_PROTOCOL_WORKER ?= env VGI_BAD_PROTOCOL_VERSION=3.0.0 uv run --project $(HOME)/Development/vgi-python vgi-fixture-bad-protocol-worker
 
 # Worker that advertises an unrecognized null_handling enum value ("WEIRD") for
 # one scalar function, to drive test/sql/integration/bad_enum.test.
