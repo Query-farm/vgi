@@ -30,12 +30,53 @@
 #include "nanoarrow/nanoarrow.h"
 
 #include <functional>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 using namespace duckdb::vgi;
 using namespace duckdb::vgi::generated;
 
 namespace {
+
+std::vector<uint8_t> DecodeBase64(const std::string &text) {
+	static const std::string alphabet =
+	    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	std::vector<uint8_t> out;
+	uint32_t bits = 0;
+	int available = 0;
+	for (auto ch : text) {
+		if (ch == '=') {
+			break;
+		}
+		auto index = alphabet.find(ch);
+		REQUIRE(index != std::string::npos);
+		bits = (bits << 6) | static_cast<uint32_t>(index);
+		available += 6;
+		if (available >= 8) {
+			available -= 8;
+			out.push_back(static_cast<uint8_t>((bits >> available) & 0xff));
+		}
+	}
+	return out;
+}
+
+std::vector<uint8_t> GoldenFixture(const std::string &name) {
+	auto root = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+	std::ifstream input(root / "conformance" / "catalog-contracts.json");
+	REQUIRE(input.good());
+	std::ostringstream contents;
+	contents << input.rdbuf();
+	auto json = contents.str();
+	auto marker = "\"" + name + "\": \"";
+	auto begin = json.find(marker);
+	REQUIRE(begin != std::string::npos);
+	begin += marker.size();
+	auto end = json.find('"', begin);
+	REQUIRE(end != std::string::npos);
+	return DecodeBase64(json.substr(begin, end - begin));
+}
 
 LargeBytes Buf(const std::string &s) {
 	return VgiBuffer::FromString(s);
@@ -48,6 +89,54 @@ T RoundTrip(const T &value) {
 	REQUIRE(batch->num_rows() == 1);
 	REQUIRE_NOTHROW(ValidateBatch(*batch, VgiValidation::FULL));
 	return Decode<T>(batch, 0, "test-worker");
+}
+
+TEST_CASE("Protocol 3.1 distribution records decode the Python golden plan", "[protocol-records]") {
+	auto path = DecodeIpcRecord<FieldPath>(GoldenFixture("partition_field_path"), "golden-vector");
+	CHECK(path.components == std::vector<std::string> {"customer", "region"});
+
+	auto transform =
+	    DecodeIpcRecord<TransformSpec>(GoldenFixture("partition_parameterized_transform"), "golden-vector");
+	REQUIRE(transform.parameters.has_value());
+	auto parameters = DeserializeFromIpcBytes(*transform.parameters);
+	CHECK(parameters->GetColumnByName("buckets").GetInt(0) == 16);
+	CHECK(parameters->GetColumnByName("algorithm").GetString(0) == "murmur3");
+	CHECK(parameters->GetColumnByName("nulls_equal").GetBool(0));
+
+	auto grouping = DecodeIpcRecord<KeyGrouping>(GoldenFixture("partition_key_grouping"), "golden-vector");
+	CHECK(grouping.keys.size() == 2);
+	auto ranges =
+	    DecodeIpcRecord<RangePartitioning>(GoldenFixture("partition_range_partitioning"), "golden-vector");
+	CHECK(ranges.keys.size() == 2);
+	auto points = DeserializeFromIpcBytes(ranges.split_points);
+	REQUIRE(points->num_rows() == 4);
+	auto regions = points->GetColumnByName("customer.region");
+	auto times = points->GetColumnByName("event_time");
+	CHECK(regions.IsNull(0));
+	CHECK(regions.GetString(1) == "east");
+	CHECK(regions.GetString(3) == "west");
+	CHECK(times.IsNull(0));
+	CHECK(times.GetInt(1) == 20);
+	CHECK(times.GetInt(2) == 10);
+	CHECK(times.GetInt(3) == 99);
+
+	auto split = DecodeIpcRecord<ScanSplitWire>(GoldenFixture("partition_scan_split"), "golden-vector");
+	CHECK(split.range_index == 2);
+	CHECK(split.location_ids == std::optional<std::vector<int64_t>> {{0, 1}});
+	REQUIRE(split.key_value.has_value());
+	auto key = DeserializeFromIpcBytes(*split.key_value);
+	CHECK(key->GetColumnByName("customer.region").GetString(0) == "east");
+	CHECK(key->GetColumnByName("event_time").GetInt(0) == 15);
+
+	auto plan =
+	    DecodeIpcRecord<TableFunctionPlanResult>(GoldenFixture("partition_plan_response"), "golden-vector");
+	CHECK(plan.max_workers == 3);
+	CHECK(plan.locations == std::optional<std::vector<std::string>> {{"worker-a", "worker-b"}});
+	CHECK(plan.key_grouping == std::optional<Bytes> {GoldenFixture("partition_key_grouping")});
+	CHECK(plan.range_partitioning ==
+	      std::optional<Bytes> {GoldenFixture("partition_range_partitioning")});
+	REQUIRE(plan.splits.size() == 1);
+	CHECK(plan.splits[0] == GoldenFixture("partition_scan_split"));
 }
 
 // A one-row batch of `schema` whose column j is row 0 of `batch`'s column

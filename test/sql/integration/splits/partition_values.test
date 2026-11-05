@@ -28,7 +28,17 @@ require vgi
 require httpfs
 
 statement ok
-ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+ATTACH 'example' AS example (TYPE vgi, LOCATION '{VGI_TEST_WORKER}');
+
+# The bind-time declaration and Protocol 3.1 plan keys meet in the physical
+# source: DuckDB must select its partition-aware aggregate, while the exact
+# per-split values themselves come only from ScanSplit.key_value below.
+query II
+EXPLAIN SELECT country, SUM(sales)
+FROM example.main.split_partitioned(rows_per_country := 5)
+GROUP BY country;
+----
+physical_plan	<REGEX>:.*Partitioned Aggregate.*
 
 # Each partition intact and distinct. Every partition's values are offset by its
 # own index, so swapping two splits' labels MOVES these sums — with identical
