@@ -526,8 +526,8 @@ struct VgiScanSplit {
 struct VgiScanPlanPage {
 	//! Decoded split facts needed by the DuckDB adapter, in worker order.
 	std::vector<VgiScanSplit> splits;
-	//! Continuation cursor; empty means enumeration is complete.
-	std::vector<uint8_t> next_cursor;
+	//! Disjoint, exhaustive continuation branches, in worker order.
+	std::vector<std::vector<uint8_t>> next_cursors;
 	//! Normative cap on how many splits may be in flight at once.
 	int64_t max_workers = 0;
 	//! The catalog counter this plan is pinned to.

@@ -36,6 +36,7 @@
 #include "vgi_protocol_constants.hpp"
 
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <set>
 #include <typeinfo>
@@ -1584,61 +1585,80 @@ TableFunctionCardinalityResult InvokeTableFunctionCardinality(
 
 //! Parse one ``PlanResponse`` batch into a page.
 //!
-//! Everything is optional except ``splits`` itself, and an EMPTY splits list is
-//! legal — a fully-pruned scan plans zero splits, and that must produce an empty
-//! result rather than an error.
+//! ``splits`` and ``scope`` are required. An EMPTY splits list is legal — a
+//! fully-pruned scan plans zero splits, and that must produce an empty result
+//! rather than an error.
 VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
                                      const std::string &worker_path) {
 	VgiScanPlanPage page;
-	if (!batch || batch->num_rows() == 0) {
-		return page;
+	auto violation = [&](const char *field) {
+		return CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, field);
+	};
+	if (!batch || batch->num_rows() != 1) {
+		const auto rows = batch ? batch->num_rows() : 0;
+		throw IOException(violation("result").ExpectedActual("1", std::to_string(rows)),
+		                  "VGI worker '%s' returned a plan response with %lld rows; expected exactly one",
+		                  worker_path, static_cast<long long>(rows));
 	}
 
 	// splits: list<binary>, one serialized ScanSplit per entry.
-	if (auto list = batch->GetColumnByName("splits")) {
-		if (HasType(list, NANOARROW_TYPE_LIST)) {
-			if (!list.IsNull(0)) {
-				auto values = list.child(0);
-				if (!IsBinaryOrUtf8(values)) {
-					throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
-					                  "VGI worker '%s' returned a plan whose 'splits' entries are not binary",
-					                  worker_path);
-				}
-				int64_t start = 0;
-				int64_t end = 0;
-				list.ListRange(0, start, end);
-				page.splits.reserve(static_cast<size_t>(end - start));
-				for (auto i = start; i < end; i++) {
-					// Decode the protocol-3.1 fields DuckDB consumes. The outer split
-					// cell remains zero-copy; generated decoding copies only the token
-					// and optional exact key tuple that survive planning.
-					auto split_batch = DeserializeFromIpcBytesZeroCopy(BinaryCell(batch, values, i));
-					if (!split_batch || split_batch->num_rows() == 0) {
-						throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
-						                  "VGI worker '%s' returned an unparseable ScanSplit", worker_path);
-					}
-					generated::ScanSplitWire wire;
-					generated::FromBatch(split_batch, 0, wire, worker_path);
-					if (wire.token.empty()) {
-						throw IOException(
-						    CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "token"),
-						    "VGI worker '%s' returned a ScanSplit with no token; the framework stamps this, "
-						    "so an absent token means the worker bypassed it.",
-						    worker_path);
-					}
-					VgiScanSplit split;
-					split.token.assign(reinterpret_cast<const char *>(wire.token.data()), wire.token.size());
-					split.key_value = std::move(wire.key_value);
-					page.splits.push_back(std::move(split));
-				}
+	auto list = batch->GetColumnByName("splits");
+	if (!list || !HasType(list, NANOARROW_TYPE_LIST) || list.IsNull(0)) {
+		throw IOException(violation("splits"),
+		                  "VGI worker '%s' returned a plan without a non-null list<binary> 'splits' field",
+		                  worker_path);
+	}
+	{
+		auto values = list.child(0);
+		if (!HasType(values, NANOARROW_TYPE_BINARY)) {
+			throw IOException(violation("splits"),
+			                  "VGI worker '%s' returned a plan whose 'splits' entries are not binary",
+			                  worker_path);
+		}
+		int64_t start = 0;
+		int64_t end = 0;
+		list.ListRange(0, start, end);
+		page.splits.reserve(static_cast<size_t>(end - start));
+		for (auto i = start; i < end; i++) {
+			if (values.IsNull(i)) {
+				throw IOException(violation("splits"),
+				                  "VGI worker '%s' returned a null entry in plan 'splits'", worker_path);
 			}
+			// Decode the protocol-3.1 fields DuckDB consumes. The outer split
+			// cell remains zero-copy; generated decoding copies only the token
+			// and optional exact key tuple that survive planning.
+			auto split_batch = DeserializeFromIpcBytesZeroCopy(BinaryCell(batch, values, i));
+			if (!split_batch || split_batch->num_rows() == 0) {
+				throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
+				                  "VGI worker '%s' returned an unparseable ScanSplit", worker_path);
+			}
+			generated::ScanSplitWire wire;
+			generated::FromBatch(split_batch, 0, wire, worker_path);
+			if (wire.token.empty()) {
+				throw IOException(
+				    CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "token"),
+				    "VGI worker '%s' returned a ScanSplit with no token; the framework stamps this, "
+				    "so an absent token means the worker bypassed it.",
+				    worker_path);
+			}
+			VgiScanSplit split;
+			split.token.assign(reinterpret_cast<const char *>(wire.token.data()), wire.token.size());
+			split.key_value = std::move(wire.key_value);
+			page.splits.push_back(std::move(split));
 		}
 	}
 
 	auto binary_field = [&](const char *name) -> std::vector<uint8_t> {
 		std::vector<uint8_t> out;
 		auto arr = batch->GetColumnByName(name);
-		if (IsBinaryOrUtf8(arr) && !arr.IsNull(0)) {
+		if (!arr || arr.IsNull(0)) {
+			return out;
+		}
+		if (!HasType(arr, NANOARROW_TYPE_BINARY)) {
+			throw IOException(violation(name), "VGI worker '%s' returned non-binary plan field '%s'",
+			                  worker_path, name);
+		}
+		{
 			auto view = arr.GetView(0);
 			out.assign(view.begin(), view.end());
 		}
@@ -1646,25 +1666,40 @@ VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
 	};
 	auto int_field = [&](const char *name) -> int64_t {
 		auto arr = batch->GetColumnByName(name);
-		if (HasType(arr, NANOARROW_TYPE_INT64) && !arr.IsNull(0)) {
-			return arr.GetInt(0);
+		if (!arr || arr.IsNull(0)) {
+			return 0;
 		}
-		return 0;
+		if (!HasType(arr, NANOARROW_TYPE_INT64)) {
+			throw IOException(violation(name), "VGI worker '%s' returned non-int64 plan field '%s'",
+			                  worker_path, name);
+		}
+		return arr.GetInt(0);
 	};
 
-	// next_cursors: list<binary>. More than one means the worker wants parallel
-	// enumeration, which is only sound if the cursors partition the remainder
-	// disjointly. DuckDB paginates serially, so it follows the first and ignores
-	// the rest rather than pretending to fan out.
-	if (auto list = batch->GetColumnByName("next_cursors")) {
-		if (HasType(list, NANOARROW_TYPE_LIST) && !list.IsNull(0)) {
+	// next_cursors: every non-empty entry is a disjoint, exhaustive branch.
+	if (auto cursors = batch->GetColumnByName("next_cursors")) {
+		if (!cursors.IsNull(0)) {
+			if (!HasType(cursors, NANOARROW_TYPE_LIST)) {
+				throw IOException(violation("next_cursors"),
+				                  "VGI worker '%s' returned non-list plan field 'next_cursors'", worker_path);
+			}
 			int64_t start = 0;
 			int64_t end = 0;
-			list.ListRange(0, start, end);
-			auto values = list.child(0);
-			if (end > start && IsBinaryOrUtf8(values)) {
-				auto view = values.GetView(start);
-				page.next_cursor.assign(view.begin(), view.end());
+			cursors.ListRange(0, start, end);
+			auto values = cursors.child(0);
+			if (!HasType(values, NANOARROW_TYPE_BINARY)) {
+				throw IOException(violation("next_cursors"),
+				                  "VGI worker '%s' returned non-binary plan continuation cursors", worker_path);
+			}
+			for (auto i = start; i < end; ++i) {
+				if (values.IsNull(i)) {
+					throw IOException(violation("next_cursors"),
+					                  "VGI worker '%s' returned a null plan continuation cursor", worker_path);
+				}
+				auto view = values.GetView(i);
+				if (!view.empty()) {
+					page.next_cursors.emplace_back(view.begin(), view.end());
+				}
 			}
 		}
 	}
@@ -1678,7 +1713,11 @@ VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
 	// top-level vgi.identity/1 transforms without parameters. Other transforms
 	// remain valid protocol metadata but do not activate this adapter.
 	auto key_grouping = batch->GetColumnByName("key_grouping");
-	if (IsBinaryOrUtf8(key_grouping) && !key_grouping.IsNull(0)) {
+	if (key_grouping && !key_grouping.IsNull(0)) {
+		if (!HasType(key_grouping, NANOARROW_TYPE_BINARY)) {
+			throw IOException(violation("key_grouping"),
+			                  "VGI worker '%s' returned non-binary plan field 'key_grouping'", worker_path);
+		}
 		auto view = key_grouping.GetView(0);
 		page.key_grouping = std::vector<uint8_t>(view.begin(), view.end());
 		auto grouping = DecodeIpcRecord<generated::KeyGrouping>(*page.key_grouping, worker_path);
@@ -1704,9 +1743,11 @@ VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
 	}
 
 	auto scope = batch->GetColumnByName("scope");
-	if (HasType(scope, NANOARROW_TYPE_STRING) && !scope.IsNull(0)) {
-		page.scope = scope.GetString(0);
+	if (!scope || !HasType(scope, NANOARROW_TYPE_STRING) || scope.IsNull(0)) {
+		throw IOException(violation("scope"),
+		                  "VGI worker '%s' returned a plan without a non-null utf8 'scope' field", worker_path);
 	}
+	page.scope = scope.GetString(0);
 
 	return page;
 }
@@ -1748,7 +1789,8 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 
 	VgiScanPlan plan;
 	plan.function_name = function_name;
-	std::vector<uint8_t> cursor;
+	std::deque<std::vector<uint8_t>> pending_cursors;
+	pending_cursors.emplace_back();
 	// Split disjointness is the WORKER's obligation and is not policed here.
 	//
 	// A paginated enumeration must not hand out the same split twice; violating
@@ -1779,7 +1821,9 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	std::optional<std::vector<uint8_t>> first_key_grouping;
 	bool key_grouping_consistent = true;
 
-	while (true) {
+	while (!pending_cursors.empty()) {
+		auto cursor = std::move(pending_cursors.front());
+		pending_cursors.pop_front();
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
@@ -1839,14 +1883,11 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 			                  "buffer an unbounded split vector.",
 			                  worker_path, static_cast<unsigned long long>(kMaxSplits));
 		}
-
-
 		plan.pages = pages;
 
-		if (page.next_cursor.empty()) {
-			break;
+		for (auto &next : page.next_cursors) {
+			pending_cursors.push_back(std::move(next));
 		}
-		cursor = page.next_cursor;
 	}
 	if (!key_grouping_consistent) {
 		plan.identity_key_columns.reset();

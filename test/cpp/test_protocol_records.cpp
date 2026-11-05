@@ -25,6 +25,7 @@
 #include "duckdb/common/exception.hpp"
 
 #include "vgi_arrow.hpp"
+#include "vgi_catalog_rpc.hpp"
 
 #include "nanoarrow/nanoarrow.h"
 
@@ -191,6 +192,36 @@ TEST_CASE("Default-constructed records encode valid one-row batches", "[protocol
 		REQUIRE(entry.second);
 		CHECK(entry.second->num_rows() == 1);
 		CHECK_NOTHROW(ValidateBatch(*entry.second, VgiValidation::FULL));
+	}
+}
+
+TEST_CASE("Scan plan pages drain every cursor and reject malformed required fields", "[protocol-records]") {
+	ScanSplitWire split;
+	split.token = {7};
+	TableFunctionPlanResult result;
+	result.splits = {SerializeToIpcBytes(ToBatch(split))};
+	result.next_cursors = std::vector<Bytes> {{1}, {2}};
+	result.scope = "catalog";
+	auto batch = ToBatch(result);
+
+	auto page = ParseVgiScanPlanPage(batch, "test-worker");
+	REQUIRE(page.splits.size() == 1);
+	CHECK(page.splits[0].token == std::string(1, '\x07'));
+	REQUIRE(page.next_cursors.size() == 2);
+	CHECK(page.next_cursors[0] == std::vector<uint8_t> {1});
+	CHECK(page.next_cursors[1] == std::vector<uint8_t> {2});
+
+	SECTION("splits is required") {
+		auto without_splits = RemoveColumn(batch, batch->schema()->GetFieldIndex("splits"));
+		auto error = ErrorOf([&] { ParseVgiScanPlanPage(without_splits, "test-worker"); });
+		CHECK(error.find("splits") != std::string::npos);
+	}
+	SECTION("present optional fields retain their declared type") {
+		auto field = FieldOf(type::Utf8().Named("max_workers", /*is_nullable=*/true));
+		auto wrong = SetColumn(batch, batch->schema()->GetFieldIndex("max_workers"), field->field(0),
+		                       [](ArrowArray *a) { append::String(a, "four"); });
+		auto error = ErrorOf([&] { ParseVgiScanPlanPage(wrong, "test-worker"); });
+		CHECK(error.find("max_workers") != std::string::npos);
 	}
 }
 
