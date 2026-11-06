@@ -257,6 +257,17 @@ the enclosing DELIM_JOIN is unaffected. Eligibility (`IsBatchableLateralGet`):
 !table_buffering && !projected_input.empty() && children.size()==1`. Gated on
 the `vgi_batch_lateral` setting (default true).
 
+**SQL reconstruction.** `EXPLAIN (SQL)` supports batched correlated calls without
+disabling `vgi_batch_lateral`. The logical operator retains the original
+`LogicalGet` invocation metadata and delegates SQL reconstruction to the engine
+using its current child plan. Function identity, arguments, projected columns and
+the surrounding filters retain their SQL semantics; execution still uses the
+batched physical operator. Export may bind against the worker but does not send
+input rows for execution. Other unsupported plan shapes still report the engine's
+SQL-export diagnostic. The `lateral_batch_sql_export*.test` suites check direct
+execution and execution of reconstructed SQL with `explain_sql_strict`; named
+correlated arguments run only on engines that support them.
+
 **Row provenance.** Batching is sound because the worker declares, per output
 row, which input row produced it — a per-batch `vgi_rpc.parent_row#b64`
 metadata array (base64 raw LE `int32[]`, length = output rows), mirroring the

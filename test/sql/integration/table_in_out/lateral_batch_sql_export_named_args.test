@@ -1,0 +1,50 @@
+# name: test/sql/integration/table_in_out/lateral_batch_sql_export_named_args.test
+# description: Batched LATERAL SQL export retains named arguments.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+# Named correlated arguments require the binder fix shipped by Haybarn.
+require-env VGI_ENGINE_CORRELATED_NAMED_ARGS 1
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '{VGI_TEST_WORKER}');
+
+statement ok
+SET vgi_batch_lateral=true;
+
+foreach mode none explain_sql_strict
+
+statement ok
+SET debug_verify_statement='{mode}';
+
+query IT rowsort
+SELECT row_sum, typeof(row_sum)
+FROM (VALUES (-1.0, -2.0), (3.0, -4.0), (3.0, -4.0), (NULL, -4.0)) v(a, b),
+     LATERAL ex.row_sum(v.a, v.b, absolute := true);
+----
+3.0	DOUBLE
+7.0	DOUBLE
+7.0	DOUBLE
+NULL	DOUBLE
+
+query II rowsort
+SELECT n, i FROM (VALUES (0), (2), (NULL)) t(n)
+LEFT JOIN LATERAL ex.blended_paged(t.n, page_size := 1) ON true;
+----
+0	NULL
+2	0
+2	1
+NULL	NULL
+
+endloop
+
+statement ok
+RESET debug_verify_statement;
+
+statement ok
+DETACH ex;

@@ -20,20 +20,21 @@
 #include "duckdb/parallel/thread_context.hpp" // context.thread.profiler
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/logical_plan_sql_exporter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 #include <chrono>
 
-#include "vgi_arrow_ipc.hpp"          // SerializeRecordBatch
-#include "vgi_arrow_utils.hpp"        // BuildArrowSchemaFromDuckDB / ArrowSchemaToDuckDBTypes / DataChunkToArrow
-#include "vgi_cache_control.hpp"      // VgiCacheControl
+#include "vgi_arrow_ipc.hpp"     // SerializeRecordBatch
+#include "vgi_arrow_utils.hpp"   // BuildArrowSchemaFromDuckDB / ArrowSchemaToDuckDBTypes / DataChunkToArrow
+#include "vgi_cache_control.hpp" // VgiCacheControl
 #include "vgi_exception.hpp"
 #include "vgi_exchange_cache_key.hpp" // exchange-mode result cache (M2)
 #include "vgi_ifunction_connection.hpp"
-#include "vgi_input_dedup.hpp"        // input dedup (ship distinct tuples; expand back)
+#include "vgi_input_dedup.hpp" // input dedup (ship distinct tuples; expand back)
 #include "vgi_logging.hpp"
-#include "vgi_memo_arena.hpp"         // per-value memo arena (columnar store)
-#include "vgi_result_cache.hpp"       // VgiResultCache singleton
+#include "vgi_memo_arena.hpp"   // per-value memo arena (columnar store)
+#include "vgi_result_cache.hpp" // VgiResultCache singleton
 
 namespace duckdb {
 namespace vgi {
@@ -41,6 +42,36 @@ namespace vgi {
 // ============================================================================
 // LogicalVgiLateralBatch
 // ============================================================================
+
+LogicalVgiLateralBatch::LogicalVgiLateralBatch(unique_ptr<LogicalGet> source, vector<LogicalType> worker_output_types,
+                                               vector<ColumnBinding> worker_bindings,
+                                               vector<column_t> worker_column_ids, bool projection_pushdown)
+    : table_index(source->table_index), projected_input(source->projected_input),
+      worker_output_types(std::move(worker_output_types)), worker_column_ids(std::move(worker_column_ids)),
+      projection_pushdown(projection_pushdown), worker_bindings(std::move(worker_bindings)),
+      sql_source(std::move(source)) {
+	children = std::move(sql_source->children);
+}
+
+LogicalPlanSQLExportResult LogicalVgiLateralBatch::ToSQL(LogicalPlanSQLExportContext &context,
+                                                         const LogicalPlanVerificationPath &path) {
+	// Delegate to the engine's table-function exporter with the current child, not
+	// a snapshot of its pre-optimization plan. Restore ownership even if export throws.
+	struct SourceChildrenScope {
+		SourceChildrenScope(LogicalGet &source, LogicalVgiLateralBatch &batch) : source(source), batch(batch) {
+			D_ASSERT(source.children.empty());
+			source.children.swap(batch.children);
+		}
+		~SourceChildrenScope() {
+			source.children.swap(batch.children);
+		}
+		LogicalGet &source;
+		LogicalVgiLateralBatch &batch;
+	};
+	sql_source->types = types;
+	SourceChildrenScope scope(*sql_source, *this);
+	return sql_source->ToSQL(context, path);
+}
 
 vector<ColumnBinding> LogicalVgiLateralBatch::GetColumnBindings() {
 	// Worker output columns under table_index (snapshot), then the child's
@@ -86,10 +117,9 @@ PhysicalOperator &LogicalVgiLateralBatch::CreatePlan(ClientContext &context, Phy
 	const idx_t base_idx = worker_output_types.size();
 	D_ASSERT(worker_column_ids.size() == base_idx);
 	auto out_types = types; // [worker | projected]
-	auto &op = planner.Make<PhysicalVgiLateralBatch>(std::move(out_types), std::move(bind_data),
-	                                                  std::move(projected_input), input_length, base_idx,
-	                                                  std::move(worker_column_ids), projection_pushdown,
-	                                                  estimated_cardinality);
+	auto &op = planner.Make<PhysicalVgiLateralBatch>(
+	    std::move(out_types), std::move(sql_source->bind_data), std::move(projected_input), input_length, base_idx,
+	    std::move(worker_column_ids), projection_pushdown, estimated_cardinality);
 	op.children.push_back(child_plan);
 	return op;
 }
@@ -1310,11 +1340,10 @@ void RewriteOne(unique_ptr<LogicalOperator> &op) {
 		}
 	}
 
-	auto new_op = make_uniq<LogicalVgiLateralBatch>(get.table_index, std::move(get.projected_input),
-	                                                std::move(worker_output_types), std::move(worker_bindings),
-	                                                std::move(get.bind_data), std::move(worker_column_ids),
-	                                                projection_pushdown);
-	new_op->children.push_back(std::move(get.children[0]));
+	auto source = unique_ptr_cast<LogicalOperator, LogicalGet>(std::move(op));
+	auto new_op =
+	    make_uniq<LogicalVgiLateralBatch>(std::move(source), std::move(worker_output_types), std::move(worker_bindings),
+	                                      std::move(worker_column_ids), projection_pushdown);
 	new_op->ResolveOperatorTypes();
 	op = std::move(new_op);
 }

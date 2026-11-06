@@ -6,6 +6,7 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "vgi_table_in_out_impl.hpp"
 
@@ -28,15 +29,9 @@ namespace vgi {
 
 class LogicalVgiLateralBatch : public LogicalExtensionOperator {
 public:
-	LogicalVgiLateralBatch(TableIndex table_index, vector<column_t> projected_input,
-	                       vector<LogicalType> worker_output_types, vector<ColumnBinding> worker_bindings,
-	                       unique_ptr<FunctionData> bind_data, vector<column_t> worker_column_ids,
-	                       bool projection_pushdown)
-	    : table_index(table_index), projected_input(std::move(projected_input)),
-	      worker_output_types(std::move(worker_output_types)), worker_bindings(std::move(worker_bindings)),
-	      bind_data(std::move(bind_data)), worker_column_ids(std::move(worker_column_ids)),
-	      projection_pushdown(projection_pushdown) {
-	}
+	LogicalVgiLateralBatch(unique_ptr<LogicalGet> source, vector<LogicalType> worker_output_types,
+	                       vector<ColumnBinding> worker_bindings, vector<column_t> worker_column_ids,
+	                       bool projection_pushdown);
 
 	TableIndex table_index;
 	//! Trailing child-chunk column indices of the correlated/outer columns.
@@ -55,14 +50,14 @@ public:
 	//! Worker output column bindings (ColumnBinding(table_index, i)); snapshot at
 	//! rewrite so we don't depend on the child for these.
 	vector<ColumnBinding> worker_bindings;
-	//! The VgiTableInOutBindData (owns worker connection info); outlives the LogicalGet.
-	unique_ptr<FunctionData> bind_data;
 
 public:
 	vector<ColumnBinding> GetColumnBindings() override;
 	vector<TableIndex> GetTableIndex() const override;
 	string GetName() const override;
 	string GetExtensionName() const override;
+	LogicalPlanSQLExportResult ToSQL(LogicalPlanSQLExportContext &context,
+	                                 const LogicalPlanVerificationPath &path) override;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 
@@ -70,6 +65,10 @@ public:
 
 protected:
 	void ResolveTypes() override;
+
+private:
+	//! Retains the complete invocation and bind data; the live child belongs to this operator.
+	unique_ptr<LogicalGet> sql_source;
 };
 
 // ============================================================================
