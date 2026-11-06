@@ -699,7 +699,7 @@ test_python:
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	    python3 scripts/run_tests.py -j 6 \
+	    python3 scripts/run_tests.py -j 6 --isolate-launcher \
 	        --min-executed $$(( $(VGI_PYTHON_MIN_EXECUTED) - $(VGI_ENGINE_FLOOR_SLACK) )) $(VGI_EXPECTED_SKIPS) \
 	        --allow-skip 'require-env VGI_TEST_DEDICATED_WORKER' \
 	        "test/*" \
