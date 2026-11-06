@@ -7,19 +7,28 @@
   </a>
 </p>
 
-# VGI Extension for DuckDB
+# VGI for DuckDB
 
-[![DuckDB](https://img.shields.io/badge/DuckDB-extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://query.farm/products/extensions/vgi/)
-[![main build](https://github.com/Query-farm/vgi/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main)](https://github.com/Query-farm/vgi/actions/workflows/MainDistributionPipeline.yml?query=branch%3Amain)
+VGI lets DuckDB call table, scalar, aggregate, table-in-out and `COPY`
+functions served by remote workers over Apache Arrow IPC.
 
-Extend DuckDB with workers written in Python, TypeScript, Go, Rust, and other languages over Apache Arrow IPC.
+**This branch is the DuckDB community-repository placeholder, not the
+extension.** VGI is distributed from the Query.Farm extension repository.
+Loading this build tells you how to install VGI from there, or, once you have,
+loads that build.
+
+## Installation
+
+```sql
+SET allow_extension_repositories = 'allowed';
+CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm';
+INSTALL vgi FROM query_farm;
+LOAD vgi FROM query_farm;
+```
 
 ## Documentation
 
-Full documentation, including installation, usage, the function reference, and cookbook examples, is available at:
+**[https://query.farm/products/extensions/vgi](https://query.farm/products/extensions/vgi)**
 
-**[https://query.farm/products/extensions/vgi/](https://query.farm/products/extensions/vgi/)**
-
-[Repository notes](REPOSITORY_NOTES.md) · [License](../LICENSE)
-
-Preparation work: [DuckDB 2.0 plan](duckdb-2.0-plan.md), [catalog audit](duckdb-2.0-catalog-audit.md), and [compile diagnostics](duckdb-2.0-a0-diagnostics.md).
+The extension source is on the `v2.0` branch of
+[Query-farm/vgi](https://github.com/Query-farm/vgi).

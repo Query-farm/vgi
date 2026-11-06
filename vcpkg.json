@@ -1,29 +1,3 @@
 {
-    "dependencies": [
-        "nanoarrow",
-        "openssl",
-        "curl",
-        {
-            "name": "zstd",
-            "platform": "!emscripten"
-        },
-        {
-            "name": "lz4",
-            "platform": "!emscripten"
-        },
-        {
-            "name": "sqlite3",
-            "platform": "!emscripten"
-        }
-    ],
-    "vcpkg-configuration": {
-        "overlay-ports": [
-            "./vcpkg_overlay_ports",
-            "./extension-ci-tools/vcpkg_ports"
-        ],
-        "overlay-triplets": [
-            "./overlay-triplets",
-            "./extension-ci-tools/toolchains"
-        ]
-    }
+  "dependencies": []
 }

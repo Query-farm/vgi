@@ -1,77 +1,28 @@
-#
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
-#
 name: Main Extension Distribution Pipeline
 on:
   push:
-  pull_request:
-  workflow_dispatch:
-
+    branches:
+    - v2.0-community-stub
+  pull_request: null
+  workflow_dispatch: null
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/v2.0' && github.sha || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{
+    github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
   cancel-in-progress: true
-
-# jobs:
-#   duckdb-stable-build:
-#     name: Build extension binaries
-#     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
-#     with:
-#       duckdb_version: v1.5.5
-#       ci_tools_version: v1.5.5
-#       extension_name: vgi
-
 jobs:
-  header-hygiene:
-    name: Header hygiene (fan-out guardrail)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Enforce heavy-include denylist on hub headers
-        # Fails if a guarded hub header (see GUARDED_HEADERS in the script /
-        # CLAUDE.md "Header hygiene") transitively pulls in the Arrow umbrella.
-        # Pure source scan — no build needed.
-        run: python3 scripts/header_reach.py --check
-      - name: Check generated settings and reference
-        run: python3 scripts/generate_settings.py --check
-
   duckdb-stable-build:
     name: Build extension binaries
-    # The v2.0 branch builds against the Haybarn 2.0 engine with the 2.0 line of
-    # the Haybarn ci-tools fork, the same pairing as the community haybarn-2.0
-    # lane. Keep duckdb_version in lockstep with the duckdb submodule's tag.
-    uses: Query-farm-haybarn/haybarn-extension-ci-tools/.github/workflows/_extension_distribution.yml@haybarn-2.0
-    secrets:
-      vcpkg_token: ${{ secrets.HAYBARN_VCPKG_TOKEN }}
-      VCPKG_CACHING_AWS_ACCESS_KEY_ID: ${{ secrets.HAYBARN_BUILD_CACHE_R2_ACCESS_KEY_ID }}
-      VCPKG_CACHING_AWS_SECRET_ACCESS_KEY: ${{ secrets.HAYBARN_BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
-      VCPKG_CACHING_AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+    uses: Query-farm/extension-ci-tools/.github/workflows/build.yml@query-farm
     with:
-      duckdb_version: haybarn-v2.0.0-rc10
-      ci_tools_version: haybarn-2.0
-      override_duckdb_repository: 'https://github.com/Query-farm-haybarn/haybarn'
-      override_ci_tools_repository: 'Query-farm-haybarn/haybarn-extension-ci-tools'
-      extension_name: vgi
-      # wasm_mvp, osx_amd64 and windows_arm64 are not built on the 2.0 line.
-      # windows_amd64_mingw is not consumed and is consistently the slowest
-      # matrix leg (roughly 20 minutes even with warm vcpkg and ccache state).
-      exclude_archs: 'wasm_mvp;osx_amd64;windows_arm64;windows_amd64_mingw'
-      # vcpkg release 2026.06.24, the 2.0-line pin.
-      vcpkg_commit: 'cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3'
-      # The embedded Iroh connector is compiled from the pinned Rust source as
-      # part of the extension, so the builders need Cargo.
-      extra_toolchains: parser_tools;rust
-      # NOTE: this pipeline does NOT run the VGI integration suite.
-      #
-      # Every integration .test file carries `require-env VGI_TEST_WORKER`, so
-      # with no worker on the runner all ~300 SKIP and this job means "built +
-      # header-clean" — nothing more. That is a real gap, and it is covered by
-      # .github/workflows/integration.yml instead, which owns its own steps and
-      # can therefore install the fixture workers before testing.
-      #
-      # It was briefly attempted here, via `test_env_variables` plus a
-      # `ci_fixtures` prerequisite on the inherited `make test_<type>` target.
-      # It cannot work: the reusable distribution workflow exposes no hook that
-      # runs a COMMAND before the test step, and on the Linux leg the tests run
-      # inside `docker run ... make test_release`, a fresh container the install
-      # never reached. The result was worse than skipping — VGI_TEST_WORKER was
-      # set, so ~300 tests FAILED against a worker path that did not exist.
+      duckdb_version: v2.0.0
+      ci_tools_version: query-farm
+      groups: |
+        main:
+          config: extension_config.cmake
+          toolchain: main
+      exclude_archs: wasm_mvp;wasm_eh;wasm_threads
+      # The stub test LOADs the binary from {BUILD_DIRECTORY}/extension/, which the
+      # separate test jobs do not restore; the build jobs already run it on each binary.
+      test_jobs: false
+    secrets:
+      ccache_remote_token: ${{ secrets.QUERY_FARM_CCACHE_TOKEN }}
