@@ -22,14 +22,14 @@
     {
       "language": "Rust",
       "repo": "vgi-rust",
-      "version": "0.49.1",
-      "tagCommit": "4ffed31f4eb0fc04fb847e49a57e9d1c5007d2f0",
-      "mainCommit": "d863cd15d65866dc21252a61c42ef3099d01a591",
+      "version": "0.49.2",
+      "tagCommit": "fe2ed0803eb46c245e2422accea8a3ce2ace8fb1",
+      "mainCommit": "fe2ed0803eb46c245e2422accea8a3ce2ace8fb1",
       "packages": ["vgi-protocol", "vgi", "vgi-client"],
       "status": "registry_verified",
-      "publishRun": 42148418456,
-      "releaseUrl": "https://github.com/Query-farm/vgi-rust/releases/tag/v0.49.1",
-      "validation": "Workspace fmt, all-target/all-feature clippy and tests, doc tests, and native end-to-end documentation examples passed."
+      "publishRun": 42160438204,
+      "releaseUrl": "https://github.com/Query-farm/vgi-rust/releases/tag/v0.49.2",
+      "validation": "Workspace fmt, all-target/all-feature clippy and tests, doc tests, hosted protocol conformance, all native transport integrations, and the nested-struct comparison regression passed."
     },
     {
       "language": "Python",
@@ -137,8 +137,9 @@
     "nativeDistributionRun": 42157622477,
     "nativeIntegrationRun": 42157621812,
     "rust": {
-      "ciRun": 42157680983,
-      "integrationRun": 42157680987
+      "ciRun": 42159699658,
+      "integrationRun": 42159699665,
+      "publishRun": 42160438204
     },
     "python": {
       "ciRun": 42157680729,
