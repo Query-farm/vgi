@@ -33,7 +33,11 @@ concurrency:
 jobs:
   integration:
     name: Integration suite (launcher transport)
-    runs-on: ubuntu-latest
+    # This job publishes the reusable native runner consumed by SDK jobs that
+    # still run on Ubuntu 24.04. Building it on the moving ubuntu-latest image
+    # (now Ubuntu 26) produced a GLIBC_2.43 dependency those consumers cannot
+    # load. Keep the artifact baseline explicit and no newer than its users.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     defaults:
       run:
