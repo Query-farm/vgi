@@ -9,29 +9,28 @@
 # duckdb_version in place of the duckdb submodule, so extension_config.cmake and
 # vgi_engine_compat.hpp select the upstream engine and its httpfs.
 #
-# Every push to v2.0 builds. Publishing runs only from a manual dispatch or a tag:
+# Like the other Query.Farm extensions, every push to v2.0 builds, tests and,
+# if all of that passes, publishes. A manual dispatch republishes the branch head:
+#   gh workflow run QueryFarmDeploy.yml --ref v2.0                    # publish
 #   gh workflow run QueryFarmDeploy.yml --ref v2.0 -f dry_run=true    # sign, verify, list; upload nothing
-#   gh workflow run QueryFarmDeploy.yml --ref v2.0 -f dry_run=false   # publish
 #
 name: Query.Farm Extension Deploy
 on:
   push:
     branches:
       - v2.0
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       dry_run:
         description: Sign and verify, but upload nothing to the Query.Farm repository
         type: boolean
-        default: true
+        default: false
 
-# Key on the event too: a branch push supersedes earlier pushes, but must never
-# cancel a manual (workflow_dispatch) publish or a tag release of the same ref.
+# Key on the event too: a newer push supersedes an older push's run, but must
+# never cancel a manual (workflow_dispatch) publish of the same branch.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   duckdb-upstream-build:
@@ -55,15 +54,12 @@ jobs:
   duckdb-deploy:
     name: Deploy to duckdb-extensions.query.farm
     needs: duckdb-upstream-build
-    if: >-
-      github.event_name != 'pull_request' &&
-      (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/'))
+    if: github.event_name != 'pull_request' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/v2.0' || startsWith(github.ref, 'refs/tags/'))
     uses: Query-farm/extension-ci-tools/.github/workflows/_query_farm_deploy.yml@query-farm
     with:
       extension_name: vgi
       duckdb_version: v2.0.0
-      # A manual dispatch defaults to a dry run; a tag always publishes.
-      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      dry_run: ${{ inputs.dry_run == true }}
     secrets:
       signing_key: ${{ secrets.QUERY_FARM_EXTENSION_SIGNING_KEY }}
       r2_access_key_id: ${{ secrets.QUERY_FARM_R2_ACCESS_KEY_ID }}

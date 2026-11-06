@@ -112,6 +112,28 @@ commit.
   no-replay case expects one dispatch on Haybarn (a per-request clone with
   `retries = 0`) and none on upstream (refused before dispatch).
 
+## Publishing to the Query.Farm repository
+
+`.github/workflows/QueryFarmDeploy.yml` builds this source against upstream
+DuckDB v2.0.0 (linux_amd64, linux_arm64, osx_arm64, windows_amd64), runs the
+extension tests, then signs the binaries and uploads them to
+`https://duckdb-extensions.query.farm`. Like the other Query.Farm extensions, it
+publishes on every push to `v2.0` once the build and tests pass; a manual
+dispatch republishes the branch head (`-f dry_run=true` signs and verifies but
+uploads nothing). Users install it with:
+
+```sql
+SET allow_extension_repositories = 'allowed';
+CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm';
+INSTALL vgi FROM query_farm;
+LOAD vgi FROM query_farm;
+```
+
+The DuckDB community repository carries only a placeholder `vgi` (branch
+`v2.0-community-stub`) that points users here, or loads this build once it is
+installed. Haybarn builds come from `MainDistributionPipeline.yml`, which does
+not publish to this repository.
+
 ## When upstream catches up
 
 When an upstream release ships one of these, switch its macro in
