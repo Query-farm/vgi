@@ -2,7 +2,7 @@
 
 > Historical batching plan: the `vgi.v2` / `2.2.0` transition below was
 > integrated before the combined DuckDB 2.0 protocol preparation. That combined
-> successor now uses `vgi.v3` / `3.0.0`; see [protocol routing](protocol_routing.md)
+> successor now uses `vgi.v3` / `3.1.0`; see [protocol routing](protocol_routing.md)
 > for current routing and migration requirements. The historical version
 > decisions below do not authorize publishing the successor as `vgi.v2`.
 

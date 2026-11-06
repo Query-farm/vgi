@@ -18,9 +18,10 @@ The `vgi-nano` migration is incorporated here. The `duckdb` submodule pins Hayba
 2.0 engine at `54f8340a3ede`; `extension_config.cmake` pins its matching HTTPFS fork.
 Use the committed submodule revision, not `git submodule update --remote`.
 
-The wire contract is **`vgi.v3` / `3.0.0`**. Workers need matching SDK releases;
-older `vgi.v2` workers are incompatible. See `docs/duckdb-2.0-sdk-releases.json`
-for the coordinated releases and `docs/native-dependencies.md` for the Go 0.38.1 followup.
+The wire contract is **`vgi.v3` / `3.1.0`**. Workers need matching SDK releases;
+older `vgi.v2` and `vgi.v3` / `3.0.x` workers are incompatible. See
+`docs/protocol-3.1-sdk-releases.json` for the coordinated releases and
+`docs/native-dependencies.md` for dependency details.
 
 The Clang Linux ARM64 build and configured suites pass. The latest dependency
 build, unit and Python/Go transport evidence is in
@@ -31,7 +32,7 @@ coverage remain open in `docs/duckdb-2.0-plan.md`. Native changes remain on `v2.
 
 ## Build
 
-Edit locally; build and test on EC2. The current host is `ec2-user@54.224.166.207`
+Edit locally; build and test on EC2. The current host is `ec2-user@100.55.10.44`
 (48 CPUs), with owned workspace `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC`.
 The 2.0 lane is `vgi-native2-nano-20261027-1i9LOE` beneath that root:
 `native/` holds extension source, `engine/` holds the pinned engine, and

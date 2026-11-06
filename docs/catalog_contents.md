@@ -2,7 +2,7 @@
 
 `catalog_contents` was introduced in protocol 2.1.0. Protocol 2.2.0 changed
 its wire representation to six Arrow collections spanning the whole catalog.
-The combined successor retains that representation under **`vgi.v3` / `3.0.0`**,
+The combined successor retains that representation under **`vgi.v3` / `3.1.0`**,
 with the updated catalog record schemas. Clients and workers must agree on the
 protocol routing name and major/minor wire revision. See
 [protocol routing](protocol_routing.md) and the

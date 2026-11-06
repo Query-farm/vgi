@@ -27,7 +27,7 @@ Reflection declares no version and is exempt from the version gate, so its
 requests carry no `vgi_rpc.protocol_version` key at all: the serializers omit
 the key for any `VgiProtocolId` whose version is empty.
 
-The combined successor identifies itself as **`vgi.v3` / `3.0.0`**. Its
+The current contract identifies itself as **`vgi.v3` / `3.1.0`**. Its
 breaking catalog, macro and expression contracts are distinct from the
 published `vgi.v2` / `2.2.0` surface. The major version is part of the routing
 name, so a request for an unsupported major is rejected before entering that
@@ -36,7 +36,9 @@ protocol's handlers. Over HTTP, ordinary requests use `{base}/vgi.v3/{method}`.
 The application wire revision is checked separately: peers must agree on its
 major and minor components; patch revisions must remain wire compatible. The
 historical catalog metadata transition used `2.1` → `2.2` under `vgi.v2`.
-The combined successor uses a new major and routing namespace instead.
+The 3.0 successor introduced the new major and routing namespace; 3.1 adds
+partition-distribution planning under that same namespace and therefore uses
+the exact minor-version gate.
 
 Deploy matched consumers and workers, with old and new versions at separate
 endpoints/processes during migration. Drain old sessions and transactions,
@@ -79,4 +81,3 @@ modes, and only one of them was cheap.
 generator cannot see: that the value reaches the wire, on the right method, and
 is absent on reserved methods where its presence is rejected. Those are the
 secret-protocol and reserved-method cases the integration suite never reaches.
-
