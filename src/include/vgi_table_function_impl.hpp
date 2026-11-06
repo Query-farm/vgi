@@ -929,6 +929,10 @@ bool VgiContainsDynamicFilter(const TableFilter &filter);
 //! Expression pushdown callback: checks if the expression tree only uses functions the worker supports
 bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr);
 
+//! Expression pushdown callback for buffered table-in/out functions, whose
+//! LogicalGet owns VgiTableInOutBindData rather than VgiTableFunctionBindData.
+bool VgiTableInOutPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr);
+
 //! Init global function - creates primary connection and performs init handshake
 unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 

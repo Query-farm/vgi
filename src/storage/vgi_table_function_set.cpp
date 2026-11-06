@@ -267,6 +267,8 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.requires_input_batch_index = vgi_info.function_info().requires_input_batch_index;
 	params.projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 	params.filter_pushdown = SupportsVgiFilterV2(vgi_info.function_info());
+	params.filter_semantic_profiles = vgi_info.function_info().filter_semantic_profiles;
+	params.additional_filter_functions = vgi_info.function_info().additional_filter_functions;
 	// A3 serial opt-out: a worker that declares Meta.max_workers=1 keeps its
 	// streaming table-in-out on a single shared worker (MaxThreads()=1).
 	params.max_workers = vgi_info.function_info().max_workers.value_or(0);
@@ -402,7 +404,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			if (is_buffering) {
 				table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
 				if (table_func.filter_pushdown) {
-					table_func.pushdown_expression = vgi::VgiPushdownExpression;
+					table_func.pushdown_expression = vgi::VgiTableInOutPushdownExpression;
 				}
 			}
 			table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);

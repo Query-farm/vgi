@@ -83,6 +83,10 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->source_order_dependent = source_order_dependent;
 	copy->sink_order_dependent = sink_order_dependent;
 	copy->requires_input_batch_index = requires_input_batch_index;
+	copy->projection_pushdown = projection_pushdown;
+	copy->filter_pushdown = filter_pushdown;
+	copy->filter_semantic_profiles = filter_semantic_profiles;
+	copy->additional_filter_functions = additional_filter_functions;
 	copy->parallel_safe = parallel_safe;
 	copy->has_finalize = has_finalize;
 	copy->stability = stability;
@@ -163,6 +167,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->requires_input_batch_index = params.requires_input_batch_index;
 	bind_data->projection_pushdown = params.projection_pushdown;
 	bind_data->filter_pushdown = params.filter_pushdown;
+	bind_data->filter_semantic_profiles = params.filter_semantic_profiles;
+	bind_data->additional_filter_functions = params.additional_filter_functions;
 	// Phase A: a streaming table-in-out function is a per-substream map, so it
 	// parallelizes by default — one worker per substream (per PipelineExecutor).
 	// This holds EVEN with a finalize callback: with per-substream workers each

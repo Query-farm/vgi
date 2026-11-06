@@ -110,6 +110,12 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// pushes — column_ids has only a virtual GetAnyColumn placeholder).
 	bool projection_pushdown = false;
 	bool filter_pushdown = false;
+	// Expression-filter negotiation copied from FunctionInfo. Buffered
+	// table-in/out functions use a distinct bind-data type from ordinary table
+	// functions, so their pushdown callback must read these values here rather
+	// than casting to VgiTableFunctionBindData.
+	std::vector<std::string> filter_semantic_profiles;
+	std::vector<VgiFilterFunctionCapability> additional_filter_functions;
 	// Phase A parallelism gate, DERIVED at bind from the registered finalize
 	// callback (`input.table_function.in_out_function_final`), not from
 	// func_info metadata. True (default) = no finalize = per-substream map =
@@ -345,6 +351,8 @@ struct VgiTableInOutBindParams {
 	// represent a real projection (vs. the default GetAnyColumn placeholder).
 	bool projection_pushdown = false;
 	bool filter_pushdown = false;
+	std::vector<std::string> filter_semantic_profiles;
+	std::vector<VgiFilterFunctionCapability> additional_filter_functions;
 
 	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }

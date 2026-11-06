@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_settings_defaults.hpp"
 #include "vgi_table_function_impl.hpp"
+#include "vgi_table_in_out_impl.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/function/scalar/struct_utils.hpp"
@@ -548,6 +549,26 @@ bool ExpressionTreeIsSupported(const Expression &expr,
 	}
 }
 
+bool PushdownExpression(ClientContext &context, Expression &expr, const string &function_name,
+                        const std::vector<std::string> &semantic_profiles,
+                        const std::vector<VgiFilterFunctionCapability> &additional_functions) {
+	if (std::find(semantic_profiles.begin(), semantic_profiles.end(), "vgi.duckdb.standard.v1") ==
+	    semantic_profiles.end()) {
+		return false;
+	}
+	bool supported = ExpressionTreeIsSupported(expr, additional_functions);
+	if (supported) {
+		VGI_LOG(context, "table_function.expression_filter_accepted",
+		        {{"function_name", function_name}, {"expression", expr.ToString()}});
+	} else {
+		VGI_LOG(context, "table_function.expression_filter_rejected",
+		        {{"function_name", function_name},
+		         {"expression", expr.ToString()},
+		         {"reason", "expression tree contains unsupported function or node type"}});
+	}
+	return supported;
+}
+
 } // anonymous namespace
 
 bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
@@ -555,21 +576,17 @@ bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expres
 		return false;
 	}
 	auto &bind_data = get.bind_data->Cast<VgiTableFunctionBindData>();
-	if (std::find(bind_data.filter_semantic_profiles.begin(), bind_data.filter_semantic_profiles.end(),
-	              "vgi.duckdb.standard.v1") == bind_data.filter_semantic_profiles.end()) {
+	return PushdownExpression(context, expr, bind_data.function_name, bind_data.filter_semantic_profiles,
+	                          bind_data.additional_filter_functions);
+}
+
+bool VgiTableInOutPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
+	if (!get.bind_data) {
 		return false;
 	}
-	bool supported = ExpressionTreeIsSupported(expr, bind_data.additional_filter_functions);
-	if (supported) {
-		VGI_LOG(context, "table_function.expression_filter_accepted",
-		        {{"function_name", bind_data.function_name}, {"expression", expr.ToString()}});
-	} else {
-		VGI_LOG(context, "table_function.expression_filter_rejected",
-		        {{"function_name", bind_data.function_name},
-		         {"expression", expr.ToString()},
-		         {"reason", "expression tree contains unsupported function or node type"}});
-	}
-	return supported;
+	auto &bind_data = get.bind_data->Cast<VgiTableInOutBindData>();
+	return PushdownExpression(context, expr, bind_data.function_name, bind_data.filter_semantic_profiles,
+	                          bind_data.additional_filter_functions);
 }
 
 // ============================================================================
