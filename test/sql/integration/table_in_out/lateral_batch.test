@@ -205,41 +205,7 @@ SELECT x, b FROM range(4) t(x), LATERAL ex.projectable_blended(t.x) ORDER BY x;
 2	200
 3	300
 
-statement ok
-SET vgi_batch_lateral=true;
-
-# ---------------------------------------------------------------------------
-# Adversarial provenance: the worker (a semi-trusted, possibly remote, party)
-# supplies integers used as input-row indices. A malformed vgi_rpc.parent_row must
-# be REJECTED (clear error), never used as an unchecked array index. hostile_provenance
-# emits a poisoned payload per `mode`; each must throw on BOTH transports so the
-# subprocess and HTTP parse/validate paths stay symmetric. threads=1 makes the
-# single input chunk deterministic.
-# ---------------------------------------------------------------------------
-
-statement ok
-SET threads=1;
-
-# out-of-range index (== num_rows, one past the last valid): the range check throws.
-statement error
-SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'range');
-----
-out of range
-
-# wrong-length blob (one int32 too many): the length check throws.
-statement error
-SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'length');
-----
-vgi_rpc.parent_row
-
-# non-base64 payload: the connection's base64 decode throws before any indexing.
-statement error
-SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'base64');
-----
-invalid base64 payload
-
-statement ok
-RESET threads;
+# Adversarial provenance (hostile_provenance) is in lateral_batch_named_args.test.
 
 statement ok
 DETACH ex;

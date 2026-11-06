@@ -27,7 +27,10 @@ import subprocess
 import sys
 import time
 
+# The shell is `haybarn` on Haybarn and `duckdb` on upstream DuckDB.
 HAYBARN = os.path.join(os.path.dirname(__file__), "..", "build", "release", "haybarn")
+if not os.path.isfile(HAYBARN):
+    HAYBARN = os.path.join(os.path.dirname(__file__), "..", "build", "release", "duckdb")
 EXT = os.path.join(os.path.dirname(__file__), "..", "build", "release", "extension", "vgi", "vgi.duckdb_extension")
 VGI_PROJECT = os.path.expanduser("~/Development/vgi-python")
 

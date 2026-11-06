@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #define DUCKDB_EXTENSION_MAIN
 
+#include "vgi_engine_compat.hpp"
 #include "vgi_arrow.hpp"
 #include "vgi_settings_defaults.hpp"
 #include "vgi_extension.hpp"
@@ -69,6 +70,7 @@
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_catalogs.hpp"
+#include "vgi_engine_features.hpp"
 #include "vgi_protocols.hpp"
 #include "vgi_query_function.hpp"
 #include "vgi_projection_pushdown.hpp"
@@ -3763,6 +3765,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
 	RegisterVgiProtocolsFunction(loader);
+	RegisterVgiEngineFeaturesFunction(loader);
 	vgi::RegisterVgiQueryFunction(loader);
 	vgi::RegisterVgiExportSessionFunction(loader);
 
@@ -3784,7 +3787,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		scan_func.deserialize = VgiTableEntry::VgiTableScanDeserialize;
 		scan_func.projection_pushdown = true;
 		scan_func.filter_pushdown = true;
-		scan_func.runtime_filter_pushdown = false;
+		VgiDisableRuntimeFilterPushdown(scan_func);
 		CreateTableFunctionInfo scan_info(scan_func);
 		scan_info.descriptions.push_back(vgi::MakeFunctionDescription(
 		    "Internal: the physical scan operator for tables in an attached VGI catalog. DuckDB binds it "

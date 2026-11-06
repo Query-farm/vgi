@@ -30,7 +30,10 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")  # enable_logging colours stdout; strip be
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-HAYBARN = os.environ.get("VGI_HAYBARN", os.path.join(ROOT, "build/release/haybarn"))
+HAYBARN = os.environ.get("VGI_HAYBARN") or next(
+    (p for p in (os.path.join(ROOT, "build/release", n) for n in ("haybarn", "duckdb")) if os.path.exists(p)),
+    os.path.join(ROOT, "build/release/haybarn"),
+)
 EXTENSION = os.environ.get(
     "VGI_EXTENSION", os.path.join(ROOT, "build/release/extension/vgi/vgi.duckdb_extension")
 )

@@ -16,6 +16,7 @@
 
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_transaction.hpp"
+#include "vgi_engine_compat.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_column_expression.hpp"
 #include "vgi_projection_pushdown.hpp"
@@ -56,7 +57,7 @@ TableFunction MakeNativeDelegationMarkerFunction() {
 	// on this LogicalGet's table_filters; the rewriter then hands them off to
 	// the real native function on the rewritten LogicalGet.
 	fn.filter_pushdown = true;
-	fn.runtime_filter_pushdown = false;
+	VgiDisableRuntimeFilterPushdown(fn);
 	fn.projection_pushdown = true;
 	return fn;
 }
@@ -943,7 +944,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// Generated-table optimizer callbacks still use logical coordinates; keep
 	// those filters/order/statistics local until their remapping is qualified.
 	func.filter_pushdown = !generated_columns && has_filter_pushdown && supports_filter_v2;
-	func.runtime_filter_pushdown = false;
+	VgiDisableRuntimeFilterPushdown(func);
 	func.sampling_pushdown = has_sampling_pushdown;
 	// Propagate the worker's declared order preservation to the synthetic
 	// TableFunction so DuckDB's planner sees the right SourceOrder() for
@@ -1168,12 +1169,14 @@ virtual_column_map_t VgiTableEntry::GetVirtualColumns() const {
 	return result;
 }
 
+#if VGI_ENGINE_HAS_DELETE_RETURNING_VIRTUAL_COLUMNS
 virtual_column_map_t VgiTableEntry::GetDeleteReturningVirtualColumns() const {
 	// The provider returns user columns for DELETE. Its transport row identifier
 	// is available to scans but is absent from the returned row schema; response
 	// order is not an identity mapping back to the input identifiers.
 	return {};
 }
+#endif
 
 vector<column_t> VgiTableEntry::GetRowIdColumns() const {
 	if (rowid_type_ != LogicalType::INVALID) {

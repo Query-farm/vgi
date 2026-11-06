@@ -10,6 +10,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HAYBARN="${VGI_HAYBARN:-$HERE/build/release/haybarn}"
+[ -x "$HAYBARN" ] || [ -n "${VGI_HAYBARN:-}" ] || HAYBARN="$HERE/build/release/duckdb"  # upstream DuckDB shell
 WORKER="${VGI_TEST_WORKER:-uv run --project $HOME/Development/vgi-python vgi-fixture-worker}"
 TMP="$(mktemp -d)"
 RC="$TMP/xproc"

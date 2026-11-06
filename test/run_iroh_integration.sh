@@ -10,6 +10,7 @@ VGI_PYTHON_DIR="${VGI_PYTHON_DIR:-$HOME/Development/vgi-python}"
 VGI_RPC_PYTHON_DIR="${VGI_RPC_PYTHON_DIR:-}"
 VGI_IROH_BRIDGE_BIN="${VGI_IROH_BRIDGE_BIN:-$HOME/Development/vgi-rpc-rust/target/release/vgi-iroh-bridge}"
 HAYBARN="${ROOT_DIR}/build/${BUILD_DIR}/haybarn"
+[ -x "$HAYBARN" ] || HAYBARN="${ROOT_DIR}/build/${BUILD_DIR}/duckdb"  # upstream DuckDB shell
 
 for required in "$HAYBARN" "$VGI_IROH_BRIDGE_BIN"; do
     if [[ ! -x "$required" ]]; then

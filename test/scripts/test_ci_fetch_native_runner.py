@@ -25,6 +25,7 @@ class NativeArtifactTests(unittest.TestCase):
         self.artifact = {"name": "vgi-native-runner-linux_amd64", "expired": False}
         self.bad_revision = False
         self.corrupt = False
+        self.engine_env = None  # None: a manifest packaged before engine gates
 
     def api(self, path):
         if path.endswith("/artifacts"):
@@ -41,6 +42,8 @@ class NativeArtifactTests(unittest.TestCase):
             "protocol_version": "3.0.0",
             "sha256": {name: runner.digest(staging / name) for name in ("unittest", "haybarn")},
         }
+        if self.engine_env is not None:
+            manifest["engine_test_env"] = self.engine_env
         (staging / "manifest.json").write_text(json.dumps(manifest))
         if self.corrupt:
             (staging / "unittest").write_bytes(b"corrupt executable")
@@ -62,6 +65,52 @@ class NativeArtifactTests(unittest.TestCase):
         self.assertIn("RUNNER_LINKS_EXTENSIONS=1\n", environment)
         self.assertIn(f"HAYBARN_UNITTEST={self.root}/output/unittest\n", environment)
         self.assertTrue(os.access(self.root / "output/unittest", os.X_OK))
+
+    def test_haybarn_artifact_exports_engine_test_env(self):
+        self.engine_env = {
+            "VGI_ENGINE_CORRELATED_NAMED_ARGS": "1",
+            "VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS": "1",
+        }
+        self.fetch()
+        environment = (self.root / "environment").read_text()
+        self.assertIn("VGI_ENGINE_CORRELATED_NAMED_ARGS=1\n", environment)
+        self.assertIn("VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS=1\n", environment)
+
+    def test_upstream_and_legacy_artifacts_export_no_engine_test_env(self):
+        for engine_env in ({}, None):
+            with self.subTest(engine_env=engine_env):
+                self.engine_env = engine_env
+                (self.root / "environment").unlink(missing_ok=True)
+                self.fetch()
+                environment = (self.root / "environment").read_text()
+                self.assertIn("HAYBARN_UNITTEST=", environment)
+                self.assertNotIn("VGI_ENGINE_", environment)
+
+    def test_malformed_engine_test_env_is_rejected(self):
+        for engine_env in ({"VGI_ENGINE_X": "0"}, {"PATH": "1"}, ["VGI_ENGINE_X=1"]):
+            with self.subTest(engine_env=engine_env):
+                self.engine_env = engine_env
+                with self.assertRaisesRegex(RuntimeError, "engine"):
+                    self.fetch()
+                self.assertFalse((self.root / "environment").exists())
+
+    def test_engine_flavor_follows_the_checked_out_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "duckdb/src/include/duckdb").mkdir(parents=True)
+            self.assertEqual(runner.engine_flavor(source), "duckdb")
+            (source / "duckdb/src/include/duckdb/haybarn.h").write_text("#define HAYBARN 1\n")
+            self.assertEqual(runner.engine_flavor(source), "haybarn")
+
+    def test_parse_engine_test_env(self):
+        self.assertEqual(runner.parse_engine_test_env(""), {})
+        self.assertEqual(
+            runner.parse_engine_test_env("VGI_ENGINE_A=1\nVGI_ENGINE_B=1\n"),
+            {"VGI_ENGINE_A": "1", "VGI_ENGINE_B": "1"},
+        )
+        for bad in ("make: Entering directory", "VGI_ENGINE_A=", "VGI_ENGINE_A=yes", "OTHER=1"):
+            with self.subTest(line=bad), self.assertRaises(RuntimeError):
+                runner.parse_engine_test_env(bad)
 
     def test_mismatched_manifest_is_rejected(self):
         self.bad_revision = True

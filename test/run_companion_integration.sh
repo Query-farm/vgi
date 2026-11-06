@@ -17,6 +17,7 @@ set -euo pipefail
 VGI_PYTHON_DIR="${VGI_PYTHON_DIR:-$HOME/Development/vgi-python}"
 BUILD_DIR="${BUILD_DIR:-release}"
 HAYBARN="./build/${BUILD_DIR}/haybarn"
+[ -x "$HAYBARN" ] || HAYBARN="./build/${BUILD_DIR}/duckdb"  # upstream DuckDB shell
 RUN_TESTS=(python3 scripts/run_tests.py --build "$BUILD_DIR")
 FILTER="${1:-test/sql/integration/catalog/companion_catalogs.test}"
 shift 2>/dev/null || true

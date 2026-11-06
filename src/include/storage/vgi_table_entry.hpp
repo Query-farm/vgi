@@ -13,6 +13,7 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
+#include "vgi_engine_compat.hpp"
 #include "vgi_catalog_metadata.hpp"
 
 namespace duckdb {
@@ -89,7 +90,9 @@ public:
 
 	// Virtual columns: return rowid if table has a row_id column
 	virtual_column_map_t GetVirtualColumns() const override;
+#if VGI_ENGINE_HAS_DELETE_RETURNING_VIRTUAL_COLUMNS
 	virtual_column_map_t GetDeleteReturningVirtualColumns() const override;
+#endif
 
 	// Row ID columns: return COLUMN_IDENTIFIER_ROW_ID if table has a row_id column
 	vector<column_t> GetRowIdColumns() const override;

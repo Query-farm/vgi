@@ -4,7 +4,10 @@
 set -euo pipefail
 
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-duckdb_bin=${VGI_DATABASE_WORKER_DUCKDB:-"${project_dir}/build/release/haybarn"}
+# The shell is build/release/haybarn on Haybarn, build/release/duckdb upstream.
+default_bin="${project_dir}/build/release/haybarn"
+[ -x "$default_bin" ] || default_bin="${project_dir}/build/release/duckdb"
+duckdb_bin=${VGI_DATABASE_WORKER_DUCKDB:-"$default_bin"}
 python_worker=${VGI_DATABASE_PYTHON_WORKER:?set VGI_DATABASE_PYTHON_WORKER}
 bun_worker=${VGI_DATABASE_BUN_WORKER:?set VGI_DATABASE_BUN_WORKER}
 rust_worker=${VGI_DATABASE_RUST_WORKER:?set VGI_DATABASE_RUST_WORKER}

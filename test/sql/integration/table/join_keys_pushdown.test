@@ -78,10 +78,16 @@ SELECT MAX(s.n) FROM large_keys l JOIN example.sequence(10000) s ON l.id = s.n;
 # Above the threshold, only independently exposed min/max pruning may arrive.
 # ============================================================================
 
+# Only with TableFunction::runtime_filter_pushdown (vgi_engine_features();
+# duckdb/duckdb#28090): upstream v2.0.0 builds a prefix-range filter for this
+# join, which VGI cannot ship, and pushes no min/max bounds alongside it.
 query T
-SELECT DISTINCT pushed_filters FROM large_keys l JOIN example.filter_echo(10000) s ON l.id = s.n LIMIT 1;
+SELECT DISTINCT pushed_filters = CASE
+    WHEN (SELECT available FROM vgi_engine_features() WHERE feature = 'runtime_filter_pushdown')
+    THEN 'n >= 0 AND n <= 995' ELSE '(none)' END
+FROM large_keys l JOIN example.filter_echo(10000) s ON l.id = s.n LIMIT 1;
 ----
-n >= 0 AND n <= 995
+true
 
 # ============================================================================
 # A user-selected threshold remains authoritative

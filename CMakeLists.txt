@@ -341,6 +341,7 @@ src/vgi_oauth_env.cpp
 src/vgi_oauth_store.cpp
 src/vgi_catalogs.cpp
 src/vgi_protocols.cpp
+src/vgi_engine_features.cpp
 src/vgi_attach_tickets.cpp
 src/vgi_reflection.cpp
 src/vgi_hosted_protocols.cpp
@@ -697,16 +698,20 @@ if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS
 
   # Verify request-local provider parameter copies independently of the VGI
   # archive, so native-engine HTTP integration can be checked during an API port.
-  add_executable(vgi_http_params_clone_tests
-    test/cpp/test_main.cpp
-    test/cpp/test_http_params_clone.cpp)
-  target_include_directories(vgi_http_params_clone_tests PRIVATE
-    duckdb/src/include
-    duckdb/third_party/catch
-    $<TARGET_PROPERTY:httpfs_extension,SOURCE_DIR>/src/include)
-  target_link_libraries(vgi_http_params_clone_tests
-    httpfs_extension
-    duckdb_static)
+  # HTTPParams::Clone (duckdb/duckdb#28088) and interrupt_context are Haybarn-only
+  # (vgi_engine_compat.hpp); upstream DuckDB has nothing for this to test.
+  if(VGI_ENGINE_FLAVOR STREQUAL "haybarn")
+    add_executable(vgi_http_params_clone_tests
+      test/cpp/test_main.cpp
+      test/cpp/test_http_params_clone.cpp)
+    target_include_directories(vgi_http_params_clone_tests PRIVATE
+      duckdb/src/include
+      duckdb/third_party/catch
+      $<TARGET_PROPERTY:httpfs_extension,SOURCE_DIR>/src/include)
+    target_link_libraries(vgi_http_params_clone_tests
+      httpfs_extension
+      duckdb_static)
+  endif()
 endif()
 
 # Catalog metadata fields exist in CreateInfo even where the pinned SQL parser

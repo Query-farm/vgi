@@ -11,10 +11,29 @@ duckdb_extension_load(vgi
 # overrides this list.
 duckdb_extension_statically_link(vgi)
 
-# The v2.0 branch builds against Haybarn's DuckDB 2.0 engine. Pin its matching
-# HTTP stack so the extension and httpfs share the same engine APIs.
-set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
-set(HTTPFS_GIT_TAG d312888956c2edef09c68a42f3fdb28e1dd55acf)
+# The v2.0 branch builds against either Haybarn's DuckDB 2.0 engine (the `duckdb`
+# submodule) or upstream DuckDB v2.0.0 (DUCKDB_SRCDIR pointing at an upstream
+# checkout; see docs/upstream-duckdb-build.md). Only Haybarn ships
+# duckdb/haybarn.h, so its presence selects the flavor. Pin the matching HTTP
+# stack so the extension and httpfs share the same engine APIs.
+if(EXISTS "${CMAKE_SOURCE_DIR}/src/include/duckdb/haybarn.h")
+    set(VGI_ENGINE_FLAVOR haybarn)
+    set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
+    set(HTTPFS_GIT_TAG d312888956c2edef09c68a42f3fdb28e1dd55acf)
+else()
+    set(VGI_ENGINE_FLAVOR duckdb)
+    # The httpfs revision upstream v2.0.0 pins in
+    # .github/config/extensions/httpfs.cmake.
+    set(HTTPFS_GIT_URL https://github.com/duckdb/duckdb-httpfs)
+    set(HTTPFS_GIT_TAG 77392a72077a85897db2519fae11e2c0da972b8a)
+endif()
+message(STATUS "VGI: building against the ${VGI_ENGINE_FLAVOR} engine (httpfs ${HTTPFS_GIT_TAG})")
+# vgi_engine_compat.hpp checks its own duckdb/haybarn.h detection against this.
+if(VGI_ENGINE_FLAVOR STREQUAL "haybarn")
+    add_compile_definitions(VGI_ENGINE_FLAVOR_HAYBARN=1)
+else()
+    add_compile_definitions(VGI_ENGINE_FLAVOR_HAYBARN=0)
+endif()
 
 # httpfs is curl-based. On the MinGW toolchain
 # (x64-mingw-static, rtools GCC) it fails to link against static curl with

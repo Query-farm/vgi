@@ -30,6 +30,18 @@ have their own artifact hashes. These results do not establish cross-platform re
 readiness. Automatic whole-query pushdown, nested schemas and broader 2.0 type/grammar
 coverage remain open in `docs/duckdb-2.0-plan.md`. Native changes remain on `v2.0`.
 
+The same source also builds against **upstream DuckDB v2.0.0**
+(`scripts/use_duckdb_engine.sh duckdb`). Gate engine-specific code on the
+`VGI_ENGINE_HAS_*` macros in `src/include/vgi_engine_compat.hpp`, never on
+`HAYBARN` directly. Tests that depend on a feature use
+`require-env VGI_ENGINE_<FEATURE> 1` (or `require-env-not VGI_ENGINE_<FEATURE>`).
+The Makefile exports these for Haybarn trees. Direct `unittest` /
+`run_tests.py` runs must load them from `make -s engine_test_env`.
+Gate only the cases that need the feature: split them into a sibling file
+(`*_named_args.test`) and keep the rest ungated. Lanes that pass `--allow-skip`
+take the gating reasons from `VGI_ENGINE_EXPECTED_SKIPS`.
+See `docs/upstream-duckdb-build.md`.
+
 ## Build
 
 Edit locally; build and test on EC2. The current host is `ec2-user@100.55.10.44`
@@ -409,6 +421,7 @@ remain supported. Preserve this rule when changing pool/connection cleanup.
 | Topic | Doc |
 |-------|-----|
 | DuckDB 2.0 scope and remaining work | `docs/duckdb-2.0-plan.md` |
+| Haybarn vs upstream DuckDB builds (`vgi_engine_features()`) | `docs/upstream-duckdb-build.md` |
 | Native dependencies and Go producer compatibility | `docs/native-dependencies.md` |
 | Current dependency build/release evidence | `docs/duckdb-2.0-dependency-qualification.json` |
 | Settings, ATTACH options, LOCATION schemes, SQL diagnostic functions | `docs/reference.md` |

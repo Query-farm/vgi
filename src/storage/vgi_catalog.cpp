@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "storage/vgi_catalog.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "vgi_engine_compat.hpp"
 #include "vgi_result_cache.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -67,6 +68,31 @@ static void RequireWriteResultMode(const VgiTableEntry &table, const string &ope
 		    StringUtil::Format("Table '%s' does not support result mode '%s' for %s (maximum is '%s')", table.name,
 		                       requested, StringUtil::Upper(operation), entry->second));
 	}
+}
+
+// Engines without TableCatalogEntry::GetDeleteReturningVirtualColumns (upstream
+// DuckDB; see vgi_engine_compat.hpp) bind DELETE ... RETURNING as the user
+// columns followed by every scan virtual column (rowid), and a reference to
+// rowid binds. The provider's RETURNING rows carry user columns only, and this
+// hook cannot see which columns the query uses, so refuse before any row is
+// deleted rather than return values the worker never sent.
+static void RequireDeleteReturningLayout(const VgiTableEntry &table, bool return_chunk) {
+#if VGI_ENGINE_HAS_DELETE_RETURNING_VIRTUAL_COLUMNS
+	(void)table;
+	(void)return_chunk;
+#else
+	if (return_chunk && !table.GetVirtualColumns().empty()) {
+		throw BinderException(
+		    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+		        .Set(vgi::error_key::kTable, table.name.GetIdentifierName())
+		        .Set(vgi::error_key::kOperation, "DELETE"),
+		    StringUtil::Format("DELETE ... RETURNING on VGI table '%s' needs "
+		                       "TableCatalogEntry::GetDeleteReturningVirtualColumns (duckdb/duckdb#28089), which this "
+		                       "DuckDB engine lacks (see vgi_engine_features()). Run the DELETE without RETURNING, "
+		                       "or use a Haybarn build.",
+		                       table.name));
+	}
+#endif
 }
 
 VgiCatalog::VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name, AccessMode access_mode,
@@ -217,6 +243,7 @@ PhysicalOperator &VgiCatalog::PlanDelete(ClientContext &context, PhysicalPlanGen
                                          PhysicalOperator &plan) {
 	auto &table = op.table.Cast<VgiTableEntry>();
 	RequireWriteResultMode(table, "delete", op.return_chunk);
+	RequireDeleteReturningLayout(table, op.return_chunk);
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
 	auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, bound_ref.Index());
 	del.children.push_back(plan);

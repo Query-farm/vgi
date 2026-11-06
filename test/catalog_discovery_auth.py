@@ -20,6 +20,8 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build' / os.environ.get('BUILD_DIR', 'release')
+# The shell is `haybarn` on Haybarn and `duckdb` on upstream DuckDB.
+SHELL = BUILD / 'haybarn' if (BUILD / 'haybarn').is_file() else BUILD / 'duckdb'
 ACCESS = 'discovery-test-access-only'
 REFRESH = 'discovery-test-refresh-only'
 
@@ -95,7 +97,7 @@ def main():
 
     def sql(statement, expected_error=None):
         prefix = f"LOAD '{BUILD / 'extension/vgi/vgi.duckdb_extension'}';\nSET vgi_oauth_cache='memory';\n"
-        result = subprocess.run([str(BUILD / 'haybarn'), '-unsigned', '-batch', '-bail'],
+        result = subprocess.run([str(SHELL), '-unsigned', '-batch', '-bail'],
                                 input=prefix + statement, text=True, capture_output=True, timeout=30,
                                 env=dict(os.environ, QUERY_FARM_TELEMETRY_OPT_OUT='1'))
         output = result.stdout + result.stderr

@@ -1,0 +1,57 @@
+# name: test/sql/integration/simple_writable/delete_returning_unsupported.test
+# description: Without TableCatalogEntry::GetDeleteReturningVirtualColumns (upstream DuckDB),
+#   DELETE ... RETURNING binds a rowid the provider never returns. VGI refuses it at
+#   plan time, so no row is deleted.
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+# Only on engines WITHOUT GetDeleteReturningVirtualColumns (duckdb/duckdb#28089).
+require-env-not VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS
+
+require vgi
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+statement ok
+INSERT INTO w.main.items VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40);
+
+statement error
+DELETE FROM w.main.items WHERE id = 1 RETURNING rowid;
+----
+needs TableCatalogEntry::GetDeleteReturningVirtualColumns
+
+statement error
+DELETE FROM w.main.items WHERE id = 2 RETURNING *;
+----
+needs TableCatalogEntry::GetDeleteReturningVirtualColumns
+
+statement ok
+PRAGMA disable_optimizer;
+
+statement error
+DELETE FROM w.main.items WHERE id = 3 RETURNING id;
+----
+needs TableCatalogEntry::GetDeleteReturningVirtualColumns
+
+statement ok
+PRAGMA enable_optimizer;
+
+# Nothing was deleted.
+query III
+SELECT id, name, qty FROM w.main.items ORDER BY id;
+----
+1	a	10
+2	b	20
+3	c	30
+4	d	40
+
+# Without RETURNING the DELETE goes through.
+statement ok
+DELETE FROM w.main.items WHERE id = 1;
+
+query I
+SELECT COUNT(*) FROM w.main.items;
+----
+3

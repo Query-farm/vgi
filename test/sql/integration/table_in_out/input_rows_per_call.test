@@ -107,19 +107,18 @@ statement ok
 RESET vgi_exchange_input_dedup;
 
 # ---------------------------------------------------------------------------
-# Equivalence with blended_explode across several input chunks, with and without
-# each call's output also continuing across replies (page_size 2).
+# Equivalence with blended_explode across several input chunks. The same check
+# with each call's output also continuing across replies (page_size := 2) is in
+# input_rows_per_call_named_args.test.
 # ---------------------------------------------------------------------------
 
 statement ok
 CREATE TABLE explode_ref AS
 SELECT x, i FROM range(3000) t(x), LATERAL ex.blended_explode(t.x % 11);
 
-foreach page_size 2 1000000
-
 statement ok
-CREATE OR REPLACE TABLE sliced AS
-SELECT x, i, call_rows FROM range(3000) t(x), LATERAL ex.blended_sliced(t.x % 11, page_size := ${page_size});
+CREATE TABLE sliced AS
+SELECT x, i, call_rows FROM range(3000) t(x), LATERAL ex.blended_sliced(t.x % 11);
 
 query I
 SELECT count(*) FROM (
@@ -134,8 +133,6 @@ query I
 SELECT max(call_rows) <= 3 AND count(*) > 0 FROM sliced;
 ----
 true
-
-endloop
 
 # Distinct inputs across chunks: 3000 rows, every call at most 3.
 query II
@@ -184,100 +181,15 @@ statement ok
 SET threads = 8;
 
 query II
-SELECT count(*), max(call_rows) FROM range(20000) t(x), LATERAL ex.blended_sliced(t.x % 5, page_size := 4);
+SELECT count(*), max(call_rows) FROM range(20000) t(x), LATERAL ex.blended_sliced(t.x % 5);
 ----
 40000	3
 
 statement ok
 RESET threads;
 
-# ---------------------------------------------------------------------------
-# Per-value cache across calls. With cache_ttl, each call's first reply advertises
-# per-value caching, so each call's values are stored. A second query with the same
-# values in another order misses the whole-chunk cache but is served entirely from
-# the per-value entries: no worker call. Sum over n = 0..9 of n(n-1)/2 = 120.
-# ---------------------------------------------------------------------------
-
-statement ok
-SET threads = 1;
-
-statement ok
-CALL enable_logging(level := 'debug');
-
-statement ok
-CALL truncate_duckdb_logs();
-
-query II
-SELECT count(*), sum(i) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x, cache_ttl := 300);
-----
-45	120
-
-query I
-SELECT count(*) > 0
-FROM duckdb_logs()
-WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
-  AND message LIKE '%blended_sliced%';
-----
-true
-
-statement ok
-CALL truncate_duckdb_logs();
-
-query II
-SELECT count(*), sum(i) FROM range(10) t(x), LATERAL ex.blended_sliced(9 - t.x, cache_ttl := 300);
-----
-45	120
-
-query I
-SELECT count(*)
-FROM duckdb_logs()
-WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
-  AND message LIKE '%blended_sliced%';
-----
-0
-
-# Served rows keep their own outer columns.
-query II
-SELECT x, i FROM range(10) t(x), LATERAL ex.blended_sliced(9 - t.x, cache_ttl := 300) WHERE x >= 7 ORDER BY x, i;
-----
-7	0
-7	1
-8	0
-
-# A call whose output continued is never stored, so the reordered repeat calls the
-# worker again — and still gets the same rows.
-statement ok
-CALL truncate_duckdb_logs();
-
-query II
-SELECT count(*), sum(i) FROM range(10) t(x), LATERAL ex.blended_sliced(t.x, page_size := 2, cache_ttl := 300);
-----
-45	120
-
-statement ok
-CALL truncate_duckdb_logs();
-
-query II
-SELECT count(*), sum(i) FROM range(10) t(x), LATERAL ex.blended_sliced(9 - t.x, page_size := 2, cache_ttl := 300);
-----
-45	120
-
-query I
-SELECT count(*) > 0
-FROM duckdb_logs()
-WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
-  AND message LIKE '%blended_sliced%';
-----
-true
-
-statement ok
-CALL disable_logging();
-
-statement ok
-RESET threads;
+# The correlated per-value-cache and paged cases pass named arguments
+# (cache_ttl :=, page_size :=): input_rows_per_call_named_args.test.
 
 statement error
 SELECT * FROM ex.blended_sliced(3, page_size := 0);

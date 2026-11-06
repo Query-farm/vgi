@@ -1,0 +1,60 @@
+# name: test/sql/integration/table_in_out/lateral_batch_named_args.test
+# description: Batched correlated LATERAL rejects malformed worker provenance
+#   (hostile_provenance selects its poisoned payload with a named arg).
+#   Needs named arguments in correlated table-function calls (duckdb/duckdb#27833,
+#   merged after DuckDB v2.0.0).
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+# Named args in correlated calls (duckdb/duckdb#27833); see docs/upstream-duckdb-build.md.
+require-env VGI_ENGINE_CORRELATED_NAMED_ARGS 1
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded (else a "VGI HTTP transport requires
+# the httpfs extension" error — containing "HTTP" — makes the harness silently
+# skip the whole file). Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET vgi_batch_lateral=true;
+
+# ---------------------------------------------------------------------------
+# Adversarial provenance: the worker (a semi-trusted, possibly remote, party)
+# supplies integers used as input-row indices. A malformed vgi_rpc.parent_row must
+# be REJECTED (clear error), never used as an unchecked array index. hostile_provenance
+# emits a poisoned payload per `mode`; each must throw on BOTH transports so the
+# subprocess and HTTP parse/validate paths stay symmetric. threads=1 makes the
+# single input chunk deterministic.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads=1;
+
+# out-of-range index (== num_rows, one past the last valid): the range check throws.
+statement error
+SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'range');
+----
+out of range
+
+# wrong-length blob (one int32 too many): the length check throws.
+statement error
+SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'length');
+----
+vgi_rpc.parent_row
+
+# non-base64 payload: the connection's base64 decode throws before any indexing.
+statement error
+SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'base64');
+----
+invalid base64 payload
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH ex;

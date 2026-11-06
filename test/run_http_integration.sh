@@ -9,6 +9,14 @@ BUILD_DIR="${BUILD_DIR:-release}"
 FILTER="${1:-test/sql/integration/*}"
 shift 2>/dev/null || true
 
+# The engine feature variables the SQL tests gate on (docs/upstream-duckdb-build.md).
+# make exports them already; a direct run loads them, so the gated files run on
+# Haybarn instead of skipping. An assignment, so a make error stops the script.
+engine_env="$(make -s --no-print-directory -C "$(dirname "$0")/.." engine_test_env)"
+set -a
+eval "$engine_env"
+set +a
+
 # database_worker/package.test packages a worker as an executable that the
 # database:// resolver execs locally. VGI_TEST_WORKER is a location on this lane,
 # not a command, so give the package a launchable one (override to package a

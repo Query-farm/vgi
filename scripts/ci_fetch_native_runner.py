@@ -45,7 +45,41 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+_ENGINE_TEST_VAR = re.compile(r"VGI_ENGINE_[A-Z0-9_]+")
+
+
+def parse_engine_test_env(text: str) -> dict[str, str]:
+    """``NAME=1`` lines from ``make engine_test_env`` (none for upstream DuckDB).
+
+    The .test files gate engine-dependent files on these with require-env /
+    require-env-not, and test/sql/engine_features/ fails when they disagree
+    with the binary, so a lane running this unittest needs exactly these.
+    """
+    values = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        name, sep, value = line.strip().partition("=")
+        if not sep or not _ENGINE_TEST_VAR.fullmatch(name) or value != "1":
+            raise RuntimeError(f"unexpected engine test variable line: {line!r}")
+        values[name] = value
+    return values
+
+
+def engine_test_env(source: Path) -> dict[str, str]:
+    return parse_engine_test_env(
+        command("make", "-s", "--no-print-directory", "-C", str(source), "engine_test_env")
+    )
+
+
+def engine_flavor(source: Path) -> str:
+    """The engine the `duckdb` tree is: the same haybarn.h test as the build."""
+    return "haybarn" if (source / "duckdb/src/include/duckdb/haybarn.h").is_file() else "duckdb"
+
+
 def package(source: Path, build: Path, output: Path, revision: str) -> None:
+    # The shell is build/haybarn on Haybarn and build/duckdb upstream. It is
+    # packaged as `haybarn` either way, the name the SDK lanes already run.
     cli = build / "haybarn"
     if not cli.is_file():
         cli = build / "duckdb"
@@ -58,10 +92,11 @@ def package(source: Path, build: Path, output: Path, revision: str) -> None:
         shutil.copy2(binary, output / name)
         hashes[name] = digest(output / name)
         # The artifact is the bare executables: any shared library they need from
-        # the build tree (libhaybarn.so) is missing on the SDK runners, where the
-        # binary then fails to start and every test is silently skipped.
+        # the build tree (libhaybarn.so, or libduckdb.so upstream) is missing on the
+        # SDK runners, where the binary then fails to start and every test is
+        # silently skipped.
         linked = command("ldd", str(output / name))
-        if "libhaybarn" in linked or "not found" in linked:
+        if "libhaybarn" in linked or "libduckdb" in linked or "not found" in linked:
             raise RuntimeError(f"{name} is not self-contained:\n{linked}")
     header = (source / "src/generated/vgi_protocol_version.hpp").read_text()
     version = re.search(r'VGI_PROTOCOL_VERSION\s*=\s*"([^"]+)"', header)
@@ -69,9 +104,13 @@ def package(source: Path, build: Path, output: Path, revision: str) -> None:
         raise RuntimeError("generated protocol version is missing")
     manifest = {
         "revision": revision,
-        "engine_revision": command("git", "-C", str(source), "rev-parse", "HEAD:duckdb"),
+        # The engine actually checked out, not the committed submodule pin:
+        # scripts/use_duckdb_engine.sh can switch the tree to upstream.
+        "engine": engine_flavor(source),
+        "engine_revision": command("git", "-C", str(source / "duckdb"), "rev-parse", "HEAD"),
         "platform": platform_name(),
         "protocol_version": version.group(1),
+        "engine_test_env": engine_test_env(source),
         "sha256": hashes,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -134,6 +173,12 @@ def fetch(revision: str, output: Path, timeout: int, branch: str = DEFAULT_BRANC
         "HAYBARN_CLI": str(output / "haybarn"),
         "RUNNER_LINKS_EXTENSIONS": "1",
     }
+    # Artifacts packaged before the engine gates carry none (and their tests
+    # have no gates). Re-validate: the manifest came from another workflow.
+    engine_env = manifest.get("engine_test_env", {})
+    if not isinstance(engine_env, dict):
+        raise RuntimeError("native artifact engine_test_env is malformed")
+    values.update(parse_engine_test_env("\n".join(f"{k}={v}" for k, v in engine_env.items())))
     environment = os.environ.get("GITHUB_ENV")
     if environment:
         with Path(environment).open("a") as target:

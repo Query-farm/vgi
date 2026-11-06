@@ -5,8 +5,8 @@
 #   (f(52,13) -> PhysicalTableScan single-row scan-mode), the column call (FROM t,
 #   f(t.x,t.y) -> streaming), and LATERAL (f(t.x,t.y)). Covers the simple fixture
 #   (geo_encode), an arity overload sharing the name (geo_encode3), and a VARARGS
-#   fixture (row_sum). Inline named args in the FROM-clause forms are a separate
-#   follow-up (a Haybarn binder patch); not exercised here.
+#   fixture (row_sum). Named args in the column/LATERAL forms are in
+#   blended_named_args.test.
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER
@@ -131,30 +131,7 @@ SELECT row_sum FROM ex.row_sum(-1.0, -2.0, absolute := true);
 ----
 3.0
 
-# COLUMN form + named (row_sum(a, b) with absolute -> abs(a)+abs(b))
-query I
-SELECT row_sum FROM (VALUES (-1.0, -2.0), (3.0, -4.0)) v(a, b), ex.row_sum(v.a, v.b, absolute := true) ORDER BY 1;
-----
-3.0
-7.0
-
-# LATERAL form + named
-query I
-SELECT row_sum FROM (VALUES (-5.0, -5.0)) v(a, b), LATERAL ex.row_sum(v.a, v.b, absolute := true);
-----
-10.0
-
-# a named value referencing an outer column is rejected (named args are constants)
-statement error
-SELECT row_sum FROM (VALUES (1.0, 2.0)) v(a, b), ex.row_sum(v.a, v.b, absolute := (v.a > 0));
-----
-does not support lateral join column parameters
-
-# an unknown named param is rejected at bind
-statement error
-SELECT row_sum FROM (VALUES (1.0, 2.0)) v(a, b), ex.row_sum(v.a, v.b, nope := true);
-----
-Invalid named parameter
+# The COLUMN / LATERAL forms with named args are in blended_named_args.test.
 
 # a reserved SQL keyword works as a named param when quoted (literal form)
 query I

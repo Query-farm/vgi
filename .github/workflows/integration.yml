@@ -74,6 +74,13 @@ jobs:
         with:
           submodules: recursive
 
+      # Tests gate engine-dependent files on VGI_ENGINE_* (require-env); make
+      # exports them, but later steps run scripts/run_tests.py and the shell
+      # scripts directly. Put the engine tree's values in every step's
+      # environment. test/sql/engine_features/ fails if they are missing.
+      - name: Export engine feature variables
+        run: make -s --no-print-directory engine_test_env | tee -a "$GITHUB_ENV"
+
       - name: Check native artifact selection
         run: python3 -m unittest discover -s test/scripts -p 'test_*.py'
 
@@ -254,7 +261,10 @@ jobs:
             --allow-skip 'require-env VGI_MALFORMED_BATCH_WORKER' \
             --allow-skip 'require-env VGI_NO_REFLECTION_WORKER' \
             --allow-skip 'require-env VGI_ROWID_CONSTRAINT_WORKER' \
-            "test/sql/integration/*"
+            --allow-skip 'require-env-not VGI_ENGINE_CORRELATED_NAMED_ARGS' \
+            --allow-skip 'require-env-not VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS' \
+            "test/sql/integration/*" \
+            "test/sql/engine_features/*"
 
       - name: Cache statistics
         if: always()

@@ -67,7 +67,7 @@ class Runner:
         candidates = [build / "haybarn", build / "duckdb", build / "tools/shell/duckdb"]
         self.cli = next((path for path in candidates if path.is_file()), None)
         if self.cli is None:
-            raise FileNotFoundError("build the pinned shell target (expected build/release/haybarn)")
+            raise FileNotFoundError("build the pinned shell target (expected build/release/haybarn or build/release/duckdb)")
         self.extension = build / "extension/vgi/vgi.duckdb_extension"
 
     def run(self, name, sql, *, expected=(), starts=0, mode="", enabled=True, error=None, settings="", cancel=False):

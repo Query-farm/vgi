@@ -19,6 +19,52 @@ endif
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
+# Engine features the SQL tests gate on with `require-env VAR 1` and
+# `require-env-not VAR` (docs/upstream-duckdb-build.md): 1 on Haybarn, UNSET
+# otherwise -- `require-env-not VAR value` would skip when VAR is unset. Like
+# extension_config.cmake and src/include/vgi_engine_compat.hpp, the engine is
+# Haybarn iff it ships duckdb/haybarn.h. Exported, so every recipe's environment
+# has them -- including extension-ci-tools' own `make test`, whose runner passes
+# its environment to unittest. A direct ./build/<mode>/test/unittest run must
+# export them itself; test/sql/engine_features/ fails if they don't match the
+# binary. Upstream v2.0.0 has none of these features, so leave them unset there.
+VGI_ENGINE_TEST_VARS := VGI_ENGINE_CORRELATED_NAMED_ARGS VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS
+ifneq ($(wildcard $(DUCKDB_SRCDIR)/src/include/duckdb/haybarn.h),)
+VGI_ENGINE_CORRELATED_NAMED_ARGS ?= 1
+VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS ?= 1
+export $(VGI_ENGINE_TEST_VARS)
+endif
+# Each is 1 or unset. Any other value, empty included, satisfies neither
+# `require-env VAR 1` nor `require-env-not VAR`: both sides of every split, and
+# both drift guards, would skip without a word.
+$(foreach v,$(VGI_ENGINE_TEST_VARS),$(if $(filter-out undefined,$(origin $(v))),$(if $(filter 1,$($(v))),,$(error $(v)='$($(v))': engine test variables must be 1 or unset (docs/upstream-duckdb-build.md)))))
+
+# The skip reasons engine gating produces, for lanes that pass --allow-skip: on
+# Haybarn the "absent" files skip (`require-env-not VAR`), on upstream the files
+# needing the feature do (`require-env VAR 1`). An unset variable on Haybarn
+# still fails such a lane, through the unlisted reason and the drift guards.
+ifneq ($(wildcard $(DUCKDB_SRCDIR)/src/include/duckdb/haybarn.h),)
+VGI_ENGINE_EXPECTED_SKIPS := $(foreach v,$(VGI_ENGINE_TEST_VARS),--allow-skip 'require-env-not $(v)')
+else
+VGI_ENGINE_EXPECTED_SKIPS := $(foreach v,$(VGI_ENGINE_TEST_VARS),--allow-skip 'require-env $(v) 1')
+endif
+
+# Execution floors (--min-executed) are calibrated on Haybarn. Upstream skips
+# the files that need an engine feature, so lower them by that many there.
+ifneq ($(wildcard $(DUCKDB_SRCDIR)/src/include/duckdb/haybarn.h),)
+VGI_ENGINE_FLOOR_SLACK := 0
+else
+VGI_ENGINE_FLOOR_SLACK := $(shell grep -rlE '^require-env VGI_ENGINE_[A-Z0-9_]+ 1' test/sql 2>/dev/null | wc -l | tr -d ' ')
+endif
+
+# The variables above as NAME=value lines (none on upstream), for anything that
+# runs the tests outside make: CI appends them to $GITHUB_ENV, the native SDK
+# runner records them in its manifest, and a shell can load them with
+#   set -a; eval "$(make -s --no-print-directory engine_test_env)"; set +a
+.PHONY: engine_test_env
+engine_test_env:
+	@$(foreach v,$(VGI_ENGINE_TEST_VARS),$(if $($(v)),echo '$(v)=$($(v))';)) true
+
 # Resource benchmarks run on Linux. See benchmarks/README.md for the isolated
 # EC2 workflow, repeatable baselines, and CPU/allocation profiles.
 .PHONY: benchmark_build benchmark_test benchmark benchmark_compare
@@ -31,8 +77,13 @@ benchmark:
 benchmark_compare:
 	python3 benchmarks/bench.py compare $(BENCH_ARGS)
 
+# vgi-python checkout that provides the fixture workers below (exported: the
+# HTTP / AF_UNIX integration scripts read it too).
+VGI_PYTHON_DIR ?= $(HOME)/Development/vgi-python
+export VGI_PYTHON_DIR
+
 # VGI test worker (subprocess transport)
-VGI_TEST_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-worker
+VGI_TEST_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-worker
 
 # The shared-transport matrix exercises the local RPC checkout when present so
 # protocol/transport fixes can be validated end-to-end before they are released
@@ -53,34 +104,34 @@ export VGI_TEST_BRANCH_DIR
 
 # Versioned fixture workers for attach/versioning*.test. Set to overrideable
 # defaults so `require-env` gates pass under `make test_spawn` by default.
-VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-versioned-worker
-VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-versioned-tables-worker
-VGI_ATTACH_OPTIONS_REQUIRED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-attach-options-worker
-VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-attach-options-worker
+VGI_VERSIONED_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-versioned-worker
+VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-versioned-tables-worker
+VGI_ATTACH_OPTIONS_REQUIRED_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-attach-options-worker
+VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-attach-options-worker
 
 # Worker that advertises the previous incompatible protocol minor (3.0.0) to drive
 # test/sql/integration/protocol_version/version_mismatch.test.
-VGI_BAD_PROTOCOL_WORKER ?= env VGI_BAD_PROTOCOL_VERSION=3.0.0 uv run --project $(HOME)/Development/vgi-python vgi-fixture-bad-protocol-worker
+VGI_BAD_PROTOCOL_WORKER ?= env VGI_BAD_PROTOCOL_VERSION=3.0.0 uv run --project $(VGI_PYTHON_DIR) vgi-fixture-bad-protocol-worker
 
 # Worker that advertises an unrecognized null_handling enum value ("WEIRD") for
 # one scalar function, to drive test/sql/integration/bad_enum.test.
-VGI_BAD_ENUM_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-bad-enum-worker
+VGI_BAD_ENUM_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-bad-enum-worker
 
 # Minimal SQLite-backed writable fixture: exercises the INSERT/UPDATE/DELETE wire
 # path without requiring duckdb-python's subcursor() (which the production
 # writable fixture uses). Skips real transactional semantics; tests under
 # test/sql/integration/simple_writable/ assume that.
-VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-simple-writable-worker
+VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-simple-writable-worker
 # Hostile-metadata fixture (constraints naming the row_id column); lives in this
 # repo and runs in vgi-python's environment, like the Iroh fixtures.
-VGI_ROWID_CONSTRAINT_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/rowid_constraint_worker.py
+VGI_ROWID_CONSTRAINT_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/rowid_constraint_worker.py
 # Hostile-data fixture (well-framed IPC with malformed buffer contents).
-VGI_MALFORMED_BATCH_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/malformed_batch_worker.py
+VGI_MALFORMED_BATCH_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/malformed_batch_worker.py
 # The fixture worker with every result externalized (test_launcher_external_storage).
-VGI_EXTERNAL_STORAGE_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/external_storage_worker.py
+VGI_EXTERNAL_STORAGE_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/external_storage_worker.py
 # The fixture worker without vgi_rpc.Reflection.v1, standing in for a worker
 # that predates reflection (test/sql/integration/reflection/pre_reflection.test).
-VGI_NO_REFLECTION_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/no_reflection_worker.py
+VGI_NO_REFLECTION_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/no_reflection_worker.py
 
 # The schema_reconcile and projection_pushdown_repro fixtures are now
 # hosted inside vgi-fixture-worker (VGI_TEST_WORKER) — no separate worker
@@ -336,12 +387,14 @@ test_launcher_cloudflare_do_debug:
 test_unix:
 	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" \
 	    ./test/run_unix_integration.sh "test/sql/integration/*" \
+	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
 test_unix_debug:
 	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" \
 	    BUILD_DIR=debug ./test/run_unix_integration.sh "test/sql/integration/*" \
+	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
@@ -356,12 +409,14 @@ test_unix_debug:
 test_http:
 	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" \
 	    ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
 test_http_debug:
 	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" \
 	    BUILD_DIR=debug ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
@@ -425,12 +480,14 @@ test_launcher_external_storage:
 test_http_demo_storage:
 	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 \
 	    ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
 test_http_demo_storage_debug:
 	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 BUILD_DIR=debug \
 	    ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
@@ -567,7 +624,7 @@ test_queries:
 # executable, and Rust compiles the full example worker. The resulting tests do
 # not delegate to VGI_TEST_WORKER; the BLOB restored from DuckDB is the worker.
 VGI_DATABASE_WORKER_FIXTURE_DIR ?= $(PROJ_DIR)build/database-worker-fixtures
-VGI_DATABASE_PYTHON_DIR ?= $(HOME)/Development/vgi-python
+VGI_DATABASE_PYTHON_DIR ?= $(VGI_PYTHON_DIR)
 VGI_DATABASE_RUST_DIR ?= $(HOME)/Development/vgi-rust
 VGI_DATABASE_OPEN_METEO_DIR ?= $(HOME)/Development/vgi-open-meteo
 
@@ -643,7 +700,7 @@ test_python:
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	    python3 scripts/run_tests.py -j 6 \
-	        --min-executed $(VGI_PYTHON_MIN_EXECUTED) $(VGI_EXPECTED_SKIPS) \
+	        --min-executed $$(( $(VGI_PYTHON_MIN_EXECUTED) - $(VGI_ENGINE_FLOOR_SLACK) )) $(VGI_EXPECTED_SKIPS) \
 	        --allow-skip 'require-env VGI_TEST_DEDICATED_WORKER' \
 	        "test/*" \
 	        "~test/sql/duckdb2/column_paths.test" \
@@ -739,12 +796,13 @@ VGI_EXPECTED_SKIPS := \
 	--allow-skip 'require-env VGI_NO_REFLECTION_WORKER' \
 	--allow-skip 'require-env VGI_SCHEMA_RECONCILE_DB' \
 	--allow-skip 'require-env VGI_RULES_WORKER' \
-	--allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT'
+	--allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT' \
+	$(VGI_ENGINE_EXPECTED_SKIPS)
 
 # Rust's lane runs 293 today. The floor sits a little under so an unrelated
 # environment wobble doesn't fail the build, while a fixture dropping out does.
 VGI_RUST_MIN_EXECUTED ?= 290
-VGI_COVERAGE_GATE = --min-executed $(VGI_RUST_MIN_EXECUTED) $(VGI_EXPECTED_SKIPS)
+VGI_COVERAGE_GATE = --min-executed $$(( $(VGI_RUST_MIN_EXECUTED) - $(VGI_ENGINE_FLOOR_SLACK) )) $(VGI_EXPECTED_SKIPS)
 
 VGI_RUST_WORKER   := $(VGI_RUST_DIR)/target/debug/vgi-example-worker
 VGI_RUST_WRAPPERS := $(VGI_RUST_DIR)/ci/wrappers

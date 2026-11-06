@@ -17,6 +17,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "httpfs_extension.hpp"
 #include "vgi_http_client.hpp"
+#include "vgi_engine_compat.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_rpc_client.hpp"
 
@@ -169,6 +170,10 @@ double SecondsSince(std::chrono::steady_clock::time_point start) {
 
 } // namespace
 
+// Aborting a transfer in flight needs the engine's HTTP cancellation hook
+// (HTTPParams::interrupt_context), which upstream DuckDB lacks: there the
+// request runs to completion or timeout (VGI_ENGINE_HAS_HTTP_CANCELLATION).
+#if VGI_ENGINE_HAS_HTTP_CANCELLATION
 TEST_CASE("an armed POST is aborted mid-flight by an interrupt", "[http-interrupt]") {
 	SlowServer server(std::chrono::seconds(30));
 	Fixture f;
@@ -216,6 +221,7 @@ TEST_CASE("an armed GET is aborted mid-flight by an interrupt", "[http-interrupt
 	REQUIRE(interrupted);
 	REQUIRE(elapsed < 5.0);
 }
+#endif
 
 TEST_CASE("an unarmed POST still completes while the query is interrupted", "[http-interrupt]") {
 	// The cancel dispatcher's server-side cancel and a rollback both run after
@@ -273,8 +279,15 @@ TEST_CASE("protected unary HTTP mutations are not replayed after dispatch", "[ht
 			});
 			INFO(method);
 			REQUIRE(failed);
+#if VGI_ENGINE_HAS_HTTP_PARAMS_CLONE
+			// A per-request clone drops retries to 0: sent exactly once.
 			REQUIRE(server.DispatchedPosts() == 1);
 			REQUIRE(server.Accepted() == 1);
+#else
+			// Without Clone a single-attempt RPC must arrive with the catalog's
+			// retries=0 snapshot; a retrying one is refused before dispatch.
+			REQUIRE(server.DispatchedPosts() == 0);
+#endif
 			REQUIRE(cached->retries == 2);
 		}
 	}

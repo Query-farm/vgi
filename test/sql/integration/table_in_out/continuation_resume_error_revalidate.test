@@ -27,6 +27,10 @@
 #     conditional request: the first reply is instead empty, carries
 #     vgi.cache.not_modified (ttl = 0, etag "v1", revalidatable) and says more; the
 #     replies after it are the changed pages as above.
+#
+# The batched-LATERAL cases pass named arguments to a correlated call, so they are in
+# continuation_resume_error_revalidate_named_args.test (duckdb/duckdb#27833); the
+# literal blended_paged calls here still go through the blended path.
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER
@@ -50,21 +54,6 @@ SET threads = 1;
 # ---------------------------------------------------------------------------
 
 foreach page 2 3
-
-statement error
-SELECT count(*) FROM range(3) t(x), LATERAL ex.blended_paged(t.x + 4, page_size := 2, fail_on_page := ${page});
-----
-as asked
-
-query II
-SELECT count(*), sum(i) FROM range(3) t(x), LATERAL ex.blended_paged(t.x + 4, page_size := 2);
-----
-15	31
-
-query II
-SELECT count(*), sum(i) FROM range(3) t(x), LATERAL ex.blended_paged(t.x + 4, page_size := 2);
-----
-15	31
 
 statement error
 SELECT count(*) FROM ex.blended_paged(5, page_size := 2, fail_on_page := ${page});
@@ -94,6 +83,7 @@ SELECT count(*), sum(i) FROM ex.paged_explode((SELECT 5 AS n), page_size := 2);
 endloop
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Revalidation answered with continued output. The first query stores the
 # one-reply output (i = 0..n-1). Each repeat revalidates the stale entry; the
 # worker says the data changed and pages the new output (i + 1000) one row per
@@ -109,54 +99,6 @@ CREATE TABLE rv AS SELECT * FROM (VALUES (2), (3)) v(x);
 
 statement ok
 CALL enable_logging(level := 'debug');
-
-# --- batched LATERAL ---
-
-statement ok
-CALL truncate_duckdb_logs();
-
-query II
-SELECT x, i FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1, revalidate := true) ORDER BY x, i;
-----
-2	0
-2	1
-3	0
-3	1
-3	2
-
-query I
-SELECT count(*) > 0
-FROM duckdb_logs()
-WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
-  AND message LIKE '%blended_paged%';
-----
-true
-
-foreach run 1 2
-
-statement ok
-CALL truncate_duckdb_logs();
-
-query II
-SELECT x, i FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1, revalidate := true) ORDER BY x, i;
-----
-2	1000
-2	1001
-3	1000
-3	1001
-3	1002
-
-query II
-SELECT
-  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.continue'),
-  count(*) FILTER (WHERE regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store')
-FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%blended_paged%';
-----
-4	0
-
-endloop
 
 # --- stock in-out ---
 
@@ -212,21 +154,6 @@ endloop
 # that also says more. The client must refuse it, not serve the stored entry, and
 # the next query on the worker pool must still work.
 # ---------------------------------------------------------------------------
-
-query I
-SELECT count(*) FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1, revalidate := true, not_modified_more := true);
-----
-5
-
-statement error
-SELECT count(*) FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1, revalidate := true, not_modified_more := true);
-----
-not_modified on a continued reply
-
-query II
-SELECT count(*), sum(i) FROM rv, LATERAL ex.blended_paged(rv.x, page_size := 1);
-----
-5	4
 
 query I
 SELECT count(*) FROM ex.paged_explode((SELECT x FROM rv), page_size := 1, revalidate := true, not_modified_more := true);

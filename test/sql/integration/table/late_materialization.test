@@ -103,11 +103,15 @@ LIMIT 1;
 statement ok
 SET late_materialization_max_rows=500;
 
-# >50 survivors → no IN-list (in=0), range only.
+# >50 survivors → no IN-list (in=0), range only. The range needs
+# TableFunction::runtime_filter_pushdown (vgi_engine_features();
+# duckdb/duckdb#28090): upstream v2.0.0 picks a prefix-range filter here and
+# pushes no min/max bounds alongside it.
 query II
 SELECT
     regexp_extract(pushed, 'in=([0-9]+)', 1)::INT AS in_count,
-    pushed NOT LIKE '%rng=none%' AS has_range
+    (pushed NOT LIKE '%rng=none%') = (
+        SELECT available FROM vgi_engine_features() WHERE feature = 'runtime_filter_pushdown') AS range_as_expected
 FROM (SELECT pushed, payload FROM example.data.late_mat ORDER BY ord LIMIT 200)
 LIMIT 1;
 ----

@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_engine_compat.hpp"
 #include "vgi_settings_defaults.hpp"
 #include "vgi_http_client.hpp"
 
@@ -283,7 +284,13 @@ static bool IsInterruptedRequest(ClientContext *cancellation, const HTTPResponse
 	if (!cancellation || !cancellation->IsInterrupted()) {
 		return false;
 	}
+#if VGI_ENGINE_HAS_HTTP_CANCELLATION
 	return !response || response->IsCancelled() || response->HasRequestError();
+#else
+	// Without engine HTTP cancellation the request was never aborted; a transport
+	// failure that coincides with the interrupt is still reported as the interrupt.
+	return !response || response->HasRequestError();
+#endif
 }
 
 // Forward declarations — defined below with the capability-header parsing.
@@ -421,10 +428,11 @@ static std::string HttpPostArrowIpcInternal(
 			if (single_attempt) owned->retries = 0;
 			params = std::shared_ptr<HTTPParams>(owned.release());
 		}
+#if VGI_ENGINE_HAS_HTTP_PARAMS_CLONE
 		// Provider-specific parameters are cached across queries. Clone polymorphically
 		// before choosing this request's interruption/retry policy; a rollback or cleanup
 		// must still run after its caller was interrupted.
-		auto request_params = params->Clone();
+		std::shared_ptr<HTTPParams> request_params = params->Clone();
 		request_params->interrupt_context.reset();
 		if (cancellation) {
 			request_params->interrupt_context = cancellation->shared_from_this();
@@ -432,6 +440,24 @@ static std::string HttpPostArrowIpcInternal(
 		if (single_attempt) {
 			request_params->retries = 0;
 		}
+#else
+		// No polymorphic HTTPParams::Clone (and no interrupt hook) on this engine,
+		// and copying the base would drop the provider's TLS/credential fields,
+		// so the shared snapshot is used as-is and never mutated. Every
+		// single-attempt method is a catalog RPC, and the catalog hands those its
+		// dedicated retries=0 snapshot (VgiAttachParameters::GetOrInitHttpParams).
+		// A single-attempt request arriving with a retrying snapshot is a caller
+		// bug: refuse it before dispatch. Building fresh parameters here instead
+		// would re-enter the secret manager, which deadlocks when the RPC runs
+		// inside VgiTransaction::Start (duckdb#22258).
+		std::shared_ptr<HTTPParams> request_params = params;
+		if (single_attempt && request_params->retries != 0) {
+			throw InternalException("vgi: single-attempt HTTP RPC to %s was given HTTP parameters that retry (%llu); "
+			                        "single-attempt methods must use the retries=0 snapshot from "
+			                        "GetOrInitHttpParams(..., single_attempt=true)",
+			                        url, static_cast<unsigned long long>(request_params->retries));
+		}
+#endif
 		PostRequestInfo post(url, headers, *request_params, reinterpret_cast<const_data_ptr_t>(req_body_data),
 		                     static_cast<idx_t>(req_body_size));
 		post.try_request = true;
@@ -997,10 +1023,12 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 	};
 
 	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
+#if VGI_ENGINE_HAS_HTTP_CANCELLATION
 	params->interrupt_context.reset();
 	if (cancellation) {
 		params->interrupt_context = cancellation->shared_from_this();
 	}
+#endif
 	auto response = http_util.Request(get);
 	if (IsInterruptedRequest(cancellation, response.get())) {
 		throw InterruptException();

@@ -1,0 +1,17 @@
+# name: test/sql/engine_features/correlated_named_args_absent.test
+# description: Drift guard for VGI_ENGINE_CORRELATED_NAMED_ARGS (duckdb/duckdb#27833). Tests gate on it with
+#   require-env / require-env-not; the Makefile exports it from the engine tree.
+#   Runs when it is unset (feature absent) and checks that the extension
+#   was really compiled that way, so a wrong or missing variable fails here instead
+#   of silently skipping, or wrongly running, the gated files.
+#   See docs/upstream-duckdb-build.md.
+# group: [vgi_engine_features]
+
+require-env-not VGI_ENGINE_CORRELATED_NAMED_ARGS
+
+require vgi
+
+query I
+SELECT available FROM vgi_engine_features() WHERE feature = 'correlated_named_args';
+----
+false

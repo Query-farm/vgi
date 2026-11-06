@@ -1,6 +1,7 @@
-#include "vgi_function_docs.hpp"
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "storage/vgi_table_function_set.hpp"
+#include "vgi_engine_compat.hpp"
+#include "vgi_function_docs.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
@@ -400,7 +401,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// savings). Expression pushdown is intentionally
 			// skipped for the same reason.
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
-			table_func.runtime_filter_pushdown = false;
+			VgiDisableRuntimeFilterPushdown(table_func);
 			if (is_buffering) {
 				table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
 				if (table_func.filter_pushdown) {
@@ -435,7 +436,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			                         vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 			table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
-			table_func.runtime_filter_pushdown = false;
+			VgiDisableRuntimeFilterPushdown(table_func);
 			table_func.sampling_pushdown = func_info.sampling_pushdown.value_or(false);
 			table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 			if (table_func.filter_pushdown) {

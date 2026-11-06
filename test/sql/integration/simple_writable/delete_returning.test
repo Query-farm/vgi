@@ -1,0 +1,74 @@
+# name: test/sql/integration/simple_writable/delete_returning.test
+# description: DELETE ... RETURNING against the simple writable fixture
+#   (needs TableCatalogEntry::GetDeleteReturningVirtualColumns, duckdb/duckdb#28089)
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+# TableCatalogEntry::GetDeleteReturningVirtualColumns (duckdb/duckdb#28089).
+require-env VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS 1
+
+require vgi
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+statement ok
+INSERT INTO w.main.items VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40);
+
+# Transport row identifiers are usable by scans, but provider RETURNING rows
+# contain user columns only. Reject a virtual rowid before executing DELETE,
+# including when the optimizer is disabled.
+statement error
+DELETE FROM w.main.items WHERE id = 1 RETURNING rowid;
+----
+Referenced column "rowid" not found
+
+statement ok
+PRAGMA disable_optimizer;
+
+statement error
+DELETE FROM w.main.items WHERE id = 1 RETURNING rowid;
+----
+Referenced column "rowid" not found
+
+statement ok
+PRAGMA enable_optimizer;
+
+query I
+SELECT COUNT(*) FROM w.main.items;
+----
+4
+
+statement ok
+DELETE FROM w.main.items WHERE id = 1;
+
+# ============================================================================
+# DELETE ... RETURNING
+# ============================================================================
+
+query I rowsort
+DELETE FROM w.main.items WHERE id IN (2, 3) RETURNING id;
+----
+2
+3
+
+query III
+SELECT id, name, qty FROM w.main.items ORDER BY id;
+----
+4	d	40
+
+# ============================================================================
+# DELETE ... RETURNING *
+# ============================================================================
+
+query III
+DELETE FROM w.main.items WHERE id = 4 RETURNING *;
+----
+4	d	40
+
+query I
+SELECT COUNT(*) FROM w.main.items;
+----
+0
+

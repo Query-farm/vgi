@@ -188,7 +188,8 @@ def main():
     build = args.build.resolve() if args.build else native / "build/release"
     artifacts = args.artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
-    cli = build / "haybarn"
+    # The shell is `haybarn` on Haybarn and `duckdb` on upstream DuckDB.
+    cli = build / "haybarn" if (build / "haybarn").is_file() else build / "duckdb"
     extension = build / "extension/vgi/vgi.duckdb_extension"
     results = []
     for name, phase, operation, explicit, body, expected_state, expected_rows in scenarios():
