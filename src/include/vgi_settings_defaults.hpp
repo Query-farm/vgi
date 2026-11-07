@@ -12,7 +12,9 @@ inline constexpr bool CANCEL_ENABLED = true;
 inline constexpr bool CATALOG_CONTENTS = true;
 inline constexpr int64_t EAGER_LOAD_THRESHOLD = 1000LL;
 inline constexpr bool EXCHANGE_INPUT_DEDUP = true;
+inline constexpr bool GITHUB_ALLOW_LATEST = true;
 inline constexpr const char *GITHUB_CACHE_DIR = "";
+inline constexpr int64_t GITHUB_LATEST_TTL_SECONDS = 3600LL;
 #ifdef __EMSCRIPTEN__
 inline constexpr int64_t HTTP_ACCEPTED_MAX_RESPONSE_BYTES = 67108864LL;
 #else

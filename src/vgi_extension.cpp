@@ -115,6 +115,7 @@
 #include "vgi_result_cache.hpp"
 #include "vgi_companion_catalogs.hpp"
 #include "vgi_github_functions.hpp"
+#include "vgi_github.hpp"
 #include "vgi_database_worker.hpp"
 #include "vgi_worker_package_functions.hpp"
 #include "vgi_worker_pool_functions.hpp"
@@ -2113,6 +2114,13 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		worker_artifact_anchor = std::move(resolved.lifetime_anchor);
 	}
 
+	// github-auto:// latest-release LOCATIONs (owner/repo, owner/repo@latest)
+	// resolve to one tag here, so the catalog — every worker it spawns or pools —
+	// runs that release for its whole lifetime, and worker_path (logs,
+	// vgi_global_functions) records what actually ran. vgi_export_session keeps
+	// the user's @latest LOCATION.
+	worker_path = vgi::PinGithubLatestLocation(worker_path, context);
+
 #ifdef __EMSCRIPTEN__
 	// WASM: HTTP and browser SAB targets are supported. `worker:` names a legacy
 	// worker script; `iroh://` names a remote EndpointId that the page bridge maps
@@ -3834,6 +3842,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	vgi::RegisterVgiWorkerPoolFlushFunction(loader);
 	vgi::RegisterVgiGithubCacheFunction(loader);
 	vgi::RegisterVgiGithubCacheFlushFunction(loader);
+	vgi::RegisterVgiGithubLatestFunction(loader);
+	vgi::RegisterVgiGithubResolveFunction(loader);
 	vgi::RegisterVgiWorkerPackageMacro(loader);
 	vgi::RegisterVgiWorkerCacheFunctions(loader);
 

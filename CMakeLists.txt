@@ -388,6 +388,7 @@ src/vgi_input_dedup.cpp
 src/vgi_result_cache_functions.cpp
 src/vgi_cached_replay_connection.cpp
 src/vgi_github.cpp
+src/vgi_github_parse.cpp
 src/vgi_database_worker.cpp
 src/vgi_worker_package_functions.cpp
 src/vgi_global_functions.cpp
@@ -528,6 +529,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_launcher_e2e.cpp
     test/cpp/test_launcher_flock_parity.cpp
     test/cpp/test_transport_detection.cpp
+    test/cpp/test_github_latest.cpp
     test/cpp/test_error_info.cpp
     test/cpp/test_batch_validation.cpp
     test/cpp/test_container_runtime.cpp
@@ -571,6 +573,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_hosted_protocols.cpp
     src/vgi_transport.cpp
     src/vgi_location_classify.cpp
+    src/vgi_github_parse.cpp
     src/vgi_container_runtime.cpp
     src/vgi_subprocess.cpp
     src/vgi_unix_socket_worker.cpp)
@@ -578,7 +581,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/include
     duckdb/src/include
     duckdb/third_party/catch
-    duckdb/third_party/mbedtls/include)
+    duckdb/third_party/mbedtls/include
+    duckdb/third_party/yyjson/include)
   # Compile WebWorkerFunctionConnection (SAB transport) natively against the
   # in-process ring backend for the runtime e2e; its production form is
   # emscripten-only.

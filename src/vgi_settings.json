@@ -73,6 +73,15 @@
     "description": "Before an exchange-mode MAP call (scalar / streaming table-in-out / batched correlated LATERAL), ship only the DISTINCT worker-input tuples in each chunk to the worker and scatter the results back \u2014 turning e.g. 2048 evals over a low-cardinality column into the distinct count. Compute-only (no cache); sound under the same per-row-purity the cacheability opt-in asserts. Default ON"
   },
   {
+    "name": "vgi_github_allow_latest",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next github-auto:// latest-release resolution (ATTACH, vgi_catalogs, vgi_github_resolve); catalogs already attached keep the release they pinned.",
+    "platform": "native",
+    "description": "Allow github-auto:// LOCATIONs that name a repo's latest release (owner/repo or owner/repo@latest) instead of a fixed tag. Set to false (with lock_configuration) to require pinned tags."
+  },
+  {
     "name": "vgi_github_cache_dir",
     "type": "VARCHAR",
     "default": "",
@@ -80,6 +89,17 @@
     "effect": "Next worker-package resolution/install; existing workers and leases retain their artifacts.",
     "platform": "native",
     "description": "Cache directory for worker binaries downloaded from GitHub releases (github:// / github-auto:// LOCATIONs); empty = ${XDG_CACHE_HOME:-~/.cache}/vgi/releases"
+  },
+  {
+    "name": "vgi_github_latest_ttl_seconds",
+    "type": "BIGINT",
+    "default": 3600,
+    "scope": "session",
+    "effect": "Next github-auto:// latest-release resolution; catalogs already attached keep the release they pinned.",
+    "platform": "native",
+    "description": "How long a resolved github-auto:// latest-release tag is reused from the on-disk cache before GitHub is asked again; 0 asks every time. When GitHub cannot be reached, an expired tag is still used, with a warning.",
+    "minimum": 0,
+    "maximum": 9223372036854775807
   },
   {
     "name": "vgi_http_accepted_max_response_bytes",

@@ -32,7 +32,7 @@ Comma-separated and case-insensitive. The default is `all`; `none` refuses every
 | `launch` | `launch:<argv>` | yes |
 | `unix` | `unix:///path` (a named pipe on Windows) | yes |
 | `oci` | `oci://`, `docker://` | yes |
-| `github` | `github://`, `github-auto://` | yes |
+| `github` | `github://`, `github-auto://` (incl. latest-release `owner/repo` / `@latest`) | yes |
 | `database` | `database://` | yes |
 | `http` / `https` | `http://` / `https://` (separate, so plain http can be forbidden) | no |
 | `tcp` | `tcp://host:port` | no |
@@ -81,6 +81,10 @@ Some LOCATIONs are refused whatever the policy says:
 - **Transport, not destination.** `tcp`, `http(s)` and `iroh` (through `iroh_direct_addresses` /
   `iroh_relay_urls`) can still reach services listening on loopback.
 - **An ATTACH already running** when the setting is narrowed will finish.
+- **Moving targets.** `github-auto://owner/repo` / `@latest` run whatever the publisher
+  releases next. They count as `github`; to allow pinned tags but refuse latest ones, also
+  `SET vgi_github_allow_latest = false` and freeze it with `lock_configuration`
+  (see [github-transport.md](github-transport.md#latest-release-locations)).
 - **Worker cache directories.** The directory settings (`vgi_result_cache_dir`,
   `vgi_github_cache_dir`, `vgi_worker_cache_dir`) are not governed by this policy. Use
   `lock_configuration` to freeze them.

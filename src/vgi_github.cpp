@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <stdexcept>
 #include <string>
 
 #if VGI_SUBPROCESS_TRANSPORT
@@ -34,6 +35,8 @@
 #include "vgi_http_client.hpp"
 #include "vgi_http_params.hpp"
 #include "vgi_http_compression.hpp"
+#include "vgi_logging.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "yyjson.hpp"
 
 #include <chrono>
@@ -43,6 +46,7 @@
 #include <ctime>
 #include <map>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -60,125 +64,11 @@
 namespace duckdb {
 namespace vgi {
 
-namespace {
-
-// Split "owner/repo@tag[/asset]" plus optional "#sha256=…"/"#path=…" fragments.
-// `body` is the location with the scheme already stripped. Fills owner/repo/tag
-// and `rest_after_tag` (the part after "@tag", which is "/asset…" or empty), and
-// pulls out the recognised fragments. Throws std::invalid_argument on malformed.
-void SplitCommon(const std::string &body, std::string &owner, std::string &repo, std::string &tag,
-                 std::string &rest_after_tag, std::string &sha256_out, std::string &path_out) {
-	std::string s = body;
-
-	// Pull trailing "#key=value" fragments (order-independent, repeatable).
-	while (true) {
-		auto hash = s.rfind('#');
-		if (hash == std::string::npos) {
-			break;
-		}
-		std::string frag = s.substr(hash + 1);
-		s = s.substr(0, hash);
-		auto eq = frag.find('=');
-		if (eq == std::string::npos) {
-			throw std::invalid_argument("github: malformed fragment '#" + frag + "' (expected key=value)");
-		}
-		std::string key = frag.substr(0, eq);
-		std::string val = frag.substr(eq + 1);
-		if (key == "sha256") {
-			std::transform(val.begin(), val.end(), val.begin(), [](unsigned char c) { return std::tolower(c); });
-			sha256_out = val;
-		} else if (key == "path") {
-			path_out = val;
-		} else {
-			throw std::invalid_argument("github: unknown fragment key '" + key + "' (expected sha256 or path)");
-		}
-	}
-
-	auto slash = s.find('/');
-	if (slash == std::string::npos || slash == 0) {
-		throw std::invalid_argument("github: missing owner/repo in '" + body + "'");
-	}
-	owner = s.substr(0, slash);
-	std::string after_owner = s.substr(slash + 1);
-
-	auto at = after_owner.find('@');
-	if (at == std::string::npos || at == 0) {
-		throw std::invalid_argument("github: missing @tag in '" + body + "'");
-	}
-	repo = after_owner.substr(0, at);
-	std::string after_repo = after_owner.substr(at + 1);
-
-	rest_after_tag = after_repo;
-	tag = after_repo; // provisional; callers refine
-
-	if (owner.empty() || repo.empty()) {
-		throw std::invalid_argument("github: empty owner or repo in '" + body + "'");
-	}
-}
-
-} // namespace
-
-GithubCoords ParseGithubLocation(const std::string &location) {
-	GithubCoords c;
-	std::string body = StripGithubScheme(location);
-	std::string owner, repo, tag_and_asset, rest, sha, path;
-	SplitCommon(body, owner, repo, tag_and_asset, rest, sha, path);
-	auto last_slash = rest.rfind('/');
-	if (last_slash == std::string::npos) {
-		throw std::invalid_argument("github://: missing /asset in '" + location +
-		                            "' (use github://owner/repo@tag/asset)");
-	}
-	c.owner = owner;
-	c.repo = repo;
-	c.tag = rest.substr(0, last_slash);
-	c.asset = rest.substr(last_slash + 1);
-	c.expected_sha256 = sha;
-	c.member_hint = path;
-	c.is_auto = false;
-	if (c.tag.empty() || c.asset.empty()) {
-		throw std::invalid_argument("github://: empty tag or asset in '" + location + "'");
-	}
-	return c;
-}
-
 std::string ResolveWorkerPath(const std::string &location, ClientContext &context) {
 	if (IsGithubLocation(location) || IsGithubAutoLocation(location)) {
 		return ResolveGithubWorker(location, context);
 	}
 	return location;
-}
-
-GithubCoords ParseGithubAutoLocation(const std::string &location, const std::string &platform) {
-	GithubCoords c;
-	std::string body = StripGithubAutoScheme(location);
-	std::string owner, repo, tag_and_prefix, rest, sha, path;
-	SplitCommon(body, owner, repo, tag_and_prefix, rest, sha, path);
-	std::string tag = rest;
-	std::string prefix = repo;
-	auto last_slash = rest.rfind('/');
-	if (last_slash != std::string::npos) {
-		std::string maybe_prefix = rest.substr(last_slash + 1);
-		if (!maybe_prefix.empty()) {
-			prefix = maybe_prefix;
-		}
-		tag = rest.substr(0, last_slash);
-	}
-	if (tag.empty()) {
-		throw std::invalid_argument("github-auto://: empty tag in '" + location + "'");
-	}
-	if (platform.empty()) {
-		throw std::invalid_argument("github-auto://: empty platform string");
-	}
-	c.owner = owner;
-	c.repo = repo;
-	c.tag = tag;
-	// Windows release assets are .zip by convention; everyone else ships .tar.gz.
-	const std::string ext = (platform.rfind("windows", 0) == 0) ? ".zip" : ".tar.gz";
-	c.asset = prefix + "-" + tag + "-" + platform + ext;
-	c.expected_sha256 = sha;
-	c.member_hint = path;
-	c.is_auto = true;
-	return c;
 }
 
 #if VGI_SUBPROCESS_TRANSPORT
@@ -217,6 +107,17 @@ int64_t GetIntSetting(ClientContext &context, const char *name, int64_t dflt) {
 	if (context.TryGetCurrentSetting(name, v) && !v.IsNull()) {
 		try {
 			return v.GetValue<int64_t>();
+		} catch (...) {
+		}
+	}
+	return dflt;
+}
+
+bool GetBoolSetting(ClientContext &context, const char *name, bool dflt) {
+	Value v;
+	if (context.TryGetCurrentSetting(name, v) && !v.IsNull()) {
+		try {
+			return v.GetValue<bool>();
 		} catch (...) {
 		}
 	}
@@ -878,7 +779,258 @@ std::map<std::string, std::string> ReadMeta(const std::string &meta_path) {
 std::mutex g_resolved_mu;
 std::unordered_map<std::string, std::string> g_resolved; // location -> entrypoint
 
+// ---------------------------------------------------------------------------
+// @latest resolution I/O
+// ---------------------------------------------------------------------------
+
+ErrorInfo GithubLatestInfo(const char *subtype, const std::string &owner, const std::string &repo) {
+	ErrorInfo info(subtype);
+	info.Set(error_key::kTransport, "github")
+	    .Set(error_key::kGithubRepo, owner + "/" + repo)
+	    .Set(error_key::kGithubTag, kGithubLatestTag);
+	return info;
+}
+
+std::string LatestRecordPath(const std::string &cache, const std::string &owner, const std::string &repo) {
+	return cache + "/" + Sha256Hex(GithubLatestCacheKey(owner, repo)).substr(0, 32) + ".latest";
+}
+
+bool IsLatestRecordName(const std::string &name) {
+	return name.size() == 39 && name.compare(32, 7, ".latest") == 0 &&
+	       name.find_first_not_of("0123456789abcdef") == 32;
+}
+
+bool ReadLatestRecord(const std::string &path, GithubLatestRecord &out) {
+	try {
+		return ParseGithubLatestRecord(ReadFileBytes(path), out);
+	} catch (...) {
+		return false;
+	}
+}
+
+// Advisory: a failed write only costs a network lookup next time. Written to a
+// unique temp name and moved into place so concurrent processes never see (or
+// produce) a torn record.
+void WriteLatestRecord(const std::string &path, const GithubLatestRecord &record) {
+	static std::mutex rng_mu;
+	static std::mt19937_64 rng {std::random_device {}()};
+	uint64_t nonce;
+	{
+		std::lock_guard<std::mutex> lk(rng_mu);
+		nonce = rng();
+	}
+	std::string tmp = path + ".tmp-" + std::to_string(nonce);
+	try {
+		auto body = SerializeGithubLatestRecord(record);
+		{
+			auto h = LocalFs().OpenFile(tmp, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+			h->Write(const_cast<char *>(body.data()), static_cast<idx_t>(body.size()));
+			h->Sync();
+		}
+		LocalFs().MoveFile(tmp, path);
+	} catch (...) {
+		try {
+			RmRf(tmp);
+		} catch (...) {
+		}
+	}
+}
+
+// HEAD https://github.com/{o}/{r}/releases/latest without following the
+// redirect: GitHub answers 302 → /{o}/{r}/releases/tag/{tag}. Unauthenticated
+// and outside the REST API rate limit. Returns the tag or throws.
+std::string LatestTagViaRedirect(ClientContext &context, const std::string &owner, const std::string &repo) {
+	const std::string url = "https://github.com/" + owner + "/" + repo + "/releases/latest";
+	auto &http_util = HTTPUtil::Get(*context.db);
+	auto params = InitHttpParamsWithSecrets(context, url);
+	params->timeout =
+	    static_cast<uint64_t>(GetIntSetting(context, "vgi_http_timeout_seconds", defaults::HTTP_TIMEOUT_SECONDS));
+	params->follow_location = false;
+	HTTPHeaders headers;
+	HeadRequestInfo head(url, headers, *params);
+	head.try_request = true; // a 302 is the answer, not a failure
+	auto response = http_util.Request(head);
+	if (!response) {
+		throw IOException("no response from %s", url);
+	}
+	const int status = static_cast<int>(response->status);
+	std::string target;
+	if (status >= 300 && status < 400) {
+		target = response->GetHeaderValue("Location");
+	} else if (status >= 200 && status < 300) {
+		target = response->url; // a client that followed the redirect anyway
+	} else {
+		auto err = response->GetError();
+		throw IOException("HTTP %d from %s%s", status, url, err.empty() ? std::string() : " (" + err + ")");
+	}
+	auto tag = ParseLatestReleaseRedirect(target);
+	if (tag.empty()) {
+		throw IOException("%s/%s has no published (non-draft, non-prerelease) release: %s redirected to '%s'", owner,
+		                  repo, url, target);
+	}
+	return tag;
+}
+
+std::string LatestTagViaApi(ClientContext &context, const std::string &owner, const std::string &repo) {
+	auto json = GithubApiGet(context, "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest");
+	try {
+		return ParseLatestReleaseJson(json);
+	} catch (const std::invalid_argument &e) {
+		throw IOException(GithubLatestInfo(error_subtype::kProtocolViolation, owner, repo), "%s", e.what());
+	}
+}
+
+GithubLatestRecord FetchLatestRecord(ClientContext &context, const GithubCoords &c) {
+	GithubLatestRecord r;
+	r.owner = c.owner;
+	r.repo = c.repo;
+	std::string redirect_error;
+	try {
+		r.tag = LatestTagViaRedirect(context, c.owner, c.repo);
+		r.source = "redirect";
+	} catch (const std::exception &e) {
+		redirect_error = RawMessageOf(e);
+		try {
+			r.tag = LatestTagViaApi(context, c.owner, c.repo);
+			r.source = "api";
+		} catch (const std::exception &e2) {
+			throw IOException(GithubLatestInfo(error_subtype::kWorkerNotFound, c.owner, c.repo),
+			                  "github-auto: could not resolve the latest release of %s/%s: redirect lookup failed "
+			                  "(%s); API lookup failed (%s)",
+			                  c.owner, c.repo, redirect_error, RawMessageOf(e2));
+		}
+	}
+	try {
+		ValidateResolvedTag(r.tag);
+	} catch (const std::invalid_argument &e) {
+		throw IOException(GithubLatestInfo(error_subtype::kProtocolViolation, c.owner, c.repo), "%s", e.what());
+	}
+	r.resolved_at = static_cast<int64_t>(::time(nullptr));
+	return r;
+}
+
+const char *LatestOriginName(GithubLatestOrigin origin) {
+	switch (origin) {
+	case GithubLatestOrigin::FRESH_CACHE:
+		return "cache";
+	case GithubLatestOrigin::STALE_CACHE:
+		return "stale_cache";
+	default:
+		return "network";
+	}
+}
+
 } // namespace
+
+GithubLatestResolution ResolveGithubLatest(const std::string &location, ClientContext &context) {
+	GithubCoords c;
+	try {
+		c = ParseGithubAutoLocation(location, DuckDB::Platform());
+	} catch (const std::invalid_argument &e) {
+		throw InvalidInputException("%s", e.what());
+	}
+	if (!c.is_latest) {
+		throw InvalidInputException("vgi: '%s' does not name a latest release", location);
+	}
+	if (!GetBoolSetting(context, "vgi_github_allow_latest", defaults::GITHUB_ALLOW_LATEST)) {
+		throw Exception(GithubLatestInfo(error_subtype::kTransportNotAllowed, c.owner, c.repo),
+		                ExceptionType::PERMISSION,
+		                StringUtil::Format("vgi: github-auto:// latest-release LOCATIONs are disabled "
+		                                   "(vgi_github_allow_latest = false); pin a release tag instead: "
+		                                   "github-auto://%s/%s@<tag>",
+		                                   c.owner, c.repo));
+	}
+	int64_t ttl = GetIntSetting(context, "vgi_github_latest_ttl_seconds", defaults::GITHUB_LATEST_TTL_SECONDS);
+	std::string cache = CacheDir(context);
+	MkdirP(cache);
+	std::string record_path = LatestRecordPath(cache, c.owner, c.repo);
+
+	GithubLatestRecord cached;
+	bool have_cached = ReadLatestRecord(record_path, cached) &&
+	                   GithubLatestCacheKey(cached.owner, cached.repo) == GithubLatestCacheKey(c.owner, c.repo);
+	auto fetch = [&]() {
+		try {
+			return FetchLatestRecord(context, c);
+		} catch (const std::exception &e) {
+			// With a cached record to fall back on, keep just the message for the
+			// stale-cache warning; otherwise the error propagates as-is.
+			if (!have_cached) {
+				throw;
+			}
+			throw std::runtime_error(RawMessageOf(e));
+		}
+	};
+	auto decision =
+	    DecideGithubLatest(have_cached ? &cached : nullptr, static_cast<int64_t>(::time(nullptr)), ttl, fetch);
+	if (decision.origin == GithubLatestOrigin::NETWORK) {
+		WriteLatestRecord(record_path, decision.record);
+	} else if (decision.origin == GithubLatestOrigin::STALE_CACHE) {
+		auto age = static_cast<int64_t>(::time(nullptr)) - decision.record.resolved_at;
+		auto msg = StringUtil::Format("vgi: github-auto://%s/%s: could not reach GitHub to resolve the latest release "
+		                              "(%s); using the previously resolved tag %s from %lld seconds ago",
+		                              c.owner, c.repo, decision.fetch_error, decision.record.tag,
+		                              static_cast<long long>(age));
+		DUCKDB_LOG_WARNING(context, msg);
+	}
+
+	GithubLatestResolution out;
+	out.record = decision.record;
+	out.origin = decision.origin;
+	out.pinned_location = BuildPinnedGithubAutoLocation(c, decision.record.tag);
+	VGI_LOG(context, "github.latest_resolved",
+	        {{"location", location},
+	         {"repo", c.owner + "/" + c.repo},
+	         {"tag", decision.record.tag},
+	         {"source", decision.record.source},
+	         {"origin", LatestOriginName(decision.origin)},
+	         {"pinned_location", out.pinned_location}});
+	return out;
+}
+
+std::string PinGithubLatestLocation(const std::string &location, ClientContext &context) {
+	if (!IsGithubAutoLocation(location)) {
+		return location;
+	}
+	bool latest;
+	try {
+		latest = ParseGithubAutoLocation(location, DuckDB::Platform()).is_latest;
+	} catch (const std::invalid_argument &e) {
+		throw InvalidInputException("%s", e.what());
+	}
+	return latest ? ResolveGithubLatest(location, context).pinned_location : location;
+}
+
+std::vector<GithubLatestCacheEntry> ListGithubLatestCache(ClientContext &context) {
+	std::vector<GithubLatestCacheEntry> out;
+	try {
+		auto &fs = LocalFs();
+		std::string cache = CacheDir(context);
+		if (!fs.DirectoryExists(cache)) {
+			return out;
+		}
+		int64_t ttl = GetIntSetting(context, "vgi_github_latest_ttl_seconds", defaults::GITHUB_LATEST_TTL_SECONDS);
+		int64_t now = static_cast<int64_t>(::time(nullptr));
+		std::vector<std::string> names;
+		fs.ListFiles(cache, [&](const std::string &name, bool is_dir) {
+			if (!is_dir && IsLatestRecordName(name)) {
+				names.push_back(name);
+			}
+		});
+		std::sort(names.begin(), names.end());
+		for (auto &n : names) {
+			GithubLatestCacheEntry e;
+			if (!ReadLatestRecord(cache + "/" + n, e.record)) {
+				continue;
+			}
+			e.age_seconds = now - e.record.resolved_at;
+			e.fresh = ttl > 0 && e.age_seconds >= 0 && e.age_seconds < ttl;
+			out.push_back(std::move(e));
+		}
+	} catch (...) {
+	}
+	return out;
+}
+
 
 std::string NormalizeWorkerPackageFormat(const std::string &package_format) {
 	auto format = StringUtil::Lower(package_format);
@@ -942,6 +1094,13 @@ std::string ExtractWorkerPackage(const std::string &contents, const std::string 
 
 std::string ResolveGithubWorker(const std::string &location, ClientContext &context) {
 	auto &fs = LocalFs();
+
+	// A latest location resolves (TTL-cached) to its pinned form, which then
+	// takes exactly the pinned path below. ATTACH pins before it gets here, so
+	// this serves vgi_catalogs() / vgi_protocols() and other direct callers.
+	if (IsGithubAutoLocation(location) && IsGithubLatestLocation(location)) {
+		return ResolveGithubWorker(ResolveGithubLatest(location, context).pinned_location, context);
+	}
 
 	// In-process fast path.
 	{
@@ -1135,10 +1294,13 @@ int64_t FlushGithubCache(ClientContext &context) {
 			                       ((name.size() == 37 && name.compare(32, 5, ".meta") == 0) ||
 			                        (name.size() == 37 && name.compare(32, 5, ".lock") == 0));
 			bool staging_dir = is_dir && StringUtil::StartsWith(name, ".tmp-");
+			// Cached @latest resolutions and their (crash-orphaned) temp files.
+			bool latest_file = !is_dir && name.size() >= 39 && IsLatestRecordName(name.substr(0, 39)) &&
+			                   (name.size() == 39 || name.compare(39, 5, ".tmp-") == 0);
 			if (digest_dir) {
 				count++;
 			}
-			if (digest_dir || coordinate_file || staging_dir) {
+			if (digest_dir || coordinate_file || staging_dir || latest_file) {
 				owned_entries.push_back(cache + "/" + name);
 			}
 		});
@@ -1190,6 +1352,18 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &) {
 	    location);
 }
 std::vector<GithubCacheEntry> ListGithubCache(ClientContext &) {
+	return {};
+}
+GithubLatestResolution ResolveGithubLatest(const std::string &location, ClientContext &) {
+	(void)ParseGithubAutoLocation(location, DuckDB::Platform());
+	throw InvalidInputException("vgi: github-auto:// LOCATIONs require a child-process transport not available in "
+	                            "this build (location=%s)",
+	                            location);
+}
+std::string PinGithubLatestLocation(const std::string &location, ClientContext &) {
+	return location; // ResolveGithubWorker reports the unsupported transport
+}
+std::vector<GithubLatestCacheEntry> ListGithubLatestCache(ClientContext &) {
 	return {};
 }
 int64_t FlushGithubCache(ClientContext &) {

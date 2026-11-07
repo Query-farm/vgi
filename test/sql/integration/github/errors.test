@@ -37,8 +37,9 @@ ATTACH 'x' AS g_err4 (TYPE vgi, LOCATION 'github://owner/repo@v1.0/a.tar.gz#nope
 ----
 malformed fragment
 
-# github-auto:// requires @tag
+# github-auto:// needs @tag (or @latest) before a /prefix; bare owner/repo is
+# the latest-release form (test/sql/github/latest.test).
 statement error
-ATTACH 'x' AS g_err5 (TYPE vgi, LOCATION 'github-auto://owner/repo');
+ATTACH 'x' AS g_err5 (TYPE vgi, LOCATION 'github-auto://owner/repo/prefix');
 ----
 missing @tag

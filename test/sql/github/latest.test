@@ -1,0 +1,129 @@
+# name: test/sql/github/latest.test
+# description: github-auto:// latest-release LOCATIONs — parsing, policy, settings and the tag cache (no network)
+# group: [vgi_github]
+
+# Every statement here fails or is answered before any network request. Kept
+# outside test/sql/integration/ so SDK lanes running that corpus against an
+# older released extension don't pick it up.
+
+require vgi
+
+require json
+
+statement ok
+SET vgi_github_cache_dir = '{TEST_DIR}';
+
+# Defaults: latest is allowed, resolutions are reused for an hour.
+query II
+SELECT current_setting('vgi_github_allow_latest'), current_setting('vgi_github_latest_ttl_seconds');
+----
+true	3600
+
+# A digest pins one release; it cannot be combined with "whatever is latest".
+statement error
+ATTACH 'x' AS gl_err0 (TYPE vgi, LOCATION 'github-auto://owner/repo@latest#sha256=0000000000000000000000000000000000000000000000000000000000000000');
+----
+cannot be combined with @latest
+
+statement error
+ATTACH 'x' AS gl_err1 (TYPE vgi, LOCATION 'github-auto://owner/repo#sha256=0000000000000000000000000000000000000000000000000000000000000000');
+----
+cannot be combined with @latest
+
+# A prefix needs an explicit tag (or @latest): owner/repo/prefix is ambiguous.
+statement error
+ATTACH 'x' AS gl_err2 (TYPE vgi, LOCATION 'github-auto://owner/repo/prefix');
+----
+missing @tag
+
+statement error
+SELECT * FROM vgi_github_resolve('github-auto://owner/repo@latest#sha256=00');
+----
+cannot be combined with @latest
+
+statement error
+SELECT * FROM vgi_github_resolve('/usr/bin/worker');
+----
+is not a github:// or github-auto:// LOCATION
+
+# A pinned LOCATION resolves to itself without any lookup.
+query IIII
+SELECT pinned_location, tag, origin, source IS NULL FROM vgi_github_resolve('github-auto://owner/repo@v1.2.3');
+----
+github-auto://owner/repo@v1.2.3	v1.2.3	pinned	true
+
+# github:// keeps 'latest' as a literal tag name.
+query II
+SELECT tag, origin FROM vgi_github_resolve('github://owner/repo@latest/worker.tar.gz');
+----
+latest	pinned
+
+# No resolutions cached yet.
+query I
+SELECT count(*) FROM vgi_github_latest();
+----
+0
+
+# Seed a cached resolution (the record format is one JSON object; the file is
+# named by the first 32 hex digits of sha256(lower('owner/repo'))).
+statement ok
+COPY (SELECT 'vgi-test-owner' AS owner, 'vgi-test-repo' AS repo, 'v9.8.7' AS tag, 'redirect' AS source, 1 AS resolved_at)
+TO '{TEST_DIR}/6c1f3c9efc6bb9373b0c81d6ba42d50d.latest' (FORMAT json);
+
+# Stamped in 1970: stale under the default TTL...
+query IIIII
+SELECT owner, repo, tag, source, fresh FROM vgi_github_latest();
+----
+vgi-test-owner	vgi-test-repo	v9.8.7	redirect	false
+
+# ...fresh under an unbounded one, so resolution is answered from the cache
+# (no network) — for both latest spellings, case-insensitively.
+statement ok
+SET vgi_github_latest_ttl_seconds = 9223372036854775807;
+
+query IIII
+SELECT pinned_location, tag, source, origin FROM vgi_github_resolve('github-auto://vgi-test-owner/vgi-test-repo');
+----
+github-auto://vgi-test-owner/vgi-test-repo@v9.8.7	v9.8.7	redirect	cache
+
+query II
+SELECT pinned_location, origin FROM vgi_github_resolve('github-auto://VGI-Test-Owner/VGI-Test-Repo@latest/custom#path=bin/w');
+----
+github-auto://VGI-Test-Owner/VGI-Test-Repo@v9.8.7/custom#path=bin/w	cache
+
+query I
+SELECT fresh FROM vgi_github_latest();
+----
+true
+
+# Forbidding latest refuses it before any I/O, even with a cached tag.
+statement ok
+SET vgi_github_allow_latest = false;
+
+statement error
+ATTACH 'x' AS gl_err3 (TYPE vgi, LOCATION 'github-auto://vgi-test-owner/vgi-test-repo');
+----
+vgi_github_allow_latest = false
+
+statement error
+SELECT * FROM vgi_github_resolve('github-auto://vgi-test-owner/vgi-test-repo@latest');
+----
+vgi_github_allow_latest = false
+
+# Pinned LOCATIONs are unaffected.
+query I
+SELECT origin FROM vgi_github_resolve('github-auto://vgi-test-owner/vgi-test-repo@v9.8.7');
+----
+pinned
+
+statement ok
+RESET vgi_github_allow_latest;
+
+# Flushing the release cache forgets cached resolutions too.
+statement ok
+SELECT * FROM vgi_github_cache_flush();
+
+query I
+SELECT count(*) FROM vgi_github_latest();
+----
+0
