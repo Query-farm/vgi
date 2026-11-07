@@ -19,6 +19,16 @@ scripts, the Makefile's direct `unittest` calls and `scripts/run_tests.py`
 (by default) all pass it. A lane outside this repo that runs this suite (the
 SDK repos' CI) should pass the same file.
 
+## Fixture contracts for SDK example workers
+
+Most integration files run against every SDK's example worker. Where a file
+needs functions beyond the long-standing example set, their exact contract is
+written down so each SDK can implement it, and the files are gated on an opt-in
+variable until it does:
+
+- [Secret-lookup fixtures](../docs/secret_lookup_fixtures.md) —
+  `secret/secret_lookup_*.test`, gated on `VGI_SECRET_LOOKUP_FIXTURES`.
+
 ## Windows OAuth credential storage
 
 Configure the extension build with `-DBUILD_VGI_OAUTH_STORE_TESTS=ON`, then run:

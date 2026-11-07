@@ -102,6 +102,12 @@ VGI_TRANSPORT_PYTHONPATH = $(VGI_RPC_PYTHON_DIR)$${PYTHONPATH:+:$$PYTHONPATH}
 VGI_TEST_BRANCH_DIR ?= $(shell python3 -c 'import tempfile;print(tempfile.gettempdir())')
 export VGI_TEST_BRANCH_DIR
 
+# The vgi-python example worker implements the secret-lookup conformance
+# fixtures (docs/secret_lookup_fixtures.md), which secret/secret_lookup_*.test
+# gate on. Set to empty when testing a worker that does not implement them.
+VGI_SECRET_LOOKUP_FIXTURES ?= 1
+export VGI_SECRET_LOOKUP_FIXTURES
+
 # Versioned fixture workers for attach/versioning*.test. Set to overrideable
 # defaults so `require-env` gates pass under `make test_spawn` by default.
 VGI_VERSIONED_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-versioned-worker

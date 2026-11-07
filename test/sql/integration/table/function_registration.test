@@ -173,9 +173,10 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # generated_sequence_scan because its generated-columns table needs a distinct
 # three-column projected scanner. Other SDKs use projection_sequence for
 # their projection contract fixture. C# uses geo_points for its fixed
-# geometry table. The exchange-cache probes are also excluded
-# from the portable inventory count, then validated as an exact optional set so
-# a partial registration still fails.
+# geometry table. The exchange-cache probes and the secret-lookup conformance
+# fixtures (docs/secret_lookup_fixtures.md, gated on VGI_SECRET_LOOKUP_FIXTURES)
+# are also excluded from the portable inventory count, then each validated as
+# an exact optional set so a partial registration still fails.
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
@@ -192,7 +193,12 @@ WHERE database_name = 'example' AND function_type = 'table'
     'cached_slow_sum_all',
     'generated_sequence_scan',
     'projection_sequence',
-    'geo_points'
+    'geo_points',
+    'secret_value_by_type',
+    'secret_value_by_name',
+    'secret_value_for_scope',
+    'secret_value_required',
+    'secret_types_seen'
   );
 ----
 173
@@ -215,6 +221,24 @@ WHERE database_name = 'example' AND function_type = 'table'
     'cached_reval_sum_all',
     'cached_serial_echo',
     'cached_slow_sum_all'
+  );
+----
+1
+
+query I
+SELECT CASE
+         WHEN COUNT(*) = 0 THEN 1
+         WHEN COUNT(*) = 5 AND COUNT(DISTINCT function_name) = 5 THEN 1
+         ELSE 0
+       END
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table'
+  AND function_name IN (
+    'secret_value_by_type',
+    'secret_value_by_name',
+    'secret_value_for_scope',
+    'secret_value_required',
+    'secret_types_seen'
   );
 ----
 1

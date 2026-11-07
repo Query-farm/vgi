@@ -222,6 +222,9 @@ jobs:
         env:
           VGI_TEST_WORKER: launch:uv run --project /tmp/vgi-python vgi-fixture-worker
           VGI_TEST_BRANCH_DIR: /tmp/vgi-branch
+          # vgi-python's example worker implements the secret-lookup fixtures
+          # (docs/secret_lookup_fixtures.md).
+          VGI_SECRET_LOOKUP_FIXTURES: "1"
         run: |
           mkdir -p "$VGI_TEST_BRANCH_DIR"
           # --isolate-launcher, as `make test_launcher` uses: DuckDB 2.0's unittest
