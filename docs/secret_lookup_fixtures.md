@@ -38,8 +38,16 @@ implements all five functions. Until then the files skip with the reason
 remove it in the commit that sets the variable. The vgi `Makefile` exports it (default `1`, for the
 vgi-python worker) and so does the vgi `integration.yml` suite step.
 
-Status: vgi-python implements the fixtures (`vgi/_test_fixtures/secret_lookup.py`, from 0.49.2).
-TypeScript, Go, Rust, Java and C# do not yet.
+Status: every SDK implements the fixtures and opts in.
+
+| SDK | Fixtures | From |
+|---|---|---|
+| vgi-python | `vgi/_test_fixtures/secret_lookup.py` | 0.49.2 |
+| vgi-typescript | `examples/secret_lookup.ts` | 0.48.3 |
+| vgi-go | `examples/table/secret_lookup.go` | v0.40.2 |
+| vgi-rust | `vgi-example-worker/src/secret_lookup.rs` | 0.49.4 |
+| vgi-java | `vgi-example-worker/.../table/SecretLookupFixtures.java` | 0.46.2 |
+| vgi-csharp | `fixtures/QueryFarm.Vgi.ExampleWorker/Table/SecretLookupFixtures.cs` | 0.24.1 |
 
 ## Common rules
 
