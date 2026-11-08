@@ -11,6 +11,9 @@ require-env VGI_WRITABLE_TX_WORKER
 
 require vgi
 
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
 statement ok
 ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-123');
 
