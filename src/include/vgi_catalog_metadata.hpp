@@ -72,17 +72,20 @@ struct VgiAttachOptionSpec {
 
 // A parameter definition for a VGI secret type
 struct VgiSecretTypeParam {
-	std::string name;       // Key name (e.g., "secret_string")
-	LogicalType type;       // Value type — any DuckDB type (VARCHAR, INTEGER, BOOLEAN, etc.)
-	bool redact = false;    // Whether this key should be redacted in SHOW SECRETS
+	std::string name;        // Key name (e.g., "secret_string")
+	LogicalType type;        // Value type — any DuckDB type (VARCHAR, INTEGER, BOOLEAN, etc.)
+	bool redact = false;     // Whether this key should be redacted in SHOW SECRETS
+	bool required = false;   // vgi_required field metadata: CREATE SECRET must supply it
+	std::string description; // vgi_doc field metadata (empty = undocumented)
 };
 
 // A secret type exposed by a VGI worker
 // Parsed from serialized SecretTypeSpec objects in CatalogAttachResult
 struct VgiSecretType {
-	std::string name;                              // Secret type name (e.g., "vgi_example")
-	std::string description;                       // Human-readable description
-	std::vector<VgiSecretTypeParam> parameters;    // Key-value parameter definitions
+	std::string name;                           // Secret type name (e.g., "vgi_example")
+	std::string description;                    // Human-readable description
+	std::vector<VgiSecretTypeParam> parameters; // Key-value parameter definitions
+	std::string doc_url;                        // vgi_doc_url schema metadata (empty = none)
 };
 
 // A secret requirement declared by a function

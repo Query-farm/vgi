@@ -2451,6 +2451,7 @@ VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::s
 	if (!params_schema) {
 		return secret_type;
 	}
+	secret_type.doc_url = params_schema->metadata().Get(VGI_DOC_URL_METADATA_KEY).value_or("");
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> types;
@@ -2461,8 +2462,9 @@ VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::s
 		param.name = names[i];
 		param.type = types[i];
 		auto field_metadata = params_schema->field_metadata(i);
-		auto redact_idx = field_metadata.FindKey("redact");
-		param.redact = redact_idx >= 0 && field_metadata.value(redact_idx) == "true";
+		param.redact = field_metadata.Get("redact").value_or("") == "true";
+		param.required = field_metadata.Get(VGI_REQUIRED_METADATA_KEY).value_or("") == "true";
+		param.description = field_metadata.Get(VGI_DOC_METADATA_KEY).value_or("");
 		secret_type.parameters.push_back(std::move(param));
 	}
 	return secret_type;

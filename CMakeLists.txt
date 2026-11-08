@@ -360,6 +360,7 @@ src/vgi_lateral_batch_operator.cpp
 src/vgi_multi_scan_rewriter.cpp
 src/vgi_table_branches_function.cpp
 src/vgi_function_arguments_function.cpp
+src/vgi_secret_types_function.cpp
 src/vgi_copy_from_impl.cpp
 src/vgi_copy_to_impl.cpp
 src/vgi_table_buffering_builders.cpp

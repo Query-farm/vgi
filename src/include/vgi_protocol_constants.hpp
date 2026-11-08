@@ -87,6 +87,19 @@ constexpr const char *VGI_RANGE_METADATA_KEY = "vgi_range";
 constexpr const char *VGI_PATTERN_METADATA_KEY = "vgi_pattern";
 
 // ----------------------------------------------------------------------------
+// Secret Type Parameter Metadata (credential discovery)
+// ----------------------------------------------------------------------------
+// On a SecretTypeSpec's parameters schema, surfaced through vgi_secret_types():
+//   field  vgi_doc      — what the value is and where to find it (VGI_DOC_METADATA_KEY)
+//   field  vgi_required — "true" when CREATE SECRET must supply the key
+//   field  redact       — "true" to mask the value in SHOW SECRETS (pre-existing)
+//   schema vgi_doc_url  — page explaining how to obtain the credentials
+// Presence-only and UTF-8, like the per-argument keys above. No wire change: the
+// parameters schema already carries field and schema metadata.
+constexpr const char *VGI_REQUIRED_METADATA_KEY = "vgi_required";
+constexpr const char *VGI_DOC_URL_METADATA_KEY = "vgi_doc_url";
+
+// ----------------------------------------------------------------------------
 // Row ID Metadata
 // ----------------------------------------------------------------------------
 // Arrow field metadata key indicating the field is the table's row identifier.

@@ -111,6 +111,7 @@
 #include "vgi_table_statistics_function.hpp"
 #include "vgi_table_branches_function.hpp"
 #include "vgi_function_arguments_function.hpp"
+#include "vgi_secret_types_function.hpp"
 #include "vgi_catalog_contents_function.hpp"
 #include "vgi_clear_cache.hpp"
 #include "vgi_result_cache.hpp"
@@ -3923,6 +3924,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register per-argument diagnostic function — one row per (catalog, schema,
 	// function, argument) with named/positional/const/varargs/type + vgi_doc.
 	vgi::RegisterVgiFunctionArgumentsFunction(loader);
+	vgi::RegisterVgiSecretTypesFunction(loader);
 
 	// Register OAuth diagnostic/management functions
 	{
