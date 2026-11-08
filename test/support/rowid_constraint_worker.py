@@ -10,6 +10,7 @@ which records the pre-defined ``simple_writable`` tables carry:
 * ``enforced_keys``  — supported records, all ENFORCED + ALL_ROWS:
     ``items``               PRIMARY KEY (id)
     ``items_no_returning``  PRIMARY KEY (id), UNIQUE (name)
+    ``items_insert_only``   PRIMARY KEY (id)   (declares INSERT only)
 * ``rowid_keys``     — ENFORCED + ALL_ROWS records that name the rowid column:
     ``items``               PRIMARY KEY (rowid)
     ``items_no_returning``  PRIMARY KEY (id, rowid), UNIQUE (rowid, name)
@@ -57,6 +58,7 @@ _MODES: dict[str, tuple[int, dict[str, list[Any]]]] = {
                 (ConstraintKind.PRIMARY_KEY, ["id"], _TRUSTED),
                 (ConstraintKind.UNIQUE, ["name"], _TRUSTED),
             ],
+            "items_insert_only": [(ConstraintKind.PRIMARY_KEY, ["id"], _TRUSTED)],
         },
     ),
     "rowid_keys": (
@@ -83,12 +85,25 @@ if not hasattr(vgi.worker, "validate_constraint_records"):
     raise RuntimeError("vgi.worker.validate_constraint_records moved; update this fixture")
 vgi.worker.validate_constraint_records = lambda *args, **kwargs: None
 
+# vgi-python also serves a table with constraint records read-only (drops its
+# write functions and modes) unless the attachment selected
+# vgi.constraint.enforce.v1. Keep the declared writes, so the extension's own
+# planning check is what refuses them. Same loud failure if the hook moves.
+if not hasattr(vgi.worker.Worker, "_table_for_capabilities"):
+    raise RuntimeError("vgi.worker.Worker._table_for_capabilities moved; update this fixture")
+
 
 class RowidConstraintCatalog(SimpleWritableCatalog):
     """SimpleWritableCatalog whose tables carry the records of the attached mode."""
 
     def catalog_capabilities(self, *, attach_opaque_data):  # type: ignore[no-untyped-def,override]
-        """Serve constraint records; writes are not offered, so the tables are read-only."""
+        """Serve constraint records but never negotiate vgi.constraint.enforce.v1.
+
+        The tables keep their simple_writable writes (see
+        ``RowidConstraintWorker._table_for_capabilities``), so a write a table
+        declares fails on the missing enforcement profile and one it does not
+        declare fails as unsupported.
+        """
         del attach_opaque_data
         return CatalogCapabilities(read=[CONSTRAINT_RECORDS_READ])
 
@@ -135,6 +150,17 @@ class RowidConstraintWorker(SimpleWritableWorker):
     """Worker exposing :class:`RowidConstraintCatalog`."""
 
     catalog_interface = RowidConstraintCatalog
+
+    @staticmethod
+    def _table_for_capabilities(info, selected):  # type: ignore[no-untyped-def,override]
+        served = SimpleWritableWorker._table_for_capabilities(info, selected)
+        return dataclasses.replace(
+            served,
+            write_result_modes=info.write_result_modes,
+            insert_function=info.insert_function,
+            update_function=info.update_function,
+            delete_function=info.delete_function,
+        )
 
 
 if __name__ == "__main__":

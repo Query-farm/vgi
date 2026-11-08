@@ -200,15 +200,28 @@ PRIMARY KEY	4
 UNIQUE	2
 
 # ============================================================================
-# Reading immutable constraint facts does not authorize constrained writes.
-# This must fail at native planning, before fallback write-function discovery.
-# Count mode has no RETURNING requirement to accidentally mask the missing gate.
+# A constrained table that declares no write function is read-only: writes
+# fail at native planning, before fallback write-function discovery, as
+# unsupported operations, whether or not the worker negotiated the
+# constraint-enforcement profile (only a declared write needs it; see
+# table/rowid_constraint_metadata.test). Count mode has no RETURNING
+# requirement to mask the check.
 # ============================================================================
 
 statement error
 INSERT INTO example.data.departments (id, name, budget) VALUES (99, 'unauthorized', 100);
 ----
-constraint enforcement profile was not negotiated
+<REGEX>:.*Table '.*departments.*' does not support INSERT.*
+
+statement error
+UPDATE example.data.departments SET budget = 1 WHERE id = 1;
+----
+<REGEX>:.*Table '.*departments.*' does not support UPDATE.*
+
+statement error
+DELETE FROM example.data.departments WHERE id = 1;
+----
+<REGEX>:.*Table '.*departments.*' does not support DELETE.*
 
 query I
 SELECT count(*) FROM example.data.departments;

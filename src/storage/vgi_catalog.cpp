@@ -48,7 +48,6 @@ static int WriteResultModeRank(const string &mode) {
 }
 
 static void RequireWriteResultMode(const VgiTableEntry &table, const string &operation, bool return_chunk) {
-	vgi::RequireNativeConstraintWrite(*table.GetCatalog().Cast<VgiCatalog>().attach_result(), table.GetTableInfo());
 	const auto requested = return_chunk ? "rows" : "count";
 	const auto &modes = table.GetTableInfo().write_result_modes;
 	auto entry = modes.find(operation);
@@ -59,6 +58,11 @@ static void RequireWriteResultMode(const VgiTableEntry &table, const string &ope
 		        .Set(vgi::error_key::kOperation, StringUtil::Upper(operation)),
 		    StringUtil::Format("Table '%s' does not support %s", table.name, StringUtil::Upper(operation)));
 	}
+	// Only a table that declares this operation needs the constraint-enforcement
+	// profile. Checked after the operation itself, so a read-only constrained
+	// table reports "does not support UPDATE" whether or not the worker
+	// negotiated vgi.constraint.enforce.v1.
+	vgi::RequireNativeConstraintWrite(*table.GetCatalog().Cast<VgiCatalog>().attach_result(), table.GetTableInfo());
 	if (WriteResultModeRank(entry->second) < WriteResultModeRank(requested)) {
 		throw BinderException(
 		    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)

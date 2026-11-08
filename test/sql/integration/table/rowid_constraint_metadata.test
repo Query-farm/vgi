@@ -6,12 +6,16 @@
 # a different set of constraint records per catalog name:
 #   enforced_keys       items PRIMARY KEY (id)
 #                       items_no_returning PRIMARY KEY (id), UNIQUE (name)
+#                       items_insert_only PRIMARY KEY (id)
 #   rowid_keys          items PRIMARY KEY (rowid)
 #                       items_no_returning PRIMARY KEY (id, rowid), UNIQUE (rowid, name)
 #   metadata_only_keys  items PRIMARY KEY (id), METADATA_ONLY / UNVALIDATED
 # Every record except METADATA_ONLY is ENFORCED + ALL_ROWS. Informational
 # (METADATA_ONLY) constraints are not supported. The fixture serves its records
-# unvalidated so these assertions exercise the extension's own checks.
+# unvalidated so these assertions exercise the extension's own checks. It
+# negotiates the constraint read profile only, never vgi.constraint.enforce.v1,
+# yet keeps serving the tables' declared writes (vgi-python alone would serve
+# them read-only).
 
 require-env VGI_ROWID_CONSTRAINT_WORKER
 
@@ -37,6 +41,7 @@ WHERE database_name = 'e' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')
 ORDER BY 1, 2;
 ----
 items	PRIMARY KEY	[id]
+items_insert_only	PRIMARY KEY	[id]
 items_no_returning	PRIMARY KEY	[id]
 items_no_returning	UNIQUE	[name]
 
@@ -58,6 +63,59 @@ query II
 SELECT count(rowid), count(id) FROM e.main.items_no_returning;
 ----
 0	0
+
+# --- Writes without the constraint-enforcement profile ----------------------
+# A write the table declares needs vgi.constraint.enforce.v1, which this worker
+# never negotiates, so it fails at planning on the missing profile. A write the
+# table does not declare is reported as unsupported first: the missing profile
+# is irrelevant to it.
+
+statement error
+INSERT INTO e.main.items VALUES (1, 'a', 10);
+----
+constraint enforcement profile was not negotiated
+
+statement error
+UPDATE e.main.items SET qty = 1;
+----
+constraint enforcement profile was not negotiated
+
+statement error
+DELETE FROM e.main.items;
+----
+constraint enforcement profile was not negotiated
+
+statement error
+INSERT INTO e.main.items_insert_only VALUES (1, 'a');
+----
+constraint enforcement profile was not negotiated
+
+# The profile is checked before the result mode: items_no_returning is
+# count-only, but the missing profile is what this attach lacks.
+statement error
+INSERT INTO e.main.items_no_returning VALUES (1, 'a', 10) RETURNING *;
+----
+constraint enforcement profile was not negotiated
+
+statement error
+UPDATE e.main.items_insert_only SET name = 'b';
+----
+<REGEX>:.*Table '.*items_insert_only.*' does not support UPDATE.*
+
+statement error
+DELETE FROM e.main.items_insert_only;
+----
+<REGEX>:.*Table '.*items_insert_only.*' does not support DELETE.*
+
+statement error
+UPDATE e.main.items_insert_only SET name = 'b';
+----
+<!REGEX>:.*constraint enforcement profile.*
+
+query I
+SELECT count(*) FROM e.main.items;
+----
+0
 
 # --- Keys naming the rowid column are rejected ------------------------------
 

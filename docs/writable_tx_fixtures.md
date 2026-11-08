@@ -138,9 +138,10 @@ Initial rows: `(1, 'a', 10)`, `(2, 'b', 20)`, `(3, 'c', 30)`. Scans return rows 
 `id INTEGER NOT NULL PRIMARY KEY`, `label VARCHAR`; rows `(1, 'x')`, `(2, 'y')`. Read-only: no
 insert, update or delete function, but the same constraint declarations as `items`.
 `UPDATE t.main.labels ...` must fail with the engine's `does not support UPDATE`, not with a
-constraint-profile error. (The SDK must negotiate `vgi.constraint.enforce.v1` because `items` is a
-writable table with constraints; the extension checks that negotiation before the table's write
-modes, so a missing profile shows up on `labels` too.)
+constraint-profile error. (The SDK must still negotiate `vgi.constraint.enforce.v1`, because `items`
+is a writable table with constraints. Before vgi v2.0 commit "check the declared write before the
+constraint-enforcement profile", the extension checked that negotiation first, so a missing profile
+showed up on `labels` too; it now reports the undeclared operation first.)
 
 ## Transaction hooks (transactional attaches only)
 
