@@ -1,0 +1,120 @@
+{
+  "date": "2026-11-08",
+  "protocol": {
+    "name": "vgi.v3",
+    "version": "3.2.0",
+    "nativeBranch": "v2.0",
+    "implementationCommit": "d4f849c8f7f2fe5dc194c51611d1340b8b2cae88",
+    "nativeCodeCommit": "2df81a5e75fd2d1f436526906cf5f868522c6655",
+    "spec": "vgi-python docs/protocol/scan-planning.md"
+  },
+  "frameworkReleases": [
+    {
+      "language": "Python",
+      "repo": "vgi-python",
+      "version": "0.50.0",
+      "tagCommit": "0c9e8fb0c6cfe9a0feb7c8970c089be6fd1147a4",
+      "mainCommit": "c702d3a5b7bc4854066dc5c423e24e181e7f1343",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-python/releases/tag/v0.50.0",
+      "validation": "PyPI vgi-python 0.50.0; CI + integration green on main against native 2df81a5."
+    },
+    {
+      "language": "Rust",
+      "repo": "vgi-rust",
+      "version": "0.50.0",
+      "tagCommit": "595d77f4ea8969b3dc95ce507365c3f62f7b0ac4",
+      "mainCommit": "d5a542ea3a84baa11a74b491231f1052b273be2c",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-rust/releases/tag/v0.50.0",
+      "validation": "crates.io vgi-protocol, vgi, vgi-client 0.50.0; CI + integration green."
+    },
+    {
+      "language": "Java",
+      "repo": "vgi-java",
+      "version": "0.47.0",
+      "tagCommit": "7865fe2c74428dac753a7e19c93de6fa6ce684b3",
+      "mainCommit": "e509bd521a53d343c5b432b882927cf4129f8901",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-java/releases/tag/v0.47.0",
+      "validation": "Maven Central farm.query:vgi 0.47.0; CI + integration green."
+    },
+    {
+      "language": "Go",
+      "repo": "vgi-go",
+      "version": "0.41.0",
+      "tagCommit": "40836729af40e3f89448c6a8b7023f2f13839c35",
+      "mainCommit": "1d8ccc784d3602f2154785d898f0dd1b17ccf8f3",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-go/releases/tag/v0.41.0",
+      "validation": "Go proxy github.com/Query-farm/vgi-go v0.41.0; CI + integration green."
+    },
+    {
+      "language": "C#",
+      "repo": "vgi-csharp",
+      "version": "0.25.0",
+      "tagCommit": "2a06e7a7e3e37a4b28745e680116dec6514cedfa",
+      "mainCommit": "ec875b5e5c084c8f40bbdb00c5f7f7dead28e227",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-csharp/releases/tag/v0.25.0",
+      "validation": "NuGet QueryFarm.Vgi 0.25.0; CI green."
+    },
+    {
+      "language": "C++",
+      "repo": "vgi-cpp",
+      "version": "0.15.0",
+      "tagCommit": "f961b3f9170b836e6c4df422f369da2cb2d2c0e7",
+      "mainCommit": "7860b5e0d73a1554cd238c4b822a321dacf50ac0",
+      "status": "source_release_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-cpp/releases/tag/v0.15.0",
+      "validation": "GitHub source release; CI + integration green."
+    },
+    {
+      "language": "TypeScript",
+      "repo": "vgi-typescript",
+      "version": "0.49.0",
+      "tagCommit": "a3709ea5913103ae0d5b2c85bf615038cd208fb2",
+      "mainCommit": "dd942122427737facb5850e4aa03e11f7ac4012c",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-typescript/releases/tag/v0.49.0",
+      "validation": "npm @query-farm/vgi 0.49.0; CI green on both Arrow backends."
+    }
+  ],
+  "engineAdapters": [
+    {
+      "engine": "Apache Spark",
+      "repo": "vgi-spark",
+      "version": "0.5.0",
+      "tagCommit": "3a34aaf7d2a570935b90fbaad3f04e7b53ece6f6",
+      "mainCommit": "41806c6611bd6200377b7a642d2e5ee5cc53700c",
+      "status": "source_release_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-spark/releases/tag/v0.5.0",
+      "validation": "Built against farm.query:vgi 0.47.0 from Maven Central; sends null pushdown_filters. main 41806c6 adjusts one test to the released vgi-rust fixture layout; CI green."
+    },
+    {
+      "engine": "Apache DataFusion 55",
+      "repo": "vgi-datafusion",
+      "version": "0.3.0",
+      "tagCommit": "34e33d9dbf7fe6c8e77bd682d131e3932f233530",
+      "mainCommit": "34e33d9dbf7fe6c8e77bd682d131e3932f233530",
+      "status": "source_release_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-datafusion/releases/tag/v0.3.0",
+      "validation": "Registry-only build verified against vgi-client 0.50.0; sends pushdown_filters and prunes by column_statistics."
+    },
+    {
+      "engine": "Trino",
+      "repo": "vgi-trino",
+      "version": "0.3.0",
+      "tagCommit": "ce2888838e471b62c6067ffd800dcab5a27575a7",
+      "mainCommit": "ce2888838e471b62c6067ffd800dcab5a27575a7",
+      "status": "source_release_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-trino/releases/tag/v0.3.0",
+      "validation": "Built against farm.query:vgi 0.47.0 from Maven Central; filtered tables are listed but scans are refused (no branch support yet)."
+    }
+  ],
+  "compatibility": "All listed SDKs and adapters use vgi.v3/3.2.0. Exact major+minor matching rejects 3.1 workers and clients; patch releases remain wire compatible.",
+  "knownIssues": [
+    "test/sql/duckdb2/column_paths.test fails on column_default rendering; pre-existing (reproduced on unmodified v2.0 22140b0 with vgi-python 0.49.5)."
+  ],
+  "status": "published_artifacts_and_hosted_validation_complete"
+}

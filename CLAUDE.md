@@ -21,7 +21,7 @@ Use the committed submodule revision, not `git submodule update --remote`.
 The wire contract is **`vgi.v3` / `3.2.0`** (filtered scan planning, see
 `docs/multi_branch.md`). Workers need matching SDK releases; older `vgi.v2` and
 `vgi.v3` / `3.0.x`–`3.1.x` workers are incompatible. See
-`docs/protocol-3.1-sdk-releases.json` (and its 3.2 successor) for the coordinated releases and
+`docs/protocol-3.2-sdk-releases.json` for the coordinated releases and
 `docs/native-dependencies.md` for dependency details.
 
 The Clang Linux ARM64 build and configured suites pass. The latest dependency
