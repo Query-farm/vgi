@@ -6,8 +6,8 @@
 require vgi
 
 # Test vgi_catalogs with non-existent worker path. The exact error differs by
-# platform (POSIX exec-fail "not found or not executable"; MSVC cmd.exe "failed
-# during unary RPC (exit code 1)"; MinGW "RPC response stream EOF (no schema)"),
+# platform (POSIX exec-fail "not found or not executable"; MSVC cmd.exe "exited
+# before answering its first request (exit code 1)"; MinGW "RPC response stream EOF (no schema)"),
 # so just assert that it errors.
 statement error
 SELECT * FROM vgi_catalogs('/nonexistent/path/to/worker');

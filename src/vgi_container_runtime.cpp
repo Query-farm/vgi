@@ -215,6 +215,81 @@ std::string SanitizeVolumeToken(const std::string &s) {
 
 } // namespace
 
+std::string ContainerRuntimeUnavailableReason(const std::string &kind, const std::string &output) {
+	const std::string lower = StringUtil::Lower(output);
+	auto has = [&](const char *needle) { return lower.find(needle) != std::string::npos; };
+	const bool permission = has("permission denied while trying to connect to the docker") ||
+	                        (has("permission denied") && (has(".sock") || has("socket")));
+	const bool unreachable = has("cannot connect to the docker daemon") || has("failed to connect to the docker api") ||
+	                         has("is the docker daemon running") || has("error during connect") ||
+	                         has("cannot connect to podman") || has("unable to connect to podman") ||
+	                         has("podman machine start") || has("cannot access containerd socket") ||
+	                         has("containerd.sock") || has("container system start");
+	if (permission) {
+		std::string reason = kind + " is installed but this user may not use its socket (permission denied); ";
+		if (kind == "docker") {
+			reason += "add the user to the `docker` group and log in again, or use rootless Docker or podman";
+		} else {
+			reason += "give the user access to the runtime's socket, or run it rootless";
+		}
+		return reason;
+	}
+	if (!unreachable) {
+		return "";
+	}
+	std::string reason = kind + " is installed but its daemon is not reachable; ";
+	if (kind == "docker") {
+		reason += "start Docker Desktop, or the docker service (e.g. `sudo systemctl start docker`)";
+	} else if (kind == "podman") {
+		reason += "run `podman machine start` (macOS / Windows), or check `podman system connection list`";
+	} else if (kind == "nerdctl") {
+		reason += "start containerd (e.g. `sudo systemctl start containerd`)";
+	} else if (kind == "container") {
+		reason += "run `container system start`";
+	} else {
+		reason += "start it and retry";
+	}
+	return reason;
+}
+
+namespace {
+
+// Throw RUNTIME_UNAVAILABLE when `output` shows the runtime itself is unusable,
+// so the user is pointed at the daemon instead of at the image. No-op otherwise.
+void ThrowIfRuntimeUnavailable(const ContainerRuntime &runtime, const std::string &output,
+                               const std::string &image) {
+	auto reason = ContainerRuntimeUnavailableReason(runtime.kind, output);
+	if (reason.empty()) {
+		return;
+	}
+	throw IOException(OciInfo(error_subtype::kRuntimeUnavailable)
+	                      .Set(error_key::kContainerRuntime, runtime.kind)
+	                      .Set(error_key::kContainerImage, image),
+	                  "vgi container: " + reason + "\n" + runtime.kind +
+	                      " said: " + TrimCopy(StringUtil::Replace(output, "\n", " ")));
+}
+
+// True when `<runtime> info` succeeds, i.e. its daemon answers. Positive
+// answers are cached for the process; a stopped daemon is asked again next time.
+bool RuntimeDaemonAnswers(const std::string &binary) {
+	static std::mutex mu;
+	static std::vector<std::string> answered;
+	{
+		std::lock_guard<std::mutex> lk(mu);
+		if (std::find(answered.begin(), answered.end(), binary) != answered.end()) {
+			return true;
+		}
+	}
+	if (RunCaptureCommand(ShellQuote(binary) + " info").exit_code != 0) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lk(mu);
+	answered.push_back(binary);
+	return true;
+}
+
+} // namespace
+
 ContainerRuntime DetectContainerRuntime(const std::string &override_kind) {
 	if (!override_kind.empty()) {
 		std::string kind = StringUtil::Lower(override_kind);
@@ -232,11 +307,27 @@ ContainerRuntime DetectContainerRuntime(const std::string &override_kind) {
 		}
 		return ContainerRuntime {bin, kind};
 	}
+	std::vector<ContainerRuntime> installed;
 	for (const auto &kind : kKnownRuntimes()) {
 		std::string bin = WhichBinary(kind);
 		if (!bin.empty()) {
-			return ContainerRuntime {bin, kind};
+			installed.push_back(ContainerRuntime {bin, kind});
 		}
+	}
+	if (installed.size() == 1) {
+		return installed[0];
+	}
+	if (installed.size() > 1) {
+		// Several installed: prefer one whose daemon is running, so a stopped
+		// Docker Desktop does not hide a working podman. Apple's `container`
+		// has no `info`; it is taken as-is. When none answers, the first is
+		// used and its own error (RUNTIME_UNAVAILABLE) explains what to start.
+		for (const auto &rt : installed) {
+			if (rt.kind == "container" || RuntimeDaemonAnswers(rt.binary)) {
+				return rt;
+			}
+		}
+		return installed[0];
 	}
 	throw IOException(
 	    OciInfo(error_subtype::kRuntimeNotFound),
@@ -256,11 +347,14 @@ std::vector<ContainerVolume> InspectImageVolumes(const ContainerRuntime &runtime
 
 	CommandResult res = run_inspect();
 	if (res.exit_code != 0) {
+		// A stopped daemon fails the inspect too; say so before trying a pull.
+		ThrowIfRuntimeUnavailable(runtime, res.output, image);
 		// Most likely the image isn't present locally.  Pull once (auth deferred
 		// to the runtime's own login), then retry inspect.
 		std::string pull_cmd = ShellQuote(runtime.binary) + " pull " + ShellQuote(image);
 		CommandResult pull = RunCaptureCommand(pull_cmd);
 		if (pull.exit_code != 0) {
+			ThrowIfRuntimeUnavailable(runtime, pull.output, image);
 			throw IOException(
 			    OciInfo(error_subtype::kWorkerNotFound)
 			        .Set(error_key::kContainerImage, image)
@@ -270,6 +364,7 @@ std::vector<ContainerVolume> InspectImageVolumes(const ContainerRuntime &runtime
 		}
 		res = run_inspect();
 		if (res.exit_code != 0) {
+			ThrowIfRuntimeUnavailable(runtime, res.output, image);
 			throw IOException(OciInfo(error_subtype::kWorkerNotFound)
 			                      .Set(error_key::kContainerImage, image)
 			                      .Set(error_key::kContainerRuntime, runtime.kind),
@@ -1197,6 +1292,7 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 			}
 			return cache_put(finish(mode, got));
 		}
+		ThrowIfRuntimeUnavailable(spec.runtime, run.output, spec.image);
 		throw IOException(OciInfo(error_subtype::kWorkerExited)
 		                      .Set(error_key::kContainerName, name)
 		                      .Set(error_key::kContainerImage, spec.image)

@@ -29,7 +29,8 @@ namespace {
 	std::fprintf(stderr,
 	              "usage: launcher_test_worker --unix PATH [--idle-timeout SEC] "
 	              "[--noisy-prefix N] [--no-bind] [--exit-with N] "
-	              "[--dump-argv-to FILE]\n");
+	              "[--dump-argv-to FILE] [--stderr MSG] "
+	              "[--stderr-flood-after-bind BYTES --flood-done-file FILE]\n");
 	std::exit(rc);
 }
 
@@ -42,6 +43,9 @@ struct Args {
 	std::string dump_argv_path;  // if set, write full argv (one token per line) here
 	                             // before doing anything else.  Used by tests to
 	                             // verify the launcher passed the expected args.
+	std::string stderr_message;  // if set, written to stderr first (startup-failure tests)
+	long flood_bytes = 0;        // after binding, write this many bytes to stderr...
+	std::string flood_done_path; // ...then create this file, unless a write failed
 };
 
 Args ParseArgs(int argc, char **argv) {
@@ -60,6 +64,12 @@ Args ParseArgs(int argc, char **argv) {
 			a.exit_with = std::atoi(argv[++i]);
 		} else if (s == "--dump-argv-to" && i + 1 < argc) {
 			a.dump_argv_path = argv[++i];
+		} else if (s == "--stderr" && i + 1 < argc) {
+			a.stderr_message = argv[++i];
+		} else if (s == "--stderr-flood-after-bind" && i + 1 < argc) {
+			a.flood_bytes = std::atol(argv[++i]);
+		} else if (s == "--flood-done-file" && i + 1 < argc) {
+			a.flood_done_path = argv[++i];
 		} else if (s == "-h" || s == "--help") {
 			Usage(0);
 		} else {
@@ -83,6 +93,11 @@ int main(int argc, char **argv) {
 			}
 			std::fclose(f);
 		}
+	}
+
+	if (!args.stderr_message.empty()) {
+		std::fprintf(stderr, "%s\n", args.stderr_message.c_str());
+		std::fflush(stderr);
 	}
 
 	if (args.exit_with >= 0) {
@@ -130,6 +145,32 @@ int main(int argc, char **argv) {
 
 	std::printf("UNIX:%s\n", args.path.c_str());
 	std::fflush(stdout);
+
+	if (args.flood_bytes > 0) {
+		// Test scenario: a chatty worker after readiness. Far more than a pipe
+		// buffer holds, so it only completes if someone keeps draining stderr;
+		// a failed write (EPIPE — nobody is reading) means no done file.
+		std::thread([&args]() {
+			char block[4096];
+			std::memset(block, 'x', sizeof(block));
+			block[sizeof(block) - 1] = '\n';
+			long left = args.flood_bytes;
+			while (left > 0) {
+				size_t n = static_cast<size_t>(left < static_cast<long>(sizeof(block)) ? left : sizeof(block));
+				ssize_t w = ::write(STDERR_FILENO, block, n);
+				if (w <= 0) {
+					return;
+				}
+				left -= w;
+			}
+			if (!args.flood_done_path.empty()) {
+				FILE *f = std::fopen(args.flood_done_path.c_str(), "w");
+				if (f) {
+					std::fclose(f);
+				}
+			}
+		}).detach();
+	}
 
 	// Track active connection count + idle timer.  Simple monolithic accept
 	// loop with select() so we can wake up on a timer.

@@ -168,8 +168,18 @@ see [`CLAUDE.md`](../CLAUDE.md) "Transports" section for why.
   launcher's worker-startup-timeout (currently hardcoded to 60 s in
   the launcher binary, not user-tunable yet).  Workaround: use
   `unix://` and start the JVM out-of-band.
-- **Worker stderr is currently discarded.**  No ATTACH option for
-  capture yet — the senior-review pass dropped `launcher_worker_stderr`
+- **Worker stderr is shown only for startup failures.**  Until the
+  worker prints its `UNIX:<path>` line, the launcher captures its stderr
+  (tail-capped at 64 KiB); if the worker exits or times out first, the
+  error carries that stderr and, when a program it needs is missing
+  (`uv`, `java`, a `#!` interpreter), a `hint:` line saying where to get
+  it.  An exec failure is reported directly (`'uv' was not found on
+  PATH`), never as a bare exit code 127.  Once the worker is ready its
+  stderr goes to a detached `cat` writing to `/dev/null` — the worker is
+  shared and outlives DuckDB, so stderr must stay drained after DuckDB
+  exits — which shows up in `ps` as a `cat` alongside each launched
+  worker and exits with it.  There is no ATTACH option to keep stderr
+  after startup — the senior-review pass dropped `launcher_worker_stderr`
   because per-spawn-shared workers can't honour per-connection
   stderr destinations without breaking on respawn.  For debugging,
   use `VGI_WORKER_DEBUG=1` (env var; passes through to the launched

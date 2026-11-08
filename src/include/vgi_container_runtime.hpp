@@ -57,9 +57,18 @@ struct ContainerSpec {
 
 // Detect a usable container runtime.  If `override_kind` is non-empty it must be
 // one of docker/podman/nerdctl/container and is required (errors if absent).
-// Otherwise probes PATH in order: docker → podman → nerdctl → container.
+// Otherwise probes PATH in order: docker → podman → nerdctl → container; when
+// more than one is installed, the first whose daemon answers `<runtime> info`
+// wins (so a stopped Docker Desktop falls through to a running podman).
 // Throws IOException listing what was searched when none is found.
 ContainerRuntime DetectContainerRuntime(const std::string &override_kind);
+
+// When `output` from a `<runtime> ...` command shows the runtime is installed
+// but unusable — its daemon / VM is not running, or this user may not use its
+// socket — a sentence saying so and how to fix it for runtime `kind`
+// ("docker is installed but its daemon is not reachable; start ...").
+// Otherwise "".
+std::string ContainerRuntimeUnavailableReason(const std::string &kind, const std::string &output);
 
 // Read the image's `farm.query.vgi.volumes` OCI label and return the volumes it
 // declares (possibly empty).  Runs `<runtime> image inspect …`; on a

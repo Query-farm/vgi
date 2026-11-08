@@ -40,12 +40,13 @@ sent as an empty string.
 
 | Value | Meaning |
 |---|---|
-| `WORKER_NOT_FOUND` | The executable, container image, release asset or database package does not exist (exit code 127 for a subprocess). |
+| `WORKER_NOT_FOUND` | The executable, container image, release asset or database package does not exist, or a program it runs (`uv`, `java`, an interpreter) is not installed (exit code 127 for a subprocess; `missing_program` when identified). |
 | `WORKER_NOT_EXECUTABLE` | The worker exists but cannot be run (exit code 126). |
 | `WORKER_EXITED` | The worker exited with a non-zero `exit_code`. |
 | `WORKER_KILLED` | The worker was killed by `exit_signal` (POSIX). |
 | `WORKER_START_TIMEOUT` | The worker or container did not become ready in time. Usually retryable. |
 | `RUNTIME_NOT_FOUND` | No container runtime is available. |
+| `RUNTIME_UNAVAILABLE` | A container runtime is installed but unusable: its daemon or VM is not running, or the user may not access its socket (`container_runtime`). The message says what to start. |
 | `WORKER_EXCEPTION` | The worker's own code raised. Carries `worker_exception_type`, `error_kind`, `traceback`. |
 
 ### What the worker sent back
@@ -93,6 +94,7 @@ sent as an empty string.
 | `worker_path`, `worker_pid`, `execution_id` | The worker location (credentials redacted), process id, and the function execution: the worker-minted id shared by every RPC of one function call (absent for catalog and other unary RPCs). The same value is the `execution_id` key in VGI `duckdb_logs`, so it joins an error to its log lines. |
 | `url`, `http_status`, `content_type`, `body_preview` | HTTP request context. `url` has userinfo passwords and secret query values redacted; `body_preview` is a short single-line excerpt of a non-VGI response. |
 | `exit_code`, `exit_signal` | How a worker process ended. |
+| `missing_program` | A program the worker needs that is not installed or not on PATH (`uv`, `java`, a `#!` interpreter), when the failure identifies one. The message then ends with a `hint:` line naming where to install it. |
 | `catalog`, `entity_kind`, `entity` | The ATTACH alias, and what was being resolved (`schema` / `table` / `function` …) and its qualified name. |
 | `rpc_method` | The VGI RPC method that failed. |
 | `function_name`, `function_kind` | The function involved; kind is `SCALAR`, `TABLE`, `AGGREGATE`, `TABLE_IN_OUT` or `COPY`. |

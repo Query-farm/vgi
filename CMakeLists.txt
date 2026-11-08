@@ -315,6 +315,7 @@ src/vgi_unix_socket_worker.cpp
 src/vgi_named_pipe.cpp
 src/vgi_logging.cpp
 src/vgi_subprocess.cpp
+src/vgi_missing_program.cpp
 src/vgi_arrow_ipc.cpp
 src/vgi_arrow.cpp
 src/vgi_ipc.cpp
@@ -533,6 +534,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_error_info.cpp
     test/cpp/test_batch_validation.cpp
     test/cpp/test_container_runtime.cpp
+    test/cpp/test_missing_program.cpp
     test/cpp/test_oauth.cpp
     test/cpp/test_telemetry.cpp
     test/cpp/test_attach_credentials.cpp
@@ -576,6 +578,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_github_parse.cpp
     src/vgi_container_runtime.cpp
     src/vgi_subprocess.cpp
+    src/vgi_missing_program.cpp
     src/vgi_unix_socket_worker.cpp)
   target_include_directories(vgi_unit_tests PRIVATE
     src/include

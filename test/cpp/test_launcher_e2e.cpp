@@ -11,6 +11,7 @@
 
 #include "catch.hpp"
 
+#include "vgi_exception.hpp"
 #include "vgi_launcher.hpp"
 #include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
@@ -688,4 +689,161 @@ TEST_CASE("LaunchOverrides::state_dir routes the worker into the requested direc
 	REQUIRE(sock_count == 1);
 
 	duckdb::vgi::ClearLauncherSocketCache();
+}
+
+// ---------------------------------------------------------------------------
+// Startup failures name their cause: an exec failure says which program and
+// why, a worker that dies early shows its stderr, and a missing well-known
+// program gets an install hint.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct LaunchFailure {
+	std::string message;
+	duckdb::vgi::ErrorInfo info;
+};
+
+LaunchFailure LaunchExpectingFailure(const LaunchConfig &cfg) {
+	try {
+		duckdb::vgi::Launch(cfg);
+	} catch (const IOException &e) {
+		return {duckdb::vgi::RawMessageOf(e), duckdb::vgi::ExtraInfoOf(e)};
+	}
+	FAIL("Launch unexpectedly succeeded");
+	return {};
+}
+
+bool Contains(const std::string &haystack, const std::string &needle) {
+	return haystack.find(needle) != std::string::npos;
+}
+
+std::string InfoValue(const duckdb::vgi::ErrorInfo &info, const char *key) {
+	auto it = info.find(key);
+	return it == info.end() ? std::string() : it->second;
+}
+
+// A file under `dir` with `content` and `mode`.
+std::string WriteFile(const std::string &dir, const std::string &name, const std::string &content, mode_t mode) {
+	std::string path = dir + "/" + name;
+	{
+		std::ofstream out(path, std::ios::binary);
+		out << content;
+	}
+	::chmod(path.c_str(), mode);
+	return path;
+}
+
+} // namespace
+
+TEST_CASE("Launch names a worker program missing from PATH", "[launcher][e2e][startup-errors]") {
+	IsolatedStateDir dir;
+	auto cfg = BaselineConfig(dir.path());
+	cfg.worker_argv = {"vgi-no-such-program-4d1c"};
+
+	auto f = LaunchExpectingFailure(cfg);
+	INFO(f.message);
+	REQUIRE(Contains(f.message, "cannot start worker: 'vgi-no-such-program-4d1c' was not found on PATH"));
+	REQUIRE(Contains(f.message, "hint: 'vgi-no-such-program-4d1c' was not found on the PATH DuckDB was started with"));
+	REQUIRE(InfoValue(f.info, "error_subtype") == "WORKER_NOT_FOUND");
+	REQUIRE(InfoValue(f.info, "errno_name") == "ENOENT");
+	REQUIRE(InfoValue(f.info, "missing_program") == "vgi-no-such-program-4d1c");
+}
+
+TEST_CASE("Launch says a path-qualified worker does not exist", "[launcher][e2e][startup-errors]") {
+	IsolatedStateDir dir;
+	auto cfg = BaselineConfig(dir.path());
+	cfg.worker_argv = {dir.path() + "/missing-worker"};
+
+	auto f = LaunchExpectingFailure(cfg);
+	INFO(f.message);
+	REQUIRE(Contains(f.message, "missing-worker' does not exist"));
+	REQUIRE_FALSE(Contains(f.message, "hint:"));
+	REQUIRE(InfoValue(f.info, "error_subtype") == "WORKER_NOT_FOUND");
+}
+
+TEST_CASE("Launch names a script's missing #! interpreter", "[launcher][e2e][startup-errors]") {
+	IsolatedStateDir dir;
+	auto script = WriteFile(dir.path(), "worker.sh", "#!/nonexistent/bin/python3\nprint('hi')\n", 0755);
+	auto cfg = BaselineConfig(dir.path());
+	cfg.worker_argv = {script};
+
+	auto f = LaunchExpectingFailure(cfg);
+	INFO(f.message);
+	REQUIRE(Contains(f.message, "its interpreter '/nonexistent/bin/python3' (from the #! line) was not found"));
+	REQUIRE(Contains(f.message, "install python from"));
+	REQUIRE(InfoValue(f.info, "missing_program") == "/nonexistent/bin/python3");
+}
+
+TEST_CASE("Launch reports a worker that is not executable", "[launcher][e2e][startup-errors]") {
+	// No execute bit at all: EACCES even for root.
+	IsolatedStateDir dir;
+	auto script = WriteFile(dir.path(), "worker.sh", "#!/bin/sh\nexit 0\n", 0644);
+	auto cfg = BaselineConfig(dir.path());
+	cfg.worker_argv = {script};
+
+	auto f = LaunchExpectingFailure(cfg);
+	INFO(f.message);
+	REQUIRE(Contains(f.message, "is not executable (permission denied)"));
+	REQUIRE(InfoValue(f.info, "error_subtype") == "WORKER_NOT_EXECUTABLE");
+}
+
+TEST_CASE("Launch shows the stderr of a worker that exits during startup", "[launcher][e2e][startup-errors]") {
+	IsolatedStateDir dir;
+	auto cfg = BaselineConfig(dir.path(), {"--stderr", "fatal: project directory /x not found", "--exit-with", "3"});
+
+	auto f = LaunchExpectingFailure(cfg);
+	INFO(f.message);
+	REQUIRE(Contains(f.message, "worker exited before emitting UNIX:<path> (exit code 3)"));
+	REQUIRE(Contains(f.message, "worker stderr:\n  fatal: project directory /x not found"));
+	REQUIRE(InfoValue(f.info, "error_subtype") == "WORKER_EXITED");
+}
+
+TEST_CASE("Launch hints at a well-known program a wrapper could not find", "[launcher][e2e][startup-errors]") {
+	// env itself starts; the program it runs does not exist on its PATH, so
+	// this is the "started, then exited 127" path rather than an exec failure.
+	IsolatedStateDir dir;
+	auto cfg = BaselineConfig(dir.path());
+	cfg.worker_argv = {"/usr/bin/env", "PATH=/nonexistent", "uv", "run", "worker"};
+
+	auto f = LaunchExpectingFailure(cfg);
+	INFO(f.message);
+	REQUIRE(Contains(f.message, "(exit code 127)"));
+	REQUIRE(Contains(f.message, "worker stderr:"));
+	REQUIRE(Contains(f.message, "hint: 'uv' is not installed"));
+	REQUIRE(Contains(f.message, "docs.astral.sh/uv"));
+	REQUIRE(InfoValue(f.info, "missing_program") == "uv");
+}
+
+TEST_CASE("Launch startup timeout includes the worker's stderr", "[launcher][e2e][startup-errors]") {
+	IsolatedStateDir dir;
+	auto cfg = BaselineConfig(dir.path(), {"--stderr", "still downloading model weights", "--no-bind"});
+	cfg.worker_startup_timeout = 1500ms;
+
+	auto f = LaunchExpectingFailure(cfg);
+	INFO(f.message);
+	REQUIRE(Contains(f.message, "within startup timeout"));
+	REQUIRE(Contains(f.message, "still downloading model weights"));
+	REQUIRE(InfoValue(f.info, "error_subtype") == "WORKER_START_TIMEOUT");
+}
+
+TEST_CASE("A ready worker's stderr keeps draining after Launch returns", "[launcher][e2e][startup-errors]") {
+	// 4 MiB is far beyond any pipe buffer: the worker's writes complete only
+	// if the stderr sink keeps reading after the launcher has let go.
+	IsolatedStateDir dir;
+	std::string done = dir.path() + "/flood.done";
+	auto cfg = BaselineConfig(dir.path(), {"--stderr-flood-after-bind", "4194304", "--flood-done-file", done});
+	cfg.idle_timeout = 30s;
+
+	auto path = duckdb::vgi::Launch(cfg);
+	REQUIRE(!path.empty());
+	auto deadline = std::chrono::steady_clock::now() + 15s;
+	struct stat st;
+	while (::stat(done.c_str(), &st) != 0 && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(50ms);
+	}
+	REQUIRE(::stat(done.c_str(), &st) == 0);
+	// And the worker still serves.
+	auto sock = UnixSocket::Connect(path);
+	REQUIRE(sock.IsOpen());
 }

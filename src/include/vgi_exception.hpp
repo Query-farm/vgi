@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "vgi_location_policy.hpp"
+#include "vgi_missing_program.hpp"
 #include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
 #include "duckdb/common/error_data.hpp"
@@ -118,6 +119,7 @@ inline constexpr const char *kErrno = "errno_name"; // ECONNREFUSED, ENOENT, ...
 inline constexpr const char *kContainerImage = "container_image";
 inline constexpr const char *kContainerRuntime = "container_runtime";
 inline constexpr const char *kContainerName = "container_name";
+inline constexpr const char *kMissingProgram = "missing_program"; // a program the worker needs that is not installed
 inline constexpr const char *kGithubRepo = "github_repo"; // owner/repo
 inline constexpr const char *kGithubTag = "github_tag";
 inline constexpr const char *kGithubAsset = "github_asset";
@@ -166,6 +168,9 @@ inline constexpr const char *kConnectFailed = "CONNECT_FAILED";
 inline constexpr const char *kPeerIdentityMismatch = "PEER_IDENTITY_MISMATCH";
 // No container runtime is available.
 inline constexpr const char *kRuntimeNotFound = "RUNTIME_NOT_FOUND";
+// A container runtime is installed but cannot be used: its daemon / VM is not
+// running, or the user may not access its socket.
+inline constexpr const char *kRuntimeUnavailable = "RUNTIME_UNAVAILABLE";
 // The worker raised an exception in its own code (`worker_exception_type`,
 // `error_kind`, `traceback`).
 inline constexpr const char *kWorkerException = "WORKER_EXCEPTION";
@@ -524,13 +529,18 @@ inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 //   VGI worker <ctx> (exit code N) [worker: <path>]
 //   worker stderr:
 //     <captured stderr tail>
+//   hint: <what to install, when a missing program was identified>
 [[noreturn]] inline void ThrowVgiWorkerExitException(const std::string &msg, const std::string &worker_path,
                                                      pid_t worker_pid, const std::string &execution_id_hex,
                                                      const std::string &worker_stderr,
-                                                     const ErrorInfo &context = ErrorInfo()) {
+                                                     const ErrorInfo &context = ErrorInfo(),
+                                                     const std::string &hint = "") {
 	ErrorInfo extra_info = context;
 	extra_info.Worker(worker_path, worker_pid, execution_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path) + FormatWorkerStderrSuffix(worker_stderr);
+	if (!hint.empty()) {
+		full_msg += "\n" + hint;
+	}
 	throw IOException(extra_info, full_msg);
 }
 
@@ -576,14 +586,26 @@ inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_pa
 	// Build the messages by concatenation (no printf) so the stderr block lands
 	// *after* the "[worker: …]" context tag that ThrowVgiWorkerExitException
 	// appends, and so worker stderr containing '%' is never format-interpreted.
+	//
+	// A program the worker needs may be missing (`uv`, `java`, a shebang's
+	// interpreter): name it, and say where to get it.
+	std::string missing_program;
+	const std::string hint = WorkerStartupHint(worker_stderr, worker_path, exit_status, &missing_program);
+	auto with_program = [&](ErrorInfo info) {
+		info.Set(error_key::kMissingProgram, missing_program);
+		return info;
+	};
 	if (exit_status == 127) {
-		ThrowVgiWorkerExitException("VGI worker not found or not executable", worker_path, proc.GetPid(),
-		                            execution_id_hex, worker_stderr,
-		                            ErrorInfo(error_subtype::kWorkerNotFound).Set(error_key::kExitCode, 127));
+		ThrowVgiWorkerExitException(
+		    missing_program.empty() ? "VGI worker not found or not executable"
+		                            : "VGI worker could not start: '" + missing_program + "' was not found",
+		    worker_path, proc.GetPid(), execution_id_hex, worker_stderr,
+		    with_program(ErrorInfo(error_subtype::kWorkerNotFound).Set(error_key::kExitCode, 127)), hint);
 	} else if (exit_status == 126) {
 		ThrowVgiWorkerExitException("VGI worker permission denied", worker_path, proc.GetPid(), execution_id_hex,
 		                            worker_stderr,
-		                            ErrorInfo(error_subtype::kWorkerNotExecutable).Set(error_key::kExitCode, 126));
+		                            ErrorInfo(error_subtype::kWorkerNotExecutable).Set(error_key::kExitCode, 126),
+		                            hint);
 	}
 #if !defined(_WIN32)
 	// TryWait reports a signal death as the negated signal number. POSIX
@@ -593,14 +615,16 @@ inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_pa
 		                                std::to_string(-exit_status) + ")",
 		                            worker_path, proc.GetPid(), execution_id_hex, worker_stderr,
 		                            ErrorInfo(error_subtype::kWorkerKilled)
-		                                .Set(error_key::kExitSignal, static_cast<int64_t>(-exit_status)));
+		                                .Set(error_key::kExitSignal, static_cast<int64_t>(-exit_status)),
+		                            hint);
 	}
 #endif
 	if (exit_status != 0) {
 		ThrowVgiWorkerExitException("VGI worker " + error_context + " (exit code " + std::to_string(exit_status) + ")",
 		                            worker_path, proc.GetPid(), execution_id_hex, worker_stderr,
-		                            ErrorInfo(error_subtype::kWorkerExited)
-		                                .Set(error_key::kExitCode, static_cast<int64_t>(exit_status)));
+		                            with_program(ErrorInfo(error_subtype::kWorkerExited)
+		                                             .Set(error_key::kExitCode, static_cast<int64_t>(exit_status))),
+		                            hint);
 	}
 
 	return true; // Process exited normally (exit_status == 0)

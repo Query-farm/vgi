@@ -106,7 +106,9 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 				         {"phase", opts.phase}});
 			}
 		} else {
-			CheckWorkerExitStatus(*proc, opts.worker_path, "failed during unary RPC", "",
+			// A freshly spawned worker that died here never answered its first
+			// request — usually a startup failure (missing runtime, bad project).
+			CheckWorkerExitStatus(*proc, opts.worker_path, "exited before answering its first request", "",
 			                      drainer ? drainer->CaptureStderrSnapshot() : std::string());
 		}
 		throw;

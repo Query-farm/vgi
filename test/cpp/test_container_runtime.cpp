@@ -267,3 +267,48 @@ TEST_CASE("TcpConnect rejects unsafe SOCKS5h configuration", "[tcp][socks5h]") {
 	                 "socks5h://127.0.0.1:1080") < 0);
 	CHECK(error.find("control") != std::string::npos);
 }
+
+TEST_CASE("ContainerRuntimeUnavailableReason recognises a stopped daemon", "[container]") {
+	using duckdb::vgi::ContainerRuntimeUnavailableReason;
+	auto contains = [](const std::string &s, const std::string &n) { return s.find(n) != std::string::npos; };
+
+	// Docker, old and new wording.
+	auto old_docker = ContainerRuntimeUnavailableReason(
+	    "docker", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?");
+	REQUIRE(contains(old_docker, "docker is installed but its daemon is not reachable"));
+	REQUIRE(contains(old_docker, "Docker Desktop"));
+	REQUIRE(contains(ContainerRuntimeUnavailableReason(
+	                     "docker", "failed to connect to the docker API at unix:///Users/u/.docker/run/docker.sock; "
+	                               "check if the path is correct and if the daemon is running"),
+	                 "daemon is not reachable"));
+	// Docker on Windows.
+	REQUIRE(contains(ContainerRuntimeUnavailableReason(
+	                     "docker", "error during connect: Get \"http://%2F%2F.%2Fpipe%2Fdocker_engine/v1.24/info\""),
+	                 "daemon is not reachable"));
+	// Socket permission.
+	auto perm = ContainerRuntimeUnavailableReason(
+	    "docker", "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock");
+	REQUIRE(contains(perm, "permission denied"));
+	REQUIRE(contains(perm, "`docker` group"));
+	// podman machine stopped.
+	auto podman = ContainerRuntimeUnavailableReason(
+	    "podman", "Cannot connect to Podman. Please verify your connection to the Linux system using `podman system "
+	              "connection list`, or try `podman machine init` and `podman machine start` to manage a new Linux VM");
+	REQUIRE(contains(podman, "podman is installed but its daemon is not reachable"));
+	REQUIRE(contains(podman, "podman machine start"));
+	// nerdctl without containerd.
+	REQUIRE(contains(ContainerRuntimeUnavailableReason(
+	                     "nerdctl", "time=\"...\" level=fatal msg=\"cannot access containerd socket "
+	                                "\\\"/run/containerd/containerd.sock\\\": no such file or directory\""),
+	                 "start containerd"));
+
+	// Image problems are not runtime problems.
+	REQUIRE(ContainerRuntimeUnavailableReason(
+	            "docker", "Error response from daemon: manifest for ghcr.io/x/y:latest not found: manifest unknown")
+	            .empty());
+	REQUIRE(ContainerRuntimeUnavailableReason("podman", "Error: initializing source docker://x: reading manifest "
+	                                                    "latest in docker.io/library/x: requested access to the "
+	                                                    "resource is denied")
+	            .empty());
+	REQUIRE(ContainerRuntimeUnavailableReason("docker", "").empty());
+}

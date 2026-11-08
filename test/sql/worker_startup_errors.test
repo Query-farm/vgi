@@ -1,0 +1,75 @@
+# name: test/sql/worker_startup_errors.test
+# description: a worker that cannot start because a program is missing says which one, and where to get it
+# group: [vgi]
+
+# No worker needed: every case fails before any protocol exchange.
+# POSIX-only: the commands rely on /bin/sh, /usr/bin/env and the fork/exec
+# transports.
+require notwindows
+
+require vgi
+
+# --- bare command (run through /bin/sh) ---------------------------------------
+
+# The shell's "command not found" names the program.
+statement error
+ATTACH 'x' AS w1 (TYPE vgi, LOCATION 'vgi-no-such-program-4d1c --flag');
+----
+VGI worker could not start: 'vgi-no-such-program-4d1c' was not found
+
+statement error
+ATTACH 'x' AS w1 (TYPE vgi, LOCATION 'vgi-no-such-program-4d1c --flag');
+----
+hint: 'vgi-no-such-program-4d1c' was not found on the PATH DuckDB was started with
+
+# A well-known program gets an install link.
+statement error
+ATTACH 'x' AS w2 (TYPE vgi, LOCATION 'PATH=/nonexistent; uv run --project /x vgi-fixture-worker');
+----
+docs.astral.sh/uv
+
+# A path that does not exist keeps the plain message: the shell already said so.
+statement error
+ATTACH 'x' AS w3 (TYPE vgi, LOCATION '/nonexistent/vgi-worker');
+----
+VGI worker not found or not executable
+
+# --- launch: (direct exec, no shell) ------------------------------------------
+
+# The exec failure itself is reported, not a bare exit code 127.
+statement error
+ATTACH 'x' AS l1 (TYPE vgi, LOCATION 'launch:vgi-no-such-program-4d1c --flag');
+----
+vgi launcher: cannot start worker: 'vgi-no-such-program-4d1c' was not found on PATH
+
+statement error
+ATTACH 'x' AS l2 (TYPE vgi, LOCATION 'launch:/nonexistent/vgi-worker');
+----
+vgi launcher: cannot start worker: '/nonexistent/vgi-worker' does not exist
+
+# A worker that starts and then fails shows its stderr...
+statement error
+ATTACH 'x' AS l3 (TYPE vgi, LOCATION 'launch:/bin/sh -c "echo vgi-startup-marker >&2; exit 3"');
+----
+vgi-startup-marker
+
+# ...and a wrapper that cannot find a well-known program gets the hint.
+statement error
+ATTACH 'x' AS l4 (TYPE vgi, LOCATION 'launch:/usr/bin/env PATH=/nonexistent uv run worker');
+----
+hint: 'uv' is not installed
+
+# --- structured fields ----------------------------------------------------------
+
+statement ok
+SET errors_as_json = true;
+
+statement error
+ATTACH 'x' AS j1 (TYPE vgi, LOCATION 'launch:vgi-no-such-program-4d1c');
+----
+"missing_program":"vgi-no-such-program-4d1c"
+
+statement error
+ATTACH 'x' AS j2 (TYPE vgi, LOCATION 'PATH=/nonexistent; uv run worker');
+----
+"missing_program":"uv"
