@@ -110,8 +110,11 @@ public:
 	// table may resolve to different function names / args at different
 	// versions (see test/sql/integration/table/time_travel.test).
 	// at_unit/at_value are empty strings for non-time-travel binds.
+	// `pushdown_filters` (protocol 3.2) carries the query's predicates for a
+	// scan_planning='filtered' table; nullopt for bind-time fetches.
 	vgi::VgiScanBranchesResult FetchScanBranches(ClientContext &context, const std::string &at_unit,
-	                                             const std::string &at_value);
+	                                             const std::string &at_value,
+	                                             const std::optional<std::vector<uint8_t>> &pushdown_filters = std::nullopt);
 
 	// Cheap pre-RPC check for "is this table multi-branch under the no-AT
 	// view?" Returns true only when we know cheaply that the table is

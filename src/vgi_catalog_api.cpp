@@ -1141,7 +1141,8 @@ static VgiScanBranchesResult WrapLegacyAsOneBranch(VgiScanFunctionResult legacy)
 
 VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value) {
+    const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value,
+    const std::optional<std::vector<uint8_t>> &pushdown_filters) {
 	auto &worker_path = ctx.params->worker_path();
 
 	// Capability-detection cache (A8): if a prior call against this attach
@@ -1164,7 +1165,7 @@ VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
 	// which we catch narrowly here.
 	auto params = generated::BuildCatalogTableScanBranchesGetParams(
 	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, OptStrIfNonEmpty(at_unit),
-	    OptStrIfNonEmpty(at_value), OptTxn(ctx));
+	    OptStrIfNonEmpty(at_value), OptTxn(ctx), pushdown_filters);
 	try {
 		auto response = InvokeRpcMethod(ctx, "catalog_table_scan_branches_get", params, context);
 		auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_branches_get", worker_path);
@@ -2595,6 +2596,23 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
 		return ParseScanFunctionResult(context, DeserializeFromIpcBytes(*bytes), worker_path);
 	};
 	info.scan_function = decode_inlined(wire.scan_function);
+	// Protocol 3.2 scan planning. Unknown values and a filtered table that also
+	// inlines its scan redirect are worker bugs: reject them at catalog load so
+	// the error names the catalog, not a later query.
+	info.scan_planning = wire.scan_planning;
+	if (info.scan_planning != "bind" && info.scan_planning != "filtered") {
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kField, "scan_planning"),
+		                  StringUtil::Format("VGI table '%s' declares unknown scan_planning '%s' (expected 'bind' or "
+		                                     "'filtered') [worker: %s]",
+		                                     info.name, info.scan_planning, worker_path));
+	}
+	if (info.IsFilteredScanPlanning() && info.scan_function.has_value()) {
+		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kField, "scan_function"),
+		                  StringUtil::Format("VGI table '%s' declares scan_planning='filtered' but also inlines "
+		                                     "scan_function; a filtered table's scan redirect must be resolved per "
+		                                     "query [worker: %s]",
+		                                     info.name, worker_path));
+	}
 	info.insert_function = decode_inlined(wire.insert_function);
 	info.update_function = decode_inlined(wire.update_function);
 	info.delete_function = decode_inlined(wire.delete_function);
@@ -2834,12 +2852,10 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 	result.required_extensions = std::move(wire.required_extensions);
 	// Each branch is the IPC bytes of a 1-row ScanBranch batch.
 	const auto &branch_blobs = wire.branches;
-	if (branch_blobs.empty()) {
-		// Loud-fail at parse time — workers must return at least one branch.
-		// Catches "worker bug returned empty" before silent zero-row queries.
-		throw BinderException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kField, "branches"),
-		                      "VGI table returned zero scan branches [worker: " + worker_path + "]");
-	}
+	// Zero branches parse successfully: protocol 3.2 makes it the legal "no
+	// rows" answer for a scan_planning='filtered' table. Bind-time callers
+	// (VgiTableEntry::GetScanFunctionImpl, for 'bind' tables) still reject it
+	// as a protocol violation.
 
 	result.branches.reserve(branch_blobs.size());
 	std::vector<size_t> writable_ordinals;
@@ -2876,12 +2892,36 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 				                      "VGI branch_filter parsed to no expressions [worker: " + worker_path +
 				                          ", filter: " + branch.branch_filter + "]");
 			}
-			// If the worker supplied multiple comma-separated expressions,
-			// AND them together. (Single expression is the typical case.)
+			// branch_filter is exactly one SQL expression (protocol 3.2 makes
+			// this explicit). Protocol 3.1 clients silently kept exprs[0] and
+			// dropped the rest, so a branch scoped by "a < 5, b > 7" returned
+			// rows outside its declared scope.
+			if (exprs.size() > 1) {
+				throw BinderException(ErrorInfo(error_subtype::kProtocolViolation)
+				                          .Worker(worker_path)
+				                          .Set(error_key::kBranchIndex, static_cast<int64_t>(i))
+				                          .Set(error_key::kField, "branch_filter"),
+				                      StringUtil::Format("VGI branch_filter must be a single expression; it parsed to "
+				                                         "%d expressions (combine conditions with AND) [worker: %s, "
+				                                         "filter: %s]",
+				                                         static_cast<int>(exprs.size()), worker_path,
+				                                         branch.branch_filter));
+			}
 			branch.parsed_branch_filter = std::move(exprs[0]);
-			// Multi-expression case: leave as a single expression by AND-ing.
-			// Skipped here for simplicity — typical worker emits one
-			// predicate; multi-AND can be added if it shows up in practice.
+		}
+
+		// Protocol 3.2 branch statistics.
+		if (branch_wire.row_count.has_value() && *branch_wire.row_count < 0) {
+			throw BinderException(ErrorInfo(error_subtype::kProtocolViolation)
+			                          .Worker(worker_path)
+			                          .Set(error_key::kBranchIndex, static_cast<int64_t>(i))
+			                          .Set(error_key::kField, "row_count"),
+			                      StringUtil::Format("VGI scan branch %d has negative row_count [worker: %s]",
+			                                         static_cast<int>(i), worker_path));
+		}
+		branch.row_count = branch_wire.row_count;
+		if (branch_wire.column_statistics.has_value()) {
+			branch.column_statistics = std::move(*branch_wire.column_statistics);
 		}
 
 		// writable flag is non-nullable on the wire — surface a loud error

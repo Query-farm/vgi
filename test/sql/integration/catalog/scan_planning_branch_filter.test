@@ -1,0 +1,60 @@
+# name: test/sql/integration/catalog/scan_planning_branch_filter.test
+# description: Protocol 3.2 branch_filter contradiction on a bind-time table.
+#              data.planned_days_bf returns one read_parquet branch per day with
+#              branch_filter "event_date = DATE '<day>'"; the extension drops the
+#              branches whose branch_filter contradicts the query before binding
+#              them. The 2026-10-05 file is never created, so a query that keeps
+#              that branch errors. Also: a branch_filter must be ONE expression.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_BRANCH_DIR
+
+require vgi
+
+require parquet
+
+statement ok
+COPY (SELECT DATE '2026-10-01' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-01.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-02' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-02.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-03' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-03.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-04' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-04.parquet' (FORMAT 'parquet');
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT count(*) FROM example.data.planned_days_bf WHERE event_date = DATE '2026-10-03';
+----
+10
+
+query II
+SELECT count(*), min(event_date) FROM example.data.planned_days_bf WHERE event_date BETWEEN DATE '2026-10-02' AND DATE '2026-10-04';
+----
+30	2026-10-02
+
+query I
+SELECT count(*) FROM example.data.planned_days_bf WHERE event_date > DATE '2026-12-31';
+----
+0
+
+statement error
+SELECT count(*) FROM example.data.planned_days_bf;
+----
+<REGEX>:.*(No files found|does not exist|IO Error).*
+
+# Protocol 3.2: "n < 5, n > 2" is two expressions; 3.1 silently kept the first.
+statement error
+SELECT count(*) FROM example.data.multi_branch_comma_filter;
+----
+branch_filter must be a single expression
+
+statement ok
+DETACH example;

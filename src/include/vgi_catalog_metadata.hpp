@@ -283,6 +283,15 @@ struct VgiScanBranch {
 	// which names a catalog-table branch's SOURCE table's schema, a different,
 	// older field.
 	std::string schema_name;
+
+	// --- Protocol 3.2 branch statistics (docs/protocol/scan-planning.md) -------
+	// Estimated rows before any predicate; cardinality only, never exact.
+	std::optional<int64_t> row_count;
+	// Raw serialize_column_statistics IPC payload (same wire shape as
+	// TableInfo.column_statistics), keyed by the table's declared column names.
+	// Conservative claims: the rewriter drops the branch when a query predicate
+	// is provably false against them. Empty when the worker sent none.
+	std::vector<uint8_t> column_statistics;
 };
 
 // Result of the new catalog_table_scan_branches_get RPC. New-protocol shape;
@@ -340,6 +349,14 @@ struct VgiTableInfo {
 	// (rotating credentials, presigned URLs, per-transaction snapshots)
 	// must leave these unset so the per-bind RPC continues to fire.
 	std::optional<VgiScanFunctionResult> scan_function;
+	// Protocol 3.2: "bind" resolves the scan redirect at bind time (3.1
+	// behaviour); "filtered" defers catalog_table_scan_branches_get to the
+	// pre-optimizer rewrite, which sends the query's predicates as
+	// pushdown_filters. Validated at parse (no inlined scan_function).
+	std::string scan_planning = "bind";
+	bool IsFilteredScanPlanning() const {
+		return scan_planning == "filtered";
+	}
 	std::optional<VgiScanFunctionResult> insert_function;
 	std::optional<VgiScanFunctionResult> update_function;
 	std::optional<VgiScanFunctionResult> delete_function;

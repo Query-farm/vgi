@@ -50,6 +50,7 @@ large_sequence	A large sequence of integers from 0 to 1,000,000
 late_mat	Late-materialization table (1000 rows, unique rowid)
 late_mat_dup	Late-materialization table with deliberately non-unique rowid (contract violation)
 late_mat_nulls	Late-materialization table with NULLs in the ord column
+multi_branch_comma_filter	Protocol 3.2: multi-expression branch_filter is rejected
 multi_branch_empty	Multi-branch: empty branches list — used by multi_branch_empty_branches.test
 multi_branch_filtered_numbers	Multi-branch with complementary branch_filters — exercises pruning
 multi_branch_format	Format branch: read_csv with delim/header options — used by multi_branch_format.test
@@ -61,6 +62,9 @@ multi_branch_recon	Multi-branch: column reconciliation — used by multi_branch_
 multi_branch_split	Multi-branch: split_sequence(30, splits=6) + sequence(20) — used by splits/multi_branch.test
 multi_branch_two_writable	Multi-branch with two writable=True arms — used by multi_branch_two_writable.test
 numbers	First 100 integers (demonstrates explicit columns)
+planned_days	Protocol 3.2: worker-side pruning of per-day files — scan_planning_filtered.test
+planned_days_bf	Protocol 3.2: pruning by branch_filter contradiction — scan_planning_branch_filter.test
+planned_days_stats	Protocol 3.2: client-side pruning by ScanBranch statistics — scan_planning_stats.test
 products	Product table with column defaults
 projects	Projects with composite PK and FK to departments
 rowid_first	Table with row_id at column index 0

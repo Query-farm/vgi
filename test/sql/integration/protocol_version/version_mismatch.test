@@ -2,8 +2,8 @@
 # description: VGI application protocol_version mismatch is fatal at the dispatch boundary
 # group: [vgi_integration_protocol_version]
 
-# The fixture worker advertises protocol_version 3.0.0 (the previous minor)
-# while the C++ extension declares and sends 3.1.0 on every request. The
+# The fixture worker advertises protocol_version 3.1.0 (the previous minor)
+# while the C++ extension declares and sends 3.2.0 on every request. The
 # vgi-rpc framework enforces an exact major+minor match at the dispatch
 # boundary, so the very first RPC ATTACH issues (catalog discovery) must fail
 # with a directional ProtocolVersionError that round-trips back as an

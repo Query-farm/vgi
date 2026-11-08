@@ -1,0 +1,64 @@
+# name: test/sql/integration/catalog/scan_planning_stats.test
+# description: Protocol 3.2 branch statistics. data.planned_days_stats returns one
+#              read_parquet branch per day with event_date min/max statistics and
+#              ignores the predicates; the extension drops the branches whose
+#              statistics exclude the query. The 2026-10-05 file is never created,
+#              so a query that keeps that branch errors.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_BRANCH_DIR
+
+require vgi
+
+require parquet
+
+statement ok
+COPY (SELECT DATE '2026-10-01' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-01.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-02' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-02.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-03' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-03.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-04' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-04.parquet' (FORMAT 'parquet');
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT count(*) FROM example.data.planned_days_stats WHERE event_date = DATE '2026-10-02';
+----
+10
+
+query II
+SELECT count(*), count(DISTINCT event_date) FROM example.data.planned_days_stats WHERE event_date <= DATE '2026-10-04';
+----
+40	4
+
+query I
+SELECT count(*) FROM example.data.planned_days_stats WHERE event_date IN (DATE '2026-10-01', DATE '2026-10-03');
+----
+20
+
+# Every branch pruned: empty result.
+query I
+SELECT count(*) FROM example.data.planned_days_stats WHERE event_date < DATE '2026-01-01';
+----
+0
+
+query I
+SELECT count(*) FROM example.data.planned_days_stats WHERE event_date BETWEEN DATE '2026-10-02' AND DATE '2026-10-03' AND n >= 5;
+----
+10
+
+statement error
+SELECT count(*) FROM example.data.planned_days_stats;
+----
+<REGEX>:.*(No files found|does not exist|IO Error).*
+
+statement ok
+DETACH example;

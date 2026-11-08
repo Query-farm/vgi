@@ -56,6 +56,21 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/optimizer/filter_combiner.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "vgi_catalog_rpc.hpp"
+#include "vgi_exception.hpp"
+#include "vgi_rpc_types.hpp"
+#include "vgi_table_function_impl.hpp"
 
 #include "vgi_logging.hpp"
 
@@ -183,10 +198,31 @@ static unique_ptr<Expression> BindBranchFilterExpr(ClientContext &context, const
 		return BindBranchFilterComparison(context, expr.Cast<ComparisonExpression>(), cols);
 	case ExpressionClass::CONJUNCTION:
 		return BindBranchFilterConjunction(context, expr.Cast<ConjunctionExpression>(), cols);
+	case ExpressionClass::CAST: {
+		// Typed literals — DATE '2026-10-03', TIMESTAMP '...', 42::BIGINT — parse
+		// as a cast of a constant. Fold them to a typed constant; a cast of a
+		// column is outside this minimal binder.
+		const auto &cast = expr.Cast<CastExpression>();
+		auto child = BindBranchFilterExpr(context, cast.Child(), cols);
+		if (child->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+			throw BinderException("VGI branch_filter only supports casts of constants (typed literals such as "
+			                      "DATE '2026-01-01'), not of columns.");
+		}
+		const auto target = TransformStringToLogicalType(cast.TargetType().ToString(), context);
+		const auto &value = child->Cast<BoundConstantExpression>().GetValue();
+		Value folded;
+		if (cast.IsTryCast()) {
+			auto attempt = value.TryCastAs(context, target);
+			folded = attempt ? *attempt : Value(target);
+		} else {
+			folded = value.CastAs(context, target);
+		}
+		return make_uniq<BoundConstantExpression>(std::move(folded));
+	}
 	default:
 		throw BinderException(
 		    "VGI branch_filter only supports column references, constants, comparisons "
-		    "(=, <, >, <=, >=, <>), and AND/OR conjunctions. Expression class %s is not supported. "
+		    "(=, <, >, <=, >=, <>), and AND/OR conjunctions. Expression class %d is not supported. "
 		    "Restructure your filter to use only the supported expression forms.",
 		    static_cast<int>(expr.GetExpressionClass()));
 	}
@@ -559,11 +595,290 @@ static bool IsMultiBranchMarker(const LogicalGet &get) {
 	return dynamic_cast<const VgiMultiBranchMarkerBindData *>(get.bind_data.get()) != nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Protocol 3.2 scan planning: predicate collection, filtered fetch, pruning
+// (docs/protocol/scan-planning.md in vgi-python)
+// ---------------------------------------------------------------------------
+
+using ConjunctList = vector<const Expression *>;
+
+static void SplitConjuncts(const Expression &expr, ConjunctList &out) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (const auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			SplitConjuncts(*child, out);
+		}
+		return;
+	}
+	out.push_back(&expr);
+}
+
+// The WHERE conjuncts that apply to every row reaching each child of `op`.
+// Filters add their conjuncts; inner joins and cross products pass them to
+// both sides; outer, semi, anti and mark joins only to the preserved side;
+// every other operator (projection, aggregate, window, limit, set operation,
+// delim join, ...) stops them. Collection is for pruning only, so stopping
+// early merely forgoes pruning.
+static vector<ConjunctList> ChildConjuncts(const LogicalOperator &op, const ConjunctList &applicable) {
+	vector<ConjunctList> out(op.children.size());
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_FILTER: {
+		ConjunctList extended = applicable;
+		for (const auto &expr : op.Cast<LogicalFilter>().expressions) {
+			SplitConjuncts(*expr, extended);
+		}
+		for (auto &child : out) {
+			child = extended;
+		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+		for (auto &child : out) {
+			child = applicable;
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
+		const auto join_type = op.Cast<LogicalJoin>().join_type;
+		if (join_type == JoinType::INNER) {
+			for (auto &child : out) {
+				child = applicable;
+			}
+		} else if ((join_type == JoinType::LEFT || join_type == JoinType::SEMI || join_type == JoinType::ANTI ||
+		            join_type == JoinType::MARK || join_type == JoinType::SINGLE) &&
+		           !out.empty()) {
+			out[0] = applicable;
+		} else if ((join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI ||
+		            join_type == JoinType::RIGHT_ANTI) &&
+		           out.size() > 1) {
+			out[1] = applicable;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	return out;
+}
+
+// A predicate the planner may send to the worker and prune with: it references
+// only this scan's columns (at least one), and it is deterministic and constant
+// at planning time (no prepared-statement parameter, subquery or volatile call).
+static bool IsPlanningPredicate(const Expression &expr, TableIndex table_index) {
+	if (expr.HasParameter() || expr.HasSubquery() || expr.IsVolatile() || !expr.IsConsistent()) {
+		return false;
+	}
+	bool references_scan = false;
+	bool only_scan = true;
+	ExpressionIterator::VisitExpression<BoundColumnRefExpression>(expr, [&](const BoundColumnRefExpression &col_ref) {
+		if (col_ref.Binding().table_index == table_index) {
+			references_scan = true;
+		} else {
+			only_scan = false;
+		}
+	});
+	ExpressionIterator::VisitExpression<BoundReferenceExpression>(
+	    expr, [&](const BoundReferenceExpression &) { only_scan = false; });
+	return references_scan && only_scan;
+}
+
+// A collected predicate over exactly one declared column, in the two forms the
+// planner needs: `bound` keeps the scan's column bindings (for FilterCombiner),
+// `filter` is the table-filter form (BoundReference #0) used for statistics
+// pruning and for serializing pushdown_filters.
+struct PlanningPredicate {
+	idx_t declared_column;
+	unique_ptr<Expression> bound;
+	unique_ptr<ExpressionFilter> filter;
+};
+
+// BETWEEN is a function in DuckDB 2.0; its own filter pushdown splits it into
+// two comparisons later, but this rewrite runs first. Split it here so the
+// filter encoder and FilterCombiner see plain comparisons.
+static vector<unique_ptr<Expression>> NormalizeConjunct(const Expression &conjunct) {
+	vector<unique_ptr<Expression>> out;
+	if (conjunct.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		const auto &func = conjunct.Cast<BoundFunctionExpression>();
+		if (BoundBetweenExpression::HasValidBindData(func)) {
+			out.push_back(BoundComparisonExpression::Create(BoundBetweenExpression::LowerComparisonType(func),
+			                                                BoundBetweenExpression::Input(func).Copy(),
+			                                                BoundBetweenExpression::LowerBound(func).Copy()));
+			out.push_back(BoundComparisonExpression::Create(BoundBetweenExpression::UpperComparisonType(func),
+			                                                BoundBetweenExpression::Input(func).Copy(),
+			                                                BoundBetweenExpression::UpperBound(func).Copy()));
+			return out;
+		}
+	}
+	out.push_back(conjunct.Copy());
+	return out;
+}
+
+// Fold constant subexpressions to literals. The pre-optimizer runs before
+// DuckDB's expression rewriter, so DATE '2026-10-02' is still a cast of a
+// string here; the filter encoder and statistics checks need a constant.
+static void FoldConstants(ClientContext &context, unique_ptr<Expression> &expr) {
+	if (expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		return;
+	}
+	if (expr->IsFoldable()) {
+		Value value;
+		if (ExpressionExecutor::TryEvaluateScalar(context, *expr, value)) {
+			auto folded = make_uniq<BoundConstantExpression>(std::move(value));
+			folded->SetAlias(expr->GetAlias());
+			expr = std::move(folded);
+			return;
+		}
+	}
+	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) { FoldConstants(context, child); });
+}
+
+static vector<PlanningPredicate> CollectPlanningPredicates(ClientContext &context, const LogicalGet &get,
+                                                           const ConjunctList &applicable) {
+	vector<PlanningPredicate> out;
+	const auto &column_ids = get.GetColumnIds();
+	vector<unique_ptr<Expression>> normalized;
+	for (const auto *conjunct : applicable) {
+		if (!IsPlanningPredicate(*conjunct, get.table_index)) {
+			continue;
+		}
+		for (auto &part : NormalizeConjunct(*conjunct)) {
+			FoldConstants(context, part);
+			normalized.push_back(std::move(part));
+		}
+	}
+	for (const auto &owned : normalized) {
+		const Expression *conjunct = owned.get();
+		optional_idx binding_column;
+		bool single_column = true;
+		ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+		    *conjunct, [&](const BoundColumnRefExpression &col_ref) {
+			    const idx_t col = col_ref.Binding().column_index.GetIndex();
+			    if (binding_column.IsValid() && binding_column.GetIndex() != col) {
+				    single_column = false;
+			    }
+			    binding_column = optional_idx(col);
+		    });
+		if (!single_column || !binding_column.IsValid() || binding_column.GetIndex() >= column_ids.size() ||
+		    column_ids[binding_column.GetIndex()].IsVirtualColumn()) {
+			continue;
+		}
+		auto filter_expr = conjunct->Copy();
+		ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+		    filter_expr, [&](BoundColumnRefExpression &col_ref, unique_ptr<Expression> &child) {
+			    child = make_uniq<BoundReferenceExpression>(col_ref.GetAlias(), col_ref.GetReturnType(), 0ULL);
+		    });
+		PlanningPredicate predicate;
+		predicate.declared_column = column_ids[binding_column.GetIndex()].GetPrimaryIndex();
+		predicate.bound = conjunct->Copy();
+		predicate.filter = make_uniq<ExpressionFilter>(std::move(filter_expr));
+		out.push_back(std::move(predicate));
+	}
+	return out;
+}
+
+// Serialize the predicates as a filter v2 snapshot over the declared columns.
+// Each predicate is first serialized alone: one the filter encoder can't
+// express, or one that would need an out-of-band join-key payload (this RPC
+// has no join_keys channel), is left out. Every predicate is advisory, so
+// leaving one out only forgoes pruning.
+static std::optional<std::vector<uint8_t>> SerializePlanningPredicates(ClientContext &context,
+                                                                       const vector<PlanningPredicate> &predicates,
+                                                                       const std::vector<std::string> &std_column_names,
+                                                                       const string &table_label) {
+	const vector<string> column_names(std_column_names.begin(), std_column_names.end());
+	auto make_set = [](const PlanningPredicate &p, TableFilterSet &set) {
+		set.PushFilter(ProjectionIndex(p.declared_column), p.filter->Copy());
+	};
+	auto serialize = [&](TableFilterSet &set) {
+		return VgiSerializeFilters(context, {}, set, column_names, table_label, "", -1, nullptr,
+		                           VgiFilterColumnIndexDomain::BIND_SCHEMA);
+	};
+	TableFilterSet kept;
+	idx_t kept_count = 0;
+	for (const auto &predicate : predicates) {
+		try {
+			TableFilterSet single;
+			make_set(predicate, single);
+			auto trial = serialize(single);
+			if (!trial.filter_bytes || !trial.join_keys_buffers.empty()) {
+				continue;
+			}
+		} catch (const std::exception &) {
+			continue;
+		}
+		make_set(predicate, kept);
+		kept_count++;
+	}
+	if (kept_count == 0) {
+		return std::nullopt;
+	}
+	auto serialized = serialize(kept);
+	if (!serialized.filter_bytes || !serialized.join_keys_buffers.empty()) {
+		return std::nullopt;
+	}
+	const auto *data = serialized.filter_bytes->data();
+	return std::vector<uint8_t>(data, data + serialized.filter_bytes->size());
+}
+
+// Whether `branch` provably holds no row satisfying `predicates`: its column
+// statistics make a predicate always false (or false-or-null), or its
+// branch_filter contradicts them. Anything that can't be evaluated keeps the
+// branch.
+static bool BranchIsPruned(ClientContext &context, const VgiScanBranch &branch,
+                           const vector<PlanningPredicate> &predicates, const VgiMultiBranchMarkerBindData &marker,
+                           const ArmColumnLookup &scan_columns, const string &table_label) {
+	if (predicates.empty()) {
+		return false;
+	}
+	if (!branch.column_statistics.empty()) {
+		try {
+			auto stats = ParseColumnStatisticsBatch(DeserializeFromIpcBytes(branch.column_statistics),
+			                                        marker.canonical_column_types, marker.canonical_column_names,
+			                                        table_label, "table", table_label, context);
+			for (const auto &predicate : predicates) {
+				const auto &name = marker.canonical_column_names[predicate.declared_column];
+				auto entry = stats.find(name);
+				if (entry == stats.end() || !entry->second) {
+					continue;
+				}
+				const auto result = predicate.filter->CheckStatistics(context, *entry->second);
+				if (result == FilterPropagateResult::FILTER_ALWAYS_FALSE ||
+				    result == FilterPropagateResult::FILTER_FALSE_OR_NULL) {
+					return true;
+				}
+			}
+		} catch (const std::exception &) {
+			// Unreadable statistics never prune.
+		}
+	}
+	if (branch.parsed_branch_filter) {
+		try {
+			auto bound_filter = BindBranchFilterExpr(context, *branch.parsed_branch_filter, scan_columns);
+			FilterCombiner combiner(context);
+			if (combiner.AddFilter(std::move(bound_filter)) == FilterResult::UNSATISFIABLE) {
+				return true;
+			}
+			for (const auto &predicate : predicates) {
+				if (combiner.AddFilter(predicate.bound->Copy()) == FilterResult::UNSATISFIABLE) {
+					return true;
+				}
+			}
+		} catch (const std::exception &) {
+			// A branch_filter over columns this scan doesn't project, or a shape
+			// the minimal binder rejects, never prunes here; the arm binds it later.
+		}
+	}
+	return false;
+}
+
 static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, Binder &binder,
-                        LogicalOperator &root) {
+                        LogicalOperator &root, const ConjunctList &applicable) {
 	// Recurse children first (bottom-up). Mirrors the spike implementation.
-	for (auto &child : op->children) {
-		RewriteOne(child, context, binder, root);
+	// Each child receives the WHERE conjuncts that apply to it (protocol 3.2).
+	{
+		auto child_conjuncts = ChildConjuncts(*op, applicable);
+		for (idx_t i = 0; i < op->children.size(); i++) {
+			RewriteOne(op->children[i], context, binder, root, child_conjuncts[i]);
+		}
 	}
 	if (op->type != LogicalOperatorType::LOGICAL_GET) {
 		return;
@@ -574,6 +889,67 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 	}
 
 	auto &marker = get.bind_data->Cast<VgiMultiBranchMarkerBindData>();
+	const string table_label = marker.table_schema_name;
+
+	// Protocol 3.2: collect this scan's planning predicates, fetch deferred
+	// branches with them, and prune branches the predicates exclude.
+	auto predicates = CollectPlanningPredicates(context, get, applicable);
+	if (marker.deferred) {
+		auto filters = SerializePlanningPredicates(context, predicates, marker.canonical_column_names, table_label);
+		auto fetched = marker.fetch_branches(context, filters);
+		marker.branches = std::move(fetched.branches);
+		marker.required_extensions = std::move(fetched.required_extensions);
+		marker.deferred = false;
+		VGI_LOG(context, "vgi.scan_planning.fetched",
+		        {{"schema", table_label},
+		         {"predicates_collected", std::to_string(predicates.size())},
+		         {"predicates_sent", filters ? "true" : "false"},
+		         {"branches", std::to_string(marker.branches.size())}});
+	}
+	{
+		auto scan_bindings = get.GetColumnBindings();
+		std::vector<std::string> scan_names;
+		std::vector<LogicalType> scan_types;
+		for (const auto &idx : get.GetColumnIds()) {
+			const idx_t col = idx.IsVirtualColumn() ? 0 : idx.GetPrimaryIndex();
+			scan_names.push_back(col < marker.canonical_column_names.size() ? marker.canonical_column_names[col] : "");
+			scan_types.push_back(col < marker.canonical_column_types.size() ? marker.canonical_column_types[col]
+			                                                                : LogicalType::SQLNULL);
+		}
+		ArmColumnLookup scan_columns {scan_names, scan_types, scan_bindings};
+		const auto before = marker.branches.size();
+		std::vector<VgiScanBranch> kept;
+		kept.reserve(before);
+		for (auto &branch : marker.branches) {
+			if (!BranchIsPruned(context, branch, predicates, marker, scan_columns, table_label)) {
+				kept.push_back(std::move(branch));
+			}
+		}
+		marker.branches = std::move(kept);
+		if (marker.branches.size() != before) {
+			VGI_LOG(context, "vgi.scan_planning.pruned",
+			        {{"schema", table_label},
+			         {"before", std::to_string(before)},
+			         {"after", std::to_string(marker.branches.size())}});
+		}
+	}
+	if (marker.has_at_clause &&
+	    (marker.branches.size() > 1 ||
+	     (marker.branches.size() == 1 && (!marker.branches[0].branch_filter.empty() ||
+	                                      marker.branches[0].IsCatalogTable() || marker.branches[0].IsFormatBranch())))) {
+		throw BinderException(ErrorInfo(error_subtype::kUnsupported).Set(error_key::kOperation, "AT"),
+		                      StringUtil::Format("AT (...) clauses are not supported on multi-branch VGI tables "
+		                                         "[schema: %s, branches: %d]",
+		                                         table_label, static_cast<int>(marker.branches.size())));
+	}
+	if (marker.branches.empty()) {
+		// Every branch was pruned, or a filtered table's worker returned none:
+		// the scan produces no rows. LogicalEmptyResult keeps the scan's types
+		// and column bindings, so parent operators need no rebinding.
+		op = make_uniq<LogicalEmptyResult>(std::move(op));
+		VGI_LOG(context, "vgi.scan_planning.empty", {{"schema", table_label}});
+		return;
+	}
 
 	// Auto-load required extensions before binding any branch.
 	for (const auto &ext : marker.required_extensions) {
@@ -708,7 +1084,7 @@ private:
 		if (!plan) {
 			return;
 		}
-		RewriteOne(plan, input.context, input.optimizer.binder, *plan);
+		RewriteOne(plan, input.context, input.optimizer.binder, *plan, ConjunctList());
 	}
 };
 

@@ -223,10 +223,13 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
 // Tries the new method first; on MethodNotImplemented falls back to
 // InvokeCatalogTableScanFunctionGet and synthesises a one-branch result.
 // All other exceptions propagate. See A7 in the plan.
+// `pushdown_filters` (protocol 3.2): a VGI Filter Encoding v2 snapshot over the
+// table's declared columns, sent for scan_planning='filtered' tables. Advisory;
+// the legacy fallback drops it.
 VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit,
-    const std::string &at_value);
+    const std::string &at_value, const std::optional<std::vector<uint8_t>> &pushdown_filters = std::nullopt);
 
 // Parse a ScanBranchesResult RecordBatch into the in-memory C++ struct.
 // Loud-rejects empty branches lists and surfaces parse errors on

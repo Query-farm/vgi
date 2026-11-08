@@ -21,6 +21,9 @@
 // ~/.claude/plans/right-now-vgi-and-partitioned-nebula.md
 // =============================================================================
 
+#include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -68,6 +71,17 @@ struct VgiMultiBranchMarkerBindData : public TableFunctionData {
 	std::string table_catalog_name;
 	std::string table_schema_name;
 	std::string default_schema;
+
+	// Protocol 3.2 filtered scan planning (docs/protocol/scan-planning.md).
+	// When `deferred` is set the table declared scan_planning='filtered':
+	// `branches` is empty at bind time and the rewriter calls `fetch_branches`
+	// with the query's predicates (a filter v2 snapshot, or nullopt) to get the
+	// branches, which may legitimately be empty ("no rows"). `has_at_clause`
+	// records an AT (...) on the scan; the rewriter refuses it when more than
+	// one branch remains.
+	bool deferred = false;
+	bool has_at_clause = false;
+	std::function<VgiScanBranchesResult(ClientContext &, const std::optional<std::vector<uint8_t>> &)> fetch_branches;
 };
 
 // Construct the placeholder TableFunction. Its execute callback throws

@@ -66,11 +66,16 @@ that reconcile columns by name.
 
 A `branch_filter` is a **scope-restriction directive**, not a pruning
 claim. The C++ side AND's it into the branch's scan before filter
-pushdown runs. If the user writes `WHERE ts > some_cutoff` and the
-conjunction is unsatisfiable in conjunction with the branch's
-`branch_filter`, DuckDB's existing empty-arm elimination drops that
-arm from the plan entirely. The pruning is a *side effect* of standard
-filter-pushdown + stats reasoning, not a separate trusted hint.
+pushdown runs. Since protocol 3.2 the rewriter also drops, before binding
+it, any branch whose `branch_filter` contradicts the query's `WHERE`
+predicates on the table (it feeds both into DuckDB's `FilterCombiner` and
+drops the arm on `UNSATISFIABLE`). Protocol 3.1 had no such step: every arm
+was bound and scanned, and the `branch_filter` only removed its rows.
+
+A `branch_filter` is exactly **one** SQL expression; combine conditions with
+`AND`. A value that parses as several expressions (a top-level comma, e.g.
+`"n < 5, n > 2"`) is rejected at parse time. Protocol 3.1 clients silently
+kept only the first expression.
 
 **Failure mode if you misdeclare:** rows go missing (loud — `COUNT(*)`
 is wrong) or duplicate (loud — overlapping `branch_filter` predicates
@@ -86,13 +91,52 @@ binder supporting:
 - Comparisons: `=`, `<`, `>`, `<=`, `>=`, `<>`
 - Logical operators: `AND`, `OR`
 - Implicit cast between a column and a same-typed constant
-  (`ts >= TIMESTAMP '...'` works without explicit `CAST`)
+- Typed literals and other casts of constants (`DATE '2026-10-15'`,
+  `TIMESTAMP '...'`, `42::BIGINT`), folded to a typed constant. Before
+  protocol 3.2 these failed: the parser produces a cast, which the binder
+  did not accept.
 
 Function calls (`now()`, `current_timestamp`, etc.), subqueries,
 lambdas, and other complex expressions throw `BinderException` with a
 "not supported" message. Workarounds: emit literal constants from the
 worker side (e.g. compute `cutoff` in Python, emit
 `ts >= TIMESTAMP '2026-05-15 12:34:56'`).
+
+## Filtered scan planning and branch statistics (protocol 3.2)
+
+Normative spec: `docs/protocol/scan-planning.md` in vgi-python.
+
+- **`TableInfo.scan_planning = "filtered"`.** At bind time the table returns
+  the multi-branch marker in *deferred* mode and makes no RPC. The
+  pre-optimizer rewrite (`VgiMultiScanRewriter`) collects the `WHERE`
+  conjuncts that apply to the scan: they flow down through filters, inner
+  joins and cross products, and into only the preserved side of outer, semi,
+  anti and mark joins. It keeps those that reference only this scan's columns
+  and are constant at planning time: no prepared-statement parameter,
+  subquery or volatile call. It folds constant subexpressions, splits
+  `BETWEEN`, and serializes the single-column ones as a VGI Filter Encoding v2
+  snapshot over the declared columns. Then it calls
+  `catalog_table_scan_branches_get` once for that scan with
+  `pushdown_filters`. Predicates the encoder can't express, or that would need
+  an out-of-band join-key payload, are left out; every predicate is advisory.
+- **Zero branches** from a filtered table plan a `LogicalEmptyResult` with the
+  scan's types and bindings. A `"bind"` table returning zero branches is still
+  a protocol error.
+- **`ScanBranch.row_count` / `column_statistics`.** For filtered and bind
+  tables alike, the rewriter drops a branch when DuckDB's zone-map check
+  (`ExpressionFilter::CheckStatistics`) proves a collected predicate always
+  false (or false-or-null) against the branch's statistics. Statistics are
+  conservative claims; wrong ones silently lose rows.
+- **Limits of the reference client.** Collection runs before DuckDB's own
+  filter pushdown, so predicates DuckDB would later derive from join
+  conditions aren't seen. `AT (...)` is refused when more than one branch
+  remains after pruning.
+- **Logging.** `vgi.scan_planning.deferred`, `.fetched` (predicates
+  collected/sent, branch count), `.pruned` (before/after) and `.empty`.
+
+Tests: `test/sql/integration/catalog/scan_planning_{filtered,stats,branch_filter}.test`,
+against the `planned_days*` fixtures. Every pruned day's file is deliberately
+missing, so a passing query proves the pruning happened.
 
 ## Column reconciliation
 

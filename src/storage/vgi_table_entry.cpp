@@ -353,7 +353,8 @@ void VgiTableEntry::RecordMultiBranchHintNoAT(bool is_multi_branch) const {
 }
 
 vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &context, const std::string &at_unit,
-                                                            const std::string &at_value) {
+                                                            const std::string &at_value,
+                                                            const std::optional<std::vector<uint8_t>> &pushdown_filters) {
 	// Fresh RPC per call. branches[] can vary with AT(...) — e.g.,
 	// versioned_data tables return different function args per version.
 	// Capability cache on VgiAttachParameters (A8) avoids the doomed-RPC
@@ -367,7 +368,8 @@ vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &conte
 	rpc_ctx.entity_kind = "table";
 	rpc_ctx.entity_qualifier = ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName();
 	auto result = vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name.GetIdentifierName(),
-	                                                     name.GetIdentifierName(), context, at_unit, at_value);
+	                                                     name.GetIdentifierName(), context, at_unit, at_value,
+	                                                     pushdown_filters);
 	// Populate the multi-branch hint for the no-AT case so subsequent
 	// write-refusal helpers can short-circuit without an RPC. AT-carrying
 	// fetches don't populate the hint because the count COULD differ
@@ -409,6 +411,52 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// ...). That rewriter ships in Phase C — until then, multi-branch
 	// returns surface a NotImplementedException loud-fail so the design
 	// is observable without the rewriter shipping.
+	// Protocol 3.2 filtered scan planning: make no RPC at bind time. Return the
+	// multi-branch marker in deferred mode; the pre-optimizer rewrite collects
+	// the query's predicates on this scan, calls catalog_table_scan_branches_get
+	// with them, prunes, and emits the arms (or an empty result).
+	if (table_info_.IsFilteredScanPlanning()) {
+		if (generated_columns) {
+			throw NotImplementedException("VGI generated columns require a single worker function scan");
+		}
+		Value mb_enabled;
+		if (!context.TryGetCurrentSetting("vgi_multi_branch_scans", mb_enabled) || mb_enabled.IsNull() ||
+		    !mb_enabled.GetValue<bool>()) {
+			throw BinderException(
+			    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+			        .Set(vgi::error_key::kTable, ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName())
+			        .Set(vgi::error_key::kOperation, "SCAN")
+			        .Set(vgi::error_key::kSetting, "vgi_multi_branch_scans"),
+			    StringUtil::Format("VGI table %s.%s uses filtered scan planning, which needs the multi-branch scan "
+			                       "rewriter; it is disabled via vgi_multi_branch_scans=false.",
+			                       ParentSchema().name.GetIdentifierName(), name.GetIdentifierName()));
+		}
+		vgi::RequireVgiOptimizerExtensions(context, StringUtil::Format("Filtered-planning VGI table %s.%s",
+		                                                               ParentSchema().name.GetIdentifierName(),
+		                                                               name.GetIdentifierName()));
+		auto marker_bd = make_uniq<vgi::VgiMultiBranchMarkerBindData>();
+		marker_bd->deferred = true;
+		marker_bd->has_at_clause = !at_unit.empty();
+		marker_bd->table_catalog_name = catalog_.GetName().GetIdentifierName();
+		marker_bd->table_schema_name = ParentSchema().name.GetIdentifierName();
+		marker_bd->default_schema = attach_result->default_schema.value_or("");
+		const auto &cols = GetColumns();
+		for (auto &col : cols.Logical()) {
+			marker_bd->canonical_column_names.push_back(col.Name().GetIdentifierName());
+			marker_bd->canonical_column_types.push_back(col.Type());
+		}
+		// The catalog entry outlives planning (the rewrite runs right after
+		// bind, inside the same query), so capturing `this` is safe.
+		marker_bd->fetch_branches = [this, at_unit, at_value](ClientContext &ctx,
+		                                                      const std::optional<std::vector<uint8_t>> &filters) {
+			return FetchScanBranches(ctx, at_unit, at_value, filters);
+		};
+		VGI_LOG(context, "vgi.scan_planning.deferred",
+		        {{"schema", ParentSchema().name.GetIdentifierName()}, {"table", name.GetIdentifierName()}});
+		bind_data = std::move(marker_bd);
+		return vgi::MakeMultiBranchMarkerFunction();
+	}
+
 	vgi::VgiScanFunctionResult scan_result;
 	bool used_inline = false;
 	if (table_info_.scan_function.has_value()) {
@@ -424,6 +472,16 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// params avoids the doomed-RPC round-trip on workers without the new
 		// method.
 		auto branches_result = FetchScanBranches(context, at_unit, at_value);
+		// Zero branches is legal only for scan_planning='filtered' tables
+		// (protocol 3.2), which never reach this bind-time path. For a 'bind'
+		// table it is still a worker bug: fail before a silent zero-row query.
+		if (branches_result.branches.empty()) {
+			throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kProtocolViolation)
+			                          .Worker(attach_params->worker_path())
+			                          .Set(vgi::error_key::kField, "branches"),
+			                      "VGI table returned zero scan branches [worker: " + attach_params->worker_path() +
+			                          "]");
+		}
 
 		// B2 (Phase B): refuse AT (...) on multi-branch tables with a
 		// BinderException at bind time, so the rewriter never sees an AT

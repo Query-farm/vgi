@@ -1,0 +1,95 @@
+# name: test/sql/integration/catalog/scan_planning_filtered.test
+# description: Protocol 3.2 filtered scan planning. data.planned_days declares
+#              scan_planning='filtered': the extension defers
+#              catalog_table_scan_branches_get to planning, sends the query's
+#              predicates as pushdown_filters, and the fixture worker returns only
+#              the day files they can match (ScanPlanningFilters.may_match).
+#              The 2026-10-05 file is never created, so a query that fails to
+#              prune that day errors — a passing query proves the pruning.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_BRANCH_DIR
+
+require vgi
+
+require parquet
+
+require json
+
+statement ok
+COPY (SELECT DATE '2026-10-01' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-01.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-02' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-02.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-03' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-03.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT DATE '2026-10-04' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-04.parquet' (FORMAT 'parquet');
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# A range predicate reaches the worker, which returns only the matching days.
+query I
+SELECT count(*) FROM example.data.planned_days WHERE event_date BETWEEN DATE '2026-10-02' AND DATE '2026-10-03';
+----
+20
+
+query TT
+SELECT received_filters, days::VARCHAR FROM read_json('${VGI_TEST_BRANCH_DIR}/planned_days_last_plan.json');
+----
+true	[2026-10-02, 2026-10-03]
+
+query II
+SELECT count(*), sum(n) FROM example.data.planned_days WHERE event_date < DATE '2026-10-05';
+----
+40	180
+
+# Equality, projection of a non-filter column, ORDER BY / LIMIT above the scan.
+query I
+SELECT n FROM example.data.planned_days WHERE event_date = DATE '2026-10-04' ORDER BY n DESC LIMIT 1;
+----
+9
+
+# OR of equalities on the planning column.
+query I
+SELECT count(*) FROM example.data.planned_days WHERE event_date = DATE '2026-10-01' OR event_date = DATE '2026-10-03';
+----
+20
+
+# A predicate above an inner join still reaches the scan.
+query I
+SELECT count(*) FROM example.data.planned_days p JOIN (SELECT 1 AS k) t ON true WHERE p.event_date = DATE '2026-10-02';
+----
+10
+
+# Predicates on other columns are sent but cannot prune days; combined with a
+# day predicate the result is exact.
+query I
+SELECT count(*) FROM example.data.planned_days WHERE event_date >= DATE '2026-10-04' AND event_date < DATE '2026-10-05' AND n < 3;
+----
+3
+
+# Nothing matches: the worker returns zero branches and the scan is empty.
+query I
+SELECT count(*) FROM example.data.planned_days WHERE event_date > DATE '2027-01-01';
+----
+0
+
+query TT
+SELECT received_filters, days::VARCHAR FROM read_json('${VGI_TEST_BRANCH_DIR}/planned_days_last_plan.json');
+----
+true	[]
+
+# Without a usable predicate every day is planned, including the missing file.
+statement error
+SELECT count(*) FROM example.data.planned_days;
+----
+<REGEX>:.*(No files found|does not exist|IO Error).*
+
+statement ok
+DETACH example;
