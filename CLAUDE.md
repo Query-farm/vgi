@@ -44,17 +44,17 @@ See `docs/upstream-duckdb-build.md`.
 
 ## Build
 
-Edit locally; build and test on EC2. The current host is `ec2-user@100.55.10.44`
-(48 CPUs), with owned workspace `/home/ec2-user/vgi-duckdb2-20261013-UgAEHC`.
-The 2.0 lane is `vgi-native2-nano-20261027-1i9LOE` beneath that root:
-`native/` holds extension source, `engine/` holds the pinned engine, and
-`build-clang/` holds outputs (`native/build/release` points there).
-Keep this lane separate from the 1.5 builds and other users' jobs. Synchronize changed
-content with fresh timestamps and record revisions with test evidence.
+Edit locally; build and test on the Linux ARM64 build host (EC2), never the local
+Mac. Its address changes whenever the instance restarts, so it is not recorded here:
+if you don't have it, or ssh times out, ask the user for the current address rather
+than building locally. Work in a v2.0 checkout on that host with an existing Clang
+build and ccache. Don't disturb other users' checkouts or the 1.5 builds; if a
+checkout you borrow is in use, make your own. Restore borrowed checkouts when done.
+Synchronize changed content with fresh timestamps and record revisions with test evidence.
 
 Use **Clang** for native 2.0 builds. Do not add a GCC workaround for the diagnosed
-ARM HUGEINT compiler bug. Reuse the existing Clang build/cache; use available host
-parallelism (`CMAKE_BUILD_PARALLEL_LEVEL=48` on this EC2 host) for builds.
+ARM HUGEINT compiler bug. Reuse the existing Clang build/cache; use the host's full
+parallelism (`CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)`) for builds.
 
 The Makefile auto-detects `VCPKG_TOOLCHAIN_PATH` from `vcpkg/` in the project tree. Set
 `USE_MERGED_VCPKG_MANIFEST=1` — the extension is built from multiple modules.
@@ -180,7 +180,7 @@ Python/fixture environment has the `vgi-rpc[http]` extra and run
 Put the intended Python environment on `PATH`; server startup failures do not qualify
 the native adapter. For published RPC qualification, use `make test_http VGI_RPC_PYTHON_DIR=`
 to disable the Makefile's sibling RPC checkout override. Use `VGI_RUN_TESTS_JOBS` for
-file parallelism (the latest EC2 HTTP run used 24). HTTP servers run from the repository
+file parallelism (the latest build-host HTTP run used 24). HTTP servers run from the repository
 root because COPY paths resolve against their cwd. Versioned/attach/auth variants have
 separate targets; the default HTTP target alone does not cover every variant.
 
@@ -248,7 +248,7 @@ vgi-python's `.venv/bin` first on `PATH`.
 
 The distribution workflow still selects `haybarn-v1.5.5-rc1` and `v1.5.5` images.
 It does not qualify DuckDB 2.0 distribution; the 2.0 Clang evidence above is from
-the EC2 lane. Updating the distribution/platform matrix remains release work.
+the build-host lane. Updating the distribution/platform matrix remains release work.
 
 ## Debug Environment Variables
 
