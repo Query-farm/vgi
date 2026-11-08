@@ -1,10 +1,14 @@
 # name: test/sql/integration/writable_tx/returning_old.test
-# description: Write result mode `changes` is unreachable from SQL today. The
-#              extension requests only `count` (plain UPDATE) and `rows`
-#              (RETURNING), and refuses RETURNING OLD.x, which would need the
-#              OLD row image `changes` carries, before any row changes. A table
-#              advertising more than `rows` still serves both. Revisit when
-#              the extension bridges `changes` to OLD/NEW RETURNING.
+# description: Write result mode `changes` is unreachable from SQL today, so
+#              this file pins what IS reachable. The extension requests only
+#              `count` (plain UPDATE) and `rows` (RETURNING); see
+#              BuildWriteOptions in src/storage/vgi_physical_write.cpp. The one
+#              SQL form that would need the OLD row image `changes` carries,
+#              RETURNING OLD.x, does not bind in this engine at all, for VGI
+#              and native tables alike. A table advertising `changes` serves
+#              `count` and `rows`. When this file starts failing on the OLD
+#              assertions, the engine has grown OLD/NEW RETURNING: wire
+#              `changes` through and replace them with real coverage.
 #              Fixture contract: docs/writable_tx_fixtures.md.
 # group: [vgi_integration_writable_tx]
 
@@ -25,17 +29,30 @@ SELECT ok FROM t.main.reset();
 ----
 true
 
+# The engine refuses OLD in RETURNING before planning (a native table behaves
+# the same way: this is not a VGI restriction)...
+statement ok
+CREATE TABLE native_items (id INTEGER, qty BIGINT);
+
+statement ok
+INSERT INTO native_items VALUES (1, 10);
+
 statement error
-UPDATE t.main.items SET qty = 11 WHERE id = 1 RETURNING OLD.qty, NEW.qty;
+UPDATE native_items SET qty = 11 RETURNING OLD.qty;
 ----
-<REGEX>:.*(OLD row image|OLD).*
+<REGEX>:.*Binder Error.*OLD.*
+
+statement error
+UPDATE t.main.items SET qty = 11 WHERE id = 1 RETURNING OLD.qty;
+----
+<REGEX>:.*Binder Error.*OLD.*
 
 statement error
 UPDATE ttx.main.items SET qty = 11 WHERE id = 1 RETURNING OLD.qty;
 ----
-<REGEX>:.*(OLD row image|OLD).*
+<REGEX>:.*Binder Error.*OLD.*
 
-# Nothing was changed by either.
+# ...so nothing was changed, and no transaction reached commit with a change.
 query II
 SELECT id, qty FROM t.main.items ORDER BY id;
 ----
@@ -43,18 +60,27 @@ SELECT id, qty FROM t.main.items ORDER BY id;
 2	20
 3	30
 
-# NEW.x is the ordinary RETURNING (mode `rows`).
-query II
-UPDATE t.main.items SET qty = 11 WHERE id = 1 RETURNING id, NEW.qty;
+# The worker advertises update mode `changes` (a maximum); the extension asks
+# for `rows` for RETURNING...
+query ITI
+UPDATE t.main.items SET qty = 11 WHERE id = 1 RETURNING *;
 ----
-1	11
+1	a	11
 
 query I
-UPDATE t.main.items SET qty = 12 WHERE id = 1;
+UPDATE ttx.main.items SET qty = 12 WHERE id = 1 RETURNING qty;
 ----
-1
+12
+
+# ...and `count` without it.
+query I
+UPDATE t.main.items SET qty = 13 WHERE id <= 2;
+----
+2
 
 query II
-SELECT id, qty FROM t.main.items WHERE id = 1;
+SELECT id, qty FROM t.main.items ORDER BY id;
 ----
-1	12
+1	13
+2	13
+3	30

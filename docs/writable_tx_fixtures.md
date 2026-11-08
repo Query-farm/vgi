@@ -171,13 +171,14 @@ All VOLATILE, no arguments, in schema `main`.
 
 ## Write result modes
 
-DuckDB asks the update function for `count` (plain UPDATE) or `rows` (UPDATE ... RETURNING),
-never `changes`: the extension sends only those two (`BuildWriteOptions` in
+DuckDB asks the update function for `count` (plain UPDATE) or `rows` (UPDATE ... RETURNING), never
+`changes`: the extension sends only those two (`BuildWriteOptions` in
 `src/storage/vgi_physical_write.cpp`). An advertised `changes` is a maximum and satisfies both.
-`UPDATE ... RETURNING OLD.x` would need the OLD row image `changes` carries; the extension refuses
-it at plan time (`VgiCatalog::PlanUpdate`, "does not support returning the OLD row image").
-`returning_old.test` pins that, so it fails, and should be revisited, once the extension bridges
-`changes` results to DuckDB's OLD/NEW RETURNING.
+The SQL that would need the OLD row image `changes` carries, `UPDATE ... RETURNING OLD.x`, does not
+bind in this engine at all (Binder Error `Referenced table "OLD" not found`, for native tables
+too), and the extension would refuse it anyway (`VgiCatalog::PlanUpdate` throws on
+`capture_old_rows`). `returning_old.test` pins this, so it fails, and should be turned into real
+coverage, once the engine grows OLD/NEW RETURNING.
 
 ## What the files cover
 
@@ -187,4 +188,4 @@ it at plan time (`VgiCatalog::PlanUpdate`, "does not support returning the OLD r
 | `update.test` | rowid = id (BIGINT, in WHERE); plain UPDATE counts; multi-column/multi-row; no-match; computed SET; SET NULL; RETURNING `*` and expressions; `id` not updatable; `qty >= 0`; refused statements change nothing; `SET id = id` is not a change; INSERT/DELETE not supported on `items`; `labels` "does not support UPDATE", not a constraint-profile error; `reset()` |
 | `transactions.test` | BEGIN/UPDATE/RETURNING/read-your-writes/computed SET on staged value/COMMIT, other attach sees committed only; ROLLBACK; refused COMMIT (`commit refused: qty -5 for id 2`) applies nothing and the session recovers; autocommit UPDATE (plain and RETURNING) applies; refused autocommit commit; event log order, `ok` values, distinct lowercase-hex ids, begin first per id |
 | `transaction_ids.test` | non-transactional attach: no id in or out of BEGIN, no events, in-out `tx_id` NULL; autocommit statements each get an id that begin minted and commit received; in one transaction `current_tx()` (twice), `tag_tx()` over several rows and the update function share one id, which the commit event carries; the rollback hook gets the id; consecutive transactions differ; both attaches in one statement |
-| `returning_old.test` | `changes` is never requested: `RETURNING OLD.x` is refused before any change is made; a table advertising `changes` still serves `count` and `rows` |
+| `returning_old.test` | `RETURNING OLD.x` is a Binder Error on a native table and on both attaches, and changes nothing; with `changes` advertised, RETURNING gets `rows` and plain UPDATE `count` (both attaches) |
