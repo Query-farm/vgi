@@ -55,14 +55,28 @@ SELECT token, transactional FROM ttx.main.whoami();
 ----
 tok-123	true
 
+# The fixture reads the token through the SDK's public attach-options accessor.
+# The SDK delivers a secret option encrypted inside attach_opaque_data, never
+# as plaintext: the token's bytes must not appear in the attach bytes the SDK
+# hands the catalog and its functions (the opened bytes on HTTP).
+query TT
+SELECT token, token_in_attach_data FROM t.main.whoami();
+----
+tok-123	false
+
+query TT
+SELECT token, token_in_attach_data FROM ttx.main.whoami();
+----
+tok-123	false
+
 # Inside an explicit transaction on the transactional attach too.
 statement ok
 BEGIN;
 
-query TT
-SELECT token, transactional FROM ttx.main.whoami();
+query TTT
+SELECT token, transactional, token_in_attach_data FROM ttx.main.whoami();
 ----
-tok-123	true
+tok-123	true	false
 
 statement ok
 COMMIT;
@@ -71,10 +85,10 @@ COMMIT;
 statement ok
 ATTACH 'txfix' AS texpr (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-' || '123');
 
-query TT
-SELECT token, transactional FROM texpr.main.whoami();
+query TTT
+SELECT token, transactional, token_in_attach_data FROM texpr.main.whoami();
 ----
-tok-123	false
+tok-123	false	false
 
 query I
 SELECT count(*) FROM duckdb_databases() WHERE database_name = 'texpr' AND options::VARCHAR LIKE '%tok-123%';
@@ -88,10 +102,10 @@ DETACH texpr;
 statement ok
 ATTACH 'txfix' AS tnone (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}');
 
-query TT
-SELECT token IS NULL, transactional FROM tnone.main.whoami();
+query TTT
+SELECT token IS NULL, transactional, token_in_attach_data FROM tnone.main.whoami();
 ----
-true	false
+true	false	false
 
 statement ok
 DETACH tnone;

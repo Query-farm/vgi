@@ -87,6 +87,15 @@ Status:
 | `transactional` | BOOLEAN, default false | The attach result's `supports_transactions` is **true only when this is true**, per attach. |
 | `token` | VARCHAR, **secret**, optional | DuckDB redacts it. Its value MUST reach every function of the attach (bind and process), the update function, and the transaction hooks. |
 
+**How the token reaches the fixture.** The fixture obtains `token` (and `transactional`) **only
+through the SDK's public attach-options accessor**, the same one that returns non-secret options,
+in bind, process and the transaction hooks. It never packs the token into attach bytes of its own.
+The SDK, not the author, carries secret option values from ATTACH to the functions: it encrypts
+them inside `attach_opaque_data` with a key the client never has (HKDF-derived from the HTTP
+signing key, or from a host-local key file on stdio/unix/launch), bound to the attach's id, so the
+value never appears in plaintext in any opaque value on any transport (vgi-python
+`docs/protocol/vgi-opaque-data-sealing.md` rule 5). `whoami().token_in_attach_data` checks this.
+
 ### State
 
 Shared across processes: the stdio, launcher and HTTP lanes may route statements of one test, even
@@ -161,7 +170,7 @@ All VOLATILE, no arguments, in schema `main`.
 | Function | Output | Meaning |
 |---|---|---|
 | `reset()` | `ok BOOLEAN` (one row, `true`) | Restore the partition's initial rows; clear its staged changes and events. |
-| `whoami()` | `token VARCHAR, transactional BOOLEAN` (one row) | The attach's options as the function sees them (`token` NULL when absent). |
+| `whoami()` | `token VARCHAR, transactional BOOLEAN, token_in_attach_data BOOLEAN` (one row) | The attach's options as the function sees them through the SDK's accessor (`token` NULL when absent). `token_in_attach_data`: true iff the token's UTF-8 bytes occur anywhere in the attach opaque bytes the SDK hands the function (the opened inner bytes on HTTP, the raw bytes on stdio/unix); false when there is no token. Tests require it to be false. |
 | `current_tx()` | `in_tx BOOLEAN, tx_id VARCHAR` (one row) | The plaintext transaction id this call received, lowercase hex; `false`/NULL when none. Read it at **process time** (not only at bind). |
 | `events()` | `seq BIGINT, kind VARCHAR, tx_id VARCHAR, ok BOOLEAN` | The partition's event log in order (`seq` increasing). `kind` is `begin`, `commit` or `rollback`; `tx_id` lowercase hex; `ok` is `false` only for a refused commit, `true` otherwise. |
 
@@ -185,7 +194,7 @@ coverage, once the engine grows OLD/NEW RETURNING.
 
 | File | Cases |
 |---|---|
-| `attach_options.test` | `token` redacted in `duckdb_databases()` (literal and expression); `whoami()` sees it on both attaches, in and out of a transaction, `transactional` per attach, NULL token without the option; the token partitions state (write through `t` visible through `ttx`, not through another token) |
+| `attach_options.test` | `token` redacted in `duckdb_databases()` (literal and expression); `whoami()` sees it on both attaches, never in plaintext in the attach bytes (`token_in_attach_data` false), in and out of a transaction, `transactional` per attach, NULL token without the option; the token partitions state (write through `t` visible through `ttx`, not through another token) |
 | `update.test` | rowid = id (BIGINT, in WHERE); plain UPDATE counts; multi-column/multi-row; no-match; computed SET; SET NULL; RETURNING `*` and expressions; `id` not updatable; `qty >= 0`; refused statements change nothing; `SET id = id` is not a change; INSERT/DELETE not supported on `items`; `labels` "does not support UPDATE", not a constraint-profile error; `reset()` |
 | `transactions.test` | BEGIN/UPDATE/RETURNING/read-your-writes/computed SET on staged value/COMMIT, other attach sees committed only; ROLLBACK; refused COMMIT (`commit refused: qty -5 for id 2`) applies nothing and the session recovers; autocommit UPDATE (plain and RETURNING) applies; refused autocommit commit; event log order, `ok` values, distinct lowercase-hex ids, begin first per id |
 | `transaction_ids.test` | non-transactional attach: no id in or out of BEGIN, no events, in-out `tx_id` NULL; autocommit statements each get an id that begin minted and commit received; in one transaction `current_tx()` (twice), `tag_tx()` over several rows and the update function share one id, which the commit event carries; the rollback hook gets the id; consecutive transactions differ; both attaches in one statement |
