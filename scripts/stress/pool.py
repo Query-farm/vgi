@@ -131,7 +131,7 @@ def _correctness(cfg: StressConfig) -> list[str]:
 def _faults(cfg: StressConfig) -> list[str]:
     failures: list[str] = []
 
-    # --- Phase A: deterministic recovery (mirrors buffered_pool_recovery.test).
+    # --- Phase A: deterministic recovery (mirrors test_deferred/crash_recovery/table_buffering_pool_recovery.test).
     # Warm the pool, kill every live worker, then a clean query MUST recover via
     # the pool's EPIPE stale-connection retry, and misses MUST grow.
     c = common.connect()

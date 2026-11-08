@@ -246,7 +246,6 @@ jobs:
             --allow-skip 'require-env VGI_TEST_ICEBERG' \
             --allow-skip 'require-env VGI_TEST_COMPANION_TARGET' \
             --allow-skip 'require-env VGI_TEST_BEARER_TOKEN' \
-            --allow-skip 'require-env VGI_TEST_DEDICATED_WORKER' \
             --allow-skip 'require-env VGI_HTTP_TRANSPORT' \
             --allow-skip 'require-env VGI_HTTP_DISABLE_ZSTD' \
             --allow-skip 'require-env VGI_HTTP_NO_COMPRESSION' \

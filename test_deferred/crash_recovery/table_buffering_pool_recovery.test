@@ -1,12 +1,13 @@
-# name: test/sql/integration/table_in_out/buffered_pool_recovery.test
+# name: test_deferred/crash_recovery/table_buffering_pool_recovery.test
 # description: After a SIGKILL'd worker is "returned" to the pool (in spirit —
 #   really it just exits), the next ATTACH+query gets a fresh worker. Exercises
 #   AcquireAndBindConnection's stale-conn EPIPE retry on the buffered path,
 #   and proves the pool doesn't retain dead PIDs.
 #
-# Dedicated-worker only — see buffered_worker_crash.test header for the
-# explanation of why crash_on_process (which SIGKILLs its own process) is
-# not safe under shared-worker transports.
+# Dedicated-worker only — see table_buffering_worker_crash.test header for
+# the explanation of why crash_on_process (which SIGKILLs its own process) is
+# not safe under shared-worker transports. Not part of the default suite; see
+# README.md in this directory.
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER

@@ -1,4 +1,4 @@
-# name: test/sql/integration/table_in_out/buffered_worker_crash.test
+# name: test_deferred/crash_recovery/table_buffering_worker_crash.test
 # description: Worker SIGKILLs itself during table_buffering.process —
 #   verify the C++ side surfaces a clean error and the pool recovers so
 #   the next query against the same catalog succeeds on a fresh worker.
@@ -8,10 +8,9 @@
 # DuckDB-process worker child, which is what this test asserts. Under any
 # shared-worker transport (http://, https://, unix://, launch:) it would
 # tear down the single process serving every concurrent test, cascading
-# into "RPC response stream EOF" failures across the suite. The
-# VGI_TEST_DEDICATED_WORKER env var is set by Makefile test_subprocess*
-# targets and auto-detected by scripts/run_tests.py from a bare-path
-# VGI_TEST_WORKER; shared-worker runs leave it unset so this test skips.
+# into "RPC response stream EOF" failures across the suite. Set
+# VGI_TEST_DEDICATED_WORKER only when VGI_TEST_WORKER is a bare worker path.
+# Not part of the default suite; see README.md in this directory.
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER

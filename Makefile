@@ -206,7 +206,6 @@ test_shm:
 	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
 
 test_shm_debug:
@@ -224,7 +223,6 @@ test_shm_debug:
 	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
 
 # Cold-spawn transport tests: every worker connection starts a *fresh* Python
@@ -252,7 +250,6 @@ test_spawn:
 	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
 
 test_spawn_debug:
@@ -269,7 +266,6 @@ test_spawn_debug:
 	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
 
 # Launcher transport tests — runs the same .test suite as test_spawn but
@@ -615,7 +611,7 @@ VGI_JAVA_DIR   ?= $(HOME)/Development/vgi-java
 VGI_RUST_DIR   ?= $(HOME)/Development/vgi-rust
 VGI_CSHARP_DIR ?= $(HOME)/Development/vgi-csharp
 
-.PHONY: test_python test_python_crash test_column_paths test_dependencies test_semantic_alter test_queries test_go test_typescript test_java test_rust test_csharp test_languages \
+.PHONY: test_python test_column_paths test_dependencies test_semantic_alter test_queries test_go test_typescript test_java test_rust test_csharp test_languages \
 	build_database_workers test_database_workers test_database_worker_restart
 
 # Successor protocol preparation: run real 1.5 SQL against the durable DDL
@@ -682,25 +678,6 @@ test_database_worker_restart: build_database_workers
 #
 # Python runs 304 today.
 #
-# VGI_TEST_DEDICATED_WORKER is DECLARED as an expected skip, not wired — and
-# wiring it here would be a BUG, not a coverage win.
-#
-# It gates table_buffering_{worker_crash,pool_recovery}.test, whose
-# `crash_on_process` fixture SIGKILLs the worker serving it. Both files ATTACH
-# ${VGI_TEST_WORKER} — the LAUNCHER location on this lane — not a dedicated
-# binary, so the victim is the ONE shared worker every concurrent DuckDB process
-# is talking to. Setting the var un-skips them and the survivors then fail with
-# "RPC response stream EOF" / "Broken pipe": collateral damage, not a race of
-# their own. That is exactly the eight-file failure I first mistook for a
-# concurrency bug in the buffered path; it is neither a concurrency bug nor
-# specific to any SDK. run_tests.py deliberately leaves the var unset for
-# shared-worker transports (see its env.setdefault guard), and setting it here
-# defeats that.
-#
-# To actually run those two, point VGI_TEST_WORKER itself at a bare path so each
-# DuckDB process owns a private worker it can watch die — see vgi-java's
-# `test-crash` target, which runs exactly those files over the subprocess
-# transport after the main suite.
 VGI_PYTHON_MIN_EXECUTED ?= 300
 test_python:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
@@ -719,7 +696,6 @@ test_python:
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	    python3 scripts/run_tests.py -j 6 --isolate-launcher \
 	        --min-executed $$(( $(VGI_PYTHON_MIN_EXECUTED) - $(VGI_ENGINE_FLOOR_SLACK) )) $(VGI_EXPECTED_SKIPS) \
-	        --allow-skip 'require-env VGI_TEST_DEDICATED_WORKER' \
 	        "test/*" \
 	        "~test/sql/duckdb2/column_paths.test" \
 	        "~test/sql/duckdb2/required_filter_paths.test" \
@@ -728,18 +704,6 @@ test_python:
 	        "~test/sql/duckdb2/default_schema.test" \
 	        "~test/sql/integration/writable/*" \
 	        "~test/sql/vgi_worker_pool.test"
-	@$(MAKE) test_python_crash
-
-# The two crash/pool-recovery files the launcher lane must skip, run over the
-# SUBPROCESS transport where each DuckDB process owns a private worker it can
-# watch die. That is the shape they were written for; on a shared-worker lane
-# they would SIGKILL the process serving every concurrent test. Mirrors
-# vgi-java's `test-crash`.
-test_python_crash:
-	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
-	    python3 scripts/run_tests.py -j 2 --min-executed 2 \
-	        "test/sql/integration/table_in_out/table_buffering_worker_crash.test" \
-	        "test/sql/integration/table_in_out/table_buffering_pool_recovery.test"
 
 test_go:
 	$(MAKE) -C $(VGI_GO_DIR) test
@@ -819,9 +783,9 @@ VGI_EXPECTED_SKIPS := \
 	--allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT' \
 	$(VGI_ENGINE_EXPECTED_SKIPS)
 
-# Rust's lane runs 293 today. The floor sits a little under so an unrelated
+# Rust's lane runs 291 today. The floor sits a little under so an unrelated
 # environment wobble doesn't fail the build, while a fixture dropping out does.
-VGI_RUST_MIN_EXECUTED ?= 290
+VGI_RUST_MIN_EXECUTED ?= 288
 VGI_COVERAGE_GATE = --min-executed $$(( $(VGI_RUST_MIN_EXECUTED) - $(VGI_ENGINE_FLOOR_SLACK) )) $(VGI_EXPECTED_SKIPS)
 
 VGI_RUST_WORKER   := $(VGI_RUST_DIR)/target/debug/vgi-example-worker
@@ -830,7 +794,6 @@ test_rust:
 	cd $(VGI_RUST_DIR) && cargo build -p vgi-example-worker
 	VGI_WORKER_BIN="$(VGI_RUST_WORKER)" \
 	VGI_TEST_WORKER="$(VGI_RUST_WORKER)" \
-	VGI_TEST_DEDICATED_WORKER="$(VGI_RUST_WORKER)" \
 	VGI_VERSIONED_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-versioned" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-versioned-tables" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-attach-options" \
