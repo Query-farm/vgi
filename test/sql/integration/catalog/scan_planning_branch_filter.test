@@ -15,6 +15,8 @@ require vgi
 
 require parquet
 
+require httpfs
+
 statement ok
 COPY (SELECT DATE '2026-10-01' AS event_date, range AS n FROM range(10)) TO '${VGI_TEST_BRANCH_DIR}/planned_days_2026-10-01.parquet' (FORMAT 'parquet');
 

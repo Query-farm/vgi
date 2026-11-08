@@ -16,6 +16,8 @@ require vgi
 
 require parquet
 
+require httpfs
+
 require json
 
 statement ok
