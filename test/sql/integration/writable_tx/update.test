@@ -1,0 +1,217 @@
+# name: test/sql/integration/writable_tx/update.test
+# description: UPDATE on a catalog table whose descriptor declares an update
+#              function (txfix main.items), on a NON-transactional attach:
+#              plain, RETURNING, computed SET, the row id, refused columns and
+#              values, and a read-only table. Fixture contract:
+#              docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-update');
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	10
+2	b	20
+3	c	30
+
+# ============================================================================
+# Row id: a BIGINT virtual column equal to id, usable in projections and WHERE
+# ============================================================================
+
+query II
+SELECT rowid, id FROM t.main.items ORDER BY id;
+----
+1	1
+2	2
+3	3
+
+query T
+SELECT typeof(rowid) FROM t.main.items LIMIT 1;
+----
+BIGINT
+
+query T
+SELECT name FROM t.main.items WHERE rowid = 2;
+----
+b
+
+# ============================================================================
+# Plain UPDATE (write result mode `count`)
+# ============================================================================
+
+query I
+UPDATE t.main.items SET name = 'aa' WHERE id = 1;
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	aa	10
+2	b	20
+3	c	30
+
+# Several columns, several rows.
+query I
+UPDATE t.main.items SET name = upper(name), qty = 7 WHERE id >= 2;
+----
+2
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	aa	10
+2	B	7
+3	C	7
+
+# No matching row: nothing to do.
+query I
+UPDATE t.main.items SET qty = 1 WHERE id = 99;
+----
+0
+
+# Changes are immediate and the row id is stable across them.
+query II
+SELECT rowid, qty FROM t.main.items WHERE id = 2;
+----
+2	7
+
+# ============================================================================
+# Computed SET (the scan supplies the current value)
+# ============================================================================
+
+query I
+UPDATE t.main.items SET qty = qty + 1;
+----
+3
+
+query II
+SELECT id, qty FROM t.main.items ORDER BY id;
+----
+1	11
+2	8
+3	8
+
+# A NULL into the nullable column.
+statement ok
+UPDATE t.main.items SET qty = NULL WHERE id = 3;
+
+query II
+SELECT id, qty IS NULL FROM t.main.items ORDER BY id;
+----
+1	false
+2	false
+3	true
+
+# ============================================================================
+# RETURNING (write result mode `rows`): the new row values
+# ============================================================================
+
+query ITI
+UPDATE t.main.items SET qty = 5 WHERE id = 3 RETURNING *;
+----
+3	C	5
+
+query IT rowsort
+UPDATE t.main.items SET name = 'bb', qty = qty * 10 WHERE id IN (1, 2) RETURNING id, name || ':' || qty;
+----
+1	bb:110
+2	bb:80
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	bb	110
+2	bb	80
+3	C	5
+
+# ============================================================================
+# Refused by the worker: changing id, a negative qty
+# ============================================================================
+
+statement error
+UPDATE t.main.items SET id = 10 WHERE id = 1;
+----
+<REGEX>:.*txfix: id is not updatable.*
+
+statement error
+UPDATE t.main.items SET qty = -1 WHERE id = 2;
+----
+<REGEX>:.*txfix: qty must be >= 0.*
+
+# A refused statement changed nothing.
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	bb	110
+2	bb	80
+3	C	5
+
+# Setting id to its current value is not a change (RETURNING sends every column).
+query ITI
+UPDATE t.main.items SET id = id, qty = 6 WHERE id = 3 RETURNING *;
+----
+3	C	6
+
+# ============================================================================
+# What the table does not declare
+# ============================================================================
+
+# items declares an update function only.
+statement error
+INSERT INTO t.main.items VALUES (4, 'd', 40);
+----
+<REGEX>:.*does not support INSERT.*
+
+statement error
+DELETE FROM t.main.items WHERE id = 1;
+----
+<REGEX>:.*does not support DELETE.*
+
+# labels is read-only. It declares constraints, like items: the error must be
+# the missing operation, not a constraint-enforcement negotiation failure.
+query IT
+SELECT id, label FROM t.main.labels ORDER BY id;
+----
+1	x
+2	y
+
+statement error
+UPDATE t.main.labels SET label = 'z' WHERE id = 1;
+----
+<REGEX>:.*does not support UPDATE.*
+
+statement error
+UPDATE t.main.labels SET label = 'z' WHERE id = 1;
+----
+<!REGEX>:.*constraint enforcement profile.*
+
+query IT
+SELECT id, label FROM t.main.labels ORDER BY id;
+----
+1	x
+2	y
+
+# reset() restores the initial rows.
+statement ok
+SELECT * FROM t.main.reset();
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	10
+2	b	20
+3	c	30

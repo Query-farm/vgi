@@ -108,6 +108,18 @@ export VGI_TEST_BRANCH_DIR
 VGI_SECRET_LOOKUP_FIXTURES ?= 1
 export VGI_SECRET_LOOKUP_FIXTURES
 
+# Writable-table and transaction-hook fixtures (docs/writable_tx_fixtures.md),
+# which writable_tx/*.test gate on together with VGI_WRITABLE_TX_WORKER (the
+# fixture worker LOCATION). vgi-python has no such fixture yet, so neither is
+# set by default; pass both (e.g. an SDK fixture worker) to run the files. Only
+# exported when non-empty: require-env treats an empty variable as set.
+ifneq ($(strip $(VGI_WRITABLE_TX_FIXTURES)),)
+export VGI_WRITABLE_TX_FIXTURES
+endif
+ifneq ($(strip $(VGI_WRITABLE_TX_WORKER)),)
+export VGI_WRITABLE_TX_WORKER
+endif
+
 # Versioned fixture workers for attach/versioning*.test. Set to overrideable
 # defaults so `require-env` gates pass under `make test_spawn` by default.
 VGI_VERSIONED_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-versioned-worker
@@ -797,6 +809,8 @@ VGI_EXPECTED_SKIPS := \
 	--allow-skip 'require-env VGI_VERSIONED_TABLES_HTTP_WORKER' \
 	--allow-skip 'require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE' \
 	--allow-skip 'require-env VGI_SIMPLE_WRITABLE_WORKER' \
+	--allow-skip 'require-env VGI_WRITABLE_TX_FIXTURES' \
+	--allow-skip 'require-env VGI_WRITABLE_TX_WORKER' \
 	--allow-skip 'require-env VGI_ROWID_CONSTRAINT_WORKER' \
 	--allow-skip 'require-env VGI_MALFORMED_BATCH_WORKER' \
 	--allow-skip 'require-env VGI_NO_REFLECTION_WORKER' \

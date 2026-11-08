@@ -1,0 +1,133 @@
+# name: test/sql/integration/writable_tx/attach_options.test
+# description: The txfix fixture's ATTACH options: the secret `token` is
+#              redacted in duckdb_databases() yet reaches the worker's
+#              functions on every attach, and `transactional` is per attach.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-123');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-123', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+# ============================================================================
+# token is declared secret: DuckDB redacts it, on both attaches
+# ============================================================================
+
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name IN ('t', 'ttx') AND options::VARCHAR LIKE '%tok-123%';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name IN ('t', 'ttx') AND options::VARCHAR LIKE '%<redacted>%';
+----
+2
+
+# ============================================================================
+# ...and still reaches the worker's functions, with the attach's own options
+# ============================================================================
+
+query TT
+SELECT token, transactional FROM t.main.whoami();
+----
+tok-123	false
+
+query TT
+SELECT token, transactional FROM ttx.main.whoami();
+----
+tok-123	true
+
+# Inside an explicit transaction on the transactional attach too.
+statement ok
+BEGIN;
+
+query TT
+SELECT token, transactional FROM ttx.main.whoami();
+----
+tok-123	true
+
+statement ok
+COMMIT;
+
+# An expression, not only a literal (in the CLI: `token getenv('TXFIX_TOKEN')`).
+statement ok
+ATTACH 'txfix' AS texpr (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-' || '123');
+
+query TT
+SELECT token, transactional FROM texpr.main.whoami();
+----
+tok-123	false
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'texpr' AND options::VARCHAR LIKE '%tok-123%';
+----
+0
+
+statement ok
+DETACH texpr;
+
+# Without the option the function sees NULL, and `transactional` defaults to false.
+statement ok
+ATTACH 'txfix' AS tnone (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}');
+
+query TT
+SELECT token IS NULL, transactional FROM tnone.main.whoami();
+----
+true	false
+
+statement ok
+DETACH tnone;
+
+# The secret reaches the UPDATE function and the commit hook as well: state is
+# partitioned by token (docs/writable_tx_fixtures.md), so a write through `t`
+# is visible through `ttx` (same token) and through a third attach with the
+# same token, but not through an attach with another token.
+statement ok
+UPDATE t.main.items SET name = 'secret-delivered' WHERE id = 1;
+
+query T
+SELECT name FROM ttx.main.items WHERE id = 1;
+----
+secret-delivered
+
+statement ok
+ATTACH 'txfix' AS tother (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-attach-options-other');
+
+statement ok
+SELECT * FROM tother.main.reset();
+
+query T
+SELECT name FROM tother.main.items WHERE id = 1;
+----
+a
+
+statement ok
+UPDATE ttx.main.items SET qty = 11 WHERE id = 1;
+
+query TT
+SELECT name, qty FROM t.main.items WHERE id = 1;
+----
+secret-delivered	11
+
+query TT
+SELECT name, qty FROM tother.main.items WHERE id = 1;
+----
+a	10
+
+statement ok
+DETACH tother;

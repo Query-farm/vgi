@@ -1,0 +1,269 @@
+# name: test/sql/integration/writable_tx/transactions.test
+# description: Transaction hooks on a transactional attach (supports_transactions
+#              true): UPDATE stages under the transaction id, scans read their
+#              own writes, COMMIT applies, ROLLBACK discards, a commit hook that
+#              fails fails COMMIT, and an autocommit statement commits by
+#              itself. Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# `t` and `ttx` share one token, so they see the same committed rows.
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-transactions');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-transactions', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+# ============================================================================
+# BEGIN / UPDATE / read-your-writes / COMMIT
+# ============================================================================
+
+statement ok
+BEGIN;
+
+query I
+UPDATE ttx.main.items SET qty = 11 WHERE id = 1;
+----
+1
+
+query ITI
+UPDATE ttx.main.items SET name = 'bb' WHERE id = 2 RETURNING *;
+----
+2	bb	20
+
+# Staged: the transaction reads its own writes...
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+1	a	11
+2	bb	20
+3	c	30
+
+# ...on top of which a computed SET builds...
+statement ok
+UPDATE ttx.main.items SET qty = qty + 1 WHERE id = 1;
+
+query II
+SELECT id, qty FROM ttx.main.items WHERE id = 1;
+----
+1	12
+
+# ...while every other attach still sees committed state.
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	10
+2	b	20
+3	c	30
+
+statement ok
+COMMIT;
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	12
+2	bb	20
+3	c	30
+
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+1	a	12
+2	bb	20
+3	c	30
+
+# ============================================================================
+# ROLLBACK discards the staged changes
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE ttx.main.items SET qty = 99, name = 'rolled' WHERE id = 3;
+
+query TI
+SELECT name, qty FROM ttx.main.items WHERE id = 3;
+----
+rolled	99
+
+statement ok
+ROLLBACK;
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	12
+2	bb	20
+3	c	30
+
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+1	a	12
+2	bb	20
+3	c	30
+
+# ============================================================================
+# A commit hook that refuses fails COMMIT; nothing is applied
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE ttx.main.items SET name = 'not-applied' WHERE id = 1;
+
+# Accepted at UPDATE time on the transactional attach: the commit hook decides.
+statement ok
+UPDATE ttx.main.items SET qty = -5 WHERE id = 2;
+
+query II
+SELECT id, qty FROM ttx.main.items WHERE id = 2;
+----
+2	-5
+
+statement error
+COMMIT;
+----
+<REGEX>:.*txfix: commit refused: qty -5 for id 2.*
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	12
+2	bb	20
+3	c	30
+
+# The session is usable again, and the transactional attach is unchanged too.
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+1	a	12
+2	bb	20
+3	c	30
+
+# ============================================================================
+# Autocommit: a statement outside BEGIN is its own transaction
+# ============================================================================
+
+query I
+UPDATE ttx.main.items SET qty = 31 WHERE id = 3;
+----
+1
+
+query I
+SELECT qty FROM t.main.items WHERE id = 3;
+----
+31
+
+query ITI
+UPDATE ttx.main.items SET qty = qty + 1 WHERE id = 3 RETURNING *;
+----
+3	c	32
+
+query I
+SELECT qty FROM t.main.items WHERE id = 3;
+----
+32
+
+# An autocommit statement whose commit is refused fails, and applies nothing.
+statement error
+UPDATE ttx.main.items SET qty = -1 WHERE id = 1;
+----
+<REGEX>:.*txfix: commit refused: qty -1 for id 1.*
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	12
+2	bb	20
+3	c	32
+
+# On the non-transactional attach the same value is refused at UPDATE time.
+statement error
+UPDATE t.main.items SET qty = -1 WHERE id = 1;
+----
+<REGEX>:.*txfix: qty must be >= 0.*
+
+# ============================================================================
+# The event log: one begin and one commit/rollback per transaction
+# ============================================================================
+
+statement ok
+SELECT * FROM t.main.reset();
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE ttx.main.items SET qty = 1 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE ttx.main.items SET qty = 2 WHERE id = 1;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE ttx.main.items SET qty = -2 WHERE id = 1;
+
+statement error
+COMMIT;
+----
+<REGEX>:.*commit refused.*
+
+# Read through `t`, which has no transaction hooks, so reading adds no event.
+query TT
+SELECT kind, ok FROM t.main.events() ORDER BY seq;
+----
+begin	true
+commit	true
+begin	true
+rollback	true
+begin	true
+commit	false
+
+# Each begin is followed by the end of the same transaction, and the three
+# transactions have distinct 16-byte ids.
+query I
+SELECT count(DISTINCT tx_id) FROM t.main.events();
+----
+3
+
+query I
+SELECT count(*) FROM t.main.events() WHERE length(tx_id) = 32 AND regexp_full_match(tx_id, '[0-9a-f]+');
+----
+6
+
+query I
+SELECT count(*) FROM (
+  SELECT tx_id, list(kind ORDER BY seq) AS kinds FROM t.main.events() GROUP BY tx_id
+) WHERE len(kinds) = 2 AND kinds[1] = 'begin';
+----
+3
+
+query I
+SELECT qty FROM t.main.items WHERE id = 1;
+----
+1

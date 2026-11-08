@@ -1,0 +1,60 @@
+# name: test/sql/integration/writable_tx/returning_old.test
+# description: Write result mode `changes` is unreachable from SQL today. The
+#              extension requests only `count` (plain UPDATE) and `rows`
+#              (RETURNING), and refuses RETURNING OLD.x, which would need the
+#              OLD row image `changes` carries, before any row changes. A table
+#              advertising more than `rows` still serves both. Revisit when
+#              the extension bridges `changes` to OLD/NEW RETURNING.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-returning-old');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-returning-old', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+statement error
+UPDATE t.main.items SET qty = 11 WHERE id = 1 RETURNING OLD.qty, NEW.qty;
+----
+<REGEX>:.*(OLD row image|OLD).*
+
+statement error
+UPDATE ttx.main.items SET qty = 11 WHERE id = 1 RETURNING OLD.qty;
+----
+<REGEX>:.*(OLD row image|OLD).*
+
+# Nothing was changed by either.
+query II
+SELECT id, qty FROM t.main.items ORDER BY id;
+----
+1	10
+2	20
+3	30
+
+# NEW.x is the ordinary RETURNING (mode `rows`).
+query II
+UPDATE t.main.items SET qty = 11 WHERE id = 1 RETURNING id, NEW.qty;
+----
+1	11
+
+query I
+UPDATE t.main.items SET qty = 12 WHERE id = 1;
+----
+1
+
+query II
+SELECT id, qty FROM t.main.items WHERE id = 1;
+----
+1	12

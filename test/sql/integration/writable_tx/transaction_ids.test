@@ -1,0 +1,248 @@
+# name: test/sql/integration/writable_tx/transaction_ids.test
+# description: supports_transactions is per attach, and inside a transaction
+#              every function (table function, table in-out function) and the
+#              commit / rollback hooks see the same plaintext transaction id
+#              the begin hook minted, read at process time, on every transport.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-transaction-ids');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-transaction-ids', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+# ============================================================================
+# Non-transactional attach: no transaction id, no hooks called
+# ============================================================================
+
+query TT
+SELECT in_tx, tx_id IS NULL FROM t.main.current_tx();
+----
+false	true
+
+statement ok
+BEGIN;
+
+query TT
+SELECT in_tx, tx_id IS NULL FROM t.main.current_tx();
+----
+false	true
+
+query T
+SELECT tx_id IS NULL FROM t.main.tag_tx((SELECT 1 AS x));
+----
+true
+
+statement ok
+UPDATE t.main.items SET qty = 15 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM t.main.events();
+----
+0
+
+# ============================================================================
+# Transactional attach, autocommit: each statement gets a fresh id
+# ============================================================================
+
+query TT
+SELECT in_tx, length(tx_id) FROM ttx.main.current_tx();
+----
+true	32
+
+query I
+SELECT count(*) FROM t.main.events() WHERE regexp_full_match(tx_id, '[0-9a-f]{32}');
+----
+2
+
+query TT
+SELECT kind, ok FROM t.main.events() ORDER BY seq;
+----
+begin	true
+commit	true
+
+# The id that function saw is the one begin minted and commit received.
+statement ok
+CREATE TEMP TABLE seen AS SELECT tx_id FROM ttx.main.current_tx();
+
+query I
+SELECT count(*) FROM t.main.events() e JOIN seen s USING (tx_id);
+----
+2
+
+query I
+SELECT count(DISTINCT tx_id) FROM t.main.events();
+----
+2
+
+statement ok
+DROP TABLE seen;
+
+statement ok
+SELECT * FROM t.main.reset();
+
+# ============================================================================
+# One explicit transaction: current_tx, tag_tx (table in-out, process time),
+# the UPDATE function and the commit hook all see one id
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP TABLE ids AS SELECT 'current_tx' AS source, tx_id FROM ttx.main.current_tx();
+
+statement ok
+INSERT INTO ids SELECT 'current_tx_again', tx_id FROM ttx.main.current_tx();
+
+# Several input rows, all tagged with the id seen while processing them.
+statement ok
+INSERT INTO ids SELECT 'tag_tx', tx_id FROM ttx.main.tag_tx((SELECT range AS n FROM range(3)));
+
+# The in-out function passes its input columns through.
+query II
+SELECT n, length(tx_id) FROM ttx.main.tag_tx((SELECT range AS n, 'v' || range AS s FROM range(2))) ORDER BY n;
+----
+0	32
+1	32
+
+query T
+SELECT s FROM ttx.main.tag_tx((SELECT range AS n, 'v' || range AS s FROM range(2))) ORDER BY n;
+----
+v0
+v1
+
+# The update function stages under the id it sees; read-your-writes proves it
+# is the transaction's id.
+statement ok
+UPDATE ttx.main.items SET qty = 100 WHERE id = 1;
+
+query I
+SELECT qty FROM ttx.main.items WHERE id = 1;
+----
+100
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM ids;
+----
+5
+
+query I
+SELECT count(DISTINCT tx_id) FROM ids;
+----
+1
+
+query I
+SELECT count(*) FROM ids WHERE regexp_full_match(tx_id, '[0-9a-f]{32}');
+----
+5
+
+# The commit hook received that same id, and the change was applied.
+query TT
+SELECT kind, ok FROM t.main.events() ORDER BY seq;
+----
+begin	true
+commit	true
+
+query I
+SELECT count(*) FROM t.main.events() WHERE tx_id = (SELECT any_value(tx_id) FROM ids);
+----
+2
+
+query I
+SELECT qty FROM t.main.items WHERE id = 1;
+----
+100
+
+statement ok
+DROP TABLE ids;
+
+# ============================================================================
+# The rollback hook receives the transaction's id too
+# ============================================================================
+
+statement ok
+SELECT * FROM t.main.reset();
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP TABLE rb AS SELECT tx_id FROM ttx.main.tag_tx((SELECT 1 AS x));
+
+statement ok
+ROLLBACK;
+
+# The TEMP table was rolled back with the transaction, so read the id from
+# the log: it must be the same on both events.
+query TT
+SELECT kind, ok FROM t.main.events() ORDER BY seq;
+----
+begin	true
+rollback	true
+
+query I
+SELECT count(DISTINCT tx_id) FROM t.main.events();
+----
+1
+
+# A second transaction gets a different id.
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP TABLE second AS SELECT tx_id FROM ttx.main.current_tx();
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM t.main.events() e JOIN second s USING (tx_id);
+----
+2
+
+query I
+SELECT count(DISTINCT tx_id) FROM t.main.events();
+----
+2
+
+# ============================================================================
+# Per attach: the same worker and catalog, one attach with hooks, one without
+# ============================================================================
+
+statement ok
+SELECT * FROM t.main.reset();
+
+statement ok
+BEGIN;
+
+query TT
+SELECT a.in_tx, b.in_tx FROM t.main.current_tx() a, ttx.main.current_tx() b;
+----
+false	true
+
+statement ok
+COMMIT;
+
+query T
+SELECT list(kind ORDER BY seq) FROM t.main.events();
+----
+[begin, commit]

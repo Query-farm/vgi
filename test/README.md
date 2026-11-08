@@ -28,6 +28,9 @@ variable until it does:
 
 - [Secret-lookup fixtures](../docs/secret_lookup_fixtures.md) —
   `secret/secret_lookup_*.test`, gated on `VGI_SECRET_LOOKUP_FIXTURES`.
+- [Writable-table and transaction-hook fixtures](../docs/writable_tx_fixtures.md) —
+  `writable_tx/*.test`, gated on `VGI_WRITABLE_TX_FIXTURES` and
+  `VGI_WRITABLE_TX_WORKER` (the fixture worker LOCATION).
 
 ## Windows OAuth credential storage
 
