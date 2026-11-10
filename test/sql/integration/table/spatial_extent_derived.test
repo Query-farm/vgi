@@ -144,3 +144,55 @@ SELECT COUNT(*) FROM example.spatial_filter_example(100)
 WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5)) AND x >= 0.3;
 ----
 18
+
+# ============================================================================
+# Only a constant with a real box derives: at least one vertex and finite X and
+# Y ranges. An empty constant has no box (`geom && EMPTY` is false for every
+# row) yet ST_Equals(EMPTY, EMPTY) is true; spatial treats a NaN point as
+# empty too, while DuckDB's extent gives it an unbounded axis.
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE ST_Equals(geom, 'POINT EMPTY'::GEOMETRY);
+----
+physical_plan	<!REGEX>:(?s).*(&&|st_intersects_extent).*
+
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE ST_Equals(geom, 'POINT(nan 1)'::GEOMETRY);
+----
+physical_plan	<!REGEX>:(?s).*(&&|st_intersects_extent).*
+
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 'inf'::DOUBLE, 0.5));
+----
+physical_plan	<!REGEX>:(?s).*(&&|st_intersects_extent).*
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 'inf'::DOUBLE, 0.5));
+----
+60
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, 'GEOMETRYCOLLECTION EMPTY'::GEOMETRY);
+----
+0
+
+# Two predicates with the same constant push one box, not two.
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5))
+  AND ST_Within(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5));
+----
+physical_plan	<!REGEX>:(?s).*st_intersects_extent.*st_intersects_extent.*
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5))
+  AND ST_Within(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5));
+----
+16

@@ -23,6 +23,21 @@
 // predicate stays in the LogicalFilter, so the result is unchanged: the worker
 // may use the box to read less, and DuckDB still applies the exact test.
 //
+// Only a constant with a real box is used: one with at least one vertex and
+// finite X and Y ranges. An empty constant has no box, so `geom && EMPTY` is
+// false for every row, yet spatial's ST_Equals(EMPTY, EMPTY) is true. A
+// constant with a NaN coordinate is empty to spatial (GEOS) but has an
+// unbounded axis to DuckDB's extent code; such constants, and infinite ones, are
+// skipped too. Every listed predicate is false for an empty constant, so the
+// gate loses nothing.
+//
+// The derived filter is always a plain `col && <constant>` over the bare
+// column, the only form VGI's filter encoding carries: the constant is
+// relabelled to a CRS-typed column's type (a CRS cast is metadata only), a
+// constant with a different CRS derives nothing, and a bind that would put a
+// cast on the column is dropped. (DuckDB 2.0 binds GEOMETRY('EPSG:4326')
+// columns without such a cast today; these are guards.)
+//
 // Phase: optimize_function (post-optimize), after FilterPushdown has settled
 // which predicates the scan took.
 
@@ -30,6 +45,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/geometry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -37,6 +53,8 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -73,6 +91,65 @@ bool IsGeometry(const LogicalType &type) {
 	return type.id() == LogicalTypeId::GEOMETRY;
 }
 
+//! Whether `constant` (a non-NULL GEOMETRY) has a usable bounding box: at
+//! least one vertex and finite X and Y ranges. See the file comment.
+bool HasFiniteExtent(const Value &constant) {
+	try {
+		auto &wkb = StringValue::Get(constant);
+		auto extent = GeometryExtent::Empty();
+		auto vertices = Geometry::GetExtent(string_t(wkb.data(), UnsafeNumericCast<uint32_t>(wkb.size())), extent);
+		return vertices > 0 && extent.HasXY();
+	} catch (std::exception &) {
+		return false;
+	}
+}
+
+//! The GEOMETRY column ref under `expr`: the expression itself, or a
+//! GEOMETRY-to-GEOMETRY cast of it (a CRS relabel). nullptr otherwise.
+const BoundColumnRefExpression *GeometryColumnRef(const Expression &expr) {
+	const Expression *inner = &expr;
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		if (!BoundCastExpression::IsCast(function) || BoundCastExpression::IsTryCast(function) ||
+		    !IsGeometry(BoundCastExpression::SourceType(function)) || !IsGeometry(function.GetReturnType())) {
+			return nullptr;
+		}
+		inner = &BoundCastExpression::Child(function);
+	}
+	if (inner->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF || !IsGeometry(inner->GetReturnType())) {
+		return nullptr;
+	}
+	return &inner->Cast<BoundColumnRefExpression>();
+}
+
+//! `constant` as a value of `column_type`: unchanged when the types match,
+//! relabelled when the constant has no CRS. Fails for a different CRS.
+bool ConstantForColumn(const Value &constant, const LogicalType &column_type, Value &result) {
+	if (constant.type() == column_type) {
+		result = constant;
+		return true;
+	}
+	if (GeoType::HasCRS(constant.type())) {
+		return false;
+	}
+	auto cast = constant.DefaultTryCastAs(column_type);
+	if (!cast) {
+		return false;
+	}
+	result = std::move(*cast);
+	return true;
+}
+
+bool ContainsEqual(const Expression &expr, const Expression &candidate) {
+	if (expr.Equals(candidate)) {
+		return true;
+	}
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(
+	    expr, [&](const Expression &child) { found = found || ContainsEqual(child, candidate); });
+	return found;
+}
+
 class SpatialExtentOptimizer : public OptimizerExtension {
 public:
 	SpatialExtentOptimizer() {
@@ -90,38 +167,46 @@ private:
 		auto &function = expr.Cast<BoundFunctionExpression>();
 		auto name = StringUtil::Lower(function.Function().GetName().GetIdentifierName());
 		if (!ExtentImplyingPredicates().count(name) || function.GetChildren().size() != 2 ||
-		    function.GetReturnType().id() != LogicalTypeId::BOOLEAN) {
+		    function.GetReturnType().id() != LogicalTypeId::BOOLEAN ||
+		    function.Function().GetCatalogName() != "system" || function.Function().GetSchemaName() != "main") {
 			return nullptr;
 		}
 		auto &children = function.GetChildren();
 		for (idx_t side = 0; side < 2; side++) {
-			auto &col = *children[side];
+			auto *ref = GeometryColumnRef(*children[side]);
 			auto &other = *children[1 - side];
-			if (col.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF || !IsGeometry(col.GetReturnType()) ||
-			    !IsGeometry(other.GetReturnType()) || !other.IsFoldable()) {
+			if (!ref || !IsGeometry(other.GetReturnType()) || !other.IsFoldable()) {
 				continue;
 			}
-			auto &ref = col.Cast<BoundColumnRefExpression>();
-			if (ref.Binding().table_index != get.table_index) {
+			if (ref->Binding().table_index != get.table_index) {
 				continue;
 			}
-			Value constant;
-			if (!ExpressionExecutor::TryEvaluateScalar(context, other, constant) || constant.IsNull()) {
+			Value evaluated;
+			if (!ExpressionExecutor::TryEvaluateScalar(context, other, evaluated) || evaluated.IsNull()) {
 				// A NULL constant makes the predicate NULL: the exact filter drops every
 				// row on its own, and there is no box to derive.
 				return nullptr;
 			}
+			auto &column_type = ref->GetReturnType();
+			Value constant;
+			if (!ConstantForColumn(evaluated, column_type, constant) || !HasFiniteExtent(constant)) {
+				return nullptr;
+			}
 			vector<unique_ptr<Expression>> args;
-			args.push_back(make_uniq<BoundReferenceExpression>(col.GetReturnType(), 0ULL));
+			args.push_back(make_uniq<BoundReferenceExpression>(column_type, 0ULL));
 			args.push_back(make_uniq<BoundConstantExpression>(constant));
 			FunctionBinder binder(context);
 			ErrorData error;
 			auto derived = binder.BindScalarFunction(Identifier(DEFAULT_SCHEMA), Identifier("st_intersects_extent"),
 			                                         std::move(args), error);
-			if (!derived) {
+			// The column side must reach the worker as the bare column: VGI's filter
+			// encoding cannot carry a cast on it.
+			if (!derived || derived->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+			    derived->Cast<BoundFunctionExpression>().GetChildren()[0]->GetExpressionClass() !=
+			        ExpressionClass::BOUND_REF) {
 				return nullptr;
 			}
-			column = ref.Binding().column_index;
+			column = ref->Binding().column_index;
 			return derived;
 		}
 		return nullptr;
@@ -156,13 +241,22 @@ private:
 			if (!derived) {
 				continue;
 			}
-			VGI_LOG(context, "table_function.spatial_extent_derived",
-			        {{"function_name", data.function_name},
-			         {"predicate", expr->ToString()},
-			         {"derived", derived->ToString()}});
 			auto type = derived->Cast<BoundFunctionExpression>().GetChildren()[0]->GetReturnType();
-			get.table_filters.PushFilter(
-			    column, make_uniq<ExpressionFilter>(CreateOptionalFilterExpression(std::move(derived), type)));
+			auto optional = CreateOptionalFilterExpression(std::move(derived), type);
+			// Idempotent: a second optimizer pass over the same plan pushes nothing new.
+			auto existing = get.table_filters.TryGetFilterByColumnIndex(column);
+			if (existing &&
+			    ContainsEqual(*ExpressionFilter::GetExpressionFilter(*existing, "SpatialExtentOptimizer").expr,
+			                  *optional)) {
+				continue;
+			}
+			if (VgiInfoLogActive(context)) {
+				VGI_LOG(context, "table_function.spatial_extent_derived",
+				        {{"function_name", data.function_name},
+				         {"predicate", expr->ToString()},
+				         {"derived", optional->ToString()}});
+			}
+			get.table_filters.PushFilter(column, make_uniq<ExpressionFilter>(std::move(optional)));
 		}
 	}
 
