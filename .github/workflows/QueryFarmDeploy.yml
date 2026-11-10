@@ -51,9 +51,45 @@ jobs:
     secrets:
       ccache_remote_token: ${{ secrets.QUERY_FARM_CCACHE_TOKEN }}
 
+  # The integration suite's engine cannot load the spatial extension, so its
+  # `require spatial` files skip there. Run them here on the binary this
+  # workflow is about to publish: stock DuckDB v2.0.0 with the real spatial
+  # extension, over the subprocess and HTTP transports. Deployment waits for it.
+  # (Not the distribution pipeline's Haybarn-engine binary: loaded into stock
+  # DuckDB it fetches Haybarn's httpfs, which segfaults.)
+  spatial-stock-duckdb:
+    name: Spatial tests on stock DuckDB
+    needs: duckdb-upstream-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      VGI_INSTALL_FIXTURES: "1"
+      VGI_FIXTURES_DIR: /tmp/vgi-python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the linux_amd64 extension
+        uses: actions/download-artifact@v4
+        with:
+          name: main-extensions-linux_amd64
+          path: ${{ runner.temp }}/vgi-extension
+
+      - name: Install the vgi-python fixture workers
+        run: scripts/ci_install_fixtures.sh
+
+      - name: Run the spatial tests
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          extension="$(find "$RUNNER_TEMP/vgi-extension" -name vgi.duckdb_extension -print -quit)"
+          [[ -n "$extension" ]] || { echo "no vgi.duckdb_extension in the artifact"; ls -R "$RUNNER_TEMP/vgi-extension"; exit 1; }
+          scripts/ci_spatial_stock.sh "$extension"
+
   duckdb-deploy:
     name: Deploy to duckdb-extensions.query.farm
-    needs: duckdb-upstream-build
+    needs: [duckdb-upstream-build, spatial-stock-duckdb]
     if: github.event_name != 'pull_request' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/v2.0' || startsWith(github.ref, 'refs/tags/'))
     uses: Query-farm/extension-ci-tools/.github/workflows/_query_farm_deploy.yml@query-farm
     with:

@@ -268,6 +268,20 @@ test_spawn_debug:
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
 
+# The `require spatial` files on stock DuckDB (the Haybarn engine cannot load
+# spatial): this tree's release extension plus the real spatial extension,
+# against VGI_TEST_WORKER. CI runs them on the upstream-DuckDB build before
+# each deploy, over the subprocess and HTTP transports
+# (scripts/ci_spatial_stock.sh). A local release build is Haybarn-engine: it
+# works on macOS, but on Linux use CI or the published query_farm binary.
+VGI_SPATIAL_TESTS := test/sql/integration/table/spatial_extent_derived.test \
+	test/sql/integration/table/expression_filter.test
+.PHONY: test_spatial_stock
+test_spatial_stock:
+	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" uv run --no-project --with duckdb==2.0.0 \
+		python scripts/run_stock_duckdb_slt.py --no-skip \
+		--extension build/release/extension/vgi/vgi.duckdb_extension $(VGI_SPATIAL_TESTS)
+
 # Launcher transport tests — runs the same .test suite as test_spawn but
 # with each worker fronted by `launch:` so traffic flows through the C++
 # launcher: ResolveLauncherSocketPath → AF_UNIX → UnixSocketWorker.  Validates
