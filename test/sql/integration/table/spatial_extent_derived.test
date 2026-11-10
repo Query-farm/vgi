@@ -1,0 +1,146 @@
+# name: test/sql/integration/table/spatial_extent_derived.test
+# description: Exact spatial predicates against a constant (ST_Intersects,
+#              ST_Within, ST_Contains, ...) reach a worker that declared
+#              duckdb.spatial/intersects_extent@1 as a derived, optional
+#              `geom && <constant>` filter, while DuckDB keeps applying the exact
+#              predicate. Negated predicates (ST_Disjoint, NOT ...) derive nothing.
+#
+#              SpatialFilterExampleFunction: 10x10 grid of points for count=100,
+#              point i at x=(i%10)/10, y=(i//10)/10, so x,y ∈ {0.0, 0.1, ..., 0.9}.
+#              Each result is compared with a baseline over a LIMITed subquery,
+#              which no filter can be pushed through.
+#
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require spatial
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# ST_Intersects with a box: the scan gets the derived && and the exact
+# predicate stays in a Filter above it.
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5));
+----
+physical_plan	<REGEX>:(?s).*Filter.*ST_Intersects.*Spatial Filter Example.*(&&|st_intersects_extent).*
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5));
+----
+36
+
+# ============================================================================
+# A triangle: its box holds 36 points, the triangle itself 21 (x + y <= 0.5;
+# the hypotenuse x + y = 0.55 passes between grid points). The derived box
+# narrows the scan; the exact predicate still decides.
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, 'POLYGON((0 0, 0.55 0, 0 0.55, 0 0))'::GEOMETRY);
+----
+21
+
+query I
+SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100) LIMIT 100000)
+WHERE ST_Intersects(geom, 'POLYGON((0 0, 0.55 0, 0 0.55, 0 0))'::GEOMETRY);
+----
+21
+
+# ============================================================================
+# Other predicates that imply intersecting boxes, in either argument order.
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE ST_Within(geom, ST_MakeEnvelope(0.15, 0.15, 0.55, 0.55));
+----
+physical_plan	<REGEX>:(?s).*Filter.*ST_Within.*Spatial Filter Example.*(&&|st_intersects_extent).*
+
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100)
+   WHERE ST_Within(geom, ST_MakeEnvelope(0.15, 0.15, 0.55, 0.55)))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100) LIMIT 100000)
+   WHERE ST_Within(geom, ST_MakeEnvelope(0.15, 0.15, 0.55, 0.55)));
+----
+true
+
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE ST_Contains(ST_MakeEnvelope(0.15, 0.15, 0.55, 0.55), geom);
+----
+physical_plan	<REGEX>:(?s).*Filter.*ST_Contains.*Spatial Filter Example.*(&&|st_intersects_extent).*
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Contains(ST_MakeEnvelope(0.15, 0.15, 0.55, 0.55), geom);
+----
+16
+
+# Points exactly on the box edge touch it: && is inclusive, so they survive.
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100)
+   WHERE ST_Touches(geom, ST_MakeEnvelope(0.2, 0.2, 0.5, 0.5)))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100) LIMIT 100000)
+   WHERE ST_Touches(geom, ST_MakeEnvelope(0.2, 0.2, 0.5, 0.5)));
+----
+true
+
+# ============================================================================
+# Negated predicates keep rows whose boxes do NOT intersect: nothing derived.
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE ST_Disjoint(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5));
+----
+physical_plan	<!REGEX>:(?s).*(&&|st_intersects_extent).*
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Disjoint(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5));
+----
+64
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE NOT ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5));
+----
+64
+
+# An OR with another predicate is not a plain conjunct: nothing derived, and the
+# result is still exact.
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5)) OR x >= 0.9;
+----
+46
+
+# A NULL constant: the predicate is NULL, no rows, nothing to derive.
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, NULL::GEOMETRY);
+----
+0
+
+# Combined with an attribute filter, both apply.
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5)) AND x >= 0.3;
+----
+18

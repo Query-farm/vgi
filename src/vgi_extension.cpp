@@ -74,6 +74,7 @@
 #include "vgi_protocols.hpp"
 #include "vgi_query_function.hpp"
 #include "vgi_projection_pushdown.hpp"
+#include "vgi_spatial_extent_pushdown.hpp"
 #include "vgi_attach_tickets.hpp"
 #include "vgi_reflection.hpp"
 #include "vgi_copy_from_impl.hpp"
@@ -3769,6 +3770,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
 	vgi::RegisterVgiLateralBatchRewriter(config);
 	OptimizerExtension::Register(config, VgiRequiredFiltersOptimizer());
+	vgi::RegisterVgiSpatialExtentOptimizer(config);
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);

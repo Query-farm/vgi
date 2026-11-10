@@ -369,6 +369,7 @@ src/vgi_query_rpc.cpp
 src/vgi_constraint_contract.cpp
 src/vgi_column_expression.cpp
 src/vgi_projection_pushdown.cpp
+src/vgi_spatial_extent_pushdown.cpp
 src/vgi_column_metadata.cpp
     src/vgi_macro_contract.cpp
 src/vgi_index_contract.cpp
