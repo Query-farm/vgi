@@ -113,18 +113,24 @@ void VgiCatalogSet::CacheMissingEntryLocked(const std::string &name, uint64_t ex
 // after the first finishes, and skip the load. No RPC duplication.
 //
 // Mirrors UnityCatalog UCTableSet::EnsureLoaded (~/Development/unity_catalog).
-void VgiCatalogSet::EnsureLoaded(ClientContext &context) {
+void VgiCatalogSet::EnsureLoaded(ClientContext &context, bool honor_empty_hint) {
 	// Pre-read setting outside any lock — avoids lock-order inversion with
 	// DuckDB's setting registry.
-	const bool trust_empty_kinds = ReadTrustEmptyKinds(context);
+	const bool trust_empty_kinds = honor_empty_hint && ReadTrustEmptyKinds(context);
 	// Check is_loaded_ briefly under entry_lock_ — quick path when already loaded.
+	// A load the zero-count hint skipped is not a load for a caller that
+	// ignores the hint.
+	auto loaded = [&]() {
+		return is_loaded_ && (honor_empty_hint || !loaded_by_empty_hint_);
+	};
 	{
 		std::lock_guard<std::mutex> entry_lk(entry_lock_);
-		if (is_loaded_) {
+		if (loaded()) {
 			return;
 		}
 		if (ShouldBypassRpcLocked(context, trust_empty_kinds)) {
 			is_loaded_ = true;
+			loaded_by_empty_hint_ = true;
 			return;
 		}
 	}
@@ -135,7 +141,7 @@ void VgiCatalogSet::EnsureLoaded(ClientContext &context) {
 	// Re-check under load_lock_ — another thread may have just finished.
 	{
 		std::lock_guard<std::mutex> entry_lk(entry_lock_);
-		if (is_loaded_) {
+		if (loaded()) {
 			return;
 		}
 	}
@@ -143,6 +149,7 @@ void VgiCatalogSet::EnsureLoaded(ClientContext &context) {
 	{
 		std::lock_guard<std::mutex> entry_lk(entry_lock_);
 		is_loaded_ = true;
+		loaded_by_empty_hint_ = false;
 	}
 }
 
@@ -166,6 +173,7 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 			outcome = "hit";
 		} else if (ShouldBypassRpcLocked(context, trust_empty_kinds)) {
 			is_loaded_ = true;
+			loaded_by_empty_hint_ = true;
 			outcome = "kind_empty";
 		}
 	}
@@ -210,6 +218,43 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 	         {"outcome", outcome},
 	         {"triggered_load", !was_loaded_before ? "true" : "false"}});
 	return nullptr;
+}
+
+void VgiCatalogSet::AddHiddenEntry(unique_ptr<CatalogEntry> entry) {
+	std::lock_guard<std::mutex> lock(entry_lock_);
+	// Same first-wins rule as CreateEntryLocked: a bound statement may hold a
+	// raw pointer to the existing entry.
+	auto key = entry->name.GetIdentifierName();
+	if (hidden_entries_.find(key) != hidden_entries_.end()) {
+		return;
+	}
+	hidden_entries_[key] = std::move(entry);
+	generation_.fetch_add(1, std::memory_order_release);
+}
+
+optional_ptr<CatalogEntry> VgiCatalogSet::GetHiddenEntry(ClientContext &context, const std::string &name) {
+	{
+		std::lock_guard<std::mutex> lock(entry_lock_);
+		auto it = hidden_entries_.find(name);
+		if (it != hidden_entries_.end()) {
+			return it->second.get();
+		}
+	}
+	EnsureLoaded(context, /*honor_empty_hint=*/false);
+	optional_ptr<CatalogEntry> result;
+	{
+		std::lock_guard<std::mutex> lock(entry_lock_);
+		auto it = hidden_entries_.find(name);
+		if (it != hidden_entries_.end()) {
+			result = it->second.get();
+		}
+	}
+	VGI_LOG(context, "catalog.entry_cache",
+	        {{"set_kind", CacheKindName()},
+	         {"name", name},
+	         {"outcome", result ? "hidden_hit" : "hidden_not_found"},
+	         {"triggered_load", "false"}});
+	return result;
 }
 
 void VgiCatalogSet::CreateEntryLocked(unique_ptr<CatalogEntry> entry) {
@@ -265,8 +310,10 @@ void VgiCatalogSet::ClearEntries() {
 	std::lock_guard<std::mutex> lock(entry_lock_);
 	generation_.fetch_add(1, std::memory_order_release);
 	entries_.clear();
+	hidden_entries_.clear();
 	missing_entries_.clear();
 	is_loaded_ = false;
+	loaded_by_empty_hint_ = false;
 }
 
 std::vector<unique_ptr<CatalogEntry>> VgiCatalogSet::HarvestEntries() {
@@ -284,9 +331,16 @@ std::vector<unique_ptr<CatalogEntry>> VgiCatalogSet::HarvestEntries() {
 			harvested.push_back(std::move(kv.second));
 		}
 	}
+	for (auto &kv : hidden_entries_) {
+		if (kv.second) {
+			harvested.push_back(std::move(kv.second));
+		}
+	}
 	entries_.clear();
+	hidden_entries_.clear();
 	missing_entries_.clear();
 	is_loaded_ = false;
+	loaded_by_empty_hint_ = false;
 	generation_.fetch_add(1, std::memory_order_release);
 	return harvested;
 }

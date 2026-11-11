@@ -9,6 +9,7 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "storage/vgi_table_function_resolver.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_column_expression.hpp"
@@ -54,51 +55,48 @@ ResolveWriteFunction(ClientContext &context, VgiTableEntry &table, const char *o
 
 using namespace vgi;
 
-// Look up the write function's ``has_finalize`` flag on its
-// ``VgiTableFunctionInfo`` (attached when the catalog loaded the function;
-// see ``vgi_table_function_set.cpp::LoadEntries``). The write function may
-// live in a different schema than the table being written to (e.g., a
-// virtual ``topics.<topic>`` table routes INSERT to ``main.kafka_topic_insert``),
-// so we try the table's schema first, then the catalog's default schema.
-// Returns false if not found or if the function isn't a VGI function —
-// preserving the legacy close-and-drain behavior for workers that don't opt in.
-static bool WriteFunctionHasFinalize(ClientContext &context, Catalog &catalog, const string &table_schema,
-                                     const string &function_name) {
-	auto entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, Identifier(table_schema),
-	                              Identifier(function_name), OnEntryNotFound::RETURN_NULL);
-	if (!entry) {
-		if (auto schema = catalog.GetDefaultSchema()) {
-			entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, *schema, Identifier(function_name),
-			                         OnEntryNotFound::RETURN_NULL);
-		}
-	}
-	if (!entry) {
-		return false;
-	}
-	for (auto &overload : entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
-		if (auto info = dynamic_cast<vgi::VgiTableFunctionInfo *>(overload->function_info.get())) {
-			return info->function_info().has_finalize;
-		}
-	}
-	return false;
-}
+// Resolve the write function's listing entry through the shared resolver
+// (vgi_table_function_resolver.hpp), the one the scan paths use: visible
+// entries in the worker-claimed schema, the table's schema and the catalog's
+// default schema (a virtual ``topics.<topic>`` table may route INSERT to
+// ``main.kafka_topic_insert``), then those schemas' hidden (protocol 3.3
+// table_only) sets, where every SDK now lists write functions. Write functions
+// are always worker RPCs, so the system catalog is never consulted, and an
+// unlisted one is a BinderException: before 3.3 it silently lost has_finalize
+// and the bind request named no schema.
+struct ResolvedWriteFunction {
+	//! The schema the function resolved in; the bind request names it, since a
+	//! worker may register the same name in several schemas.
+	string schema_name;
+	//! The function declares a finalize stage (VgiTableFunctionInfo).
+	bool has_finalize = false;
+};
 
-// Which schema the write function resolves in. A worker may register the same
-// function name in several schemas, so the bind request has to name the schema
-// the function was actually found in. Mirrors WriteFunctionHasFinalize's
-// table-schema-then-default-schema order. Empty when not found.
-static string ResolveWriteFunctionSchema(ClientContext &context, Catalog &catalog, const string &table_schema,
-                                         const string &function_name) {
-	if (catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, Identifier(table_schema),
-	                     Identifier(function_name), OnEntryNotFound::RETURN_NULL)) {
-		return table_schema;
+static ResolvedWriteFunction ResolveWriteFunctionEntry(ClientContext &context, VgiTableEntry &table,
+                                                       const char *operation,
+                                                       const VgiWriteFunctionResult &write_func) {
+	auto &catalog = table.GetCatalog();
+	vgi::VgiTableFunctionRequest request;
+	request.catalog = &catalog;
+	request.table_schema = table.GetTableInfo().schema_name;
+	request.table_name = table.GetTableInfo().name;
+	request.role = operation;
+	request.function_name = write_func.function_name;
+	request.worker_schema = write_func.schema_name;
+	if (auto default_schema = catalog.GetDefaultSchema()) {
+		request.default_schema = default_schema->GetIdentifierName();
 	}
-	auto default_schema = catalog.GetDefaultSchema();
-	if (default_schema && catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, *default_schema,
-	                                       Identifier(function_name), OnEntryNotFound::RETURN_NULL)) {
-		return default_schema->GetIdentifierName();
+	request.allow_system_catalog = false;
+	auto resolved = vgi::ResolveVgiTableFunction(context, request);
+	ResolvedWriteFunction result;
+	result.schema_name = resolved.schema_name;
+	for (auto &overload : resolved.entry->functions.functions) {
+		if (auto info = dynamic_cast<vgi::VgiTableFunctionInfo *>(overload->function_info.get())) {
+			result.has_finalize = info->function_info().has_finalize;
+			break;
+		}
 	}
-	return string();
+	return result;
 }
 
 // ============================================================================
@@ -147,7 +145,8 @@ struct SetupWriteResult {
 };
 
 static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEntry &table,
-                                             const VgiWriteFunctionResult &write_func, const VgiSchemaPtr &input_schema,
+                                             const VgiWriteFunctionResult &write_func,
+                                             const ResolvedWriteFunction &resolved, const VgiSchemaPtr &input_schema,
                                              const VgiBatchPtr &write_options,
                                              const std::vector<uint8_t> &transaction_opaque_data) {
 	auto &catalog = table.GetCatalog().Cast<VgiCatalog>();
@@ -184,8 +183,7 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
 	}
 
 	connection->SetInputSchema(input_schema);
-	connection->SetSchemaName(
-	    ResolveWriteFunctionSchema(context, catalog, table.GetTableInfo().schema_name, write_func.function_name));
+	connection->SetSchemaName(resolved.schema_name);
 	auto bind_result = connection->PerformBindRpc();
 	connection->PerformInit(bind_result, {}, nullptr, {}, "INPUT");
 	connection->OpenInputWriter();
@@ -546,10 +544,10 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 		// user-column schema (sans rowid). Same shape used by GetLocalSinkState.
 		gstate->expected_returning_schema = input_schema;
 	}
-	gstate->has_finalize = WriteFunctionHasFinalize(context, table->GetCatalog(), table->GetTableInfo().schema_name,
-	                                                write_func.function_name);
+	const auto resolved_write = ResolveWriteFunctionEntry(context, *table, "insert", write_func);
+	gstate->has_finalize = resolved_write.has_finalize;
 	{
-		auto setup = SetupWriteConnection(context, *table, write_func, input_schema, write_options,
+		auto setup = SetupWriteConnection(context, *table, write_func, resolved_write, input_schema, write_options,
 		                                  vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
@@ -699,10 +697,10 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 		}
 		gstate->expected_returning_schema = response_schema;
 	}
-	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(), table.GetTableInfo().schema_name,
-	                                                write_func.function_name);
+	const auto resolved_write = ResolveWriteFunctionEntry(context, table, "delete", write_func);
+	gstate->has_finalize = resolved_write.has_finalize;
 	{
-		auto setup = SetupWriteConnection(context, table, write_func, input_schema, write_options,
+		auto setup = SetupWriteConnection(context, table, write_func, resolved_write, input_schema, write_options,
 		                                  vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
@@ -854,10 +852,10 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 		}
 		gstate->expected_returning_schema = response_schema;
 	}
-	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(), table.GetTableInfo().schema_name,
-	                                                write_func.function_name);
+	const auto resolved_write = ResolveWriteFunctionEntry(context, table, "update", write_func);
+	gstate->has_finalize = resolved_write.has_finalize;
 	{
-		auto setup = SetupWriteConnection(context, table, write_func, input_schema, write_options,
+		auto setup = SetupWriteConnection(context, table, write_func, resolved_write, input_schema, write_options,
 		                                  vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);

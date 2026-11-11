@@ -1356,6 +1356,11 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 	};
 	std::map<std::string, GlobalGroup> groups;
 	for (const auto &func_info : attach_result.global_functions) {
+		// A global function exists to be called from SQL; a table_only one
+		// would be published only to be hidden again.
+		if (func_info.visibility == vgi::VgiFunctionVisibility::TableOnly) {
+			continue;
+		}
 		const auto global_name = vgi::VgiGlobalFunctionName(attach_result.global_function_prefix, func_info.name);
 		auto it = groups.find(global_name);
 		if (it == groups.end()) {

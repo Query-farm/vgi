@@ -3279,6 +3279,19 @@ VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
 	info.schema_name = SchemaNameFromPath(wire.schema_path, "FunctionInfo.schema_path");
 	info.tags = std::move(wire.tags);
 	info.function_type = FromWire(wire.function_type);
+	// Protocol 3.3: "public" (or null/absent) or "table_only". Anything else is a
+	// worker bug that must fail loudly: guessing would either expose a function
+	// the worker meant to hide or hide one it meant to expose.
+	if (wire.visibility && *wire.visibility != "public") {
+		if (*wire.visibility == "table_only") {
+			info.visibility = VgiFunctionVisibility::TableOnly;
+		} else {
+			throw IOException(FunctionInfoViolation(worker_path, info.name, "visibility"),
+			                  "VGI worker '%s' lists function '%s' with invalid visibility '%s' (expected 'public' "
+			                  "or 'table_only')",
+			                  worker_path, info.name, *wire.visibility);
+		}
+	}
 	info.description = std::move(wire.description);
 	// Nullable on the wire; empty == unset, the convention tables/views use.
 	info.comment = wire.comment.value_or("");

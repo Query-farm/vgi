@@ -826,6 +826,11 @@ struct FunctionInfo {
 	std::vector<std::string> required_settings{};
 	//! Secrets required by the function (each entry has secret_type, optional secret_name, optional scope).
 	std::vector<RequiredSecret> required_secrets{};
+	//! Who may see and call the function (protocol 3.3). `"public"` (also what null/absent means): an
+	//! ordinary catalog function. `"table_only"`: listed only so a table descriptor that names it (scan,
+	//! insert, update, delete) can resolve its capabilities; clients must not surface it or let SQL call
+	//! it. Any other value is a protocol violation.
+	std::optional<std::string> visibility{};
 };
 bool operator==(const FunctionInfo &a, const FunctionInfo &b);
 inline bool operator!=(const FunctionInfo &a, const FunctionInfo &b) {

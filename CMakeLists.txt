@@ -415,6 +415,7 @@ src/storage/vgi_create_index.cpp
 src/storage/vgi_scalar_function_set.cpp
 src/storage/vgi_aggregate_function_set.cpp
 src/storage/vgi_table_function_set.cpp
+src/storage/vgi_table_function_resolver.cpp
 src/storage/vgi_macro_set.cpp
 src/storage/vgi_object_counts.cpp
 src/storage/vgi_transaction.cpp

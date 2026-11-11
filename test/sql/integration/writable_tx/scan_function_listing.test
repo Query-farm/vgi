@@ -1,0 +1,119 @@
+# name: test/sql/integration/writable_tx/scan_function_listing.test
+# description: Protocol 3.3 function visibility (docs/function_visibility.md),
+#              against each SDK's txfix fixture: a table's hidden scan and its
+#              write function are listed table_only, so they are absent from
+#              duckdb_functions() and SQL cannot call them, while the table keeps
+#              their capabilities (rowid needs projection pushdown, UPDATE needs
+#              the update function); an exposed scan (expose_scan) is public.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-scan-listing');
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+# ============================================================================
+# table_only functions: not listed, not callable
+# ============================================================================
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 't' AND function_name IN ('items_scan', 'items_update');
+----
+0
+
+# The ordinary functions of the same schema are listed as before.
+query I
+SELECT count(*) > 0 FROM duckdb_functions() WHERE database_name = 't' AND function_name = 'reset';
+----
+true
+
+statement error
+SELECT * FROM t.main.items_scan();
+----
+<REGEX>:.*items_scan.*does not exist.*
+
+statement error
+SELECT * FROM t.main.items_update();
+----
+<REGEX>:.*items_update.*does not exist.*
+
+# ============================================================================
+# The table still has the hidden functions' capabilities
+# ============================================================================
+
+# rowid is a virtual column: DuckDB reads it only through projection pushdown,
+# which the hidden items_scan entry carries.
+query II
+SELECT rowid, id FROM t.main.items ORDER BY id;
+----
+1	1
+2	2
+3	3
+
+query I
+SELECT count(*) FROM t.main.items;
+----
+3
+
+query T
+SELECT name FROM t.main.items WHERE rowid = 2;
+----
+b
+
+# UPDATE resolves the hidden items_update entry.
+query II
+UPDATE t.main.items SET qty = 11 WHERE id = 1 RETURNING id, qty;
+----
+1	11
+
+query I
+UPDATE t.main.items SET qty = 12 WHERE id = 1;
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	12
+2	b	20
+3	c	30
+
+# ============================================================================
+# An exposed scan (expose_scan) is an ordinary public function
+# ============================================================================
+
+query I
+SELECT count(*) > 0 FROM duckdb_functions() WHERE database_name = 't' AND function_name = 'labels_scan';
+----
+true
+
+query IT
+SELECT id, label FROM t.main.labels_scan() ORDER BY id;
+----
+1	x
+2	y
+
+query IT
+SELECT id, label FROM t.main.labels ORDER BY id;
+----
+1	x
+2	y
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true

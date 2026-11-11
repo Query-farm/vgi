@@ -121,10 +121,16 @@ out as the initial rows below. Every test file starts with `SELECT * FROM t.main
 
 Initial rows: `(1, 'a', 10)`, `(2, 'b', 20)`, `(3, 'c', 30)`. Scans return rows ordered by `id`.
 
+- **Scan function**: `items_scan`, left **hidden**: the table descriptor does not set
+  `expose_scan` (the SDK default), so the SDK lists it with visibility `table_only`
+  ([function visibility](function_visibility.md)). It is absent from `duckdb_functions()` and
+  `SELECT * FROM t.main.items_scan()` fails, yet the table's scans keep its capabilities.
 - **Row id**: a BIGINT row-id virtual column whose value is `id`. The scan supports projection
-  pushdown (DuckDB reads `rowid` only through it).
+  pushdown (DuckDB reads `rowid` only through it, so a scan whose listing entry were missing
+  would fail with "Virtual columns require projection pushdown").
 - **Writable** through an **update function** declared on the table descriptor (`items_update`, a
-  table in-out function). Write result modes for update: advertise the highest mode the SDK can
+  table in-out function). Write functions are always `table_only`: `items_update` is listed but
+  absent from `duckdb_functions()`. Write result modes for update: advertise the highest mode the SDK can
   produce, at least `rows` (`changes` if supported; see [Write result modes](#write-result-modes)).
   No insert or delete function.
 - **Updatable**: `name`, `qty`. DuckDB sends the SET columns plus `rowid` (every column with
@@ -145,7 +151,11 @@ Initial rows: `(1, 'a', 10)`, `(2, 'b', 20)`, `(3, 'c', 30)`. Scans return rows 
 ### `main.labels`
 
 `id INTEGER NOT NULL PRIMARY KEY`, `label VARCHAR`; rows `(1, 'x')`, `(2, 'y')`. Read-only: no
-insert, update or delete function, but the same constraint declarations as `items`.
+insert, update or delete function, but the same constraint declarations as `items`. Its scan
+function is `labels_scan`, with **`expose_scan` set** on the table descriptor (`exposeScan` /
+`ExposeScan` in SDKs that spell it so), so it is `public`: listed in `duckdb_functions()` and
+callable as `SELECT * FROM t.main.labels_scan()` (no arguments; it returns the table's rows). SDKs whose fixture used other names rename to
+these.
 `UPDATE t.main.labels ...` must fail with the engine's `does not support UPDATE`, not with a
 constraint-profile error. (The SDK must still negotiate `vgi.constraint.enforce.v1`, because `items`
 is a writable table with constraints. Before vgi v2.0 commit "check the declared write before the
@@ -198,4 +208,5 @@ coverage, once the engine grows OLD/NEW RETURNING.
 | `update.test` | rowid = id (BIGINT, in WHERE); plain UPDATE counts; multi-column/multi-row; no-match; computed SET; SET NULL; RETURNING `*` and expressions; `id` not updatable; `qty >= 0`; refused statements change nothing; `SET id = id` is not a change; INSERT/DELETE not supported on `items`; `labels` "does not support UPDATE", not a constraint-profile error; `reset()` |
 | `transactions.test` | BEGIN/UPDATE/RETURNING/read-your-writes/computed SET on staged value/COMMIT, other attach sees committed only; ROLLBACK; refused COMMIT (`commit refused: qty -5 for id 2`) applies nothing and the session recovers; autocommit UPDATE (plain and RETURNING) applies; refused autocommit commit; event log order, `ok` values, distinct lowercase-hex ids, begin first per id |
 | `transaction_ids.test` | non-transactional attach: no id in or out of BEGIN, no events, in-out `tx_id` NULL; autocommit statements each get an id that begin minted and commit received; in one transaction `current_tx()` (twice), `tag_tx()` over several rows and the update function share one id, which the commit event carries; the rollback hook gets the id; consecutive transactions differ; both attaches in one statement |
+| `scan_function_listing.test` | protocol 3.3 visibility: `items_scan` and `items_update` absent from `duckdb_functions()`; `SELECT * FROM t.main.items_scan()` fails; `rowid`, `count(*)` and `UPDATE ... RETURNING` still work on `items` (the hidden entries keep their capabilities); `labels_scan` listed and callable |
 | `returning_old.test` | `RETURNING OLD.x` is a Binder Error on a native table and on both attaches, and changes nothing; with `changes` advertised, RETURNING gets `rows` and plain UPDATE `count` (both attaches) |

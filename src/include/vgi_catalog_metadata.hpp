@@ -586,10 +586,21 @@ struct VgiFilterFunctionCapability {
 	uint64_t version = 0;
 };
 
+//! FunctionInfo.visibility (protocol 3.3). Absent/null on the wire means Public.
+enum class VgiFunctionVisibility : uint8_t {
+	//! An ordinary catalog function: listed by duckdb_functions() and callable from SQL.
+	Public,
+	//! Listed only so the tables that name it (scan, insert, update, delete) can resolve
+	//! its capabilities. Held in the schema's hidden set: never returned by Scan() or
+	//! LookupEntry(), so it is neither listed nor callable from SQL.
+	TableOnly,
+};
+
 struct VgiFunctionInfo {
 	std::string name;
 	std::string schema_name;
 	VgiFunctionType function_type = VgiFunctionType::Scalar;
+	VgiFunctionVisibility visibility = VgiFunctionVisibility::Public;
 	std::string description;
 	// Short operator-facing note (e.g. "deprecated, use v2"), distinct from
 	// `description`'s intrinsic documentation — mirrors the `comment` field

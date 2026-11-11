@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "storage/vgi_table_entry.hpp"
+#include "storage/vgi_table_function_resolver.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 
@@ -439,6 +440,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		marker_bd->has_at_clause = !at_unit.empty();
 		marker_bd->table_catalog_name = catalog_.GetName().GetIdentifierName();
 		marker_bd->table_schema_name = ParentSchema().name.GetIdentifierName();
+		marker_bd->table_name = name.GetIdentifierName();
 		marker_bd->default_schema = attach_result->default_schema.value_or("");
 		const auto &cols = GetColumns();
 		for (auto &col : cols.Logical()) {
@@ -552,6 +554,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			marker_bd->required_extensions = std::move(branches_result.required_extensions);
 			marker_bd->table_catalog_name = catalog_.GetName().GetIdentifierName();
 			marker_bd->table_schema_name = ParentSchema().name.GetIdentifierName();
+			marker_bd->table_name = name.GetIdentifierName();
 			marker_bd->default_schema = attach_result->default_schema.value_or("");
 			// Canonical column list comes from the table's declared columns
 			// (GetColumns() inherited from TableCatalogEntry). The rewriter's
@@ -625,79 +628,39 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// function names per schema and may reuse one name across schemas, so the
 	// bind request has to name the schema we found it in — not just the table's.
 	std::string scan_function_schema;
-	optional_ptr<TableFunctionCatalogEntry> func_entry;
 	// `default_schema` is read regardless of which branch below needs it: the
-	// worker-provided path also checks against it (see the comment there).
+	// worker-provided path also checks against it.
 	const auto default_schema = vgi_catalog.attach_result()->default_schema.value_or("");
+	// The shared resolver (vgi_table_function_resolver.hpp): visible entries in
+	// the worker-claimed third schema, the table's own schema and the catalog's
+	// default schema; then those schemas' hidden (protocol 3.3 table_only) sets;
+	// then the system catalog for native delegation (read_parquet, iceberg_scan).
+	// A function that resolves nowhere is a BinderException naming the worker:
+	// before 3.3 it silently scanned with every capability off.
+	//
 	// A worker-claimed schema equal to one we already have a stable, live
 	// reference to (the table's own schema, or the catalog's default) is
-	// resolved through the EXACT SAME call as the pre-1.5.0 heuristic below —
-	// empirically, routing that case through a separate `if` body (even when
+	// resolved through the EXACT SAME lookup as the table/default cascade —
+	// empirically, routing that case through a separate lookup (even when
 	// passing the identical schema-name string) was observed to silently
 	// disable filter/projection pushdown on a later bind within the same
 	// session (see cache/filter_pushdown_keys.test) — a pre-existing fragility
 	// in the underlying catalog-entry cache that a byte-identical call
-	// shouldn't trigger, but reliably did. Only take the worker-provided
-	// path — genuinely new territory the pre-1.5.0 heuristic never
-	// reached — for a schema that names neither of those two.
-	bool worker_schema_is_third_schema = !scan_result.schema_name.empty() &&
-	                                     scan_result.schema_name != ParentSchema().name.GetIdentifierName() &&
-	                                     scan_result.schema_name != default_schema;
-	if (worker_schema_is_third_schema) {
-		// Worker-provided through VGI 2.0 schema_path, naming a schema other than the
-		// table's own or the catalog's default — authoritative, no guessing
-		// needed. Only the worker genuinely knows which schema its own
-		// returned function_name lives in. A worker-claimed schema with no
-		// matching VGI-registered function falls through to the
-		// system-catalog lookup below, same as the fallback path does for a
-		// genuinely native DuckDB function.
-		func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(context, Identifier(scan_result.schema_name),
-		                                                          Identifier(scan_result.function_name),
-		                                                          OnEntryNotFound::RETURN_NULL);
-		if (func_entry) {
-			scan_function_schema = scan_result.schema_name;
-		}
-	} else {
-		// schema_name absent, or naming a schema we already have a stable
-		// reference to. Absence is NOT just a pre-1.5.0-peer case: the field
-		// is optional by protocol design, and plenty of fully-1.5.0 workers
-		// (including this repo's own fixture worker — every hand-rolled
-		// catalog_table_scan_branches_get override that builds a ScanBranch
-		// directly) legitimately never set it. The old two-step heuristic —
-		// the table's own schema, then the catalog's default schema — is
-		// still required to resolve those, not just kept for compatibility.
-		func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
-		    context, ParentSchema().name, Identifier(scan_result.function_name), OnEntryNotFound::RETURN_NULL);
-		if (func_entry) {
-			scan_function_schema = ParentSchema().name.GetIdentifierName();
-		} else {
-			// Function may be in a different schema (e.g., main) than the table's schema (e.g., data)
-			if (!default_schema.empty() && default_schema != ParentSchema().name.GetIdentifierName()) {
-				func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(context, Identifier(default_schema),
-				                                                          Identifier(scan_result.function_name),
-				                                                          OnEntryNotFound::RETURN_NULL);
-				if (func_entry) {
-					scan_function_schema = default_schema;
-				}
-			}
-		}
-	}
-	bool from_system_catalog = false;
-	if (!func_entry) {
-		// Last-resort fallback to the system catalog for built-in DuckDB
-		// table functions like `read_parquet` or `iceberg_scan` that workers
-		// declare via ScanFunctionResult. The multi-branch rewriter
-		// (vgi_multi_scan_rewriter.cpp:203) already does this fallback —
-		// mirror it for the single-branch path so workers can delegate scans
-		// to native DuckDB functions without going through a UNION ALL.
-		EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(Identifier(scan_result.function_name)));
-		auto sys_entry =
-		    Catalog::GetEntry(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL);
-		if (sys_entry) {
-			func_entry = &sys_entry->Cast<TableFunctionCatalogEntry>();
-			from_system_catalog = true;
-		}
-	}
+	// shouldn't trigger, but reliably did. The resolver keeps that rule: only a
+	// schema that names neither of those two gets its own lookup.
+	vgi::VgiTableFunctionRequest scan_request;
+	scan_request.catalog = &catalog_;
+	scan_request.table_schema = ParentSchema().name.GetIdentifierName();
+	scan_request.table_name = name.GetIdentifierName();
+	scan_request.role = "scan";
+	scan_request.function_name = scan_result.function_name;
+	scan_request.worker_schema = scan_result.schema_name;
+	scan_request.default_schema = default_schema;
+	scan_request.allow_system_catalog = true;
+	auto resolved_scan = vgi::ResolveVgiTableFunction(context, scan_request);
+	optional_ptr<TableFunctionCatalogEntry> func_entry = resolved_scan.entry;
+	scan_function_schema = resolved_scan.schema_name;
+	const bool from_system_catalog = resolved_scan.from_system_catalog;
 
 	if (from_system_catalog && func_entry) {
 		if (generated_columns)

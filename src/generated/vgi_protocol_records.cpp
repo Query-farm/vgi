@@ -1383,6 +1383,7 @@ static const VgiSchemaPtr &FunctionInfoRecordSchema() {
 	    type::Int64().Named("input_rows_per_call", /*nullable=*/true),
 	    type::List(type::Utf8(), /*item_nullable=*/true).Named("required_settings", /*nullable=*/false),
 	    type::List(type::Struct({type::Utf8().Named("secret_type", /*nullable=*/false), type::Utf8().Named("scope", /*nullable=*/true), type::Utf8().Named("secret_name", /*nullable=*/true)}), /*item_nullable=*/true).Named("required_secrets", /*nullable=*/false),
+	    type::Utf8().Named("visibility", /*nullable=*/true),
 	});
 	return schema;
 }
@@ -1429,7 +1430,8 @@ bool operator==(const FunctionInfo &a, const FunctionInfo &b) {
 	       wire::Equal(a.input_from_args, b.input_from_args) &&
 	       wire::Equal(a.input_rows_per_call, b.input_rows_per_call) &&
 	       wire::Equal(a.required_settings, b.required_settings) &&
-	       wire::Equal(a.required_secrets, b.required_secrets);
+	       wire::Equal(a.required_secrets, b.required_secrets) &&
+	       wire::Equal(a.visibility, b.visibility);
 }
 
 template <class Reader>
@@ -1476,6 +1478,7 @@ static void ReadFunctionInfo(Reader &r, FunctionInfo &out) {
 	r.Optional("input_rows_per_call", out.input_rows_per_call);
 	r.Required("required_settings", out.required_settings);
 	r.Required("required_secrets", out.required_secrets);
+	r.Optional("visibility", out.visibility);
 }
 
 void ReadValue(const VgiColumn &col, int64_t i, FunctionInfo &out, const wire::Ctx &ctx) {
@@ -1526,6 +1529,7 @@ void WriteValue(ArrowArray *array, const FunctionInfo &value) {
 	WriteValue(array->children[39], value.input_rows_per_call);
 	WriteValue(array->children[40], value.required_settings);
 	WriteValue(array->children[41], value.required_secrets);
+	WriteValue(array->children[42], value.visibility);
 	::duckdb::vgi::append::FinishElement(array);
 }
 
@@ -1573,6 +1577,7 @@ VgiBatchPtr ToBatch(const FunctionInfo &value) {
 	WriteValue(b.column(39), value.input_rows_per_call);
 	WriteValue(b.column(40), value.required_settings);
 	WriteValue(b.column(41), value.required_secrets);
+	WriteValue(b.column(42), value.visibility);
 	b.FinishRow();
 	return b.Finish();
 }

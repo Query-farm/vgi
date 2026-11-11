@@ -275,6 +275,11 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 					rpc_ctx.entity_qualifier = schema_name;
 					auto function_list = vgi_schema.GetFunctionInventory(rpc_ctx, function_type, context);
 					for (auto &func : function_list) {
+						// Hidden like duckdb_functions(): table_only functions are
+						// not callable, so they have no arguments to document.
+						if (func.visibility == vgi::VgiFunctionVisibility::TableOnly) {
+							continue;
+						}
 						EmitFunctionArgs(context, catalog_name, schema_name, func, data->rows);
 					}
 				} catch (const std::exception &e) {

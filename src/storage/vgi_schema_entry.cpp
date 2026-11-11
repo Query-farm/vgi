@@ -7,6 +7,7 @@
 #include "storage/vgi_schema_entry.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
@@ -865,6 +866,15 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transa
 		// Other types not yet implemented
 		return nullptr;
 	}
+}
+
+optional_ptr<TableFunctionCatalogEntry> VgiSchemaEntry::GetHiddenTableFunction(ClientContext &context,
+                                                                               const std::string &name) {
+	auto entry = table_functions_.GetHiddenEntry(context, name);
+	if (!entry) {
+		return nullptr;
+	}
+	return &entry->Cast<TableFunctionCatalogEntry>();
 }
 
 VgiCatalogSet &VgiSchemaEntry::GetCatalogSet(CatalogType type) {

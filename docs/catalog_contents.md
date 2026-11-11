@@ -87,6 +87,12 @@ apply to singleton `FunctionInfo` results from per-name and per-schema RPCs.
 The payloads and author-facing types are unchanged. Other binary metadata fields
 remain plain binary, and existing enum dictionaries retain their int16 indices.
 
+`FunctionInfo.visibility` (protocol 3.3) is a nullable plain `utf8`, not a
+dictionary: `"public"` (also null or absent) or `"table_only"`. A `table_only`
+function is listed only so the tables that name it can resolve its
+capabilities; the client keeps it out of `duckdb_functions()` and SQL cannot
+call it. See [function visibility](function_visibility.md).
+
 Every collection is complete across all schemas. Missing categories mean that
 the catalog has no objects of that type. The worker may skip computing a kind
 whose `estimated_object_count` is zero. Object values must equal those returned

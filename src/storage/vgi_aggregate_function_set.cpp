@@ -209,6 +209,11 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 			                  "VGI worker returned '%s' function_type when 'aggregate' was requested (function: %s)",
 			                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 		}
+		// table_only only means something for the table functions a table names
+		// (vgi_table_function_set.cpp); a aggregate one is reachable by nothing.
+		if (func_info.visibility == vgi::VgiFunctionVisibility::TableOnly) {
+			continue;
+		}
 		functions_by_name[func_info.name].push_back(std::move(func_info));
 	}
 

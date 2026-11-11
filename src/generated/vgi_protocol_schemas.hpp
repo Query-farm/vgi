@@ -134,6 +134,7 @@ inline const VgiSchemaPtr &FunctionInfoSchema() {
 	    type::Int64().Named("input_rows_per_call", /*nullable=*/true),
 	    type::List(type::Utf8(), /*item_nullable=*/true).Named("required_settings", /*nullable=*/false),
 	    type::List(type::Struct({type::Utf8().Named("secret_type", /*nullable=*/false), type::Utf8().Named("scope", /*nullable=*/true), type::Utf8().Named("secret_name", /*nullable=*/true)}), /*item_nullable=*/true).Named("required_secrets", /*nullable=*/false),
+	    type::Utf8().Named("visibility", /*nullable=*/true),
 	});
 	return schema;
 }

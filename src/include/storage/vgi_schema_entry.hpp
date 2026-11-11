@@ -20,6 +20,7 @@
 namespace duckdb {
 
 class VgiCatalog;
+class TableFunctionCatalogEntry;
 
 namespace vgi {
 struct CatalogRpcContext;
@@ -56,6 +57,12 @@ public:
 	void DropEntry(ClientContext &context, DropInfo &info) override;
 
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
+
+	//! A protocol 3.3 table_only table function of this schema: built like the
+	//! visible ones but held apart, so Scan() and LookupEntry() never return it.
+	//! Only vgi::ResolveVgiTableFunction (the resolver for the functions a table
+	//! names) calls this. Null when the schema lists no such hidden function.
+	optional_ptr<TableFunctionCatalogEntry> GetHiddenTableFunction(ClientContext &context, const std::string &name);
 
 	const vgi::VgiSchemaInfo &GetSchemaInfo() {
 		EnsureSchemaInfo();

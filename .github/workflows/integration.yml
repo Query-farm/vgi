@@ -269,6 +269,7 @@ jobs:
             --allow-skip 'require-env VGI_MALFORMED_BATCH_WORKER' \
             --allow-skip 'require-env VGI_NO_REFLECTION_WORKER' \
             --allow-skip 'require-env VGI_ROWID_CONSTRAINT_WORKER' \
+            --allow-skip 'require-env VGI_VISIBILITY_WORKER' \
             --allow-skip 'require-env-not VGI_ENGINE_CORRELATED_NAMED_ARGS' \
             --allow-skip 'require-env-not VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS' \
             "test/sql/integration/*" \

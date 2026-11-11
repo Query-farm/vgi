@@ -48,6 +48,20 @@ public:
 	// Drop an entry from the set
 	void DropEntry(const std::string &name);
 
+	// Hidden entries (protocol 3.3 "table_only" functions). Built exactly like
+	// ordinary entries, by the same LoadEntries(), but kept in a separate map
+	// that GetEntry() and Scan() never read: they are absent from
+	// duckdb_functions()/autocomplete and SQL cannot call them, even fully
+	// qualified. Only GetHiddenEntry() reaches them, for resolving the
+	// functions a table descriptor names (see vgi_table_function_resolver.hpp).
+	// AddHiddenEntry() follows AddEntry()'s locking contract.
+	void AddHiddenEntry(unique_ptr<CatalogEntry> entry);
+	// The hidden entry called `name`, loading the set if necessary. Unlike
+	// GetEntry(), a worker's zero estimated count for this kind does not skip
+	// the load: the count describes what the worker lists publicly, and a
+	// table naming a function is evidence that one exists.
+	optional_ptr<CatalogEntry> GetHiddenEntry(ClientContext &context, const std::string &name);
+
 	// Scan all entries in the set
 	void Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
 
@@ -117,7 +131,9 @@ protected:
 	// load_lock_ (cheap — no entry_lock_ held during the wait), see
 	// is_loaded_=true after the first finishes, and skip the load. No RPC
 	// duplication, no thundering herd.
-	void EnsureLoaded(ClientContext &context);
+	// `honor_empty_hint` false ignores the worker's zero estimated count (see
+	// GetHiddenEntry); every other caller honors it.
+	void EnsureLoaded(ClientContext &context, bool honor_empty_hint = true);
 
 	std::mutex load_lock_;
 
@@ -183,8 +199,13 @@ protected:
 	Catalog &catalog_;
 	VgiSchemaEntry *schema_entry_ = nullptr;
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> entries_;
+	// Hidden ("table_only") entries; see AddHiddenEntry(). Guarded by entry_lock_.
+	case_insensitive_map_t<unique_ptr<CatalogEntry>> hidden_entries_;
 	case_insensitive_set_t missing_entries_;
 	bool is_loaded_ = false;
+	// True while is_loaded_ came from the zero-count bypass rather than a real
+	// LoadEntries() (see GetHiddenEntry). Guarded by entry_lock_.
+	bool loaded_by_empty_hint_ = false;
 	std::mutex entry_lock_;
 	std::atomic<uint64_t> generation_{0};
 

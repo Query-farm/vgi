@@ -26,6 +26,7 @@
 // =============================================================================
 
 #include "vgi_multi_scan_rewriter.hpp"
+#include "storage/vgi_table_function_resolver.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -332,7 +333,8 @@ static ArmBindResult BindCatalogTableArm(const VgiScanBranch &branch, ClientCont
 
 static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &context, Binder &binder,
                                     const std::string &table_catalog_name,
-                                    const std::string &table_schema_name, const std::string &default_schema,
+                                    const std::string &table_schema_name, const std::string &table_name,
+                                    const std::string &default_schema,
                                     const std::vector<ColumnIndex> &marker_column_ids) {
 	// SPIKE A: catalog-table branches take a completely different bind path
 	// (base table entry, not a table function).
@@ -373,51 +375,29 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 		}
 		eff_named = branch.format_options;
 	}
-	// Look up the branch's function. A worker-provided schema_name (protocol
-	// 1.5.0, function branches only) is authoritative — only the worker
-	// genuinely knows which schema its own function_name is registered in, so
-	// go straight there rather than guessing. Otherwise (a format/
-	// catalog-table branch which never carries this field, or a function
-	// branch whose worker didn't set it — the field is optional by protocol
-	// design, not just a pre-1.5.0-peer compatibility case) fall back to the
-	// old cascade: the table's catalog/schema first, then the catalog's
-	// default schema, then the system catalog (read_parquet, iceberg_scan, etc.).
-	EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(Identifier(eff_function_name)));
-	optional_ptr<CatalogEntry> entry;
-	// Only take the worker-provided schema_name path for a genuinely different
-	// third schema — one that names neither the table's own schema nor the
-	// catalog's default. When it names one of those two, fall through to the
-	// cascade below unconditionally instead: empirically, routing that case
-	// through a separate lookup call — even passing the identical schema-name
-	// string — was observed to silently disable filter/projection pushdown on
-	// a later bind within the same session (confirmed in the single-branch
-	// path, vgi_table_entry.cpp — see cache/filter_pushdown_keys.test), a
-	// pre-existing fragility in the underlying catalog-entry cache that a
-	// byte-identical call shouldn't trigger, but reliably did.
-	bool branch_schema_is_third_schema = branch.IsFunctionBranch() && !branch.schema_name.empty() &&
-	                                     branch.schema_name != table_schema_name &&
-	                                     branch.schema_name != default_schema;
-	if (branch_schema_is_third_schema) {
-		entry = Catalog::GetEntry(context, Identifier(table_catalog_name), Identifier(branch.schema_name), lookup,
-		                          OnEntryNotFound::RETURN_NULL);
-	}
-	if (!entry) {
-		entry = Catalog::GetEntry(context, Identifier(table_catalog_name), Identifier(table_schema_name), lookup,
-		                          OnEntryNotFound::RETURN_NULL);
-	}
-	if (!entry && !default_schema.empty() && default_schema != table_schema_name) {
-		entry = Catalog::GetEntry(context, Identifier(table_catalog_name), Identifier(default_schema), lookup,
-		                          OnEntryNotFound::RETURN_NULL);
-	}
-	if (!entry) {
-		entry = Catalog::GetEntry(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL);
-	}
-	if (!entry) {
-		throw BinderException("VGI branch references unknown function '%s'. "
-		                       "Check that any required extensions are loaded.",
-		                       eff_function_name);
-	}
-	auto &fn_entry = entry->Cast<TableFunctionCatalogEntry>();
+	// Look up the branch's function through the shared resolver
+	// (vgi_table_function_resolver.hpp), the same one the single-branch scan and
+	// the write path use: a worker-provided schema_name (protocol 1.5.0,
+	// function branches only) naming a third schema first, then the table's
+	// schema and the catalog's default schema, then the hidden (protocol 3.3
+	// table_only) sets of those schemas, then the system catalog (read_parquet,
+	// iceberg_scan, ...). Catalog::GetEntry alone would never see a table_only
+	// function: LookupEntry() deliberately does not return them. A worker-claimed
+	// schema equal to the table's or the default is resolved by that cascade
+	// itself, never by a separate call (see cache/filter_pushdown_keys.test and
+	// the comment in vgi_table_entry.cpp).
+	auto &table_catalog = Catalog::GetCatalog(context, Identifier(table_catalog_name));
+	vgi::VgiTableFunctionRequest request;
+	request.catalog = &table_catalog;
+	request.table_schema = table_schema_name;
+	request.table_name = table_name;
+	request.role = "scan";
+	request.function_name = eff_function_name;
+	request.worker_schema = branch.IsFunctionBranch() ? branch.schema_name : std::string();
+	request.default_schema = default_schema;
+	request.allow_system_catalog = true;
+	auto resolved = vgi::ResolveVgiTableFunction(context, request);
+	auto &fn_entry = *resolved.entry;
 
 	// Bind both positional and named arguments through DuckDB's signature
 	// resolver so casts, overload selection and keyword defaults agree with SQL.
@@ -1002,7 +982,7 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 	arms.reserve(marker.branches.size());
 	for (const auto &branch : marker.branches) {
 		auto arm = BindBranchArm(branch, context, binder, marker.table_catalog_name, marker.table_schema_name,
-		                          marker.default_schema, marker_column_ids);
+		                          marker.table_name, marker.default_schema, marker_column_ids);
 
 		unique_ptr<LogicalOperator> arm_top = std::move(arm.get);
 

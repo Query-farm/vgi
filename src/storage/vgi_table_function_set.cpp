@@ -577,7 +577,15 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	// signatures are added to a TableFunctionSet as significant for
 	// ambiguous matches, and we don't want non-determinism from libstdc++
 	// hash-bucket order leaking into user-visible function dispatch.
+	//
+	// Protocol 3.3 table_only functions are grouped separately and built by the
+	// same code below, but published into the hidden set: the extension keeps
+	// their full description (the capabilities of the tables that name them)
+	// while Scan()/LookupEntry() never return them. A name the worker lists both
+	// ways yields one entry in each set; the public one wins wherever both are
+	// reachable.
 	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
+	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> hidden_functions_by_name;
 	for (auto &func_info : function_list) {
 		// Streaming Table and buffered TableBuffering both live in the
 		// table-function namespace; the distinction drives bind-time
@@ -592,7 +600,9 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 			                  "VGI worker returned '%s' function_type when 'table' was requested (function: %s)",
 			                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 		}
-		functions_by_name[func_info.name].push_back(std::move(func_info));
+		auto &group = func_info.visibility == vgi::VgiFunctionVisibility::TableOnly ? hidden_functions_by_name
+		                                                                             : functions_by_name;
+		group[func_info.name].push_back(std::move(func_info));
 	}
 
 	// Registration target: this catalog's own schema.
@@ -605,40 +615,46 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	target.schema_name = schema_.name.GetIdentifierName();
 
 	// Create function entries
-	for (const auto &pair : functions_by_name) {
-		// Collect function descriptions for all overloads
-		vector<FunctionDescription> descriptions;
-		auto func_set = vgi::BuildVgiTableFunctionSet(context, pair.first, pair.second, target, descriptions);
+	auto build_entries = [&](const std::map<std::string, std::vector<vgi::VgiFunctionInfo>> &groups, bool hidden) {
+		for (const auto &pair : groups) {
+			// Collect function descriptions for all overloads
+			vector<FunctionDescription> descriptions;
+			auto func_set = vgi::BuildVgiTableFunctionSet(context, pair.first, pair.second, target, descriptions);
 
-		// Create function info and entry
-		CreateTableFunctionInfo info(func_set);
-		info.SetQualifiedName(schema_.GetQualifiedName(info.GetFunctionName()));
-		info.internal = true;
-		info.descriptions = std::move(descriptions);
+			// Create function info and entry
+			CreateTableFunctionInfo info(func_set);
+			info.SetQualifiedName(schema_.GetQualifiedName(info.GetFunctionName()));
+			info.internal = true;
+			info.descriptions = std::move(descriptions);
 
-		auto function_entry = make_uniq_base<StandardEntry, TableFunctionCatalogEntry>(
-		    catalog_, schema_, info.Cast<CreateTableFunctionInfo>());
+			auto function_entry = make_uniq_base<StandardEntry, TableFunctionCatalogEntry>(
+			    catalog_, schema_, info.Cast<CreateTableFunctionInfo>());
 
-		// DuckDB's FunctionEntry constructor does not copy comment/tags from the
-		// CreateInfo the way schema/table/view/macro entries do, so the worker's
-		// tags must be set on the constructed entry directly — otherwise they
-		// never reach duckdb_functions().tags. Tags are an entry-level concept
-		// (not per-overload), so union them across overloads. comment is a
-		// single value (not per-overload either); take the first non-empty one.
-		for (const auto &func_info : pair.second) {
-			for (const auto &[key, val] : func_info.tags) {
-				function_entry->tags[key] = val;
+			// DuckDB's FunctionEntry constructor does not copy comment/tags from the
+			// CreateInfo the way schema/table/view/macro entries do, so the worker's
+			// tags must be set on the constructed entry directly — otherwise they
+			// never reach duckdb_functions().tags. Tags are an entry-level concept
+			// (not per-overload), so union them across overloads. comment is a
+			// single value (not per-overload either); take the first non-empty one.
+			for (const auto &func_info : pair.second) {
+				for (const auto &[key, val] : func_info.tags) {
+					function_entry->tags[key] = val;
+				}
+				if (function_entry->comment.IsNull() && !func_info.comment.empty()) {
+					function_entry->comment = Value(func_info.comment);
+				}
 			}
-			if (function_entry->comment.IsNull() && !func_info.comment.empty()) {
-				function_entry->comment = Value(func_info.comment);
+
+			if (hidden) {
+				AddHiddenEntry(std::move(function_entry));
+			} else {
+				std::lock_guard<std::mutex> __entry_lk(entry_lock_);
+				CreateEntryLocked(std::move(function_entry));
 			}
 		}
-
-		{
-			std::lock_guard<std::mutex> __entry_lk(entry_lock_);
-			CreateEntryLocked(std::move(function_entry));
-		}
-	}
+	};
+	build_entries(functions_by_name, /*hidden=*/false);
+	build_entries(hidden_functions_by_name, /*hidden=*/true);
 }
 
 } // namespace duckdb

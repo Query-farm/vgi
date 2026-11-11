@@ -202,6 +202,11 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 			                  "VGI worker returned '%s' function_type when 'scalar' was requested (function: %s)",
 			                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 		}
+		// table_only only means something for the table functions a table names
+		// (vgi_table_function_set.cpp); a scalar one is reachable by nothing.
+		if (func_info.visibility == vgi::VgiFunctionVisibility::TableOnly) {
+			continue;
+		}
 		functions_by_name[func_info.name].push_back(std::move(func_info));
 	}
 

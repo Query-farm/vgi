@@ -1,0 +1,24 @@
+# name: test/sql/integration/visibility/invalid_visibility.test
+# description: A FunctionInfo.visibility other than "public"/"table_only" is a
+#              protocol violation naming the worker and the function
+#              (docs/function_visibility.md). The visfix fixture sends
+#              good_scan with visibility 'bogus' under --bad-visibility.
+# group: [vgi_integration_visibility]
+
+require-env VGI_VISIBILITY_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'visfix' AS vb (TYPE vgi, LOCATION '${VGI_VISIBILITY_WORKER} --bad-visibility');
+
+# Listings decode on first use: any statement needing main's table functions fails.
+statement error
+SELECT * FROM vb.main.good;
+----
+<REGEX>:.*lists function 'good_scan' with invalid visibility 'bogus' \(expected 'public' or 'table_only'\).*
+
+statement error
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'vb';
+----
+<REGEX>:.*good_scan.*invalid visibility 'bogus'.*

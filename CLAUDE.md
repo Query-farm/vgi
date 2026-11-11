@@ -18,9 +18,10 @@ The `vgi-nano` migration is incorporated here. The `duckdb` submodule pins Hayba
 2.0 engine at `54f8340a3ede`; `extension_config.cmake` pins its matching HTTPFS fork.
 Use the committed submodule revision, not `git submodule update --remote`.
 
-The wire contract is **`vgi.v3` / `3.2.0`** (filtered scan planning, see
+The wire contract is **`vgi.v3` / `3.3.0`** (`FunctionInfo.visibility`, see
+`docs/function_visibility.md`; 3.2 added filtered scan planning, see
 `docs/multi_branch.md`). Workers need matching SDK releases; older `vgi.v2` and
-`vgi.v3` / `3.0.x`–`3.1.x` workers are incompatible. See
+`vgi.v3` / `3.0.x`–`3.2.x` workers are incompatible. See
 `docs/protocol-3.2-sdk-releases.json` for the coordinated releases and
 `docs/native-dependencies.md` for dependency details.
 
@@ -439,6 +440,7 @@ remain supported. Preserve this rule when changing pool/connection cleanup.
 | Remote secret provider (Orchard) | `docs/remote_secret_provider_plan.md`, `docs/remote_secret_provider_status.md` |
 | Companion catalogs (lakehouse federation) | `docs/companion_catalogs.md` |
 | Multi-branch tables | `docs/multi_branch.md` |
+| Function visibility (`table_only` scan/write functions, protocol 3.3) | `docs/function_visibility.md` |
 | Global functions (`system.main`) | `docs/global_functions.md` |
 | Custom `COPY ... FROM` / `TO` | `docs/copy_from.md`, `docs/copy_to.md` |
 | Telemetry | `docs/telemetry.md` |

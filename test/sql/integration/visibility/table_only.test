@@ -1,0 +1,83 @@
+# name: test/sql/integration/visibility/table_only.test
+# description: Protocol 3.3 function visibility, extension side
+#              (docs/function_visibility.md), against the visfix fixture
+#              (test/support/visibility_worker.py): a table_only scan keeps its
+#              capabilities while staying out of duckdb_functions(); a table
+#              naming an unlisted function is a Binder Error naming the worker
+#              and the function, never a scan with every capability off; a
+#              table_only write function keeps has_finalize.
+# group: [vgi_integration_visibility]
+
+require-env VGI_VISIBILITY_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'visfix' AS v (TYPE vgi, LOCATION '${VGI_VISIBILITY_WORKER}');
+
+# ============================================================================
+# table_only scan: resolved from the hidden set, with its capabilities
+# ============================================================================
+
+# rowid is a virtual column: it needs good_scan's projection pushdown, which
+# only its (table_only) listing entry carries.
+query IIT
+SELECT rowid, id, label FROM v.main.good ORDER BY id;
+----
+1	1	a
+2	2	b
+3	3	c
+
+query I
+SELECT count(*) FROM v.main.good WHERE rowid >= 2;
+----
+2
+
+# Neither the scan nor the write function is listed or callable.
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'v' AND function_name IN ('good_scan', 'notes_scan', 'notes_insert', 'ghost_scan');
+----
+0
+
+statement error
+SELECT * FROM v.main.good_scan();
+----
+<REGEX>:.*Table Function with name good_scan does not exist.*
+
+statement error
+SELECT * FROM v.main.notes_insert();
+----
+<REGEX>:.*Table Function with name notes_insert does not exist.*
+
+# ============================================================================
+# A table naming a function the worker does not list
+# ============================================================================
+
+statement error
+SELECT * FROM v.main.ghost;
+----
+<REGEX>:.*Binder Error.*VGI table 'v\.main\.ghost' names scan function 'ghost_scan', but worker '.*visibility_worker.*' does not list it.*
+
+statement error
+SELECT count(*) FROM v.main.ghost;
+----
+<REGEX>:.*Binder Error.*ghost_scan.*does not list it.*
+
+# The rest of the catalog is unaffected.
+query I
+SELECT count(*) FROM v.main.good;
+----
+3
+
+# ============================================================================
+# table_only write function: has_finalize still honored
+# ============================================================================
+
+# notes_insert reports its row count from finalize only (process reports
+# nothing), so the count is right only if the extension ran the finalize stage
+# its hidden listing entry declares.
+query I
+INSERT INTO v.main.notes VALUES (1, 'x'), (2, 'y');
+----
+2

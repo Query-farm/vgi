@@ -150,6 +150,8 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(VGI_PYTHON_DIR) vgi-fixture-sim
 VGI_ROWID_CONSTRAINT_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/rowid_constraint_worker.py
 # Hostile-data fixture (well-framed IPC with malformed buffer contents).
 VGI_MALFORMED_BATCH_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/malformed_batch_worker.py
+# Protocol 3.3 function visibility fixture (docs/function_visibility.md).
+VGI_VISIBILITY_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/visibility_worker.py
 # The fixture worker with every result externalized (test_launcher_external_storage).
 VGI_EXTERNAL_STORAGE_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/external_storage_worker.py
 # The fixture worker without vgi_rpc.Reflection.v1, standing in for a worker
@@ -209,6 +211,7 @@ test_shm:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
@@ -226,6 +229,7 @@ test_shm_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
@@ -253,6 +257,7 @@ test_spawn:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
@@ -269,6 +274,7 @@ test_spawn_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
@@ -324,6 +330,7 @@ test_launcher:
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -343,6 +350,7 @@ test_launcher_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -381,6 +389,7 @@ test_launcher_cloudflare_do:
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -407,6 +416,7 @@ test_launcher_cloudflare_do_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -710,6 +720,7 @@ test_python:
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
 	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
+	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -795,6 +806,7 @@ VGI_EXPECTED_SKIPS := \
 	--allow-skip 'require-env VGI_WRITABLE_TX_FIXTURES' \
 	--allow-skip 'require-env VGI_WRITABLE_TX_WORKER' \
 	--allow-skip 'require-env VGI_ROWID_CONSTRAINT_WORKER' \
+	--allow-skip 'require-env VGI_VISIBILITY_WORKER' \
 	--allow-skip 'require-env VGI_MALFORMED_BATCH_WORKER' \
 	--allow-skip 'require-env VGI_NO_REFLECTION_WORKER' \
 	--allow-skip 'require-env VGI_SCHEMA_RECONCILE_DB' \

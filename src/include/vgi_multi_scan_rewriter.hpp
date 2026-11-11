@@ -64,12 +64,15 @@ struct VgiMultiBranchMarkerBindData : public TableFunctionData {
 	std::vector<std::string> canonical_column_names;
 	std::vector<LogicalType> canonical_column_types;
 
-	// Catalog context for branch-function resolution (Catalog::GetEntry).
-	// The rewriter looks up function_name in this catalog's schema first,
-	// then default_schema, then the system catalog (for native readers like
-	// read_parquet / iceberg_scan).
+	// Catalog context for branch-function resolution
+	// (vgi::ResolveVgiTableFunction): this catalog's visible entries in the
+	// table's schema and default_schema, then their hidden (table_only) sets,
+	// then the system catalog (for native readers like read_parquet /
+	// iceberg_scan).
 	std::string table_catalog_name;
 	std::string table_schema_name;
+	//! The table's own name (diagnostics: an unresolved branch function names it).
+	std::string table_name;
 	std::string default_schema;
 
 	// Protocol 3.2 filtered scan planning (docs/protocol/scan-planning.md).
