@@ -1,0 +1,282 @@
+# name: test/sql/integration/writable_tx/insert_delete_tx.test
+# description: INSERT and DELETE on a transactional attach: staged under the
+#              transaction id with read-your-writes, invisible to other attaches,
+#              editable (UPDATE/DELETE of a staged insert), discarded by ROLLBACK
+#              and by a refused COMMIT, applied by COMMIT and by autocommit.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-insert-delete-tx');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-insert-delete-tx', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+# ============================================================================
+# Staged INSERT/DELETE, read-your-writes, COMMIT
+# ============================================================================
+
+statement ok
+BEGIN;
+
+query I
+INSERT INTO ttx.main.items VALUES (4, 'd', 40);
+----
+1
+
+query ITI
+INSERT INTO ttx.main.items (id, name) VALUES (5, 'e') RETURNING *;
+----
+5	e	0
+
+query I
+DELETE FROM ttx.main.items WHERE id = 1;
+----
+1
+
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+2	b	20
+3	c	30
+4	d	40
+5	e	0
+
+# rowid = id for staged inserts too.
+query II
+SELECT rowid, id FROM ttx.main.items WHERE id >= 4 ORDER BY id;
+----
+4	4
+5	5
+
+# Other attaches see committed state only.
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	10
+2	b	20
+3	c	30
+
+# Updating and deleting a staged insert edit the staged rows.
+query ITI
+UPDATE ttx.main.items SET qty = qty + 1 WHERE id = 4 RETURNING *;
+----
+4	d	41
+
+query I
+DELETE FROM ttx.main.items WHERE id = 5;
+----
+1
+
+# A deleted row is gone for this transaction: deleting it again is a no-op.
+query I
+DELETE FROM ttx.main.items WHERE id = 1;
+----
+0
+
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+2	b	20
+3	c	30
+4	d	41
+
+statement ok
+COMMIT;
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	b	20
+3	c	30
+4	d	41
+
+# ============================================================================
+# Delete then re-insert an id in one transaction
+# ============================================================================
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM ttx.main.items WHERE id = 3;
+----
+1
+
+query I
+INSERT INTO ttx.main.items VALUES (3, 'c2', 33);
+----
+1
+
+query ITI
+SELECT id, name, qty FROM ttx.main.items WHERE id = 3;
+----
+3	c2	33
+
+statement ok
+COMMIT;
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	b	20
+3	c2	33
+4	d	41
+
+# ============================================================================
+# ROLLBACK discards staged inserts and deletes
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ttx.main.items VALUES (6, 'f', 60);
+
+statement ok
+DELETE FROM ttx.main.items WHERE id = 2;
+
+query I
+SELECT count(*) FROM ttx.main.items;
+----
+3
+
+statement ok
+ROLLBACK;
+
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+2	b	20
+3	c2	33
+4	d	41
+
+# ============================================================================
+# A refused COMMIT (an inserted qty < 0) discards everything staged
+# ============================================================================
+
+statement ok
+BEGIN;
+
+# Accepted at INSERT time on the transactional attach: the commit hook decides.
+statement ok
+INSERT INTO ttx.main.items VALUES (7, 'g', -7), (8, 'h', 8);
+
+statement ok
+DELETE FROM ttx.main.items WHERE id = 2;
+
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+3	c2	33
+4	d	41
+7	g	-7
+8	h	8
+
+statement error
+COMMIT;
+----
+<REGEX>:.*txfix: commit refused: qty -7 for id 7.*
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	b	20
+3	c2	33
+4	d	41
+
+query ITI
+SELECT id, name, qty FROM ttx.main.items ORDER BY id;
+----
+2	b	20
+3	c2	33
+4	d	41
+
+# ============================================================================
+# Duplicates against staged and committed rows
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ttx.main.items VALUES (9, 'i', 9);
+
+statement error
+INSERT INTO ttx.main.items VALUES (9, 'i2', 9);
+----
+<REGEX>:.*txfix: duplicate id 9.*
+
+statement ok
+ROLLBACK;
+
+statement error
+INSERT INTO ttx.main.items VALUES (2, 'dup', 1);
+----
+<REGEX>:.*txfix: duplicate id 2.*
+
+query I
+SELECT count(*) FROM t.main.items WHERE id = 9 OR name = 'dup';
+----
+0
+
+# ============================================================================
+# Autocommit INSERT/DELETE are their own transactions
+# ============================================================================
+
+query I
+INSERT INTO ttx.main.items VALUES (10, 'j', 10);
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id = 10;
+----
+10	j	10
+
+query I
+DELETE FROM ttx.main.items WHERE id = 10;
+----
+1
+
+query I
+SELECT count(*) FROM t.main.items WHERE id = 10;
+----
+0
+
+# An autocommit INSERT whose commit is refused fails and applies nothing...
+statement error
+INSERT INTO ttx.main.items VALUES (11, 'k', -1);
+----
+<REGEX>:.*txfix: commit refused: qty -1 for id 11.*
+
+query I
+SELECT count(*) FROM t.main.items WHERE id = 11;
+----
+0
+
+# ...while the non-transactional attach refuses the same row at INSERT time.
+statement error
+INSERT INTO t.main.items VALUES (11, 'k', -1);
+----
+<REGEX>:.*txfix: qty must be >= 0.*
+
+# The write calls carried the transaction ids the hooks saw.
+query I
+SELECT count(*) FROM t.main.writes() w WHERE finalized AND tx_id NOT IN (SELECT tx_id FROM t.main.events());
+----
+0

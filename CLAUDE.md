@@ -19,7 +19,9 @@ The `vgi-nano` migration is incorporated here. The `duckdb` submodule pins Hayba
 Use the committed submodule revision, not `git submodule update --remote`.
 
 The wire contract is **`vgi.v3` / `3.3.0`** (`FunctionInfo.visibility`, see
-`docs/function_visibility.md`; 3.2 added filtered scan planning, see
+`docs/function_visibility.md`; write-path changes: no `catalog_table_scan_function_get`,
+`catalog_table_create` returns `created`, write options carry only `result_mode`, see
+`docs/protocol_routing.md`; 3.2 added filtered scan planning, see
 `docs/multi_branch.md`). Workers need matching SDK releases; older `vgi.v2` and
 `vgi.v3` / `3.0.x`–`3.2.x` workers are incompatible. See
 `docs/protocol-3.2-sdk-releases.json` for the coordinated releases and
@@ -441,6 +443,8 @@ remain supported. Preserve this rule when changing pool/connection cleanup.
 | Companion catalogs (lakehouse federation) | `docs/companion_catalogs.md` |
 | Multi-branch tables | `docs/multi_branch.md` |
 | Function visibility (`table_only` scan/write functions, protocol 3.3) | `docs/function_visibility.md` |
+| MERGE / INSERT ... ON CONFLICT emulation, CTAS `created`, write options (protocol 3.3) | `docs/protocol_routing.md` |
+| Cross-SDK writable-table fixture contract (`txfix`, `simple_writable` CTAS) | `docs/writable_tx_fixtures.md` |
 | Global functions (`system.main`) | `docs/global_functions.md` |
 | Custom `COPY ... FROM` / `TO` | `docs/copy_from.md`, `docs/copy_to.md` |
 | Telemetry | `docs/telemetry.md` |

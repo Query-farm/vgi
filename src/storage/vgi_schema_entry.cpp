@@ -339,8 +339,15 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 		DeferDrop(catalog, indexes_.HarvestEntries());
 		DeferDrop(catalog, views_.HarvestEntries());
 	}
-	vgi::InvokeCatalogTableCreate(rpc_ctx, name.GetIdentifierName(), create_info.GetTableName().GetIdentifierName(),
-	                              columns_schema, on_conflict, constraint_definitions, context);
+	const bool created =
+	    vgi::InvokeCatalogTableCreate(rpc_ctx, name.GetIdentifierName(), create_info.GetTableName().GetIdentifierName(),
+	                                  columns_schema, on_conflict, constraint_definitions, context);
+	if (!created) {
+		// IF NOT EXISTS found an existing table, which stays as it was. Like
+		// DuckDB's own catalogs, report "nothing created": a CTAS then inserts
+		// nothing (VgiPhysicalInsert::GetGlobalSinkState).
+		return nullptr;
+	}
 	return tables_.GetEntry(context, create_info.GetTableName().GetIdentifierName());
 }
 

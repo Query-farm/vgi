@@ -13,6 +13,8 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -235,8 +237,18 @@ PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGen
 	if (plan && !op.column_index_map.empty()) {
 		plan = planner.ResolveDefaultsProjection(op, *plan);
 	}
-	auto &insert = planner.Make<VgiPhysicalInsert>(op, table, op.return_chunk, op.on_conflict_info.action_type,
-	                                               std::move(op.on_conflict_info.on_conflict_filter));
+	// DuckDB's binder turns every INSERT ... ON CONFLICT / INSERT OR REPLACE into
+	// a MERGE (bind_insert.cpp GenerateMergeInto), so a bound INSERT always
+	// throws on conflict. A deserialized plan could still carry another
+	// action: refuse it before any row reaches the worker.
+	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
+		throw NotImplementedException(vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+		                                  .Set(vgi::error_key::kTable, table.name.GetIdentifierName())
+		                                  .Set(vgi::error_key::kOperation, "INSERT ON CONFLICT"),
+		                              "INSERT ... ON CONFLICT on VGI table '%s' must be planned as a MERGE",
+		                              table.name.GetIdentifierName());
+	}
+	auto &insert = planner.Make<VgiPhysicalInsert>(op, table, op.return_chunk);
 	if (plan) {
 		insert.children.push_back(*plan);
 	}
@@ -263,14 +275,62 @@ PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGen
 	}
 	auto &table = op.table.Cast<VgiTableEntry>();
 	RequireWriteResultMode(table, "update", op.return_chunk);
-	auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk);
+	auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk, op.columns, std::move(op.expressions),
+	                                            op.bound_defaults);
 	upd.children.push_back(plan);
 	return upd;
 }
 
-// Helper: plan a single merge action using VGI physical operators
+// ============================================================================
+// MERGE INTO (and INSERT ... ON CONFLICT, which DuckDB's binder rewrites to a
+// MERGE before any catalog hook runs: bind_insert.cpp GenerateMergeInto)
+// ============================================================================
+//
+// VGI emulates MERGE with the table's ordinary write functions: every
+// INSERT/UPDATE/DELETE action becomes one write call fed by PhysicalMergeInto.
+// Each action operator must receive exactly the rows a plain INSERT/UPDATE/
+// DELETE of the same table receives, so the action's own expressions are
+// evaluated (and cast to the column types) in the action's projection
+// (MergeIntoOperator::expressions), and the write operators reference the
+// projected columns. This replicates DuckDB's PlanGenericMergeIntoAction
+// (src/execution/physical_plan/plan_merge_into.cpp, CastActionExpressionsToColumnTypes /
+// PlanMergeRowIdReferences); it is copied here rather than called because the
+// extension must also build against stock DuckDB, and because the generic
+// Catalog::PlanMergeInto refuses RETURNING, which VGI supports.
+
+//! An UPDATE action's `SET col = DEFAULT` arrives as a BoundDefaultExpression,
+//! which a projection cannot execute: substitute the column's bound default.
+static unique_ptr<Expression> ResolveMergeDefault(LogicalMergeInto &op, PhysicalIndex column,
+                                                  unique_ptr<Expression> expr) {
+	if (expr->GetExpressionType() != ExpressionType::VALUE_DEFAULT) {
+		return expr;
+	}
+	auto &col = op.table.GetColumns().GetColumn(column);
+	auto storage_idx = col.StorageOid();
+	if (storage_idx < op.bound_defaults.size() && op.bound_defaults[storage_idx]) {
+		return op.bound_defaults[storage_idx]->Copy();
+	}
+	return make_uniq<BoundConstantExpression>(Value(col.Type()));
+}
+
+//! Upstream CastActionExpressionsToColumnTypes: the operators of a regular
+//! INSERT/UPDATE read values in the table's column types.
+static void CastMergeExpressionsToColumnTypes(ClientContext &context, TableCatalogEntry &table,
+                                              vector<unique_ptr<Expression>> &expressions,
+                                              const vector<PhysicalIndex> &columns) {
+	auto &table_columns = table.GetColumns();
+	for (idx_t i = 0; i < expressions.size(); i++) {
+		auto &target_type = columns.empty() ? table_columns.GetColumn(PhysicalIndex(i)).Type()
+		                                    : table_columns.GetColumn(columns[i]).Type();
+		if (expressions[i]->GetReturnType() == target_type) {
+			continue;
+		}
+		expressions[i] = BoundCastExpression::AddCastToType(context, std::move(expressions[i]), target_type);
+	}
+}
+
 static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &context, LogicalMergeInto &op,
-                                                            PhysicalPlanGenerator &planner,
+                                                            PhysicalPlanGenerator &planner, PhysicalOperator &plan,
                                                             BoundMergeIntoAction &action) {
 	auto result = make_uniq<MergeIntoOperator>();
 	result->action_type = action.action_type;
@@ -280,21 +340,36 @@ static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &conte
 
 	switch (action.action_type) {
 	case MergeActionType::MERGE_UPDATE: {
-		RequireWriteResultMode(table, "update", op.return_chunk);
+		// A regular UPDATE reads [new values..., rowid]: project the action's
+		// rows into that layout and give the operator references into it.
+		for (idx_t i = 0; i < action.expressions.size(); i++) {
+			action.expressions[i] = ResolveMergeDefault(op, action.columns[i], std::move(action.expressions[i]));
+		}
+		CastMergeExpressionsToColumnTypes(context, op.table, action.expressions, action.columns);
+		vector<unique_ptr<Expression>> select_list;
+		vector<unique_ptr<Expression>> update_expressions;
+		for (auto &expr : action.expressions) {
+			update_expressions.push_back(make_uniq<BoundReferenceExpression>(expr->GetReturnType(), select_list.size()));
+			select_list.push_back(std::move(expr));
+		}
+		// The row id columns are the trailing columns of the merge input.
+		for (idx_t i = op.row_id_start; i < plan.types.size(); i++) {
+			select_list.push_back(make_uniq<BoundReferenceExpression>(plan.types[i], i));
+		}
+		result->expressions = std::move(select_list);
 		auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk, std::move(action.columns),
-		                                            std::move(action.expressions));
+		                                            std::move(update_expressions), op.bound_defaults);
 		result->op = upd;
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
-		RequireWriteResultMode(table, "delete", op.return_chunk);
+		// A regular DELETE reads the row id; reference it in the merge input.
 		auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, op.row_id_start);
 		result->op = del;
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
-		RequireWriteResultMode(table, "insert", op.return_chunk);
-		auto &ins = planner.Make<VgiPhysicalInsert>(op, table, op.return_chunk);
+		// The action's expressions generate the full row a regular INSERT reads.
 		if (!action.column_index_map.empty()) {
 			vector<unique_ptr<Expression>> new_expressions;
 			for (auto &col : op.table.GetColumns().Physical()) {
@@ -308,7 +383,12 @@ static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &conte
 			}
 			action.expressions = std::move(new_expressions);
 		}
+		for (idx_t i = 0; i < action.expressions.size(); i++) {
+			action.expressions[i] = ResolveMergeDefault(op, PhysicalIndex(i), std::move(action.expressions[i]));
+		}
+		CastMergeExpressionsToColumnTypes(context, op.table, action.expressions, vector<PhysicalIndex>());
 		result->expressions = std::move(action.expressions);
+		auto &ins = planner.Make<VgiPhysicalInsert>(op, table, op.return_chunk);
 		result->op = ins;
 		break;
 	}
@@ -356,6 +436,45 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 		}
 	}
 
+	// The operations the MERGE needs, before anything else: an undeclared
+	// operation reports "does not support INSERT/UPDATE/DELETE" (also for
+	// INSERT ... ON CONFLICT on a read-only table).
+	for (auto &entry : op.actions) {
+		for (auto &action : entry.second) {
+			switch (action->action_type) {
+			case MergeActionType::MERGE_UPDATE:
+				RequireWriteResultMode(table_for_returning, "update", op.return_chunk);
+				break;
+			case MergeActionType::MERGE_DELETE:
+				RequireWriteResultMode(table_for_returning, "delete", op.return_chunk);
+				break;
+			case MergeActionType::MERGE_INSERT:
+				RequireWriteResultMode(table_for_returning, "insert", op.return_chunk);
+				break;
+			default:
+				break;
+			}
+		}
+	}
+
+	// PhysicalMergeInto matches target rows by their row id (the trailing
+	// columns of the merge input). A table without one would reach
+	// PhysicalMergeInto's InternalException("MERGE row ID index is out of
+	// range") at execution, which invalidates the database: refuse here.
+	if (table_for_returning.GetRowIdColumns().empty() || op.row_id_start >= plan.types.size()) {
+		throw BinderException(
+		    vgi::ErrorInfo(vgi::error_subtype::kUnsupported)
+		        .Set(vgi::error_key::kTable, table_for_returning.ParentSchema().name.GetIdentifierName() + "." +
+		                                         table_for_returning.name.GetIdentifierName())
+		        .Set(vgi::error_key::kOperation, "MERGE"),
+		    StringUtil::Format("MERGE INTO (and INSERT ... ON CONFLICT / INSERT OR REPLACE, which DuckDB runs as a "
+		                       "MERGE) is not supported on VGI table '%s.%s': the table has no row id. VGI emulates "
+		                       "MERGE with the table's write functions and matches target rows by row id; the worker "
+		                       "must declare a row-id column for the table.",
+		                       table_for_returning.ParentSchema().name.GetIdentifierName(),
+		                       table_for_returning.name.GetIdentifierName()));
+	}
+
 	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
 
 	idx_t append_count = 0;
@@ -368,7 +487,7 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 			if (action->action_type == MergeActionType::MERGE_UPDATE && action->update_is_del_and_insert) {
 				append_count++;
 			}
-			planned_actions.push_back(VgiPlanMergeIntoAction(context, op, planner, *action));
+			planned_actions.push_back(VgiPlanMergeIntoAction(context, op, planner, plan, *action));
 		}
 		actions.emplace(entry.first, std::move(planned_actions));
 	}

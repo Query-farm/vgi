@@ -1,0 +1,66 @@
+# name: test/sql/integration/simple_writable/ctas_if_not_exists.test
+# description: CREATE TABLE IF NOT EXISTS ... AS SELECT on an existing table:
+#              catalog_table_create replies created = false, and the extension
+#              inserts nothing (it used to append the SELECT's rows into the
+#              existing table). Contract: docs/writable_tx_fixtures.md
+#              ("simple_writable: created tables").
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+# For an http:// VGI_SIMPLE_WRITABLE_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+statement ok
+CREATE TABLE w.main.ctas_exists AS SELECT 1::BIGINT AS id, 'one' AS label;
+
+query I
+CREATE TABLE IF NOT EXISTS w.main.ctas_exists AS SELECT i::BIGINT AS id, 'new' AS label FROM range(10) r(i);
+----
+0
+
+query IT
+SELECT id, label FROM w.main.ctas_exists;
+----
+1	one
+
+# Also when the SELECT's columns differ from the existing table's.
+statement ok
+CREATE TABLE IF NOT EXISTS w.main.ctas_exists AS SELECT 'x' AS other;
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'w' AND table_name = 'ctas_exists' ORDER BY column_index;
+----
+id	BIGINT
+label	VARCHAR
+
+# And for a plain CREATE TABLE IF NOT EXISTS.
+statement ok
+CREATE TABLE IF NOT EXISTS w.main.ctas_exists (x DOUBLE);
+
+query IT
+SELECT id, label FROM w.main.ctas_exists;
+----
+1	one
+
+# A missing table is created and filled.
+query I
+CREATE TABLE IF NOT EXISTS w.main.ctas_fresh AS SELECT i::BIGINT AS id FROM range(3) r(i);
+----
+3
+
+query I
+SELECT count(*) FROM w.main.ctas_fresh;
+----
+3
+
+statement ok
+DROP TABLE w.main.ctas_exists;
+
+statement ok
+DROP TABLE w.main.ctas_fresh;

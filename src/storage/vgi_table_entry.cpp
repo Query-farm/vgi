@@ -403,9 +403,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	//   1. Inlined ``table_info_.scan_function`` (legacy single-branch
 	//      pre-shipped path) — saves the per-bind RPC on HTTP transports.
 	//   2. Already-loaded ``branches_`` cache from a prior call (lazy load).
-	//   3. RPC: InvokeCatalogTableScanBranchesGet (probes the new multi-
-	//      branch method, transparently falls back to the legacy
-	//      single-function RPC for old workers).
+	//   3. RPC: InvokeCatalogTableScanBranchesGet (protocol 3.3: the only
+	//      scan-discovery RPC; there is no fallback).
 	//
 	// Multi-branch tables (branches.size() > 1) require the optimizer
 	// rewriter to stitch arms together via LogicalSetOperation(UNION_ALL,

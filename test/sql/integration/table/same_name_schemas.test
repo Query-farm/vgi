@@ -3,8 +3,8 @@
 #   family (see scalar/, table_in_out/ and aggregate/ same_name_schemas.test,
 #   which probe direct function dispatch, and cache/same_name_schemas.test,
 #   which probes the result cache). This one probes
-#   catalog_table_scan_function_get / catalog_table_scan_branches_get — the RPC
-#   pair that tells a client which function backs a declarative catalog table.
+#   catalog_table_scan_branches_get (once paired with the removed
+#   catalog_table_scan_function_get) — the RPC that tells a client which function backs a declarative catalog table.
 #   A function name is unique only within a schema, but a table's own schema
 #   isn't necessarily where its backing function lives — see
 #   vgi_table_entry.cpp's GetScanFunctionImpl.

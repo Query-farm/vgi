@@ -1,0 +1,30 @@
+# name: test/sql/integration/write_contract/scan_branches_required.test
+# description: Protocol 3.3 removed catalog_table_scan_function_get, and with it
+#              the extension's fallback from catalog_table_scan_branches_get. A
+#              worker that answers MethodNotImplemented for the branches RPC is a
+#              protocol error naming the RPC and the table, not a silent retry.
+# group: [vgi_integration_write_contract]
+
+require-env VGI_WRITE_CONTRACT_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'wcfix' AS nb (TYPE vgi, LOCATION '${VGI_WRITE_CONTRACT_WORKER} --no-branches');
+
+# main.plain inlines no scan function, so its scan asks for branches.
+statement error
+SELECT * FROM nb.main.plain;
+----
+<REGEX>:.*does not implement catalog_table_scan_branches_get, which protocol 3\.3 requires to scan a table \(table 'main\.plain'\).*
+
+statement error
+SELECT * FROM nb.main.plain;
+----
+<REGEX>:.*catalog_table_scan_function_get RPC was removed in protocol 3\.3.*
+
+# Tables whose scan function is inlined in TableInfo never ask, and still work.
+query I
+SELECT count(*) FROM nb.main.sink;
+----
+3

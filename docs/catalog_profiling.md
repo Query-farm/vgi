@@ -110,7 +110,7 @@ Which storage-layer caller emits which RPC, and what entity context it carries:
 | `VgiTableFunctionSet::LoadEntries` | `catalog_schema_contents_functions` | `schema` | schema name |
 | `VgiMacroSet::LoadEntries` | `catalog_schema_contents_macros` | `schema` | schema name |
 | `VgiTableEntry::FetchColumnStatistics` | `catalog_table_column_statistics_get` | `table` | `schema.table` |
-| `VgiTableEntry::GetScanFunctionImpl` | `catalog_table_scan_function_get` | `table` | `schema.table` |
+| `VgiTableEntry::GetScanFunctionImpl` | `catalog_table_scan_branches_get` | `table` | `schema.table` |
 | Schema/transaction/DDL paths | various | (empty) | (empty) |
 
 The empty-context paths still emit `catalog.rpc` — they just rely on `method` and `attach_id` to identify what was happening. Add entity context at those sites if you need richer profiling for a specific workload.

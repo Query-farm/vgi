@@ -67,7 +67,6 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		};
 		// Methods typed `bytes` in the Protocol whose bytes are a known record.
 		static const BlobMethod kBlobResponses[] = {
-		    {"catalog_table_scan_function_get", &ScanFunctionResultSchema},
 		    {"catalog_table_insert_function_get", &ScanFunctionResultSchema},
 		    {"catalog_table_update_function_get", &ScanFunctionResultSchema},
 		    {"catalog_table_delete_function_get", &ScanFunctionResultSchema},

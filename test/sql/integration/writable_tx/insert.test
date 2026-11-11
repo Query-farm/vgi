@@ -1,0 +1,178 @@
+# name: test/sql/integration/writable_tx/insert.test
+# description: INSERT on txfix main.items (items_insert) on the non-transactional
+#              attach: VALUES, multi-row, the qty default, RETURNING, refused rows
+#              (duplicate id, NULL id/name, qty < 0) that insert nothing, and
+#              inserted rows behaving like the others (rowid = id, UPDATE, DELETE).
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-insert');
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+query I
+INSERT INTO t.main.items VALUES (4, 'd', 40);
+----
+1
+
+query I
+INSERT INTO t.main.items VALUES (5, 'e', 50), (6, 'f', 60);
+----
+2
+
+# An omitted qty takes the declared default (0); an explicit NULL stays NULL.
+query I
+INSERT INTO t.main.items (id, name) VALUES (7, 'g');
+----
+1
+
+query I
+INSERT INTO t.main.items VALUES (8, 'h', NULL);
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id >= 4 ORDER BY id;
+----
+4	d	40
+5	e	50
+6	f	60
+7	g	0
+8	h	NULL
+
+# ============================================================================
+# RETURNING (write result mode `rows`)
+# ============================================================================
+
+query ITI
+INSERT INTO t.main.items VALUES (9, 'i', 90) RETURNING *;
+----
+9	i	90
+
+query ITI
+INSERT INTO t.main.items (name, id) VALUES ('j', 10) RETURNING id * 2, upper(name), qty;
+----
+20	J	0
+
+query ITI rowsort
+INSERT INTO t.main.items VALUES (11, 'k', 1), (12, 'l', 2) RETURNING id, name, qty + 1;
+----
+11	k	2
+12	l	3
+
+# ============================================================================
+# Refused rows: the statement fails and inserts nothing
+# ============================================================================
+
+# Duplicate of a committed row.
+statement error
+INSERT INTO t.main.items VALUES (1, 'dup', 1);
+----
+<REGEX>:.*txfix: duplicate id 1.*
+
+# Duplicate within the statement.
+statement error
+INSERT INTO t.main.items VALUES (13, 'm', 1), (13, 'm2', 2);
+----
+<REGEX>:.*txfix: duplicate id 13.*
+
+# A valid row next to a refused one is not inserted either.
+statement error
+INSERT INTO t.main.items VALUES (14, 'n', 1), (2, 'dup', 1);
+----
+<REGEX>:.*txfix: duplicate id 2.*
+
+statement error
+INSERT INTO t.main.items VALUES (15, NULL, 1);
+----
+<REGEX>:.*txfix: name required.*
+
+statement error
+INSERT INTO t.main.items VALUES (NULL, 'o', 1);
+----
+<REGEX>:.*txfix: id required.*
+
+statement error
+INSERT INTO t.main.items VALUES (16, 'p', -1);
+----
+<REGEX>:.*txfix: qty must be >= 0.*
+
+statement error
+INSERT INTO t.main.items VALUES (17, 'q', 1), (18, 'r', -5);
+----
+<REGEX>:.*txfix: qty must be >= 0.*
+
+query I
+SELECT count(*) FROM t.main.items WHERE id >= 13;
+----
+0
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id <= 3 ORDER BY id;
+----
+1	a	10
+2	b	20
+3	c	30
+
+# ============================================================================
+# Inserted rows are ordinary rows: rowid = id, UPDATE and DELETE reach them
+# ============================================================================
+
+query II
+SELECT rowid, id FROM t.main.items WHERE id BETWEEN 4 AND 6 ORDER BY id;
+----
+4	4
+5	5
+6	6
+
+query I
+UPDATE t.main.items SET qty = qty + 1 WHERE id = 4;
+----
+1
+
+query I
+DELETE FROM t.main.items WHERE id = 5;
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id BETWEEN 4 AND 6 ORDER BY id;
+----
+4	d	41
+6	f	60
+
+# INSERT ... SELECT from another attach's table works like VALUES.
+query I
+INSERT INTO t.main.items SELECT id + 100, label, id FROM t.main.labels;
+----
+2
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id > 100 ORDER BY id;
+----
+101	x	1
+102	y	2
+
+# reset() restores the initial rows.
+statement ok
+SELECT * FROM t.main.reset();
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	10
+2	b	20
+3	c	30

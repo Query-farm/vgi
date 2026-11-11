@@ -143,7 +143,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 2 table-dispatch schema-disambiguation probes: test_same_name_table_scan, a
 #   one-row producer declared in both `main` and `data`, backing the
 #   declarative `test_same_name_table` in each schema — proves
-#   catalog_table_scan_function_get/catalog_table_scan_branches_get resolve
+#   catalog_table_scan_branches_get resolve
 #   each schema's own implementation (protocol 1.5.0's schema_name field).
 #   Back table/same_name_schemas.test.
 # 2 global-registration probes (global_table, a producer; global_buffered, a

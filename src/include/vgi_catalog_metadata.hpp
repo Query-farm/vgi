@@ -199,7 +199,7 @@ struct VgiSchemaInfo {
 	std::map<std::string, int64_t> estimated_object_count;
 };
 
-// Result of table_scan_function_get - tells DuckDB which function to call to scan a table
+// A function the extension calls for a table: an inlined TableInfo.scan_function, or a write function (catalog_table_{insert,update,delete}_function_get)
 // This enables catalogs to delegate scanning to any DuckDB function (e.g., read_parquet, iceberg_scan)
 struct VgiScanFunctionResult {
 	std::string function_name;                              // The DuckDB function to call (e.g., "read_parquet")
@@ -297,10 +297,9 @@ struct VgiScanBranch {
 	std::vector<uint8_t> column_statistics;
 };
 
-// Result of the new catalog_table_scan_branches_get RPC. New-protocol shape;
-// the legacy single-function path stays at VgiScanFunctionResult so old
-// workers continue to work via the typed-catch fallback in
-// InvokeCatalogTableScanBranchesGet.
+// Result of catalog_table_scan_branches_get, the only scan-discovery RPC since
+// protocol 3.3. (VgiScanFunctionResult remains the shape of the write-function
+// RPCs and of an inlined TableInfo.scan_function.)
 struct VgiScanBranchesResult {
 	std::vector<VgiScanBranch> branches;                    // One or more; empty list is loud-rejected at parse
 	std::vector<std::string> required_extensions;           // Union across all branches

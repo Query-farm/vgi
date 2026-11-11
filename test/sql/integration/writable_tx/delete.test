@@ -1,0 +1,86 @@
+# name: test/sql/integration/writable_tx/delete.test
+# description: DELETE on txfix main.items (items_delete) on the non-transactional
+#              attach: by id, by predicate, no match, every row; a deleted id can
+#              be inserted again; writes() counts only deleted rows.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-delete');
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+query I
+DELETE FROM t.main.items WHERE id = 1;
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	b	20
+3	c	30
+
+# No match: a no-op, counted 0.
+query I
+DELETE FROM t.main.items WHERE id = 99;
+----
+0
+
+query I
+DELETE FROM t.main.items WHERE qty > 25;
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	b	20
+
+# The deleted id can be inserted again.
+query I
+INSERT INTO t.main.items VALUES (1, 'a2', 5);
+----
+1
+
+query I
+DELETE FROM t.main.items;
+----
+2
+
+query I
+SELECT count(*) FROM t.main.items;
+----
+0
+
+# writes(): one delete call per statement, counting the rows it deleted.
+statement ok
+SELECT * FROM t.main.reset();
+
+query I
+DELETE FROM t.main.items WHERE id IN (1, 99);
+----
+1
+
+query TIT
+SELECT op, rows, tx_id IS NULL FROM t.main.writes() WHERE finalized ORDER BY seq;
+----
+delete	1	true
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	b	20
+3	c	30

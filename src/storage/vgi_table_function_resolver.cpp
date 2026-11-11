@@ -74,22 +74,27 @@ VgiResolvedTableFunction ResolveVgiTableFunction(ClientContext &context, const V
 			return result;
 		}
 	}
-	for (const auto &schema : schemas) {
-		if (auto entry = LookupHidden(context, catalog, schema, request.function_name)) {
-			result.entry = entry;
-			result.schema_name = schema;
-			result.hidden = true;
-			return result;
-		}
-	}
 	if (request.allow_system_catalog) {
-		// DuckDB built-ins a worker delegates to (read_parquet, iceberg_scan, ...).
+		// DuckDB built-ins a worker delegates to (read_parquet, iceberg_scan, the
+		// readers of format branches, ...). Checked before the hidden sets: a
+		// hidden lookup lists the schema's functions even when the schema reports
+		// zero of them, and a built-in name must not force that RPC.
 		EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(Identifier(request.function_name)));
 		auto sys_entry = Catalog::GetEntry(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL);
 		if (sys_entry) {
 			result.entry = &sys_entry->Cast<TableFunctionCatalogEntry>();
 			result.from_system_catalog = true;
 			return result;
+		}
+	}
+	if (!request.format_reader) {
+		for (const auto &schema : schemas) {
+			if (auto entry = LookupHidden(context, catalog, schema, request.function_name)) {
+				result.entry = entry;
+				result.schema_name = schema;
+				result.hidden = true;
+				return result;
+			}
 		}
 	}
 
@@ -107,12 +112,21 @@ VgiResolvedTableFunction ResolveVgiTableFunction(ClientContext &context, const V
 	        .Set(error_key::kCatalog, catalog_name)
 	        .Set(error_key::kTable, request.table_schema + "." + request.table_name)
 	        .Set(error_key::kFunctionName, request.function_name),
-	    StringUtil::Format("VGI table '%s.%s.%s' names %s function '%s', but worker '%s' does not list it (searched "
-	                       "schema(s) %s%s). The worker must list every function its tables name in "
-	                       "catalog_schema_contents_functions, with visibility 'table_only' to keep it hidden.",
-	                       catalog_name, request.table_schema, request.table_name, request.role,
-	                       request.function_name, RedactCredentials(worker_path), searched,
-	                       request.allow_system_catalog ? " and the system catalog" : ""));
+	    request.format_reader
+	        ? StringUtil::Format("VGI table '%s.%s.%s' (worker '%s') reads through %s function '%s', which is "
+	                             "neither a DuckDB table function nor listed by the worker. Check that any required "
+	                             "extensions are loaded.",
+	                             catalog_name, request.table_schema, request.table_name,
+	                             RedactCredentials(worker_path), request.role, request.function_name)
+	        : StringUtil::Format(
+	              "VGI table '%s.%s.%s' names %s function '%s', but worker '%s' does not list it (searched "
+	              "schema(s) %s%s). The worker must list every function its tables name in "
+	              "catalog_schema_contents_functions, with visibility 'table_only' to keep it hidden.%s",
+	              catalog_name, request.table_schema, request.table_name, request.role, request.function_name,
+	              RedactCredentials(worker_path), searched, request.allow_system_catalog ? " and the system catalog" : "",
+	              request.allow_system_catalog ? " If it is a DuckDB function, check that any required extensions "
+	                                             "are loaded."
+	                                           : ""));
 }
 
 } // namespace vgi

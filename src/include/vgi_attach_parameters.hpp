@@ -221,21 +221,6 @@ struct VgiAttachParameters {
 	}
 
 public:
-	// Capability cache for the new catalog_table_scan_branches_get RPC.
-	// Tri-state: 0 = unknown (probe), 1 = supported, 2 = not supported.
-	// Set by InvokeCatalogTableScanBranchesGet after the first call against
-	// this attach: on success → 1, on MethodNotImplemented fallback → 2.
-	// Subsequent calls short-circuit straight to the legacy RPC when the
-	// state is 2, avoiding a per-call round-trip-and-throw. Atomic for
-	// lock-free reads on the hot path; benign races (two threads probing
-	// once each before the cache settles) are acceptable.
-	int LoadBranchesCapability() const noexcept {
-		return branches_capability_.load(std::memory_order_relaxed);
-	}
-	void StoreBranchesCapability(bool supported) const noexcept {
-		branches_capability_.store(supported ? 1 : 2, std::memory_order_relaxed);
-	}
-
 	// Per-catalog HTTP ServerCapabilities snapshot, harvested from the
 	// capability headers the server middleware stamps on every response.
 	// Shared across all of this catalog's connections so a new connection
@@ -290,9 +275,6 @@ private:
 	mutable std::mutex http_params_mutex_;
 	mutable std::shared_ptr<HTTPParams> cached_http_params_;
 	mutable std::shared_ptr<HTTPParams> cached_single_attempt_http_params_;
-
-	// Capability cache for catalog_table_scan_branches_get. See accessors above.
-	mutable std::atomic<int> branches_capability_{0};
 
 	// HTTP ServerCapabilities snapshot. See Store/LoadServerCapabilities above.
 	// Held by shared_ptr (not by value) so the unary catalog-RPC path can share

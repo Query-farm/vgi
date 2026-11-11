@@ -1,0 +1,121 @@
+# name: test/sql/integration/writable_tx/insert_select.test
+# description: INSERT ... SELECT that spans several batches of one write call
+#              (range(5000)), a self-referencing INSERT that must only see the
+#              scan's snapshot, and a failure in a later batch: earlier batches
+#              stay applied on the non-transactional attach, nothing on the
+#              transactional one.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-insert-select');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-insert-select', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+query I
+INSERT INTO t.main.items SELECT i, 'n' || i, i FROM range(100, 5100) r(i);
+----
+5000
+
+query III
+SELECT count(*), min(id), max(id) FROM t.main.items;
+----
+5003	1	5099
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id IN (100, 2147, 2148, 5099) ORDER BY id;
+----
+100	n100	100
+2147	n2147	2147
+2148	n2148	2148
+5099	n5099	5099
+
+# One write call for the whole statement, however many batches it sent.
+query TIT
+SELECT op, rows, tx_id IS NULL FROM t.main.writes() WHERE finalized ORDER BY seq;
+----
+insert	5000	true
+
+# The scan reads its snapshot when it starts: the statement inserts exactly
+# the 5003 rows that existed, never the rows it adds itself.
+query I
+INSERT INTO t.main.items SELECT id + 10000, name, qty FROM t.main.items;
+----
+5003
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id >= 20000) FROM t.main.items;
+----
+10006	0
+
+# ============================================================================
+# A duplicate in a later batch: the statement fails
+# ============================================================================
+
+# The last row (id 1) duplicates a committed row; it is not in the first batch.
+statement error
+INSERT INTO t.main.items SELECT CASE WHEN i = 24999 THEN 1 ELSE i END, 'm', 1 FROM range(20000, 25000) r(i);
+----
+<REGEX>:.*txfix: duplicate id 1.*
+
+# Non-transactional: what earlier batches applied stays applied; the refused
+# batch applied nothing.
+query I
+SELECT count(*) > 0 AND count(*) < 4999 FROM t.main.items WHERE id BETWEEN 20000 AND 24998;
+----
+true
+
+query I
+SELECT name FROM t.main.items WHERE id = 1;
+----
+a
+
+# Transactional: the failed statement's transaction is discarded as a whole.
+statement error
+INSERT INTO ttx.main.items SELECT CASE WHEN i = 34999 THEN 1 ELSE i END, 'm', 1 FROM range(30000, 35000) r(i);
+----
+<REGEX>:.*txfix: duplicate id 1.*
+
+query I
+SELECT count(*) FROM t.main.items WHERE id >= 30000;
+----
+0
+
+query I
+SELECT count(*) FROM ttx.main.items WHERE id >= 30000;
+----
+0
+
+# The same statement without the duplicate commits every batch.
+query I
+INSERT INTO ttx.main.items SELECT i, 'm', 1 FROM range(30000, 35000) r(i);
+----
+5000
+
+query I
+SELECT count(*) FROM t.main.items WHERE id >= 30000;
+----
+5000
+
+# A failed statement adds no finalized write call.
+query TI
+SELECT op, rows FROM t.main.writes() WHERE finalized ORDER BY seq;
+----
+insert	5000
+insert	5003
+insert	5000

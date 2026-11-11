@@ -1,0 +1,80 @@
+# name: test/sql/integration/writable_tx/delete_returning.test
+# description: DELETE ... RETURNING on txfix main.items (write result mode `rows`),
+#              on both attaches, including DELETE ... USING with several matches
+#              per target row (each deleted row is returned once).
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+# TableCatalogEntry::GetDeleteReturningVirtualColumns (duckdb/duckdb#28089).
+require-env VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS 1
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-delete-returning');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-delete-returning', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+query ITI
+DELETE FROM t.main.items WHERE id = 1 RETURNING *;
+----
+1	a	10
+
+query IT rowsort
+DELETE FROM t.main.items WHERE id >= 2 RETURNING id, upper(name);
+----
+2	B
+3	C
+
+statement ok
+SELECT * FROM t.main.reset();
+
+statement ok
+CREATE TEMP TABLE src AS SELECT * FROM (VALUES (1), (1), (2), (2), (2)) v(id);
+
+query ITI rowsort
+DELETE FROM t.main.items USING src WHERE items.id = src.id RETURNING *;
+----
+1	a	10
+2	b	20
+
+statement ok
+SELECT * FROM t.main.reset();
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ttx.main.items VALUES (5, 'e', 50);
+
+query ITI
+DELETE FROM ttx.main.items WHERE id = 5 RETURNING *;
+----
+5	e	50
+
+query ITI rowsort
+DELETE FROM ttx.main.items WHERE id <= 2 RETURNING *;
+----
+1	a	10
+2	b	20
+
+statement ok
+COMMIT;
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+3	c	30

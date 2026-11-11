@@ -85,6 +85,12 @@ case_insensitive_map_t<std::vector<std::string>> CollectRequirements(ClientConte
 				rpc_ctx.entity_kind = "schema";
 				rpc_ctx.entity_qualifier = schema_name;
 				for (auto &func : vgi_schema.GetFunctionInventory(rpc_ctx, function_type, context)) {
+					// A table_only function (a table's hidden scan or a write
+					// function) cannot be called from SQL, so it is not listed as
+					// requiring the secret type; its table is the user-facing name.
+					if (func.visibility == VgiFunctionVisibility::TableOnly) {
+						continue;
+					}
 					for (auto &req : func.required_secrets) {
 						auto &names = by_type[req.secret_type];
 						auto qualified = schema_name + "." + func.name;

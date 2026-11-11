@@ -105,36 +105,19 @@ static ResolvedWriteFunction ResolveWriteFunctionEntry(ClientContext &context, V
 
 // Build a one-row Arrow RecordBatch of write options to pass to the worker.
 // The batch is self-describing and extensible — new options are just new fields.
-static VgiBatchPtr BuildWriteOptions(bool return_chunk, OnConflictAction action_type,
-                                     const vector<string> &conflict_columns) {
-	string action_str;
-	switch (action_type) {
-	case OnConflictAction::THROW:
-		action_str = "throw";
-		break;
-	case OnConflictAction::NOTHING:
-		action_str = "nothing";
-		break;
-	default:
-		throw InternalException("Unsupported OnConflictAction for VGI tables");
-	}
-
-	// The wire shape the worker expects: result_mode: utf8 not null, on_conflict: utf8,
-	// on_conflict_columns: list<item: utf8> (nullable fields, nullable items).
+//
+// Protocol 3.3: the batch is exactly ``result_mode: utf8 not null``. The
+// former ``on_conflict`` / ``on_conflict_columns`` fields are gone: DuckDB's
+// binder rewrites every INSERT ... ON CONFLICT / INSERT OR REPLACE into a
+// MERGE before PlanInsert (bind_insert.cpp GenerateMergeInto), so they could
+// only ever say "throw" / empty. VGI emulates MERGE with ordinary write calls
+// (VgiCatalog::PlanMergeInto).
+static VgiBatchPtr BuildWriteOptions(bool return_chunk) {
 	static const VgiSchemaPtr schema = MakeSchema({
 	    type::Utf8().Named("result_mode", /*is_nullable=*/false),
-	    type::Utf8().Named("on_conflict"),
-	    type::List(type::Utf8()).Named("on_conflict_columns"),
 	});
 	VgiBatchBuilder builder(schema);
 	append::String(builder.column(0), return_chunk ? "rows" : "count");
-	append::String(builder.column(1), action_str);
-	// Build conflict columns as list<string>
-	auto *conflict_cols = builder.column(2);
-	for (auto &col : conflict_columns) {
-		append::String(conflict_cols->children[0], col);
-	}
-	append::FinishElement(conflict_cols);
 	builder.FinishRow();
 	return builder.Finish();
 }
@@ -376,26 +359,17 @@ static vector<LogicalType> WriteOutputTypes(const LogicalOperator &op, bool retu
 // INSERT Implementation
 // ============================================================================
 
-VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalInsert &op, VgiTableEntry &table_p, bool return_chunk_p,
-                                     OnConflictAction action_type_p, unordered_set<column_t> on_conflict_filter_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
-                       op.estimated_cardinality),
-      insert_table(&table_p), return_chunk(return_chunk_p), action_type(action_type_p),
-      on_conflict_filter(std::move(on_conflict_filter_p)) {
-}
-
 VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
                                      bool return_chunk_p)
     : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
                        op.estimated_cardinality),
-      insert_table(&table_p), return_chunk(return_chunk_p), action_type(OnConflictAction::THROW) {
+      insert_table(&table_p), return_chunk(return_chunk_p) {
 }
 
 VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, SchemaCatalogEntry &schema_p,
                                      unique_ptr<BoundCreateTableInfo> create_info_p)
     : PhysicalOperator(plan, PhysicalOperatorType::CREATE_TABLE_AS, op.types, op.estimated_cardinality),
-      schema(&schema_p), create_info(std::move(create_info_p)), return_chunk(false),
-      action_type(OnConflictAction::THROW) {
+      schema(&schema_p), create_info(std::move(create_info_p)), return_chunk(false) {
 }
 
 InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
@@ -495,12 +469,20 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 		auto &schema_ref = *schema.get_mutable();
 		auto result = schema_ref.CreateTable(schema_ref.GetCatalogTransaction(context), *create_info);
 		if (!result) {
-			// IF NOT EXISTS and table already exists — return empty result
+			// IF NOT EXISTS found an existing table (catalog_table_create
+			// replied created=false): CTAS inserts nothing into it.
 			auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), false);
 			gstate->changed_count = 0;
 			return unique_ptr<GlobalSinkState>(gstate.release());
 		}
 		table = &result->Cast<VgiTableEntry>();
+		// This statement created the table. If the CTAS then fails on a
+		// non-transactional attach, rollback drops it again (best effort,
+		// VgiTransaction::Rollback); Finalize clears the mark on success.
+		auto &create_tx = VgiTransaction::Get(context, table->GetCatalog());
+		if (create_tx.GetTransactionOpaqueData().empty()) {
+			create_tx.AddPendingCtasTable(table->GetTableInfo().schema_name, table->GetTableInfo().name);
+		}
 	} else {
 		D_ASSERT(insert_table);
 		table = insert_table;
@@ -529,13 +511,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 		input_schema = input_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
 	}
 
-	// Build conflict target column names from column IDs
-	vector<string> conflict_columns;
-	for (auto col_id : on_conflict_filter) {
-		conflict_columns.push_back(table->GetColumns().GetColumn(PhysicalIndex(col_id)).Name().GetIdentifierName());
-	}
-
-	auto write_options = BuildWriteOptions(return_chunk, action_type, conflict_columns);
+	auto write_options = BuildWriteOptions(return_chunk);
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
@@ -551,6 +527,9 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 		                                  vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
+	}
+	if (create_info) {
+		gstate->ctas_table = table;
 	}
 
 	return unique_ptr<GlobalSinkState>(gstate.release());
@@ -628,6 +607,13 @@ SinkFinalizeType VgiPhysicalInsert::Finalize(Pipeline &pipeline, Event &event, C
 		D_ASSERT(!gstate.return_chunk || finalize_count == 0);
 		gstate.changed_count += finalize_count;
 	}
+	if (gstate.ctas_table) {
+		// The CTAS completed: the created table stays even if a later
+		// statement of the same transaction fails.
+		VgiTransaction::Get(context, gstate.ctas_table->GetCatalog())
+		    .RemovePendingCtasTable(gstate.ctas_table->GetTableInfo().schema_name,
+		                            gstate.ctas_table->GetTableInfo().name);
+	}
 	return SinkFinalizeType::READY;
 }
 
@@ -684,7 +670,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	auto value_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
 	auto input_schema = value_schema->Select({table_info.row_id_column})->WithMetadata(VgiMetadata());
 
-	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
+	auto write_options = BuildWriteOptions(return_chunk);
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
@@ -726,10 +712,17 @@ SinkResultType VgiPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chu
 	rowid_chunk.data[0].Reference(chunk.data[rowid_index]);
 	rowid_chunk.SetCardinality(chunk.size());
 
-	auto batch = DataChunkToArrow(context.client, rowid_chunk, gstate.send_schema);
-
 	{
 		lock_guard<mutex> guard(gstate.write_lock);
+		// DuckDB does not de-duplicate the row ids of a DELETE on a non-native
+		// table: DELETE ... USING with several matching source rows sends a
+		// target row once per match. Send each row id once per write call, so
+		// the worker counts it once and RETURNING lists it once.
+		const auto kept = gstate.deleted_rowids.Filter(rowid_chunk);
+		if (kept == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		auto batch = DataChunkToArrow(context.client, rowid_chunk, gstate.send_schema);
 		gstate.connection->WriteInputBatch(batch);
 
 		auto response = gstate.connection->ReadDataBatch();
@@ -778,22 +771,18 @@ SourceResultType VgiPhysicalDelete::GetDataInternal(ExecutionContext &context, D
 // UPDATE Implementation
 // ============================================================================
 
-VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalUpdate &op, VgiTableEntry &table_p, bool return_chunk_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
-                       op.estimated_cardinality),
-      table(table_p), return_chunk(return_chunk_p), columns(op.columns) {
-	for (auto &expr : op.expressions) {
-		expressions.push_back(expr->Copy());
-	}
-}
-
 VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
                                      bool return_chunk_p, vector<PhysicalIndex> columns_p,
-                                     vector<unique_ptr<Expression>> expressions_p)
+                                     vector<unique_ptr<Expression>> expressions_p,
+                                     const vector<unique_ptr<Expression>> &bound_defaults_p)
     : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, WriteOutputTypes(op, return_chunk_p),
                        op.estimated_cardinality),
       table(table_p), return_chunk(return_chunk_p), columns(std::move(columns_p)),
       expressions(std::move(expressions_p)) {
+	D_ASSERT(columns.size() == expressions.size());
+	for (auto &def : bound_defaults_p) {
+		bound_defaults.push_back(def ? def->Copy() : nullptr);
+	}
 }
 
 InsertionOrderPreservingMap<string> VgiPhysicalUpdate::ParamsToString() const {
@@ -839,7 +828,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	}
 	input_schema = input_schema->AddField(input_schema->num_fields(), value_schema->field(table_info.row_id_column));
 
-	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
+	auto write_options = BuildWriteOptions(return_chunk);
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
@@ -876,19 +865,41 @@ unique_ptr<LocalSinkState> VgiPhysicalUpdate::GetLocalSinkState(ExecutionContext
 SinkResultType VgiPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
 
-	idx_t num_update_cols = columns.size();
-	idx_t rowid_col = chunk.ColumnCount() - 1;
+	// Like DuckDB's PhysicalUpdate: the child emits the new values followed by
+	// the row id (last column). Each update expression is a reference into the
+	// child's columns, or DEFAULT. A plain UPDATE gets this layout from the
+	// binder's projection, a MERGE UPDATE action from the action projection
+	// VgiCatalog::PlanMergeInto builds.
+	const idx_t num_update_cols = columns.size();
+	const idx_t rowid_col = chunk.ColumnCount() - 1;
 
 	DataChunk update_chunk;
 	vector<LogicalType> update_types;
 	for (idx_t i = 0; i < num_update_cols; i++) {
-		update_types.push_back(chunk.data[i].GetType());
+		update_types.push_back(expressions[i]->GetReturnType());
 	}
 	update_types.push_back(chunk.data[rowid_col].GetType());
 
 	update_chunk.Initialize(context.client, update_types);
 	for (idx_t i = 0; i < num_update_cols; i++) {
-		update_chunk.data[i].Reference(chunk.data[i]);
+		auto &expr = *expressions[i];
+		if (expr.GetExpressionType() == ExpressionType::BOUND_REF) {
+			update_chunk.data[i].Reference(chunk.data[expr.Cast<BoundReferenceExpression>().Index()]);
+			continue;
+		}
+		if (expr.GetExpressionType() != ExpressionType::VALUE_DEFAULT) {
+			throw InternalException("VGI UPDATE expects column references or DEFAULT, got %s", expr.ToString());
+		}
+		// SET col = DEFAULT: evaluate the column's bound default for every row.
+		const auto storage_idx = table.GetColumns().GetColumn(columns[i]).StorageOid();
+		if (storage_idx < bound_defaults.size() && bound_defaults[storage_idx]) {
+			ExpressionExecutor executor(context.client, *bound_defaults[storage_idx]);
+			executor.ExecuteExpression(chunk, update_chunk.data[i]);
+		} else {
+			// No declared default: NULL.
+			update_chunk.data[i].SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(update_chunk.data[i], true);
+		}
 	}
 	update_chunk.data[num_update_cols].Reference(chunk.data[rowid_col]);
 	update_chunk.SetCardinality(chunk.size());

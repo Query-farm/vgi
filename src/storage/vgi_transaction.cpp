@@ -5,6 +5,7 @@
 #include "storage/vgi_schema_set.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_http_params.hpp"
+#include "vgi_logging.hpp"
 
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -81,6 +82,8 @@ void VgiTransaction::Rollback() {
 		return;
 	}
 
+	DropPendingCtasTables(*ctx);
+
 	if (!transaction_opaque_data_.empty()) {
 		auto &params = vgi_catalog_.attach_parameters();
 		auto &attach_result = vgi_catalog_.attach_result();
@@ -92,6 +95,59 @@ void VgiTransaction::Rollback() {
 
 	// No extra version RPC is needed. Transaction-local cache entries were
 	// discarded above; other-session changes are caught at the next Start.
+}
+
+void VgiTransaction::AddPendingCtasTable(const std::string &schema_name, const std::string &table_name) {
+	std::lock_guard<std::mutex> guard(pending_ctas_lock_);
+	pending_ctas_tables_.emplace_back(schema_name, table_name);
+}
+
+void VgiTransaction::RemovePendingCtasTable(const std::string &schema_name, const std::string &table_name) {
+	std::lock_guard<std::mutex> guard(pending_ctas_lock_);
+	for (auto it = pending_ctas_tables_.begin(); it != pending_ctas_tables_.end(); ++it) {
+		if (it->first == schema_name && it->second == table_name) {
+			pending_ctas_tables_.erase(it);
+			return;
+		}
+	}
+}
+
+// A CTAS that created its table on a non-transactional attach (the worker has
+// no transaction to roll the CREATE back) and then failed: drop the table, so
+// the failed statement leaves nothing behind. Best effort: a drop failure is
+// logged, never raised, since the rollback must complete. CREATE OR REPLACE
+// cannot restore the table it replaced.
+void VgiTransaction::DropPendingCtasTables(ClientContext &ctx) {
+	std::vector<std::pair<std::string, std::string>> pending;
+	{
+		std::lock_guard<std::mutex> guard(pending_ctas_lock_);
+		pending.swap(pending_ctas_tables_);
+	}
+	if (pending.empty()) {
+		return;
+	}
+	auto &params = vgi_catalog_.attach_parameters();
+	auto &attach_result = vgi_catalog_.attach_result();
+	if (!attach_result) {
+		return;
+	}
+	for (auto &table : pending) {
+		std::string outcome = "dropped";
+		try {
+			vgi::CatalogRpcContext rpc_ctx {params, attach_result->attach_opaque_data, {}};
+			vgi::InvokeCatalogTableDrop(rpc_ctx, table.first, table.second, /*ignore_not_found=*/true,
+			                            /*cascade=*/false, ctx);
+		} catch (std::exception &ex) {
+			outcome = std::string("failed: ") + ex.what();
+		}
+		try {
+			VGI_LOG(ctx, "vgi.ctas.drop_after_failure",
+			        {{"schema", table.first}, {"table", table.second}, {"outcome", outcome}});
+		} catch (...) {
+		}
+	}
+	// The dropped table's cached entry must not outlive the rollback.
+	vgi_catalog_.ClearCache(/*force=*/false);
 }
 
 void VgiTransaction::ClearSchemaCache() {

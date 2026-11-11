@@ -213,19 +213,11 @@ std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
                                                  const std::string &schema_name, const std::string &view_name,
                                                  ClientContext &context);
 
-// Invoke catalog_table_scan_function_get: get scan function for a table
-VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
-    const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, const std::string &at_unit,
-    const std::string &at_value);
-
-// Invoke catalog_table_scan_branches_get: new-protocol multi-branch dispatch.
-// Tries the new method first; on MethodNotImplemented falls back to
-// InvokeCatalogTableScanFunctionGet and synthesises a one-branch result.
-// All other exceptions propagate. See A7 in the plan.
+// Invoke catalog_table_scan_branches_get, the only scan-discovery RPC since
+// protocol 3.3 (catalog_table_scan_function_get was removed). A worker that
+// answers MethodNotImplemented fails with a protocol-violation IOException.
 // `pushdown_filters` (protocol 3.2): a VGI Filter Encoding v2 snapshot over the
-// table's declared columns, sent for scan_planning='filtered' tables. Advisory;
-// the legacy fallback drops it.
+// table's declared columns, sent for scan_planning='filtered' tables. Advisory.
 VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit,
@@ -285,8 +277,10 @@ void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContex
 // DDL Operations
 // ============================================================================
 
-// Invoke catalog_table_create: create a new table in the catalog.
-void InvokeCatalogTableCreate(
+// Invoke catalog_table_create: create a new table in the catalog. Returns the
+// reply's `created` (protocol 3.3): true when this call created the table,
+// false when on_conflict IGNORE (IF NOT EXISTS) found an existing one.
+bool InvokeCatalogTableCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
     const VgiSchemaPtr &columns_schema,

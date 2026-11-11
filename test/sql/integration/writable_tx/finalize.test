@@ -1,0 +1,129 @@
+# name: test/sql/integration/writable_tx/finalize.test
+# description: Every write call runs its finalize stage exactly once (the txfix
+#              write functions declare has_finalize; finalize marks the call's
+#              writes() row): INSERT, UPDATE, DELETE, each MERGE action, calls that
+#              received no rows; a failed statement adds no finalized call.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-finalize');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-finalize', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+query I
+INSERT INTO t.main.items VALUES (4, 'd', 40), (5, 'e', 50);
+----
+2
+
+query I
+UPDATE t.main.items SET qty = qty + 1 WHERE id <= 2;
+----
+2
+
+query I
+DELETE FROM t.main.items WHERE id = 5;
+----
+1
+
+# A call that receives no rows is still opened and finalized.
+query I
+DELETE FROM t.main.items WHERE id = 99;
+----
+0
+
+query TIT
+SELECT op, rows, tx_id IS NULL FROM t.main.writes() WHERE finalized ORDER BY seq;
+----
+insert	2	true
+update	2	true
+delete	1	true
+delete	0	true
+
+# No call ran finalize twice, and every recorded call finished.
+query I
+SELECT count(*) FROM t.main.writes() WHERE NOT finalized;
+----
+0
+
+# A MERGE finalizes one call per action, including an action no row reached.
+statement ok
+SELECT * FROM t.main.reset();
+
+statement ok
+MERGE INTO t.main.items AS tgt USING (VALUES (1, 5), (2, 1)) s(id, q) ON tgt.id = s.id
+WHEN MATCHED AND s.q = 1 THEN DELETE
+WHEN MATCHED THEN UPDATE SET qty = s.q
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, 'new', s.q);
+
+query TI
+SELECT op, rows FROM t.main.writes() WHERE finalized ORDER BY op;
+----
+delete	1
+insert	0
+update	1
+
+# ============================================================================
+# Failed statements add no finalized call
+# ============================================================================
+
+statement ok
+SELECT * FROM t.main.reset();
+
+statement error
+INSERT INTO t.main.items VALUES (1, 'dup', 1);
+----
+<REGEX>:.*txfix: duplicate id 1.*
+
+statement error
+UPDATE t.main.items SET qty = -1 WHERE id = 1;
+----
+<REGEX>:.*txfix: qty must be >= 0.*
+
+statement error
+INSERT INTO ttx.main.items VALUES (2, 'dup', 1);
+----
+<REGEX>:.*txfix: duplicate id 2.*
+
+query I
+SELECT count(*) FROM t.main.writes() WHERE finalized;
+----
+0
+
+# On the transactional attach every call is finalized with the statement's
+# transaction id, also when the commit is then refused.
+query I
+INSERT INTO ttx.main.items VALUES (6, 'f', 60);
+----
+1
+
+statement error
+UPDATE ttx.main.items SET qty = -2 WHERE id = 6;
+----
+<REGEX>:.*commit refused.*
+
+query TIT
+SELECT op, rows, tx_id IS NOT NULL FROM t.main.writes() WHERE finalized ORDER BY seq;
+----
+insert	1	true
+update	1	true
+
+query I
+SELECT qty FROM t.main.items WHERE id = 6;
+----
+60

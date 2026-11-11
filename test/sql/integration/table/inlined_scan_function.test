@@ -1,6 +1,6 @@
 # name: test/sql/integration/table/inlined_scan_function.test
 # description: When TableInfo.scan_function is inlined, the extension skips
-#              catalog_table_scan_function_get and emits the
+#              catalog_table_scan_branches_get and emits the
 #              "vgi.scan_function.inlined" trace instead.
 # group: [vgi_integration_table]
 
@@ -39,18 +39,18 @@ SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
 true
 
 # Conversely, the per-bind RPC must NOT fire for this table — there should be
-# zero ``catalog_table_scan_function_get`` calls in the access log for it.
+# zero ``catalog_table_scan_branches_get`` calls in the access log for it.
 # (The chokepoint logs every catalog RPC under the ``catalog.rpc`` event.)
 query I
 SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
-  AND message LIKE '%catalog_table_scan_function_get%'
+  AND message LIKE '%catalog_table_scan_branches_get%'
   AND message LIKE '%ten_thousand_table%';
 ----
 true
 
 # ============================================================================
 # Explicit-columns table: ``Table(columns=...)`` leaves ``scan_function``
-# null. The legacy ``catalog_table_scan_function_get`` RPC still fires.
+# null, so the scan asks catalog_table_scan_branches_get.
 # ============================================================================
 
 statement ok
@@ -69,10 +69,8 @@ SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
 ----
 true
 
-# After Phase C, the new catalog_table_scan_branches_get supersedes the
-# legacy catalog_table_scan_function_get when the worker supports both
-# (fixture worker does — see vgi-python's worker.py override). Assert the
-# new RPC is the one that fires for non-inlined tables.
+# Protocol 3.3: catalog_table_scan_branches_get is the only scan-discovery
+# RPC. Assert it fires for non-inlined tables.
 query I
 SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
   AND message LIKE '%catalog_table_scan_branches_get%'

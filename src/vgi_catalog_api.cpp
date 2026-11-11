@@ -1108,92 +1108,37 @@ std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
 	return ParseViewInfo(info_batches[0], worker_path);
 }
 
-VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
-    const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value) {
-	auto &worker_path = ctx.params->worker_path();
-	auto params = generated::BuildCatalogTableScanFunctionGetParams(
-	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, OptStrIfNonEmpty(at_unit),
-	    OptStrIfNonEmpty(at_value), OptTxn(ctx));
-	auto response = InvokeRpcMethod(ctx, "catalog_table_scan_function_get", params, context);
-	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_function_get", worker_path);
-	if (!result_batch || result_batch->num_rows() == 0) {
-		throw IOException(CatalogProtocolViolation("catalog_table_scan_function_get", worker_path), "Empty response from catalog_table_scan_function_get [worker: %s]", worker_path);
-	}
-	return ParseScanFunctionResult(context, result_batch, worker_path);
-}
-
-// Helper: wrap a single-function (legacy) result as a one-branch
-// VgiScanBranchesResult. The branch carries no branch_filter (unconstrained)
-// and inherits required_extensions from the legacy result.
-static VgiScanBranchesResult WrapLegacyAsOneBranch(VgiScanFunctionResult legacy) {
-	VgiScanBranchesResult out;
-	VgiScanBranch branch;
-	branch.function_name = std::move(legacy.function_name);
-	branch.positional_arguments = std::move(legacy.positional_arguments);
-	branch.named_arguments = std::move(legacy.named_arguments);
-	branch.branch_filter.clear();
-	// parsed_branch_filter stays null — no filter to parse.
-	out.branches.push_back(std::move(branch));
-	out.required_extensions = std::move(legacy.required_extensions);
-	return out;
-}
-
+// Protocol 3.3: catalog_table_scan_branches_get is the only scan-discovery RPC
+// (catalog_table_scan_function_get and the client fallback to it are gone;
+// every worker that passes the 3.3 version check serves branches). A worker
+// answering MethodNotImplemented is a protocol error, reported as such.
 VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value,
     const std::optional<std::vector<uint8_t>> &pushdown_filters) {
 	auto &worker_path = ctx.params->worker_path();
-
-	// Capability-detection cache (A8): if a prior call against this attach
-	// already determined the worker doesn't implement the new method, skip
-	// the doomed RPC + exception entirely and go straight to the legacy
-	// fallback. State machine: 0 = unknown (probe), 1 = supported,
-	// 2 = not supported. Set by this function after each probe.
-	const int cap = ctx.params->LoadBranchesCapability();
-	if (cap == 2) {
-		auto legacy = InvokeCatalogTableScanFunctionGet(ctx, schema_name, table_name, context, at_unit, at_value);
-		return WrapLegacyAsOneBranch(std::move(legacy));
-	}
-
-	// Try the new method (either because cap == 1 / known-supported, or
-	// cap == 0 / unknown — probe). If the worker doesn't implement it, the
-	// Python-side dispatcher raises MethodNotImplementedError, which gets
-	// serialised to an EXCEPTION batch with metadata
-	// vgi_rpc.error_kind=method_not_implemented (see vgi-rpc commit adding
-	// the typed marker). The C++ side surfaces that as VgiRpcException,
-	// which we catch narrowly here.
 	auto params = generated::BuildCatalogTableScanBranchesGetParams(
 	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, OptStrIfNonEmpty(at_unit),
 	    OptStrIfNonEmpty(at_value), OptTxn(ctx), pushdown_filters);
+	UnaryResponseResult response;
 	try {
-		auto response = InvokeRpcMethod(ctx, "catalog_table_scan_branches_get", params, context);
-		auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_branches_get", worker_path);
-		if (!result_batch || result_batch->num_rows() == 0) {
-			throw IOException(CatalogProtocolViolation("catalog_table_scan_branches_get", worker_path), "Empty response from catalog_table_scan_branches_get [worker: %s]", worker_path);
-		}
-		auto parsed = ParseScanBranchesResult(context, result_batch, worker_path);
-		// Probe succeeded — pin the cache so future calls skip the legacy
-		// fallback path entirely. Idempotent on warm-cache hit (cap == 1).
-		ctx.params->StoreBranchesCapability(true);
-		return parsed;
+		response = InvokeRpcMethod(ctx, "catalog_table_scan_branches_get", params, context);
 	} catch (const VgiRpcException &e) {
 		if (e.GetErrorKind() == error_kind::kMethodNotImplemented) {
-			// Old worker: fall back to the legacy single-function RPC and
-			// synthesise a one-branch result. Pin the cache so the next
-			// catalog read skips the doomed-RPC round-trip — saves the
-			// IPC round-trip + EXCEPTION-batch parsing on every subsequent
-			// scan against this attach.
-			ctx.params->StoreBranchesCapability(false);
-			VGI_LOG(context, "catalog.rpc.scan_branches.fallback",
-			    {{"worker_path", worker_path},
-			     {"schema_name", schema_name},
-			     {"table_name", table_name}});
-			auto legacy = InvokeCatalogTableScanFunctionGet(ctx, schema_name, table_name, context, at_unit, at_value);
-			return WrapLegacyAsOneBranch(std::move(legacy));
+			throw IOException(CatalogProtocolViolation("catalog_table_scan_branches_get", worker_path),
+			                  "VGI worker does not implement catalog_table_scan_branches_get, which protocol 3.3 "
+			                  "requires to scan a table (table '%s.%s') [worker: %s]. The single-function "
+			                  "catalog_table_scan_function_get RPC was removed in protocol 3.3; the worker's SDK "
+			                  "must serve the branches RPC.",
+			                  schema_name, table_name, worker_path);
 		}
 		throw;
 	}
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_branches_get", worker_path);
+	if (!result_batch || result_batch->num_rows() == 0) {
+		throw IOException(CatalogProtocolViolation("catalog_table_scan_branches_get", worker_path), "Empty response from catalog_table_scan_branches_get [worker: %s]", worker_path);
+	}
+	return ParseScanBranchesResult(context, result_batch, worker_path);
 }
 
 // ============================================================================
@@ -1308,7 +1253,7 @@ void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContex
 // DDL Operations
 // ============================================================================
 
-void InvokeCatalogTableCreate(
+bool InvokeCatalogTableCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
     const VgiSchemaPtr &columns_schema,
@@ -1321,7 +1266,19 @@ void InvokeCatalogTableCreate(
 	                            on_conflict, constraint_definitions, ctx.transaction_opaque_data);
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 	auto params = generated::BuildCatalogTableCreateParams(request_bytes);
-	InvokeVoidRpc(ctx, "catalog_table_create", params, context);
+	// Protocol 3.3: the reply says whether this call created the table (false:
+	// IF NOT EXISTS found an existing one). It is required: a CTAS appends to
+	// the table only when this call created it.
+	const auto &worker_path = ctx.params->worker_path();
+	auto response = InvokeRpcMethod(ctx, "catalog_table_create", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_create", worker_path);
+	if (!result_batch || result_batch->num_rows() == 0) {
+		throw IOException(CatalogProtocolViolation("catalog_table_create", worker_path),
+		                  "VGI worker sent no catalog_table_create result for table '%s.%s'; protocol 3.3 requires "
+		                  "'created: bool not null' [worker: %s]",
+		                  schema_name, table_name, worker_path);
+	}
+	return generated::Decode<generated::TableCreateResponse>(result_batch, 0, worker_path).created;
 }
 
 void InvokeCatalogTableConstraintsApply(const CatalogRpcContext &ctx, const VgiTableInfo &table,

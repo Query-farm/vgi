@@ -48,7 +48,7 @@ class MyCatalog(CatalogInterface):
                 ],
                 required_extensions=["iceberg", "httpfs"],
             )
-        # Fall through to the default-impl shim — wraps the legacy
+        # Fall through to the default-impl shim — wraps the author's
         # table_scan_function_get result as a one-branch list.
         return super().table_scan_branches_get(
             schema_name=schema_name, name=name,
@@ -355,24 +355,16 @@ The C++ side calls `ExtensionHelper::TryAutoLoadExtension` on each
 entry before binding the arms. Missing extensions surface the
 standard extension-load diagnostic.
 
-## Capability detection: try-call, narrow catch, fall back
+## The branches RPC is required (protocol 3.3)
 
-The C++ extension tries `catalog_table_scan_branches_get` first. If
-the worker raises `MethodNotImplementedError` (typed exception from
-`vgi_rpc`, surfaced over the wire via the `vgi_rpc.error_kind`
-metadata key), the extension falls back to the legacy
-`catalog_table_scan_function_get` and synthesises a one-branch result.
-
-The fallback fires **at most once per attach**. A per-attach atomic
-tri-state caches the result (`unknown` → `supported` or `not supported`)
-so subsequent catalog reads against the same pooled worker skip the
-doomed-RPC round-trip. Pooled-worker replacement (different PID /
-version) resets the cache.
-
-The catch is narrow: only `RpcException` with
-`error_kind == "method_not_implemented"` triggers the fallback. All
-other RPC errors propagate as before, so a worker bug or transient
-failure doesn't get silently rerouted to the legacy path.
+`catalog_table_scan_branches_get` is the only scan-discovery RPC since
+protocol 3.3, which removed the single-function
+`catalog_table_scan_function_get` together with the extension's
+fallback to it (and its per-attach capability cache). A worker that
+answers `MethodNotImplementedError` (`vgi_rpc.error_kind =
+method_not_implemented`) is a protocol error naming the RPC and the
+table. Single-source tables answer one branch; the SDKs wrap their
+author-facing `table_scan_function_get` APIs that way.
 
 ## When NOT to use this
 
@@ -405,11 +397,8 @@ failure doesn't get silently rerouted to the legacy path.
 - **C++ rewriter**: `src/vgi_multi_scan_rewriter.cpp`. Pre-pushdown
   (`pre_optimize_function`) so DuckDB's standard filter pushdown sees the
   rewritten VGI scans inside the union.
-- **C++ dispatcher** (try-catch fallback + capability cache):
-  `InvokeCatalogTableScanBranchesGet` in `src/vgi_catalog_api.cpp`.
-- **Per-attach capability cache**: tri-state atomic on
-  `VgiAttachParameters` (`branches_capability_`), accessed via
-  `LoadBranchesCapability` / `StoreBranchesCapability`.
+- **C++ dispatcher**: `InvokeCatalogTableScanBranchesGet` in
+  `src/vgi_catalog_api.cpp`.
 - **C++ write guards**: `VgiTableEntry::GetScanFunctionImpl` (AT-clause
   refusal; multi-branch marker construction); the
   `VgiPhysicalInsert/Delete/Update::GetGlobalSinkState` paths in

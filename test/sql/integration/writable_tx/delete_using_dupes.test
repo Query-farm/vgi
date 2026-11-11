@@ -1,0 +1,57 @@
+# name: test/sql/integration/writable_tx/delete_using_dupes.test
+# description: DELETE ... USING where a target row matches several source rows:
+#              DuckDB hands the row to the delete operator once per match; each
+#              row is deleted and counted once, on both attaches.
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-delete-using');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-delete-using', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+statement ok
+CREATE TEMP TABLE src AS SELECT * FROM (VALUES (1), (1), (1), (2), (2), (9)) v(id);
+
+query I
+DELETE FROM t.main.items USING src WHERE items.id = src.id;
+----
+2
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+3	c	30
+
+query TI
+SELECT op, rows FROM t.main.writes() WHERE finalized ORDER BY seq;
+----
+delete	2
+
+statement ok
+SELECT * FROM t.main.reset();
+
+query I
+DELETE FROM ttx.main.items USING src WHERE items.id = src.id;
+----
+2
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+3	c	30

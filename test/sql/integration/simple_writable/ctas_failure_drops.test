@@ -1,0 +1,88 @@
+# name: test/sql/integration/simple_writable/ctas_failure_drops.test
+# description: A CTAS that fails after creating its table, on a non-
+#              transactional attach, drops the table again (best effort):
+#              the failed statement leaves no half-filled table behind.
+#              Contract: docs/writable_tx_fixtures.md ("simple_writable:
+#              created tables").
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+# For an http:// VGI_SIMPLE_WRITABLE_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+# The SELECT fails in a later batch, after rows were already sent.
+statement error
+CREATE TABLE w.main.ctas_fail AS SELECT CASE WHEN i < 4000 THEN i ELSE error('ctas boom') END::BIGINT AS id FROM range(5000) r(i);
+----
+<REGEX>:.*ctas boom.*
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND table_name = 'ctas_fail';
+----
+0
+
+statement error
+SELECT * FROM w.main.ctas_fail;
+----
+<REGEX>:.*ctas_fail.*does not exist.*
+
+# The name is free again.
+query I
+CREATE TABLE w.main.ctas_fail AS SELECT 1::BIGINT AS id;
+----
+1
+
+query I
+SELECT id FROM w.main.ctas_fail;
+----
+1
+
+# Inside an explicit transaction: the table goes at ROLLBACK.
+statement ok
+BEGIN;
+
+statement error
+CREATE TABLE w.main.ctas_fail_tx AS SELECT CASE WHEN i < 4000 THEN i ELSE error('ctas boom') END::BIGINT AS id FROM range(5000) r(i);
+----
+<REGEX>:.*ctas boom.*
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND table_name = 'ctas_fail_tx';
+----
+0
+
+# A CTAS that completed is not dropped when a later statement of the same
+# transaction fails (the attach is not transactional: nothing is undone).
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE w.main.ctas_kept AS SELECT 5::BIGINT AS id;
+
+statement error
+SELECT error('later failure');
+----
+<REGEX>:.*later failure.*
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT id FROM w.main.ctas_kept;
+----
+5
+
+statement ok
+DROP TABLE w.main.ctas_fail;
+
+statement ok
+DROP TABLE w.main.ctas_kept;

@@ -1,0 +1,191 @@
+# name: test/sql/integration/writable_tx/on_conflict.test
+# description: INSERT ... ON CONFLICT and INSERT OR REPLACE. DuckDB's binder
+#              rewrites each into a MERGE, which VGI emulates with the table's
+#              write functions; the worker never sees a conflict clause. Stored
+#              values are asserted after every statement: the regression test
+#              for the MERGE value-mapping bug (DO UPDATE / OR REPLACE used to
+#              send the raw merge input as the new values).
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-on-conflict');
+
+statement ok
+ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-on-conflict', transactional true);
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+# ============================================================================
+# DO NOTHING, with and without a conflict target
+# ============================================================================
+
+query I
+INSERT INTO t.main.items VALUES (1, 'dup', 1), (4, 'd', 40) ON CONFLICT DO NOTHING;
+----
+1
+
+query I
+INSERT INTO t.main.items VALUES (2, 'dup', 1), (5, 'e', 50) ON CONFLICT (id) DO NOTHING;
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	10
+2	b	20
+3	c	30
+4	d	40
+5	e	50
+
+# ============================================================================
+# DO UPDATE
+# ============================================================================
+
+statement ok
+INSERT INTO t.main.items VALUES (1, 'ignored', 11), (6, 'f', 60) ON CONFLICT (id) DO UPDATE SET qty = excluded.qty;
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id IN (1, 6) ORDER BY id;
+----
+1	a	11
+6	f	60
+
+# A SET that reads the existing row.
+statement ok
+INSERT INTO t.main.items VALUES (2, 'ignored', 5) ON CONFLICT (id) DO UPDATE SET qty = items.qty + excluded.qty;
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id = 2;
+----
+2	b	25
+
+# Several columns, in another order than the table's.
+statement ok
+INSERT INTO t.main.items VALUES (3, 'C', 33) ON CONFLICT (id) DO UPDATE SET qty = excluded.qty + 1, name = excluded.name;
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id = 3;
+----
+3	C	34
+
+# DO UPDATE ... WHERE updates only the rows that pass.
+statement ok
+INSERT INTO t.main.items VALUES (4, 'D', 1), (5, 'E', 99) ON CONFLICT (id) DO UPDATE SET qty = excluded.qty WHERE excluded.qty > 50;
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id IN (4, 5) ORDER BY id;
+----
+4	d	40
+5	e	99
+
+# An omitted column takes its default on insert, and is untouched on update.
+statement ok
+INSERT INTO t.main.items (id, name) VALUES (7, 'g'), (1, 'A') ON CONFLICT (id) DO UPDATE SET name = excluded.name;
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id IN (1, 7) ORDER BY id;
+----
+1	A	11
+7	g	0
+
+# ============================================================================
+# INSERT OR REPLACE: every non-key column takes the new value
+# ============================================================================
+
+statement ok
+INSERT OR REPLACE INTO t.main.items VALUES (6, 'F', 61), (8, 'h', 80);
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id IN (6, 8) ORDER BY id;
+----
+6	F	61
+8	h	80
+
+# ============================================================================
+# RETURNING
+# ============================================================================
+
+query ITI rowsort
+INSERT INTO t.main.items VALUES (8, 'H', 81), (9, 'i', 90) ON CONFLICT (id) DO UPDATE SET name = excluded.name, qty = excluded.qty RETURNING *;
+----
+8	H	81
+9	i	90
+
+query ITI
+INSERT INTO t.main.items VALUES (9, 'x', 1), (10, 'j', 100) ON CONFLICT DO NOTHING RETURNING *;
+----
+10	j	100
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	A	11
+2	b	25
+3	C	34
+4	d	40
+5	e	99
+6	F	61
+7	g	0
+8	H	81
+9	i	90
+10	j	100
+
+# A refused update value fails the statement.
+statement error
+INSERT INTO t.main.items VALUES (1, 'a', -1) ON CONFLICT (id) DO UPDATE SET qty = excluded.qty;
+----
+<REGEX>:.*txfix: qty must be >= 0.*
+
+query I
+SELECT qty FROM t.main.items WHERE id = 1;
+----
+11
+
+# On the transactional attach the upsert is staged and committed.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ttx.main.items VALUES (1, 'z', 12), (11, 'k', 110) ON CONFLICT (id) DO UPDATE SET qty = excluded.qty;
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id IN (1, 11) ORDER BY id;
+----
+1	A	11
+
+statement ok
+COMMIT;
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id IN (1, 11) ORDER BY id;
+----
+1	A	12
+11	k	110
+
+# ============================================================================
+# labels declares no write functions
+# ============================================================================
+
+statement error
+INSERT INTO t.main.labels VALUES (1, 'z') ON CONFLICT DO NOTHING;
+----
+<REGEX>:.*does not support INSERT.*
+
+statement error
+INSERT OR REPLACE INTO t.main.labels VALUES (1, 'z');
+----
+<REGEX>:.*does not support.*

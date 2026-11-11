@@ -379,9 +379,9 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	// (vgi_table_function_resolver.hpp), the same one the single-branch scan and
 	// the write path use: a worker-provided schema_name (protocol 1.5.0,
 	// function branches only) naming a third schema first, then the table's
-	// schema and the catalog's default schema, then the hidden (protocol 3.3
-	// table_only) sets of those schemas, then the system catalog (read_parquet,
-	// iceberg_scan, ...). Catalog::GetEntry alone would never see a table_only
+	// schema and the catalog's default schema, then the system catalog
+	// (read_parquet, iceberg_scan, ...), then the hidden (protocol 3.3
+	// table_only) sets of those schemas, which a format branch's reader skips. Catalog::GetEntry alone would never see a table_only
 	// function: LookupEntry() deliberately does not return them. A worker-claimed
 	// schema equal to the table's or the default is resolved by that cascade
 	// itself, never by a separate call (see cache/filter_pushdown_keys.test and
@@ -396,6 +396,8 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	request.worker_schema = branch.IsFunctionBranch() ? branch.schema_name : std::string();
 	request.default_schema = default_schema;
 	request.allow_system_catalog = true;
+	// A format branch names a DuckDB reader, never a worker function.
+	request.format_reader = branch.IsFormatBranch();
 	auto resolved = vgi::ResolveVgiTableFunction(context, request);
 	auto &fn_entry = *resolved.entry;
 

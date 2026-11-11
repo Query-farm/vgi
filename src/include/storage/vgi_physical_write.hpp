@@ -23,11 +23,54 @@
 #include "vgi_catalog_metadata.hpp"
 #include "vgi_ifunction_connection.hpp"
 
+#include <set>
+#include <unordered_set>
+
 namespace duckdb {
 
 // ============================================================================
 // Shared State for all write operations
 // ============================================================================
+
+//! The row ids one DELETE write call has sent. DuckDB hands a non-native
+//! table's DELETE a target row once per matching source row (DELETE ...
+//! USING); a write call sends each row id once.
+class VgiRowIdSet {
+public:
+	//! Keep only the rows of `rowids` (one column) not seen before in this call,
+	//! slicing it in place; returns the number kept. NULL row ids are kept.
+	idx_t Filter(DataChunk &rowids) {
+		auto &vec = rowids.data[0];
+		const idx_t n = rowids.size();
+		UnifiedVectorFormat format;
+		vec.ToUnifiedFormat(n, format);
+		SelectionVector keep(n);
+		idx_t kept = 0;
+		const bool is_bigint = vec.GetType().InternalType() == PhysicalType::INT64;
+		for (idx_t i = 0; i < n; i++) {
+			const auto idx = format.sel->get_index(i);
+			bool fresh = true;
+			if (format.validity.RowIsValid(idx)) {
+				if (is_bigint) {
+					fresh = bigint_ids_.insert(UnifiedVectorFormat::GetData<int64_t>(format)[idx]).second;
+				} else {
+					fresh = other_ids_.insert(vec.GetValue(i)).second;
+				}
+			}
+			if (fresh) {
+				keep.set_index(kept++, i);
+			}
+		}
+		if (kept < n) {
+			rowids.Slice(keep, kept);
+		}
+		return kept;
+	}
+
+private:
+	std::unordered_set<int64_t> bigint_ids_;
+	std::set<Value> other_ids_;
+};
 
 struct VgiWriteGlobalState : public GlobalSinkState {
 	VgiWriteGlobalState(ClientContext &context, const vector<LogicalType> &return_types, bool return_chunk_p)
@@ -61,6 +104,13 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 	// surface partial-failure errors. False: the legacy close-and-drain
 	// path runs (no finalize callback fires on the worker).
 	bool has_finalize = false;
+
+	//! DELETE: the row ids this write call already sent.
+	VgiRowIdSet deleted_rowids;
+
+	//! CTAS: the table this statement created (catalog_table_create replied
+	//! created=true). Finalize clears its rollback-drop mark.
+	optional_ptr<VgiTableEntry> ctas_table;
 };
 
 // Local sink state for RETURNING — holds persistent ArrowScanLocalState so that
@@ -94,9 +144,8 @@ struct VgiWriteSourceState : public GlobalSourceState {
 
 class VgiPhysicalInsert : public PhysicalOperator {
 public:
-	VgiPhysicalInsert(PhysicalPlan &plan, LogicalInsert &op, VgiTableEntry &table, bool return_chunk,
-	                  OnConflictAction action_type, unordered_set<column_t> on_conflict_filter);
-	// Merge-compatible constructor (accepts any LogicalOperator)
+	//! INSERT, and a MERGE's INSERT action (whose projection supplies the full
+	//! row). ON CONFLICT never reaches here: DuckDB plans it as a MERGE.
 	VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table, bool return_chunk);
 	// CREATE TABLE AS constructor — table is created during execution, not planning
 	VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, SchemaCatalogEntry &schema,
@@ -131,8 +180,6 @@ private:
 	optional_ptr<SchemaCatalogEntry> schema;     // set for CTAS
 	unique_ptr<BoundCreateTableInfo> create_info; // set for CTAS
 	bool return_chunk;
-	OnConflictAction action_type;
-	unordered_set<column_t> on_conflict_filter; // conflict target column IDs
 };
 
 // ============================================================================
@@ -183,10 +230,13 @@ private:
 
 class VgiPhysicalUpdate : public PhysicalOperator {
 public:
-	VgiPhysicalUpdate(PhysicalPlan &plan, LogicalUpdate &op, VgiTableEntry &table, bool return_chunk);
-	// Merge-compatible constructor (no columns/expressions — they come from the merge action)
+	//! UPDATE, and a MERGE's UPDATE action. `expressions[i]` (one per entry of
+	//! `columns`) references the child column holding the new value, or is
+	//! DEFAULT (evaluated from `bound_defaults`, indexed by storage oid); the
+	//! child's last column is the row id.
 	VgiPhysicalUpdate(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table, bool return_chunk,
-	                  vector<PhysicalIndex> columns, vector<unique_ptr<Expression>> expressions);
+	                  vector<PhysicalIndex> columns, vector<unique_ptr<Expression>> expressions,
+	                  const vector<unique_ptr<Expression>> &bound_defaults);
 
 	bool IsSink() const override {
 		return true;
@@ -217,6 +267,7 @@ private:
 	bool return_chunk;
 	vector<PhysicalIndex> columns;
 	vector<unique_ptr<Expression>> expressions;
+	vector<unique_ptr<Expression>> bound_defaults;
 };
 
 } // namespace duckdb

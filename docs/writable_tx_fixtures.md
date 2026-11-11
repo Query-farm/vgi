@@ -103,6 +103,11 @@ of one transaction, to different worker processes. Keep it in a file under `$VGI
 (default: `<system temp dir>/vgi-txfix`), guarded by a file lock (or a database with its own
 locking, e.g. SQLite).
 
+Write calls run **concurrently**: the INSERT, UPDATE and DELETE actions of one MERGE are
+separate write calls that may run at the same time, in different worker processes, alongside the
+scan of `items` that feeds them. Make each batch's read-validate-apply one critical section under
+the state lock (with a busy timeout, not an immediate failure, when the lock is taken).
+
 State is **partitioned by the `token` value** (a NULL token is its own partition). Each test file
 uses its own token, so files that run in parallel do not see each other's rows; and the partition a
 function or hook works on is the observable proof that the secret reached it. A partition holds the

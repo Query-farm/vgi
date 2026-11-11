@@ -42,12 +42,20 @@ public:
 		return transaction_opaque_data_;
 	}
 
+	//! CTAS on a non-transactional attach: a table this transaction created and
+	//! whose CTAS has not completed yet. Rollback drops it again (best effort),
+	//! so a failed CTAS does not leave a half-filled table behind.
+	void AddPendingCtasTable(const std::string &schema_name, const std::string &table_name);
+	void RemovePendingCtasTable(const std::string &schema_name, const std::string &table_name);
+
 	//! Temporary storage for point-in-time catalog entries (time travel).
 	//! These are created during GetEntry with an AT clause and must remain
 	//! alive until the query completes. Cleaned up when the transaction ends.
 	vector<unique_ptr<CatalogEntry>> point_in_time_entries;
 
 private:
+	void DropPendingCtasTables(ClientContext &ctx);
+
 	VgiTransactionState transaction_state = VgiTransactionState::TRANSACTION_NOT_YET_STARTED;
 	AccessMode access_mode_;
 	VgiCatalog &vgi_catalog_;
@@ -55,6 +63,9 @@ private:
 	// safely reach a ClientContext if one is still alive at rollback time.)
 	unique_ptr<VgiSchemaSet> transaction_schemas_;
 	std::vector<uint8_t> transaction_opaque_data_;   // Assigned by worker's catalog_transaction_begin
+	std::mutex pending_ctas_lock_;
+	//! (schema, table) pairs, see AddPendingCtasTable.
+	std::vector<std::pair<std::string, std::string>> pending_ctas_tables_;
 };
 
 class VgiTransactionManager : public TransactionManager {

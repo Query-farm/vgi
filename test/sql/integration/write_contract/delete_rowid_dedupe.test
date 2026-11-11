@@ -1,0 +1,43 @@
+# name: test/sql/integration/write_contract/delete_rowid_dedupe.test
+# description: DuckDB hands a non-native table's DELETE a target row once per
+#              matching source row (DELETE ... USING). The extension sends each
+#              row id once per write call. wcfix's sink_delete counts the row
+#              ids it receives (sink_received()).
+# group: [vgi_integration_write_contract]
+
+require-env VGI_WRITE_CONTRACT_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'wcfix' AS w (TYPE vgi, LOCATION '${VGI_WRITE_CONTRACT_WORKER}');
+
+statement ok
+CREATE TEMP TABLE src AS SELECT * FROM (VALUES (1), (1), (1), (2), (2), (9)) v(id);
+
+query II
+SELECT rowids, calls FROM w.main.sink_received();
+----
+0	0
+
+# Rows 1 and 2 match five source rows; the worker receives two row ids.
+query I
+DELETE FROM w.main.sink USING src WHERE sink.id = src.id;
+----
+2
+
+query II
+SELECT rowids, calls FROM w.main.sink_received();
+----
+2	1
+
+# A DELETE without duplicates sends every row id.
+query I
+DELETE FROM w.main.sink WHERE id >= 1;
+----
+3
+
+query II
+SELECT rowids, calls FROM w.main.sink_received();
+----
+5	2

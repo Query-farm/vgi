@@ -1,0 +1,29 @@
+# name: test/sql/integration/write_contract/table_create_reply.test
+# description: Protocol 3.3: catalog_table_create replies
+#              TableCreateResponse(created: bool not null). A reply of another
+#              shape (here `created` as a string) is a protocol violation: the
+#              extension needs `created` to decide whether a CTAS may insert.
+# group: [vgi_integration_write_contract]
+
+require-env VGI_WRITE_CONTRACT_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'wcfix' AS nc (TYPE vgi, LOCATION '${VGI_WRITE_CONTRACT_WORKER} --mistyped-create-reply');
+
+statement error
+CREATE TABLE nc.main.fresh (id BIGINT);
+----
+<REGEX>:.*RPC response schema mismatch for 'catalog_table_create'.*
+
+statement error
+CREATE TABLE nc.main.fresh2 AS SELECT 1::BIGINT AS id;
+----
+<REGEX>:.*RPC response schema mismatch for 'catalog_table_create'.*
+
+# The session is still usable.
+query I
+SELECT count(*) FROM nc.main.sink;
+----
+3

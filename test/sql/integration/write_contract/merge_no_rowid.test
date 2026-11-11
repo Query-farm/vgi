@@ -1,0 +1,72 @@
+# name: test/sql/integration/write_contract/merge_no_rowid.test
+# description: MERGE INTO, and INSERT ... ON CONFLICT / INSERT OR REPLACE (which
+#              DuckDB's binder rewrites into a MERGE), on a VGI table without a
+#              row id is a Binder Error at planning. It used to reach
+#              PhysicalMergeInto's InternalException("MERGE row ID index is out
+#              of range"), which invalidated the database. The wcfix fixture's
+#              main.logs is insert-only with a PRIMARY KEY and no row id.
+# group: [vgi_integration_write_contract]
+
+require-env VGI_WRITE_CONTRACT_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'wcfix' AS w (TYPE vgi, LOCATION '${VGI_WRITE_CONTRACT_WORKER}');
+
+query I
+INSERT INTO w.main.logs VALUES (1, 'one');
+----
+1
+
+statement error
+INSERT INTO w.main.logs VALUES (1, 'again') ON CONFLICT DO NOTHING;
+----
+<REGEX>:Binder Error.*MERGE INTO.*not supported on VGI table 'main.logs': the table has no row id.*
+
+# DO UPDATE / OR REPLACE need UPDATE, which logs does not declare: that is
+# reported before the missing row id.
+statement error
+INSERT INTO w.main.logs VALUES (1, 'again') ON CONFLICT (id) DO UPDATE SET msg = excluded.msg;
+----
+<REGEX>:.*does not support UPDATE.*
+
+statement error
+INSERT OR REPLACE INTO w.main.logs VALUES (1, 'again');
+----
+<REGEX>:.*does not support UPDATE.*
+
+statement error
+INSERT INTO w.main.logs VALUES (1, 'again') ON CONFLICT (id) DO NOTHING;
+----
+<REGEX>:Binder Error.*the table has no row id.*
+
+statement error
+MERGE INTO w.main.logs AS tgt USING (VALUES (2, 'two')) s(id, msg) ON tgt.id = s.id
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.msg);
+----
+<REGEX>:Binder Error.*the table has no row id.*
+
+# Never an internal error: the database is still usable, and nothing was written.
+query IT
+SELECT id, msg FROM w.main.logs ORDER BY id;
+----
+1	one
+
+query I
+INSERT INTO w.main.logs VALUES (2, 'two');
+----
+1
+
+query IT
+SELECT id, msg FROM w.main.logs ORDER BY id;
+----
+1	one
+2	two
+
+# A MERGE that needs an operation the table does not declare reports that first.
+statement error
+MERGE INTO w.main.logs AS tgt USING (VALUES (2, 'x')) s(id, msg) ON tgt.id = s.id
+WHEN MATCHED THEN UPDATE SET msg = s.msg;
+----
+<REGEX>:.*does not support UPDATE.*

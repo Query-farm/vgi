@@ -39,7 +39,8 @@ historical catalog metadata transition used `2.1` → `2.2` under `vgi.v2`.
 The 3.0 successor introduced the new major and routing namespace; 3.1 adds
 partition-distribution planning under that same namespace, 3.2 filtered scan
 planning ([multi-branch scans](multi_branch.md)), and 3.3 `FunctionInfo.visibility`
-([function visibility](function_visibility.md)); each uses the exact
+([function visibility](function_visibility.md)) plus three write-path changes
+([below](#protocol-33-write-path-changes)); each uses the exact
 minor-version gate.
 
 Deploy matched consumers and workers, with old and new versions at separate
@@ -83,3 +84,51 @@ modes, and only one of them was cheap.
 generator cannot see: that the value reaches the wire, on the right method, and
 is absent on reserved methods where its presence is rejected. Those are the
 secret-protocol and reserved-method cases the integration suite never reaches.
+
+## Protocol 3.3 write-path changes
+
+Besides `FunctionInfo.visibility`, 3.3.0 changes three things on the write path. The version
+string, `vgi.v3` / `3.3.0`, is the same; workers and the extension must both carry all of them.
+
+1. **`catalog_table_scan_function_get` is removed.** `catalog_table_scan_branches_get` is the
+   only scan-discovery RPC, and every worker must serve it (a single-source table answers one
+   branch; the SDKs' author-facing `table_scan_function_get` APIs keep working behind it). The
+   extension's per-attach fallback to the old RPC is gone: a worker that answers
+   `MethodNotImplemented` for the branches RPC is a protocol error naming the RPC and the table
+   (`write_contract/scan_branches_required.test`). A `TableInfo.scan_function` inlined in the
+   table's metadata still skips the RPC.
+2. **`catalog_table_create` returns `TableCreateResponse(created: bool not null)`**: true when
+   this call created the table (including `REPLACE`), false when `on_conflict = IGNORE`
+   (`IF NOT EXISTS`) found an existing table and left it unchanged. The extension reports "not
+   created" to DuckDB, so `CREATE TABLE IF NOT EXISTS ... AS SELECT` inserts nothing into an
+   existing table. A reply of any other shape is a protocol violation
+   (`write_contract/table_create_reply.test`).
+3. **The write-options batch is `result_mode: utf8 not null` only.** The former `on_conflict`
+   and `on_conflict_columns` fields are gone: DuckDB's binder rewrites every
+   `INSERT ... ON CONFLICT` / `INSERT OR REPLACE` into a MERGE before any catalog hook runs
+   (`bind_insert.cpp` `GenerateMergeInto`), so they could only ever say `throw` / empty.
+
+### MERGE and INSERT ... ON CONFLICT on VGI tables
+
+The extension emulates MERGE (and so every `INSERT ... ON CONFLICT` / `INSERT OR REPLACE`) with
+the table's ordinary write functions: each INSERT, UPDATE or DELETE action of the MERGE is one
+write call, fed the same rows a plain INSERT/UPDATE/DELETE of that table gets (UPDATE actions
+send their evaluated SET values, cast to the column types, plus the row id).
+`VgiCatalog::PlanMergeInto` follows DuckDB's `PlanGenericMergeIntoAction`.
+
+- **Row id required.** MERGE matches target rows by row id, so it is a Binder Error at planning
+  on a table without one (`write_contract/merge_no_rowid.test`). That includes
+  `INSERT ... ON CONFLICT DO NOTHING` on an insert-only table. `ON CONFLICT` targets also need
+  the table's declared PRIMARY KEY / UNIQUE constraints.
+- **Atomic only on transactional attaches.** The action calls run as separate write calls (in
+  parallel when at most one action inserts). On a non-transactional attach a failure in one
+  action (a refused row, a `WHEN ... THEN ERROR` clause) leaves what other calls and earlier
+  batches already applied. On a transactional attach the whole MERGE is staged in the
+  statement's transaction and discarded with it.
+- Multi-branch tables refuse MERGE ([multi-branch scans](multi_branch.md)).
+
+Related fixes in the same release: DELETE sends each row id once per write call (DuckDB hands a
+non-native DELETE ... USING a target row once per matching source row), and a CTAS that fails
+after creating its table on a non-transactional attach drops the table again (best effort,
+logged as `vgi.ctas.drop_after_failure`; `CREATE OR REPLACE TABLE ... AS` cannot restore the
+table it replaced).

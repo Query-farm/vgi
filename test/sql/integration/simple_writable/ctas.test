@@ -1,0 +1,85 @@
+# name: test/sql/integration/simple_writable/ctas.test
+# description: CREATE TABLE ... AS SELECT against the simple writable fixture:
+#              the extension creates the table (catalog_table_create replies
+#              created = true) and inserts the SELECT's rows through the created
+#              table's insert function, in one write call however many batches.
+#              CREATE OR REPLACE replaces the table. Contract:
+#              docs/writable_tx_fixtures.md ("simple_writable: created tables").
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+# For an http:// VGI_SIMPLE_WRITABLE_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+query I
+CREATE TABLE w.main.ctas_values AS SELECT 42::BIGINT AS id, 'hello' AS label;
+----
+1
+
+query IT
+SELECT id, label FROM w.main.ctas_values;
+----
+42	hello
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'w' AND table_name = 'ctas_values' ORDER BY column_index;
+----
+id	BIGINT
+label	VARCHAR
+
+# Several batches.
+query I
+CREATE TABLE w.main.ctas_range AS SELECT i AS id, 'row_' || i AS name, i % 2 = 0 AS even, i / 2 AS half FROM range(5000) r(i);
+----
+5000
+
+query IIIR
+SELECT count(*), sum(id), count(*) FILTER (WHERE even), max(half) FROM w.main.ctas_range;
+----
+5000	12497500	2500	2499.5
+
+# The created table takes ordinary INSERTs.
+query I
+INSERT INTO w.main.ctas_values VALUES (43, 'world');
+----
+1
+
+query IT
+SELECT id, label FROM w.main.ctas_values ORDER BY id;
+----
+42	hello
+43	world
+
+# CREATE OR REPLACE ... AS drops the old table and its rows.
+query I
+CREATE OR REPLACE TABLE w.main.ctas_values AS SELECT 7::BIGINT AS id, 'seven' AS label, 7.5::DOUBLE AS score;
+----
+1
+
+query ITR
+SELECT id, label, score FROM w.main.ctas_values;
+----
+7	seven	7.5
+
+# A plain CREATE of an existing name fails.
+statement error
+CREATE TABLE w.main.ctas_values AS SELECT 1::BIGINT AS id;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+DROP TABLE w.main.ctas_values;
+
+statement ok
+DROP TABLE w.main.ctas_range;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND table_name LIKE 'ctas_%';
+----
+0

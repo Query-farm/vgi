@@ -1,0 +1,217 @@
+# name: test/sql/integration/writable_tx/merge.test
+# description: MERGE INTO on the non-transactional attach. VGI emulates MERGE
+#              with the table's write functions, one write call per INSERT/
+#              UPDATE/DELETE action: every clause kind (MATCHED UPDATE/DELETE
+#              with AND conditions and computed SET, NOT MATCHED INSERT, NOT
+#              MATCHED BY SOURCE UPDATE/DELETE, DO NOTHING, ERROR), with the
+#              stored values checked after each statement (regression test:
+#              UPDATE actions used to send the raw merge input instead of the
+#              evaluated SET values).
+#              Fixture contract: docs/writable_tx_fixtures.md.
+# group: [vgi_integration_writable_tx]
+
+require-env VGI_WRITABLE_TX_FIXTURES
+
+require-env VGI_WRITABLE_TX_WORKER
+
+require vgi
+
+# For an http:// VGI_WRITABLE_TX_WORKER.
+require httpfs
+
+statement ok
+ATTACH 'txfix' AS t (TYPE vgi, LOCATION '${VGI_WRITABLE_TX_WORKER}', token 'tok-merge');
+
+query T
+SELECT ok FROM t.main.reset();
+----
+true
+
+statement ok
+CREATE TEMP TABLE src (id INTEGER, name VARCHAR, qty BIGINT);
+
+# ============================================================================
+# Upsert: MATCHED UPDATE + NOT MATCHED INSERT
+# ============================================================================
+
+statement ok
+INSERT INTO src VALUES (2, 'B', 21), (4, 'd', 40);
+
+query I
+MERGE INTO t.main.items AS tgt USING src ON tgt.id = src.id
+WHEN MATCHED THEN UPDATE SET name = src.name, qty = src.qty
+WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.name, src.qty);
+----
+2
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+1	a	10
+2	B	21
+3	c	30
+4	d	40
+
+# One write call per action.
+query TI
+SELECT op, rows FROM t.main.writes() WHERE finalized ORDER BY op, rows;
+----
+insert	1
+update	1
+
+# ============================================================================
+# Conditional MATCHED clauses, computed SET, DELETE
+# ============================================================================
+
+statement ok
+SELECT * FROM t.main.reset();
+
+statement ok
+DELETE FROM src;
+
+statement ok
+INSERT INTO src VALUES (1, 'x', 5), (2, 'y', 100), (3, 'z', 7);
+
+query I
+MERGE INTO t.main.items AS tgt USING src ON tgt.id = src.id
+WHEN MATCHED AND src.qty > 50 THEN UPDATE SET qty = tgt.qty + src.qty, name = upper(src.name)
+WHEN MATCHED AND src.qty < 6 THEN DELETE
+WHEN MATCHED THEN UPDATE SET qty = tgt.qty * 2;
+----
+3
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	Y	120
+3	c	60
+
+query TI
+SELECT op, rows FROM t.main.writes() WHERE finalized ORDER BY op, rows;
+----
+delete	1
+update	1
+update	1
+
+# SET only some columns, in another order than the table's, with a cast.
+query I
+MERGE INTO t.main.items AS tgt USING (VALUES (3, 'w', 7)) s(id, name, q) ON tgt.id = s.id
+WHEN MATCHED THEN UPDATE SET qty = s.q, name = s.name || '!';
+----
+1
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	Y	120
+3	w!	7
+
+# SET DEFAULT takes the declared default.
+statement ok
+MERGE INTO t.main.items AS tgt USING (VALUES (3)) s(id) ON tgt.id = s.id
+WHEN MATCHED THEN UPDATE SET qty = DEFAULT;
+
+query I
+SELECT qty FROM t.main.items WHERE id = 3;
+----
+0
+
+# ============================================================================
+# NOT MATCHED: INSERT with column list (default for qty), DO NOTHING
+# ============================================================================
+
+statement ok
+MERGE INTO t.main.items AS tgt USING (VALUES (5, 'e'), (6, 'skip')) s(id, name) ON tgt.id = s.id
+WHEN NOT MATCHED AND s.name = 'skip' THEN DO NOTHING
+WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name);
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	Y	120
+3	w!	0
+5	e	0
+
+# INSERT with an expression and an INTEGER literal into the BIGINT column.
+statement ok
+MERGE INTO t.main.items AS tgt USING (VALUES (7, 'g')) s(id, name) ON tgt.id = s.id
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, upper(s.name), 70);
+
+query ITI
+SELECT id, name, qty FROM t.main.items WHERE id = 7;
+----
+7	G	70
+
+# ============================================================================
+# NOT MATCHED BY SOURCE: UPDATE and DELETE target rows the source lacks
+# ============================================================================
+
+statement ok
+MERGE INTO t.main.items AS tgt USING (VALUES (2)) s(id) ON tgt.id = s.id
+WHEN MATCHED THEN DO NOTHING
+WHEN NOT MATCHED BY SOURCE AND tgt.id = 3 THEN UPDATE SET qty = 33, name = 'kept'
+WHEN NOT MATCHED BY SOURCE THEN DELETE;
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	Y	120
+3	kept	33
+
+# ============================================================================
+# A refused row fails the MERGE
+# ============================================================================
+
+statement error
+MERGE INTO t.main.items AS tgt USING (VALUES (2, -1)) s(id, q) ON tgt.id = s.id
+WHEN MATCHED THEN UPDATE SET qty = s.q;
+----
+<REGEX>:.*txfix: qty must be >= 0.*
+
+statement error
+MERGE INTO t.main.items AS tgt USING (VALUES (3, 'dup')) s(id, name) ON tgt.id + 100 = s.id
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name, 1);
+----
+<REGEX>:.*txfix: duplicate id 3.*
+
+# The same target row matched twice is DuckDB's error, before any write.
+statement error
+MERGE INTO t.main.items AS tgt USING (VALUES (2, 1), (2, 2)) s(id, q) ON tgt.id = s.id
+WHEN MATCHED THEN UPDATE SET qty = s.q;
+----
+<REGEX>:.*more than one source row.*
+
+query ITI
+SELECT id, name, qty FROM t.main.items ORDER BY id;
+----
+2	Y	120
+3	kept	33
+
+# ============================================================================
+# ERROR clause. The MERGE's write calls are not atomic together: on this
+# attach, rows other actions already wrote may stay written (how many depends
+# on scheduling); the row that hit ERROR is never written.
+# ============================================================================
+
+statement ok
+SELECT * FROM t.main.reset();
+
+statement ok
+INSERT INTO t.main.items SELECT i, 'n', 1 FROM range(100, 10100) r(i);
+
+statement error
+MERGE INTO t.main.items AS tgt USING (SELECT i AS id FROM range(100, 10100) r(i)) s ON tgt.id = s.id
+WHEN MATCHED AND s.id = 10099 THEN ERROR 'merge refused'
+WHEN MATCHED THEN UPDATE SET qty = 2;
+----
+<REGEX>:.*merge refused.*
+
+query I
+SELECT qty FROM t.main.items WHERE id = 10099;
+----
+1
+
+query I
+SELECT count(*) FROM t.main.items WHERE id >= 100 AND qty NOT IN (1, 2);
+----
+0
