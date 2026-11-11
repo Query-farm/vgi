@@ -108,6 +108,11 @@ export VGI_TEST_BRANCH_DIR
 VGI_SECRET_LOOKUP_FIXTURES ?= 1
 export VGI_SECRET_LOOKUP_FIXTURES
 
+# spatial_filter_example(..., edge_rows := true), which
+# table/spatial_extent_edge_rows.test gates on (vgi-python fixtures 0.50.1+).
+VGI_SPATIAL_EDGE_ROWS_FIXTURE ?= 1
+export VGI_SPATIAL_EDGE_ROWS_FIXTURE
+
 # Writable-table and transaction-hook fixtures (docs/writable_tx_fixtures.md),
 # which writable_tx/*.test gate on together with VGI_WRITABLE_TX_WORKER (the
 # fixture worker LOCATION). vgi-python has no such fixture yet, so neither is

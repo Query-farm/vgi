@@ -68,6 +68,8 @@ jobs:
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
+      # 0.50.1 adds spatial_filter_example(..., edge_rows := true).
+      VGI_FIXTURES_REF: v0.50.1
     steps:
       - uses: actions/checkout@v4
 

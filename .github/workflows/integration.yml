@@ -48,7 +48,7 @@ jobs:
       VGI_FIXTURES_DIR: /tmp/vgi-python
       # Pin the coordinated Protocol 3.1 fixture release. Exact major+minor
       # matching deliberately rejects the earlier 3.0 workers.
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.50.0' }}
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.50.1' }}
       GEN: ninja
       BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"
@@ -225,6 +225,8 @@ jobs:
           # vgi-python's example worker implements the secret-lookup fixtures
           # (docs/secret_lookup_fixtures.md).
           VGI_SECRET_LOOKUP_FIXTURES: "1"
+          # ... and spatial_filter_example(..., edge_rows := true) from 0.50.1.
+          VGI_SPATIAL_EDGE_ROWS_FIXTURE: "1"
           # No vgi-python writable_tx fixture yet (docs/writable_tx_fixtures.md):
           # writable_tx/*.test skip on VGI_WRITABLE_TX_FIXTURES, allowed below.
         run: |

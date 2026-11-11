@@ -17,7 +17,10 @@ FIXTURES="${2:-${VGI_FIXTURES_DIR:-/tmp/vgi-python}}"
 TESTS=(
     test/sql/integration/table/spatial_extent_derived.test
     test/sql/integration/table/expression_filter.test
+    test/sql/integration/table/spatial_extent_edge_rows.test
 )
+# vgi-python's fixture worker has spatial_filter_example(..., edge_rows := true).
+export VGI_SPATIAL_EDGE_ROWS_FIXTURE=1
 
 run_spatial() {
     uv run --no-project --with duckdb==2.0.0 python scripts/run_stock_duckdb_slt.py \
