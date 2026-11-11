@@ -379,10 +379,12 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	// (vgi_table_function_resolver.hpp), the same one the single-branch scan and
 	// the write path use: a worker-provided schema_name (protocol 1.5.0,
 	// function branches only) naming a third schema first, then the table's
-	// schema and the catalog's default schema, then the system catalog
-	// (read_parquet, iceberg_scan, ...), then the hidden (protocol 3.3
-	// table_only) sets of those schemas, which a format branch's reader skips. Catalog::GetEntry alone would never see a table_only
-	// function: LookupEntry() deliberately does not return them. A worker-claimed
+	// schema and the catalog's default schema, then the hidden (protocol 3.3
+	// table_only) sets of those schemas, then the system catalog (read_parquet,
+	// iceberg_scan, ...). A format branch's reader skips the hidden sets and
+	// goes to the system catalog right after the visible entries.
+	// Catalog::GetEntry alone would never see a table_only function:
+	// LookupEntry() deliberately does not return them. A worker-claimed
 	// schema equal to the table's or the default is resolved by that cascade
 	// itself, never by a separate call (see cache/filter_pushdown_keys.test and
 	// the comment in vgi_table_entry.cpp).

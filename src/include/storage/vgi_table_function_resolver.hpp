@@ -34,7 +34,8 @@ struct VgiTableFunctionRequest {
 	//! False for write functions, which are always worker RPCs.
 	bool allow_system_catalog = true;
 	//! A format branch's reader (read_parquet, iceberg_scan, ...): a DuckDB
-	//! function, never a worker's table_only one, so the hidden sets are skipped.
+	//! function, never a worker's table_only one, so the hidden sets are skipped
+	//! and the system catalog is consulted right after the visible entries.
 	bool format_reader = false;
 };
 
@@ -60,10 +61,13 @@ struct VgiResolvedTableFunction {
 //!      schema, neither the table's nor the default; see the comment in
 //!      GetScanFunctionImpl about cache/filter_pushdown_keys.test), the table's
 //!      schema, then the catalog's default schema;
-//!   2. the system catalog, when request.allow_system_catalog (before the hidden
-//!      sets, so a DuckDB built-in never forces a function listing RPC);
-//!   3. the hidden (table_only) set of those same schemas, in the same order.
-//! A format branch's reader (request.format_reader) skips step 3.
+//!   2. the hidden (table_only) set of those same schemas, in the same order, so
+//!      a hidden worker scan named like a DuckDB built-in (range, glob, query)
+//!      binds the worker's function, not the built-in;
+//!   3. the system catalog, when request.allow_system_catalog.
+//! A format branch's reader (request.format_reader) is a DuckDB function by
+//! construction: it skips step 2 (so a built-in reader name never forces a
+//! function listing RPC) and goes straight from step 1 to step 3.
 //!
 //! Throws a BinderException naming the worker, catalog, table and function when
 //! nothing resolves: the worker must list every function its tables name. There

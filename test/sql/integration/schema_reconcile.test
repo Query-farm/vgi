@@ -1,7 +1,10 @@
 # name: test/sql/integration/schema_reconcile.test
 # description: Verifies the C++ ReconcileBatchToSchema helper reshapes and casts
 #              every batch DuckDB hands the worker so that the worker sees its
-#              declared schema bit-for-bit. Drives the schema_reconcile fixture
+#              declared types bit-for-bit, with every field (at every level)
+#              nullable: write inputs never carry the table's NOT NULL flags,
+#              which the worker enforces itself (a NULL in a non-nullable field
+#              would be an invalid Arrow batch). Drives the schema_reconcile fixture
 #              whose handlers strict-assert on the Arrow schema of each
 #              INSERT/UPDATE/DELETE batch — a regression in the C++ helper
 #              would surface as a worker-side ValueError, not silent corruption.
@@ -28,9 +31,11 @@ ATTACH 'schema_reconcile' AS sr (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   tags      LIST(STRUCT)    NOT NULL  (NOT NULL k string leaf inside list-of-struct)
 #   rowid     BIGINT          NOT NULL  (DuckDB pseudocolumn)
 #
-# DuckDB's ArrowConverter cannot preserve any of those flags or the
-# ms+UTC timestamp on the round trip. Every assertion below depends on
-# the C++ ReconcileBatchToSchema helper to bridge the gap.
+# DuckDB's ArrowConverter cannot preserve the ms+UTC timestamp on the round
+# trip; the C++ ReconcileBatchToSchema helper bridges that gap. The write
+# input marks every field nullable (vgi_physical_write.cpp
+# NullableWriteInputSchema), so the fixture compares against its declared
+# types with all-nullable fields and enforces NOT NULL on the values.
 
 # ============================================================================
 # INSERT — covers top-level NOT NULL primitives, TZ-aware timestamps,
@@ -106,7 +111,8 @@ SELECT id, nested.a, nested.b FROM sr.main.demo ORDER BY id;
 2	20	NULL
 
 # List element fields are Arrow storage nullability, not nested SQL constraint
-# paths. They still reach the provider unchanged and must reject NULL values.
+# paths. The write input marks them nullable too; the provider still rejects
+# NULL values against its declared schema.
 statement error
 INSERT INTO sr.main.demo (id, ts, nested, tags) VALUES
     (999,
@@ -147,7 +153,7 @@ SELECT nested.a, nested.b FROM sr.main.demo WHERE id = 100;
 
 # ============================================================================
 # DELETE — exercises the rowid-only reshape path. The fixture's DELETE
-# handler strict-asserts the input batch is exactly (rowid: int64 NOT NULL).
+# handler strict-asserts the input batch is exactly (rowid: int64), nullable.
 # ============================================================================
 
 statement ok
@@ -220,7 +226,7 @@ SELECT count(*) FROM sr.main.ts_demo;
 # UPDATE addressed by the timestamp-rowid: pick the row whose id is 1 and
 # update its ``id`` field. The rowid travels through DuckDB and back; the
 # fixture's UPDATE handler asserts the rowid arrives as
-# timestamp[ms, tz=UTC] NOT NULL.
+# timestamp[ms, tz=UTC] (nullable, like every write-input field).
 statement ok
 UPDATE sr.main.ts_demo SET id = 1001 WHERE id = 1;
 
@@ -231,7 +237,7 @@ SELECT id FROM sr.main.ts_demo WHERE nested.a = 11;
 
 # DELETE addressed by the timestamp-rowid. The fixture's DELETE handler
 # strict-asserts the input batch is exactly
-# (rowid: timestamp[ms, tz=UTC] NOT NULL).
+# (rowid: timestamp[ms, tz=UTC]), nullable.
 statement ok
 DELETE FROM sr.main.ts_demo WHERE id = 2;
 
@@ -246,8 +252,9 @@ DELETE FROM sr.main.ts_demo;
 # ============================================================================
 # struct_demo — rowid is a STRUCT with a NOT NULL leaf and a nullable leaf.
 # Exercises recursive nested-type reshape on the rowid pseudocolumn:
-# DuckDB will emit the struct rowid with all-nullable children;
-# ReconcileBatchToSchema must descend and restore ``a``'s NOT NULL flag.
+# DuckDB will emit the struct rowid with all-nullable children, and the
+# write input keeps them nullable; ReconcileBatchToSchema must still descend
+# and restore the declared leaf types.
 # ============================================================================
 
 statement ok

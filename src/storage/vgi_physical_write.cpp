@@ -22,9 +22,47 @@
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
+#include "nanoarrow/nanoarrow.hpp"
+
 #include <cstring>
 
 namespace duckdb {
+
+// Write-input schemas (the Arrow batches the extension streams to an insert,
+// update or delete function) mark every field nullable, at every nesting
+// level. DuckDB does not enforce a VGI table's NOT NULL before the write call:
+// the worker does, per vgi.constraint.enforce.v1, and reports the violation
+// itself. Keeping the table's non-nullable flags here would put an INSERT or
+// UPDATE of NULL into a NOT NULL column on the wire as an invalid Arrow batch
+// (a non-nullable field holding nulls) that a strict Arrow reader rejects
+// before the worker can apply its constraint check.
+// The one exception: a map's entries struct and its keys stay non-nullable, as
+// the Arrow format requires (DuckDB map keys are never NULL); its values are
+// marked like any other field.
+static void MarkNullableRecursive(ArrowSchema &field) {
+	field.flags |= ARROW_FLAG_NULLABLE;
+	if (field.format && std::strcmp(field.format, "+m") == 0) {
+		if (field.n_children == 1 && field.children[0]->n_children == 2) {
+			MarkNullableRecursive(*field.children[0]->children[1]);
+		}
+		return;
+	}
+	for (int64_t i = 0; i < field.n_children; ++i) {
+		MarkNullableRecursive(*field.children[i]);
+	}
+	if (field.dictionary) {
+		MarkNullableRecursive(*field.dictionary);
+	}
+}
+
+static vgi::VgiSchemaPtr NullableWriteInputSchema(const vgi::VgiSchemaPtr &schema) {
+	nanoarrow::UniqueSchema output;
+	schema->ExportTo(output.get());
+	for (int64_t i = 0; i < output->n_children; ++i) {
+		MarkNullableRecursive(*output->children[i]);
+	}
+	return vgi::VgiSchema::Adopt(output.get());
+}
 
 // Resolve a write-function discovery result, preferring the inlined value on
 // VgiTableInfo when the worker populated it (skips the corresponding
@@ -514,12 +552,13 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	auto write_options = BuildWriteOptions(return_chunk);
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
-	gstate->send_schema = input_schema;
 	if (return_chunk) {
 		// RETURNING expects the worker to emit batches with the table's
 		// user-column schema (sans rowid). Same shape used by GetLocalSinkState.
 		gstate->expected_returning_schema = input_schema;
 	}
+	input_schema = NullableWriteInputSchema(input_schema);
+	gstate->send_schema = input_schema;
 	const auto resolved_write = ResolveWriteFunctionEntry(context, *table, "insert", write_func);
 	gstate->has_finalize = resolved_write.has_finalize;
 	{
@@ -668,7 +707,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 
 	auto &table_info = table.GetTableInfo();
 	auto value_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
-	auto input_schema = value_schema->Select({table_info.row_id_column})->WithMetadata(VgiMetadata());
+	auto input_schema =
+	    NullableWriteInputSchema(value_schema->Select({table_info.row_id_column})->WithMetadata(VgiMetadata()));
 
 	auto write_options = BuildWriteOptions(return_chunk);
 
@@ -811,10 +851,10 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 
 	// For each updated column, look the field up by name in the worker's
 	// declared table schema rather than re-deriving via DuckDB's Arrow
-	// converter — that converter always emits nullable=true and would
-	// silently widen the worker's contract. The C++
-	// ReconcileBatchToSchema helper reshapes incoming batches to match
-	// this declared schema before they hit the IPC writer.
+	// converter, so the worker sees its declared types. Every field is then
+	// marked nullable (NullableWriteInputSchema): NOT NULL is the worker's to
+	// enforce. The C++ ReconcileBatchToSchema helper reshapes incoming
+	// batches to match this schema before they hit the IPC writer.
 	VgiSchemaPtr input_schema = VgiSchema::Empty();
 	for (auto &col_idx : columns) {
 		auto &col = table_columns.GetColumn(col_idx);
@@ -827,6 +867,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 		}
 	}
 	input_schema = input_schema->AddField(input_schema->num_fields(), value_schema->field(table_info.row_id_column));
+	input_schema = NullableWriteInputSchema(input_schema);
 
 	auto write_options = BuildWriteOptions(return_chunk);
 

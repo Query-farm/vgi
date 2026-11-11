@@ -12,6 +12,11 @@ Serves catalog ``visfix``, schema ``main``:
             ``notes_insert`` returns its row count from ``finalize`` only, so an
             INSERT reports the right count only if the extension knew, from the hidden
             listing entry, that the function has a finalize stage.
+            ``notes_insert`` also refuses an input batch with a non-nullable field: the
+            extension marks every write-input field nullable (``notes.id`` is declared
+            NOT NULL), since the worker, not the Arrow schema, enforces NOT NULL.
+    ranged  scan named ``range``, like the DuckDB built-in: it is ``table_only``,
+            so the extension must bind the worker's function, not ``range()``.
 
 With ``--bad-visibility`` the listing sends ``good_scan`` with visibility ``bogus``,
 which the extension must reject naming the function.
@@ -121,6 +126,24 @@ class GoodScan(_Scan):
         return [{"id": i, "label": label} for i, label in ((1, "a"), (2, "b"), (3, "c"))]
 
 
+class RangeScan(_Scan):
+    """main.ranged: a hidden scan named like the DuckDB built-in range()."""
+
+    OUTPUT = pa.schema([pa.field("who", pa.string())])
+
+    class Meta:
+        """Function metadata."""
+
+        name = "range"
+        description = "The rows of main.ranged (shadows nothing: table_only)"
+        stability = FunctionStability.VOLATILE
+
+    @classmethod
+    def rows(cls) -> list[dict[str, Any]]:
+        """One row that only this worker produces."""
+        return [{"who": "visfix worker"}]
+
+
 class GhostScan(_Scan):
     """main.ghost: implemented, but never listed (see VisfixCatalog)."""
 
@@ -178,6 +201,9 @@ class NotesInsert(TableInOutGenerator[None, None]):
     def process(cls, params: ProcessParams[None], state: None, batch: pa.RecordBatch, out: OutputCollector) -> None:
         """Store the rows and report nothing yet: finalize reports the count."""
         del params, state
+        strict = [f.name for f in batch.schema if not f.nullable]
+        if strict:
+            raise ValueError(f"notes_insert: write input has non-nullable field(s) {strict}")
         rows = batch.to_pylist()
         _NOTES.extend({"id": r["id"], "note": r["note"]} for r in rows)
         _PENDING[0] += len(rows)
@@ -200,6 +226,7 @@ CATALOG = Catalog(
             tables=[
                 Table(name="good", function=GoodScan),
                 Table(name="ghost", function=GhostScan),
+                Table(name="ranged", function=RangeScan),
                 Table(name="notes", function=NotesScan, insert_function=NotesInsert),
             ],
         )

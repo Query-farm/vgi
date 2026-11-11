@@ -74,19 +74,12 @@ VgiResolvedTableFunction ResolveVgiTableFunction(ClientContext &context, const V
 			return result;
 		}
 	}
-	if (request.allow_system_catalog) {
-		// DuckDB built-ins a worker delegates to (read_parquet, iceberg_scan, the
-		// readers of format branches, ...). Checked before the hidden sets: a
-		// hidden lookup lists the schema's functions even when the schema reports
-		// zero of them, and a built-in name must not force that RPC.
-		EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(Identifier(request.function_name)));
-		auto sys_entry = Catalog::GetEntry(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL);
-		if (sys_entry) {
-			result.entry = &sys_entry->Cast<TableFunctionCatalogEntry>();
-			result.from_system_catalog = true;
-			return result;
-		}
-	}
+	// A worker function scan (and every write function) resolves to the worker's
+	// own hidden (table_only) function before any DuckDB built-in, so a hidden
+	// scan named like a built-in (range, glob, query, ...) binds the worker's
+	// function. Only a format branch's reader is a DuckDB function by
+	// construction: it skips the hidden sets entirely, so a built-in reader name
+	// never forces a function listing RPC.
 	if (!request.format_reader) {
 		for (const auto &schema : schemas) {
 			if (auto entry = LookupHidden(context, catalog, schema, request.function_name)) {
@@ -95,6 +88,17 @@ VgiResolvedTableFunction ResolveVgiTableFunction(ClientContext &context, const V
 				result.hidden = true;
 				return result;
 			}
+		}
+	}
+	if (request.allow_system_catalog || request.format_reader) {
+		// DuckDB built-ins a worker delegates to (read_parquet, iceberg_scan, the
+		// readers of format branches, ...).
+		EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(Identifier(request.function_name)));
+		auto sys_entry = Catalog::GetEntry(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL);
+		if (sys_entry) {
+			result.entry = &sys_entry->Cast<TableFunctionCatalogEntry>();
+			result.from_system_catalog = true;
+			return result;
 		}
 	}
 

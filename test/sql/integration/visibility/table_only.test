@@ -51,6 +51,34 @@ SELECT * FROM v.main.notes_insert();
 <REGEX>:.*Table Function with name notes_insert does not exist.*
 
 # ============================================================================
+# table_only scan named like a DuckDB built-in: the worker's function wins
+# ============================================================================
+
+# ranged's scan is named `range`. The resolver checks the worker's hidden set
+# before the system catalog (only a format branch's reader goes to the system
+# catalog first), so this binds the worker's no-argument scan, not range().
+query T
+SELECT who FROM v.main.ranged;
+----
+visfix worker
+
+query I
+SELECT count(*) FROM v.main.ranged;
+----
+1
+
+# Still hidden: DuckDB's range() is untouched and the worker's is not listed.
+query I
+SELECT count(*) FROM range(3);
+----
+3
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'v' AND function_name = 'range';
+----
+0
+
+# ============================================================================
 # A table naming a function the worker does not list
 # ============================================================================
 
@@ -81,3 +109,8 @@ query I
 INSERT INTO v.main.notes VALUES (1, 'x'), (2, 'y');
 ----
 2
+
+# notes.id is NOT NULL in the worker schema, yet the write input marks every
+# field nullable (NOT NULL is the worker's to enforce; a NULL there would
+# otherwise make an invalid Arrow batch). notes_insert refuses any non-nullable
+# input field, so the INSERT above also checks that.
