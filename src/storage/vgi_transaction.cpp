@@ -4,6 +4,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_schema_set.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_subprocess.hpp" // CleanupRpcScope
 #include "vgi_http_params.hpp"
 #include "vgi_logging.hpp"
 
@@ -81,6 +82,10 @@ void VgiTransaction::Rollback() {
 	if (!ctx) {
 		return;
 	}
+
+	// The failed statement left the context marked interrupted
+	// (Executor::PushError); the cleanup RPCs below must still reach the worker.
+	vgi::CleanupRpcScope cleanup_scope;
 
 	DropPendingCtasTables(*ctx);
 

@@ -717,6 +717,24 @@ void WriteAll(int, const uint8_t *, size_t) {
 
 #endif // VGI_POSIX_TRANSPORT / _WIN32 / emscripten
 
+static thread_local int cleanup_rpc_depth = 0;
+
+CleanupRpcScope::CleanupRpcScope() {
+	cleanup_rpc_depth++;
+}
+
+CleanupRpcScope::~CleanupRpcScope() {
+	cleanup_rpc_depth--;
+}
+
+bool CleanupRpcScope::Active() {
+	return cleanup_rpc_depth > 0;
+}
+
+bool RpcInterrupted(const ClientContext *context) {
+	return context && !CleanupRpcScope::Active() && context->IsInterrupted();
+}
+
 #if VGI_POSIX_TRANSPORT
 void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	// No wall-clock deadline. Match the streaming data-phase model: block
@@ -725,7 +743,7 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	constexpr int kPollIntervalMs = 250;
 
 	while (true) {
-		if (context && context->IsInterrupted()) {
+		if (RpcInterrupted(context)) {
 			// InterruptException, not IOException: the pool retries
 			// IOException on a fresh worker, and a cancel must not be retried.
 			throw InterruptException();
@@ -1121,7 +1139,7 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 			// spin forever (recv() then observes the EOF). interrupted re-checked
 			// each iteration → prompt cancel.
 			for (unsigned attempt = 0;; attempt++) {
-				if (context && context->IsInterrupted()) {
+				if (RpcInterrupted(context)) {
 					throw InterruptException(); // not IOException: never retried
 				}
 				u_long avail = 0;

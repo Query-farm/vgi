@@ -226,6 +226,30 @@ namespace vgi {
 // connection is the caller's responsibility (route through
 // VgiCancelDispatcher so the worker unblocks).
 void WaitForReadableUntilCancel(int fd, ClientContext *context);
+
+// Marks this thread as running a cleanup RPC that must reach the worker even
+// though the calling query is marked interrupted: the transaction-rollback
+// RPCs (catalog_transaction_rollback, the drop of a failed CTAS's table).
+// DuckDB's Executor::PushError marks the context interrupted when any task of
+// a statement fails, and the rollback runs before that flag is reset, so an
+// interrupt-polling wait would abort the rollback with an InterruptException
+// before the worker answered (HTTP unary RPCs already never pass the query as
+// cancellation for the same reason; see vgi_http_client.hpp). Thread-local:
+// only the RPC issued on the rolling-back thread ignores the flag; scans and
+// other tasks keep polling it.
+class CleanupRpcScope {
+public:
+	CleanupRpcScope();
+	~CleanupRpcScope();
+	CleanupRpcScope(const CleanupRpcScope &) = delete;
+	CleanupRpcScope &operator=(const CleanupRpcScope &) = delete;
+
+	static bool Active();
+};
+
+// True when a blocking transport wait on this thread should give up because
+// `context`'s query was interrupted (never inside a CleanupRpcScope).
+bool RpcInterrupted(const ClientContext *context);
 } // namespace vgi
 
 } // namespace duckdb

@@ -78,7 +78,7 @@ std::string FormatIrohError(const char *operation, const vgi_iroh_error &error) 
 
 uint8_t CheckDuckDBInterrupted(void *userdata) {
 	auto context = static_cast<ClientContext *>(userdata);
-	return context && context->IsInterrupted() ? 1 : 0;
+	return RpcInterrupted(context) ? 1 : 0;
 }
 
 ErrorInfo IrohInfo(const char *subtype) {
@@ -271,7 +271,7 @@ public:
 		int64_t total = 0;
 		auto last_progress = std::chrono::steady_clock::now();
 		while (total < nbytes) {
-			if (context_ && context_->IsInterrupted()) {
+			if (RpcInterrupted(context_)) {
 				vgi_iroh_stream_cancel(stream_->value);
 				throw InterruptException();
 			}
@@ -556,7 +556,7 @@ IrohNativeHttpResponse PerformIrohHttpRequest(
 	uint8_t chunk[64 * 1024];
 	auto last_progress = std::chrono::steady_clock::now();
 	while (true) {
-		if (context && context->IsInterrupted()) {
+		if (RpcInterrupted(context)) {
 			vgi_iroh_http_response_cancel(raw);
 			throw InterruptException();
 		}

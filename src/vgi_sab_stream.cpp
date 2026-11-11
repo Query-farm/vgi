@@ -5,6 +5,7 @@
 #include "duckdb/main/client_context.hpp" // ClientContext::interrupted (cancel polling)
 
 #include "duckdb/common/exception.hpp"
+#include "vgi_subprocess.hpp" // RpcInterrupted
 
 #include <string>
 
@@ -54,7 +55,7 @@ int64_t SabInputStream::Read(int64_t nbytes, void *out) {
 			// Executor::PushError) and busy-waits for all executor tasks to return; an
 			// uninterruptible read here would never return and would freeze the whole
 			// engine. Mirrors the subprocess WaitForReadableUntilCancel poll.
-			if (context_ && context_->IsInterrupted()) {
+			if (RpcInterrupted(context_)) {
 				throw IOException("SabInputStream: read interrupted (query cancelled)");
 			}
 			if (deadline_ && std::chrono::steady_clock::now() >= *deadline_) {

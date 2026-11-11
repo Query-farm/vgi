@@ -27,14 +27,24 @@ Flags break the worker on purpose:
     --mistyped-create-reply    ``catalog_table_create`` replies ``created`` as a string
                            instead of ``TableCreateResponse(created: bool not null)``.
 
-State is per worker process, as in visibility_worker.py.
+State (logs' rows, sink_delete's counters) is shared by the worker processes
+of one DuckDB process: a JSON file named after the parent process id in
+$TMPDIR. On stdio the extension may run a statement's RPCs on several pooled
+worker processes (children of the unittest process); a ``launch:`` worker's
+parent is its launcher, so there the state lives as long as the launcher.
 
 Run as ``uv run --project <vgi-python> python test/support/write_contract_worker.py``.
 """
 
 from __future__ import annotations
 
+import fcntl
+import json
+import os
 import sys
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -69,9 +79,31 @@ LOGS = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("msg", pa
 SINK = pa.schema([pa.field("id", pa.int64(), nullable=False)])
 PLAIN = pa.schema([pa.field("id", pa.int64())])
 
-# Per worker process.
-_LOGS: list[dict[str, Any]] = []
-_SINK_RECEIVED: list[int] = [0, 0]  # row ids received, write calls
+_STATE_PATH = os.path.join(tempfile.gettempdir(), f"vgi-wcfix-state-{os.getppid()}.json")
+
+
+@contextmanager
+def _state() -> Iterator[dict[str, Any]]:
+    """The shared state, locked; changes are written back on exit."""
+    with open(_STATE_PATH, "a+", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.seek(0)
+        text = fh.read()
+        # logs: rows of main.logs; sink: [row ids sink_delete received, its write calls]
+        state: dict[str, Any] = json.loads(text) if text else {"logs": [], "sink": [0, 0]}
+        before = json.dumps(state)
+        yield state
+        after = json.dumps(state)
+        if after != before:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(after)
+            fh.flush()
+
+
+def _read(fn: Callable[[dict[str, Any]], Any]) -> Any:
+    with _state() as state:
+        return fn(state)
 
 
 @dataclass(kw_only=True)
@@ -132,8 +164,8 @@ class LogsScan(_Scan):
 
     @classmethod
     def rows(cls) -> list[dict[str, Any]]:
-        """Rows inserted so far by this worker process."""
-        return sorted(_LOGS, key=lambda r: r["id"])
+        """Rows inserted so far (see the module docstring for the state's scope)."""
+        return sorted(_read(lambda st: st["logs"]), key=lambda r: r["id"])
 
 
 class LogsInsert(TableInOutGenerator[None, None]):
@@ -156,12 +188,13 @@ class LogsInsert(TableInOutGenerator[None, None]):
         """Validate the batch, then store it."""
         del state
         rows = [{"id": r["id"], "msg": r["msg"]} for r in batch.to_pylist()]
-        seen = {r["id"] for r in _LOGS}
-        for row in rows:
-            if row["id"] in seen:
-                raise ValueError(f"wcfix: duplicate id {row['id']}")
-            seen.add(row["id"])
-        _LOGS.extend(rows)
+        with _state() as st:
+            seen = {r["id"] for r in st["logs"]}
+            for row in rows:
+                if row["id"] in seen:
+                    raise ValueError(f"wcfix: duplicate id {row['id']}")
+                seen.add(row["id"])
+            st["logs"].extend(rows)
         out.emit(write_result_batch(write_options(params).result_mode, LOGS, [None] * len(rows), rows))
 
 
@@ -197,14 +230,16 @@ class SinkDelete(TableInOutGenerator[None, None]):
     @classmethod
     def on_bind(cls, params: BindParams[None]) -> BindResponse:
         """count only; a new call starts here."""
-        _SINK_RECEIVED[1] += 1
+        with _state() as st:
+            st["sink"][1] += 1
         return BindResponse(output_schema=write_result_schema(write_options(params).result_mode, SINK))
 
     @classmethod
     def process(cls, params: ProcessParams[None], state: None, batch: pa.RecordBatch, out: OutputCollector) -> None:
         """Count the batch's row ids; report each as deleted."""
         del state
-        _SINK_RECEIVED[0] += batch.num_rows
+        with _state() as st:
+            st["sink"][0] += batch.num_rows
         rows = [{"id": r} for r in batch.column("rowid").to_pylist()]
         out.emit(write_result_batch(write_options(params).result_mode, SINK, rows, [None] * len(rows)))
 
@@ -218,13 +253,14 @@ class SinkReceived(_Scan):
         """Function metadata."""
 
         name = "sink_received"
-        description = "Row ids sink_delete received in this worker process, and its calls"
+        description = "Row ids sink_delete received, and its calls"
         stability = FunctionStability.VOLATILE
 
     @classmethod
     def rows(cls) -> list[dict[str, Any]]:
         """One row."""
-        return [{"rowids": _SINK_RECEIVED[0], "calls": _SINK_RECEIVED[1]}]
+        rowids, calls = _read(lambda st: st["sink"])
+        return [{"rowids": rowids, "calls": calls}]
 
 
 def _constraints(table: str, key: str) -> tuple[Any, ...]:

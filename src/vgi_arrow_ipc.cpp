@@ -224,7 +224,7 @@ int64_t FdInputStream::Read(int64_t nbytes, void *out) {
 							break;
 						}
 						if (w == WAIT_TIMEOUT) {
-							if (context_ && context_->IsInterrupted()) {
+							if (RpcInterrupted(context_)) {
 								::CancelIoEx(h, &ov);
 								cancelled = true;
 								break;

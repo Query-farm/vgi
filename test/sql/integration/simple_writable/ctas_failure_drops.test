@@ -13,6 +13,11 @@ require vgi
 # For an http:// VGI_SIMPLE_WRITABLE_WORKER.
 require httpfs
 
+# The drop's outcome is logged (vgi.ctas.drop_after_failure): assert it was
+# dropped by this rollback, not by a worker that happened to finish the RPC.
+statement ok
+CALL enable_logging(level := 'debug');
+
 statement ok
 ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
 
@@ -21,6 +26,14 @@ statement error
 CREATE TABLE w.main.ctas_fail AS SELECT CASE WHEN i < 4000 THEN i ELSE error('ctas boom') END::BIGINT AS id FROM range(5000) r(i);
 ----
 <REGEX>:.*ctas boom.*
+
+# The failed statement left the query marked interrupted; the rollback's drop
+# must still complete (it used to fail with "Interrupted!" on subprocess
+# workers, leaving the table behind).
+query I
+SELECT count(*) FROM duckdb_logs() WHERE message LIKE '%vgi.ctas.drop_after_failure%table=ctas_fail,%outcome=dropped%';
+----
+1
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'w' AND table_name = 'ctas_fail';
