@@ -237,6 +237,22 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context);
 // cancellation for the same reason; see vgi_http_client.hpp). Thread-local:
 // only the RPC issued on the rolling-back thread ignores the flag; scans and
 // other tasks keep polling it.
+//
+// Consequence: a cleanup RPC cannot be interrupted by Ctrl-C (or query cancel)
+// on non-HTTP transports: subprocess pipes, the launcher's Unix sockets,
+// shared memory and native Iroh. It waits until the worker answers or the
+// connection fails. The subprocess/launcher wait has no wall-clock deadline,
+// so a worker that never answers its rollback keeps the rollback waiting until
+// the worker exits or is killed; Iroh still applies its io_timeout_seconds.
+// HTTP unary RPCs never take the query as cancellation either, but are bounded
+// by the HTTP client's timeouts.
+//
+// Native Iroh: the cancel check (CheckDuckDBInterrupted, vgi_iroh_native.cpp)
+// runs on the calling thread, so this scope is effective there too.
+// vgi-iroh-cabi's *_cancellable functions drive host_cancellable() with
+// Runtime::block_on, which polls the passed future (and so the check) on the
+// thread that calls block_on; only tasks the future spawns run on the tokio
+// worker threads, and the check is never moved into one.
 class CleanupRpcScope {
 public:
 	CleanupRpcScope();

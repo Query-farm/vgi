@@ -85,6 +85,8 @@ void VgiTransaction::Rollback() {
 
 	// The failed statement left the context marked interrupted
 	// (Executor::PushError); the cleanup RPCs below must still reach the worker.
+	// They are therefore not interruptible by Ctrl-C on non-HTTP transports
+	// (see CleanupRpcScope in vgi_subprocess.hpp).
 	vgi::CleanupRpcScope cleanup_scope;
 
 	DropPendingCtasTables(*ctx);

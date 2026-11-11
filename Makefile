@@ -115,8 +115,8 @@ export VGI_SPATIAL_EDGE_ROWS_FIXTURE
 
 # Writable-table and transaction-hook fixtures (docs/writable_tx_fixtures.md),
 # which writable_tx/*.test gate on together with VGI_WRITABLE_TX_WORKER (the
-# fixture worker LOCATION). vgi-python has no such fixture yet, so neither is
-# set by default; pass both (e.g. an SDK fixture worker) to run the files. Only
+# fixture worker LOCATION). Neither is set by default; pass both (e.g. the
+# vgi-python fixture, vgi-fixture-writable-tx-worker) to run the files. Only
 # exported when non-empty: require-env treats an empty variable as set.
 ifneq ($(strip $(VGI_WRITABLE_TX_FIXTURES)),)
 export VGI_WRITABLE_TX_FIXTURES

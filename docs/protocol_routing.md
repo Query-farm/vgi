@@ -132,3 +132,18 @@ non-native DELETE ... USING a target row once per matching source row), and a CT
 after creating its table on a non-transactional attach drops the table again (best effort,
 logged as `vgi.ctas.drop_after_failure`; `CREATE OR REPLACE TABLE ... AS` cannot restore the
 table it replaced).
+
+### Rollback RPCs are not interruptible
+
+When a statement fails, DuckDB marks the query interrupted before it rolls the transaction back.
+The extension's rollback-time RPCs (`catalog_transaction_rollback` on a transactional attach,
+and the drop of a failed CTAS's table on a non-transactional one) therefore deliberately ignore
+the interrupt flag, or they would abort before the worker answered. The consequence: **Ctrl-C
+(or a query cancel) does not interrupt a rollback RPC on non-HTTP transports** (subprocess
+stdio, the launcher's Unix sockets, shared memory, native Iroh). The rollback waits until the
+worker answers or the connection fails; on the subprocess and launcher transports there is no
+deadline, so a worker that never answers its rollback must be killed (native Iroh still applies
+`io_timeout_seconds`). HTTP unary RPCs never take the query as cancellation either, and are
+bounded by the HTTP client's timeouts. Workers should answer `catalog_transaction_rollback`
+promptly and never block it on the statement that failed. (The Iroh cancel check runs on the
+calling thread, so the same rule applies there; `CleanupRpcScope` in `src/include/vgi_subprocess.hpp`.)

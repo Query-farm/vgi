@@ -45,22 +45,27 @@ then the files skip with the reason `require-env VGI_WRITABLE_TX_FIXTURES` (or
 `require-env VGI_WRITABLE_TX_WORKER`); harnesses that enforce a skip allow-list
 (`EXPECTED_SKIP_REASONS`) must list that reason, with a comment, until the fixture lands, and must
 remove it in the commit that sets the variables. The vgi `Makefile` exports
-`VGI_WRITABLE_TX_FIXTURES` (empty by default: the vgi-python fixture does not exist yet) and its
-skip allow-list and the vgi `integration.yml` suite step allow both reasons.
+`VGI_WRITABLE_TX_FIXTURES` and `VGI_WRITABLE_TX_WORKER` only when they are set (they are empty by
+default; pass both, e.g. the vgi-python fixture below, to run the files), and its skip allow-list
+and the vgi `integration.yml` suite step allow both reasons.
 
 The harness SHOULD point `VGI_TXFIX_STATE_DIR` at a directory private to the lane (for example a
 `mktemp -d`), so lanes running at the same time on one host do not share fixture state.
 
 Status:
 
-| SDK | Fixture | From |
-|---|---|---|
-| vgi-typescript | `examples/writable-tx-worker.ts` (`bin/vgi-example-writable-tx-worker`, `--http`) | reference fixture (vgi-typescript main) |
-| vgi-python | — | pending |
-| vgi-go | — | pending |
-| vgi-rust | — | pending |
-| vgi-java | — | pending |
-| vgi-csharp | — | pending |
+Every SDK's fixture implements this page, including the protocol 3.3 write-path additions
+(`items_insert` / `items_delete`, `writes()`, staged inserts and deletes); the commits below are
+where that landed on each SDK's main.
+
+| SDK | Fixture | Worker (CI) | Landed |
+|---|---|---|---|
+| vgi-python | `vgi/_test_fixtures/writable_tx.py` | `vgi-fixture-writable-tx-worker` (`packages/vgi-fixtures`) | `365707e` (fixture), `5e89ff8` (MetaWorker relays `created`, needed by the launcher lane) |
+| vgi-typescript | `examples/writable-tx-worker.ts` | `bin/vgi-example-writable-tx-worker` (HTTP: `bin/vgi-example-writable-tx-http-worker`) | `7d1368d` |
+| vgi-go | `examples/writable_tx/` (`catalog.go`, `functions.go`, `state.go`) | `vgi-example-writable-tx-worker-go` | `17ededc` |
+| vgi-rust | `vgi-example-worker/src/txfix.rs` | `ci/wrappers/vgi-worker-txfix` (example worker, catalog `txfix`) | `81307f9` |
+| vgi-java | `vgi-example-worker/src/main/java/farm/query/vgi/example/txfix/` (`TxFixWorker.java`, `TxFixState.java`) | `ci/wrappers/vgi-worker-txfix` | `61cb573` |
+| vgi-csharp | `fixtures/QueryFarm.Vgi.WritableTxWorker/` | `vgi-writable-tx-worker` | `e710db2` |
 
 ## Common rules
 
