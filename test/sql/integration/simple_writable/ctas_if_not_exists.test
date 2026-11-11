@@ -1,9 +1,12 @@
 # name: test/sql/integration/simple_writable/ctas_if_not_exists.test
-# description: CREATE TABLE IF NOT EXISTS ... AS SELECT on an existing table:
-#              catalog_table_create replies created = false, and the extension
-#              inserts nothing (it used to append the SELECT's rows into the
-#              existing table). Contract: docs/writable_tx_fixtures.md
-#              ("simple_writable: created tables").
+# description: CREATE TABLE IF NOT EXISTS ... AS SELECT on an existing table
+#              leaves it exactly as it was. (When DuckDB's binder already sees
+#              the table it plans nothing; when it does not, e.g. another session
+#              created it meanwhile, catalog_table_create replies created =
+#              false and the extension inserts nothing: it used to append the
+#              SELECT's rows. write_contract/ctas_not_created.test covers that
+#              path.) Contract: docs/writable_tx_fixtures.md ("simple_writable:
+#              created tables").
 # group: [vgi_integration_simple_writable]
 
 require-env VGI_SIMPLE_WRITABLE_WORKER
@@ -19,10 +22,8 @@ ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}
 statement ok
 CREATE TABLE w.main.ctas_exists AS SELECT 1::BIGINT AS id, 'one' AS label;
 
-query I
+statement ok
 CREATE TABLE IF NOT EXISTS w.main.ctas_exists AS SELECT i::BIGINT AS id, 'new' AS label FROM range(10) r(i);
-----
-0
 
 query IT
 SELECT id, label FROM w.main.ctas_exists;

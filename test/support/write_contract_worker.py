@@ -15,6 +15,9 @@ Serves catalog ``wcfix``, schema ``main``:
     plain   ``id BIGINT``, declared with explicit columns, so its ``TableInfo``
             inlines no scan function and every scan asks
             ``catalog_table_scan_branches_get``.
+    phantom never listed; ``CREATE TABLE IF NOT EXISTS main.phantom`` replies
+            ``created = false`` (as if another session had created it after
+            DuckDB's binder looked), so a CTAS must insert nothing.
 
 Flags break the worker on purpose:
 
@@ -305,10 +308,13 @@ class WcfixWorker(Worker):
         )
 
     def catalog_table_create(self, request: TableCreateRequest) -> TableCreateResponse:
-        """With --mistyped-create-reply, reply `created` as a string; otherwise refuse CREATE TABLE."""
-        del request
+        """``phantom`` IF NOT EXISTS: created=False; --mistyped-create-reply: a string; else refuse."""
         if MISTYPED_CREATE_REPLY:
             return _MistypedCreateResponse()
+        if request.name == "phantom" and str(request.on_conflict).upper().endswith("IGNORE"):
+            # As if another session had created it after DuckDB's binder looked:
+            # IF NOT EXISTS finds it, so this call created nothing.
+            return TableCreateResponse(created=False)
         raise ValueError("wcfix: CREATE TABLE is not supported")
 
 

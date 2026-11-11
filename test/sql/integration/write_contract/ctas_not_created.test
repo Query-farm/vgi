@@ -1,0 +1,27 @@
+# name: test/sql/integration/write_contract/ctas_not_created.test
+# description: CREATE TABLE IF NOT EXISTS ... AS SELECT when catalog_table_create
+#              replies created = false (the table appeared after DuckDB's binder
+#              looked): the extension reports "not created" and the CTAS inserts
+#              nothing, instead of appending the SELECT's rows to the table.
+# group: [vgi_integration_write_contract]
+
+require-env VGI_WRITE_CONTRACT_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'wcfix' AS w (TYPE vgi, LOCATION '${VGI_WRITE_CONTRACT_WORKER}');
+
+query I
+CREATE TABLE IF NOT EXISTS w.main.phantom AS SELECT i::BIGINT AS id FROM range(10) r(i);
+----
+0
+
+statement ok
+CREATE TABLE IF NOT EXISTS w.main.phantom (id BIGINT);
+
+# Without IF NOT EXISTS the worker refuses.
+statement error
+CREATE TABLE w.main.phantom AS SELECT 1::BIGINT AS id;
+----
+<REGEX>:.*wcfix: CREATE TABLE is not supported.*
