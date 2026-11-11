@@ -31,6 +31,12 @@ variable until it does:
 - [Writable-table and transaction-hook fixtures](../docs/writable_tx_fixtures.md) —
   `writable_tx/*.test`, gated on `VGI_WRITABLE_TX_FIXTURES` and
   `VGI_WRITABLE_TX_WORKER` (the fixture worker LOCATION).
+- Spatial edge rows — `table/spatial_extent_edge_rows.test`, gated on
+  `VGI_SPATIAL_EDGE_ROWS_FIXTURE`. `spatial_filter_example(count, edge_rows := true)`
+  appends 8 rows with NULL `x`/`y` and these `geom` values: POINT EMPTY, POLYGON EMPTY,
+  GEOMETRYCOLLECTION EMPTY, POINT(nan 0.25), LINESTRING(nan nan, 0.25 0.25),
+  MULTIPOINT((nan nan), (0.25 0.25)), GEOMETRYCOLLECTION(POINT EMPTY, POINT(0.25 0.25)),
+  POINT(inf 0.25). vgi-python implements it from 0.50.1.
 
 ## Windows OAuth credential storage
 

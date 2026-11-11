@@ -1,0 +1,146 @@
+# name: test/sql/integration/table/spatial_extent_edge_rows.test
+# description: Geometries where a bounding-box filter could drop a row it must
+#              keep: empty geometries, all-NaN points, NaN vertices (which make
+#              a box unbounded on that axis) and infinite coordinates. Every
+#              pushed-down result must equal a baseline over a LIMITed subquery,
+#              which no filter can be pushed through.
+#
+#              spatial_filter_example(100, edge_rows := true): the 10x10 grid
+#              (x, y in {0.0, ..., 0.9}) followed by 8 rows with NULL x and y:
+#                POINT EMPTY, POLYGON EMPTY, GEOMETRYCOLLECTION EMPTY,
+#                POINT(nan 0.25), LINESTRING(nan nan, 0.25 0.25),
+#                MULTIPOINT((nan nan), (0.25 0.25)),
+#                GEOMETRYCOLLECTION(POINT EMPTY, POINT(0.25 0.25)), POINT(inf 0.25)
+#
+#              Needs a worker with the edge_rows parameter: vgi-python fixtures
+#              0.50.1 or later. Gated on VGI_SPATIAL_EDGE_ROWS_FIXTURE.
+#
+# group: [vgi_integration_table]
+
+require spatial
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_SPATIAL_EDGE_ROWS_FIXTURE
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true);
+----
+108
+
+# ============================================================================
+# A query's own `&&` reaches the worker as a REQUIRED filter: the worker's
+# result must be DuckDB 2.0 core's. LINESTRING(nan nan, 0.25 0.25) has a NaN
+# vertex, so its box is unbounded and meets a box far from (0.25, 0.25): 16
+# grid points plus that line. (DuckDB 1.5 skipped the vertex and said 16.)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true)
+WHERE geom && ST_MakeEnvelope(0.6, 0.6, 0.9, 0.9);
+----
+17
+
+query I
+SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100, edge_rows := true) LIMIT 100000)
+WHERE geom && ST_MakeEnvelope(0.6, 0.6, 0.9, 0.9);
+----
+17
+
+query I
+SELECT list(n ORDER BY n) FROM example.spatial_filter_example(100, edge_rows := true)
+WHERE n >= 100 AND geom && ST_MakeEnvelope(0, 0, 0.5, 0.5);
+----
+[103, 104, 105, 106]
+
+# ============================================================================
+# Exact predicates: the derived box must not drop a row the predicate keeps.
+# ============================================================================
+
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true)
+   WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5)))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100, edge_rows := true) LIMIT 100000)
+   WHERE ST_Intersects(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5)));
+----
+true
+
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true)
+   WHERE ST_Intersects(geom, 'POINT(0.25 0.25)'::GEOMETRY))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100, edge_rows := true) LIMIT 100000)
+   WHERE ST_Intersects(geom, 'POINT(0.25 0.25)'::GEOMETRY));
+----
+true
+
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true)
+   WHERE ST_Within(geom, ST_MakeEnvelope(0.15, 0.15, 0.55, 0.55)))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100, edge_rows := true) LIMIT 100000)
+   WHERE ST_Within(geom, ST_MakeEnvelope(0.15, 0.15, 0.55, 0.55)));
+----
+true
+
+# ST_Covers, not ST_Contains: spatial a3dbcd1781 segfaults on
+# ST_Contains(<constant polygon>, <column>) when a row is a MULTIPOINT or
+# GEOMETRYCOLLECTION holding an empty point, with or without VGI.
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true)
+   WHERE ST_Covers(ST_MakeEnvelope(0, 0, 0.5, 0.5), geom))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100, edge_rows := true) LIMIT 100000)
+   WHERE ST_Covers(ST_MakeEnvelope(0, 0, 0.5, 0.5), geom));
+----
+true
+
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true)
+   WHERE ST_Touches(geom, ST_MakeEnvelope(0.2, 0.2, 0.5, 0.5)))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100, edge_rows := true) LIMIT 100000)
+   WHERE ST_Touches(geom, ST_MakeEnvelope(0.2, 0.2, 0.5, 0.5)));
+----
+true
+
+# ST_Equals against empty and NaN constants: no box is derived, and the empty
+# rows that equal the constant survive.
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true)
+   WHERE ST_Equals(geom, 'POINT EMPTY'::GEOMETRY))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100, edge_rows := true) LIMIT 100000)
+   WHERE ST_Equals(geom, 'POINT EMPTY'::GEOMETRY));
+----
+true
+
+query I
+SELECT
+  (SELECT COUNT(*) FROM example.spatial_filter_example(100, edge_rows := true)
+   WHERE ST_Equals(geom, 'POINT(nan 1)'::GEOMETRY))
+  =
+  (SELECT COUNT(*) FROM (FROM example.spatial_filter_example(100, edge_rows := true) LIMIT 100000)
+   WHERE ST_Equals(geom, 'POINT(nan 1)'::GEOMETRY));
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM example.spatial_filter_example(100, edge_rows := true)
+WHERE ST_Equals(geom, 'POINT EMPTY'::GEOMETRY);
+----
+true
