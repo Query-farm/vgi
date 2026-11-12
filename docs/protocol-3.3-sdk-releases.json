@@ -1,0 +1,79 @@
+{
+  "date": "2026-11-11",
+  "protocol": {
+    "name": "vgi.v3",
+    "version": "3.3.0",
+    "nativeBranch": "v2.0",
+    "implementationCommit": "5e89ff8aa4995b697ea04c998523bd7c7f10fdde",
+    "nativeCodeCommit": "9dae8d55c9692cbd8b69d021c28b20a09aeee438",
+    "spec": "vgi-python docs/protocol (FunctionInfo.visibility; write path without catalog_table_scan_function_get, catalog_table_create returns created, write options carry only result_mode)"
+  },
+  "frameworkReleases": [
+    {
+      "language": "Python",
+      "repo": "vgi-python",
+      "version": "0.51.0",
+      "tagCommit": "5c424f99a01c3a5e5b272e5718a1c267c33c9700",
+      "mainCommit": "5c424f99a01c3a5e5b272e5718a1c267c33c9700",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-python/releases/tag/v0.51.0",
+      "validation": "PyPI vgi-python 0.51.0 (wheel + sdist); CI + integration green on 5c424f9. Fixture tag pinned by integration.yml and QueryFarmDeploy.yml."
+    },
+    {
+      "language": "TypeScript",
+      "repo": "vgi-typescript",
+      "version": "0.50.0",
+      "tagCommit": "7848b7b6efae8f83617c5aae9262e4b618340a03",
+      "mainCommit": "7848b7b6efae8f83617c5aae9262e4b618340a03",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-typescript/releases/tag/v0.50.0",
+      "validation": "npm @query-farm/vgi 0.50.0 (dist-tag latest, gitHead 7848b7b); Publish and CI green."
+    },
+    {
+      "language": "Go",
+      "repo": "vgi-go",
+      "version": "0.42.0",
+      "tagCommit": "26d23b32efeed528b0aa6b58a925f59b25fc6db4",
+      "mainCommit": "26d23b32efeed528b0aa6b58a925f59b25fc6db4",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-go/releases/tag/v0.42.0",
+      "validation": "Go proxy github.com/Query-farm/vgi-go v0.42.0 (hash 26d23b3); CI + integration green."
+    },
+    {
+      "language": "Java",
+      "repo": "vgi-java",
+      "version": "0.48.0",
+      "tagCommit": "a4d23ac89c8e1659b91138a29ebf7f7213c1144d",
+      "mainCommit": "a4d23ac89c8e1659b91138a29ebf7f7213c1144d",
+      "status": "publish_succeeded_registry_pending",
+      "releaseUrl": "https://github.com/Query-farm/vgi-java/releases/tag/v0.48.0",
+      "validation": "Release to Maven Central run 43137940856 succeeded (deployment validated and publishing); farm.query:vgi 0.48.0 not yet visible on repo1.maven.org at recording time."
+    },
+    {
+      "language": "C#",
+      "repo": "vgi-csharp",
+      "version": "0.26.0",
+      "tagCommit": "7e4fe9ec5b872e36a2ec33a1e626fc622e223a2f",
+      "mainCommit": "7e4fe9ec5b872e36a2ec33a1e626fc622e223a2f",
+      "status": "publish_succeeded_registry_pending",
+      "releaseUrl": "https://github.com/Query-farm/vgi-csharp/releases/tag/v0.26.0",
+      "validation": "Release run 43137938567 pushed QueryFarm.Vgi 0.26.0 (+ snupkg) to nuget.org; not yet indexed on the flat container at recording time."
+    }
+  ],
+  "pendingReleases": [
+    {
+      "language": "Rust",
+      "repo": "vgi-rust",
+      "status": "not_released",
+      "note": "crates.io vgi max_version is 0.50.2 (protocol 3.2); no 3.3 release published at recording time."
+    },
+    {
+      "language": "C++",
+      "repo": "vgi-cpp",
+      "status": "not_released",
+      "note": "Latest release v0.15.0 (protocol 3.2); no 3.3 release at recording time."
+    }
+  ],
+  "compatibility": "All listed SDKs use vgi.v3/3.3.0. Exact major+minor matching rejects 3.2 workers and clients; write functions and hidden scans no longer appear in duckdb_functions(). Patch releases remain wire compatible.",
+  "status": "partial_sdk_releases_recorded"
+}
