@@ -7,6 +7,7 @@
 # Skips cleanly (exit 0) when no container runtime is available, so it is safe to
 # wire into CI jobs that may or may not have docker/podman. Honors:
 #   VGI_DOCKER_IMAGE   image ref (default ghcr.io/query-farm/vgi-sklearn:latest)
+#   VGI_DOCKER_TX_IMAGE transactional worker image (default oci://ghcr.io/query-farm/vgi-jolt:0.4.0)
 #   CONTAINER_RUNTIME  force a runtime (docker|podman|nerdctl); else auto-detect
 #   VGI_DOCKER_NO_PULL set to 1 to skip the pre-pull (use a locally-built image)
 #   BUILD_DIR          release (default) | debug
@@ -58,6 +59,9 @@ fi
 # as the oci:// LOCATION. The extension auto-detects the runtime itself, so we
 # only export the image ref here.
 export VGI_DOCKER_IMAGE="oci://$IMAGE"
+# A worker whose catalog supports transactions, for shared_http_transactions.test.
+# Pulled on first ATTACH; set VGI_DOCKER_TX_IMAGE= (empty) to skip that test.
+export VGI_DOCKER_TX_IMAGE="${VGI_DOCKER_TX_IMAGE-oci://ghcr.io/query-farm/vgi-jolt:0.4.0}"
 export VGI_TEST_WORKER="oci://$IMAGE"
 
 # shared_tcp.test runs only when the image advertises a "tcp" transport (and thus

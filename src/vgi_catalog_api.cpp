@@ -321,6 +321,15 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 			// connections: whichever path first sees the server's
 			// VGI-Supported-Encodings settles the codec for both.
 			opts.server_caps = ctx.params->server_caps();
+		} else if (IsContainerSharedLocation(ctx.params->worker_path())) {
+			// An oci:// container served over HTTP is reached on a loopback URL
+			// resolved per call, but its catalog RPCs need the same two caches:
+			// without them every RPC re-probes /health and initializes HTTP
+			// parameters with a secret lookup, which throws inside
+			// VgiTransaction::Start (catalog_transaction_begin).
+			opts.cached_http_params = ctx.params->GetOrInitHttpParams(
+			    context, ctx.params->worker_path(), RequiresSingleAttemptUnary(method_name));
+			opts.server_caps = ctx.params->server_caps();
 		}
 		// Forward launcher overrides for `launch:` LOCATIONs.  Empty
 		// optionals on every other transport — no per-call cost.

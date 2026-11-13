@@ -212,9 +212,13 @@ struct UploadUrl {
 // Capability headers are returned on every response; /health is the
 // canonical mandatory, auth-exempt target. Honours Cache-Control:
 // max-age=N to schedule a future re-probe via cache_expires_at.
+// Pass the catalog's cached HTTPParams when available: a probe can run inside
+// VgiTransaction::Start (a capability snapshot that is missing or expired), where
+// initializing parameters with a secret lookup deadlocks.
 ServerCapabilities HttpDiscoverCapabilities(
     ClientContext &context, const std::string &base_url,
-    const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
+    const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
+    const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
 
 // Request upload URLs from the server. Posts to {base_url}/__upload_url__/init.
 std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,

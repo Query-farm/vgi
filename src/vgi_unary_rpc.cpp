@@ -248,9 +248,18 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 				auto ep = EnsureSharedContainer(shared_spec, shared_mode);
 				if (ep.mode == ContainerConnMode::HTTP) {
 					request_dispatched = true;
-					return HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth, opts.cookie_jar,
-					                       /*cached_http_params=*/nullptr, "", "", "", "",
-					                        opts.protocol);
+					// Same capability-snapshot handling as the http:// branch above.
+					ServerCapabilities caps;
+					if (opts.server_caps) {
+						caps = opts.server_caps->Load();
+					}
+					auto result = HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth,
+					                              opts.cookie_jar, opts.cached_http_params, "", "", "", "",
+					                              opts.protocol, nullptr, opts.server_caps ? &caps : nullptr);
+					if (opts.server_caps) {
+						opts.server_caps->Store(caps);
+					}
+					return result;
 				}
 				// tcp (and, later, unix): native vgi-rpc over the connected fd.
 				auto worker = ConnectSharedContainer(ep);

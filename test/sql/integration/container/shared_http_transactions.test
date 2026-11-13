@@ -1,0 +1,44 @@
+# name: test/sql/integration/container/shared_http_transactions.test
+# description: Shared HTTP container worker whose catalog supports transactions
+# group: [vgi_integration_container]
+
+# Gated on VGI_DOCKER_TX_IMAGE (set by test/run_docker_integration.sh). The image's
+# catalog must declare supports_transactions (the vgi-jolt image does), so every
+# statement sends catalog_transaction_begin from inside VgiTransaction::Start. That
+# RPC used to initialize HTTP parameters, and re-probe /health, with a secret
+# lookup, which deadlocks there: "HTTP secret lookup ... inside VGI transaction
+# start would deadlock".
+
+require-env VGI_DOCKER_TX_IMAGE
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'jolt' AS jolt (TYPE vgi, LOCATION {'image': '${VGI_DOCKER_TX_IMAGE}', 'connection': 'http'});
+
+query I
+SELECT count(*) > 0 FROM duckdb_functions() WHERE database_name = 'jolt';
+----
+true
+
+query I
+SELECT jolt.main.jolt_transform('{"a":1}', '[{"operation":"shift","spec":{"a":"b"}}]');
+----
+{"b":1}
+
+# An explicit transaction and a second statement take the same path.
+statement ok
+BEGIN;
+
+query I
+SELECT jolt.main.jolt_transform('{"x":2}', '[{"operation":"shift","spec":{"x":"y"}}]');
+----
+{"y":2}
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH jolt;

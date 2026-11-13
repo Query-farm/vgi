@@ -930,7 +930,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	if (!effective_caps->discovered ||
 	    (effective_caps->cache_expires_at != std::chrono::steady_clock::time_point{} &&
 	     std::chrono::steady_clock::now() >= effective_caps->cache_expires_at)) {
-		*effective_caps = HttpDiscoverCapabilities(context, base_url, iroh_config);
+		*effective_caps = HttpDiscoverCapabilities(context, base_url, iroh_config, cached_http_params);
 	}
 	if (!effective_caps->discovered || !effective_caps->accept_max_response_bytes_support) {
 		throw IOException(BuildHttpExtraInfo(http_error::kServerTooOld, base_url),
@@ -1371,7 +1371,8 @@ static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 }
 
 ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url,
-                                             const std::shared_ptr<IrohClientConfig> &iroh_config) {
+                                             const std::shared_ptr<IrohClientConfig> &iroh_config,
+                                             const std::shared_ptr<HTTPParams> &cached_http_params) {
 	// Capability headers are emitted by middleware on every response. Probe
 	// {base_url}/health: it is mandatory in every implementation and exempt
 	// from auth, matching the Python reference client.
@@ -1425,8 +1426,16 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = InitHttpParamsWithSecrets(context, url);
-	ApplyHttpTimeout(context, *params);
+	// Reuse the catalog's ATTACH-time parameters when the caller has them (they
+	// already carry the timeout): a re-probe can run inside VgiTransaction::Start,
+	// where a fresh secret lookup deadlocks on the MetaTransaction mutex.
+	std::unique_ptr<HTTPParams> owned_params;
+	HTTPParams *params = cached_http_params.get();
+	if (!params) {
+		owned_params = InitHttpParamsWithSecrets(context, url);
+		ApplyHttpTimeout(context, *owned_params);
+		params = owned_params.get();
+	}
 
 	HTTPHeaders headers;
 	headers.Insert(kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes));
