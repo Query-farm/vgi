@@ -15,6 +15,11 @@ Serves catalog ``wcfix``, schema ``main``:
     plain   ``id BIGINT``, declared with explicit columns, so its ``TableInfo``
             inlines no scan function and every scan asks
             ``catalog_table_scan_branches_get``.
+    amounts ``id BIGINT``, ``d32 DECIMAL(7,2)``, ``d64 DECIMAL(15,3)``, ``d128
+            DECIMAL(9,2)``, declared as decimal32 / decimal64 / decimal128; INSERT
+            only (``amounts_insert``), which fails unless each batch arrives with
+            exactly those widths (DuckDB exports decimal128 by default, and
+            decimal32/64 by storage under ``arrow_output_version = '1.5'``).
     phantom never listed; ``CREATE TABLE IF NOT EXISTS main.phantom`` replies
             ``created = false`` (as if another session had created it after
             DuckDB's binder looked), so a CTAS must insert nothing.
@@ -46,6 +51,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, ClassVar
 
 import pyarrow as pa
@@ -78,6 +84,14 @@ MISTYPED_CREATE_REPLY = _flag("--mistyped-create-reply")
 LOGS = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("msg", pa.string())])
 SINK = pa.schema([pa.field("id", pa.int64(), nullable=False)])
 PLAIN = pa.schema([pa.field("id", pa.int64())])
+AMOUNTS = pa.schema(
+    [
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("d32", pa.decimal32(7, 2)),
+        pa.field("d64", pa.decimal64(15, 3)),
+        pa.field("d128", pa.decimal128(9, 2)),
+    ]
+)
 
 _STATE_PATH = os.path.join(tempfile.gettempdir(), f"vgi-wcfix-state-{os.getppid()}.json")
 
@@ -198,6 +212,60 @@ class LogsInsert(TableInOutGenerator[None, None]):
         out.emit(write_result_batch(write_options(params).result_mode, LOGS, [None] * len(rows), rows))
 
 
+class AmountsScan(_Scan):
+    """main.amounts (no row id)."""
+
+    OUTPUT = AMOUNTS
+
+    class Meta:
+        """Function metadata."""
+
+        name = "amounts_scan"
+        description = "The rows of main.amounts"
+        stability = FunctionStability.VOLATILE
+
+    @classmethod
+    def rows(cls) -> list[dict[str, Any]]:
+        """Rows inserted so far (by id; decimals stored as strings)."""
+        stored = _read(lambda st: st.get("amounts", {}))
+        return sorted(
+            ({k: (v if k == "id" or v is None else Decimal(v)) for k, v in r.items()} for r in stored.values()),
+            key=lambda r: r["id"],
+        )
+
+
+class AmountsInsert(TableInOutGenerator[None, None]):
+    """Backs INSERT INTO main.amounts; refuses a batch whose decimal widths differ."""
+
+    class Meta:
+        """Function metadata."""
+
+        name = "amounts_insert"
+        description = "Backs INSERT INTO main.amounts"
+        stability = FunctionStability.VOLATILE
+
+    @classmethod
+    def on_bind(cls, params: BindParams[None]) -> BindResponse:
+        """count or rows."""
+        return BindResponse(output_schema=write_result_schema(write_options(params).result_mode, AMOUNTS))
+
+    @classmethod
+    def process(cls, params: ProcessParams[None], state: None, batch: pa.RecordBatch, out: OutputCollector) -> None:
+        """Check the declared types arrived bit-for-bit, then store the rows."""
+        del state
+        for field in AMOUNTS:
+            got = batch.schema.field(field.name).type
+            if got != field.type:
+                raise ValueError(f"wcfix: amounts.{field.name} arrived as {got}, declared {field.type}")
+        rows = batch.to_pylist()
+        with _state() as st:
+            # Keyed by id, so a rerun against a long-lived launcher replaces rows.
+            stored = st.setdefault("amounts", {})
+            for r in rows:
+                stored[str(r["id"])] = {k: (v if k == "id" or v is None else str(v)) for k, v in r.items()}
+        out.emit(write_result_batch(write_options(params).result_mode, AMOUNTS, [None] * len(rows), rows))
+
+
 class SinkScan(_Scan):
     """main.sink, with rowid = id."""
 
@@ -293,6 +361,12 @@ CATALOG = Catalog(
                     write_result_modes={"delete": "rows"},
                 ),
                 Table(name="plain", columns=PLAIN),
+                Table(
+                    name="amounts",
+                    function=AmountsScan,
+                    insert_function=AmountsInsert,
+                    write_result_modes={"insert": "rows"},
+                ),
             ],
         )
     ],

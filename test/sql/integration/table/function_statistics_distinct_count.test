@@ -1,0 +1,28 @@
+# name: test/sql/integration/table/function_statistics_distinct_count.test
+# description: Worker statistics without a distinct_count leave DuckDB's distinct count unknown
+# group: [vgi_integration_table]
+
+# BaseStatistics::FromConstant sets distinct_count = 1, so an omitted count used to
+# tell the optimizer the column had one distinct value. 0 means unknown, and
+# stats() then omits approx_unique.
+
+require-env VGI_MALFORMED_BATCH_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'malformed' AS m (TYPE vgi, LOCATION '${VGI_MALFORMED_BATCH_WORKER}');
+
+query I
+SELECT stats(c)::VARCHAR FROM m.main.stats_distinct_count(-1) LIMIT 1;
+----
+{'has_no_null': true, 'has_null': false, 'max': 9, 'min': 0}
+
+# A reported count is kept.
+query I
+SELECT stats(c)::VARCHAR FROM m.main.stats_distinct_count(10) LIMIT 1;
+----
+{'approx_unique': 10, 'has_no_null': true, 'has_null': false, 'max': 9, 'min': 0}
+
+statement ok
+DETACH m;

@@ -1,0 +1,37 @@
+# name: test/sql/integration/table/batch_index_cap.test
+# description: InstallBatch rejects exactly the vgi_batch_index values DuckDB's pipeline executor would
+# group: [vgi_integration_table]
+
+# PipelineExecutor::ToPipelinePartitionData maps source index i to base + i + 1 and
+# throws an InternalException at >= base + BATCH_INCREMENT - 1 (10^13 - 1), so the
+# largest accepted index is 10^13 - 3. The VGI check must fire first, at 10^13 - 2.
+
+require-env VGI_MALFORMED_BATCH_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'malformed' AS m (TYPE vgi, LOCATION '${VGI_MALFORMED_BATCH_WORKER}');
+
+# The largest index DuckDB accepts reaches the ordered collector.
+query I
+SELECT n FROM m.main.batch_index_at(9999999999997);
+----
+0
+1
+2
+
+# One more would trip DuckDB's internal check; VGI names the worker contract instead.
+statement error
+SELECT n FROM m.main.batch_index_at(9999999999998);
+----
+exceeds DuckDB's per-pipeline cap (maximum 9999999999997)
+
+# The database is still usable (an InternalException would have invalidated it).
+query I
+SELECT count(*) FROM m.main.batch_index_at(0);
+----
+3
+
+statement ok
+DETACH m;

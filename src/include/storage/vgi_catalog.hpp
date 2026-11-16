@@ -42,9 +42,8 @@ public:
 		return attach_result_ && attach_result_->supports_time_travel;
 	}
 
-	// Companion catalog aliases this VGI attach referenced (lakehouse
-	// federation). Recorded at attach time; refcount-released in OnDetach so the
-	// federation is reversible (unlike the secret-provider seam).
+	// Companion catalog aliases this attach referenced (lakehouse federation);
+	// refcount-released in OnDetach.
 	void SetCompanionCatalogs(std::vector<std::string> aliases) {
 		companion_catalogs_ = std::move(aliases);
 	}
@@ -57,7 +56,7 @@ public:
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &schema_lookup,
 	                                              OnEntryNotFound if_not_found) override;
 
-	// These operations are not supported for read-only VGI catalogs
+	// Writes are planned onto the worker's write functions (vgi_physical_write.hpp).
 	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
 	                                    PhysicalOperator &plan) override;
 	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
@@ -77,21 +76,14 @@ public:
 	bool InMemory() override;
 	std::string GetDBPath() override;
 
-	/// Default behaviour (force=false): move the cached schema entries into
-	/// a deferred-drop graveyard so any raw CatalogEntry* pointers held by
-	/// bound prepared statements remain valid until the catalog is
-	/// destroyed. The graveyard is bounded; once it fills the oldest entries
-	/// are dropped (logged).
-	///
-	/// Force-clear (force=true): purge the graveyard along with the live
-	/// entries. Used by the explicit user-facing `vgi_clear_cache()`
-	/// table function — the user accepts that bound queries may break.
+	/// Drop the cached entries and this catalog's result-cache entries. By
+	/// default the schema entries move to the bounded graveyard, so raw
+	/// CatalogEntry* pointers held by bound statements stay valid. force=true
+	/// (vgi_clear_cache()) also purges the graveyard; bound queries may break.
 	void ClearCache(bool force = false);
 
-	/// Push entries that a *child* set just harvested into the graveyard.
-	/// Called from VgiSchemaEntry's DDL paths so a single dropped/altered
-	/// table or view doesn't yank a CatalogEntry* pointer that a bound
-	/// query is still holding. Bounded by kGraveyardLimit.
+	/// Move entries a child set harvested (DDL on one table/view) into the
+	/// graveyard, so bound queries' CatalogEntry* pointers stay valid.
 	void AbsorbDroppedEntry(unique_ptr<CatalogEntry> entry);
 	void AbsorbDroppedEntries(std::vector<unique_ptr<CatalogEntry>> entries);
 
@@ -181,15 +173,16 @@ private:
 	/// Dropped by ClearCache (DDL), since it predates the change.
 	std::shared_ptr<vgi::VgiCatalogContents> pending_contents_;
 
-	/// Deferred-drop graveyard. Each ClearCache() (non-force) moves the
-	/// schema set's entries here so any bound query holding a raw pointer
-	/// stays alive. Bounded so a long-lived catalog with frequent DDL
-	/// doesn't grow forever — when the bound is hit we drop the oldest
-	/// entries (with a warning log on the next ClearCache).
+	/// Deferred-drop graveyard (see ClearCache). Holds at most kGraveyardLimit
+	/// entries; beyond that the oldest are destroyed (TrimGraveyardLocked) and
+	/// counted in graveyard_drops_since_last_log_ until the next stderr report.
 	mutable std::mutex graveyard_mutex_;
 	std::vector<unique_ptr<CatalogEntry>> deferred_dropped_entries_;
 	size_t graveyard_drops_since_last_log_ = 0;
+	bool graveyard_overflow_logged_ = false;
 	static constexpr size_t kGraveyardLimit = 1024;
+	/// Caller holds graveyard_mutex_.
+	void TrimGraveyardLocked();
 };
 
 } // namespace duckdb

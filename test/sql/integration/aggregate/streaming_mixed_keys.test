@@ -1,0 +1,85 @@
+# name: test/sql/integration/aggregate/streaming_mixed_keys.test
+# description: VGI streaming window with differing PARTITION BY / ORDER BY keys in one SELECT
+# group: [vgi_integration_aggregate]
+#
+# DuckDB plans every window expression of a SELECT into one LogicalWindow. The
+# streaming rewrite sorts its input by expression 0's keys only, so it must
+# apply only when every expression shares identical keys; otherwise the plan
+# stays on PhysicalWindow. Uses vgi_streaming_sum (vgi-python
+# _test_fixtures/aggregate/streaming.py).
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Different PARTITION BY, same ORDER BY. Sorting by (k, x) would feed the
+# PARTITION BY g session x=3 before x=1 (wrong: x=1 -> 4, x=3 -> 3).
+query IIII
+SELECT k, x,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s_k,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x) AS s_g
+FROM (VALUES ('a', 'p', 3), ('b', 'p', 1), ('a', 'q', 2), ('b', 'q', 4)) t(k, g, x)
+ORDER BY x;
+----
+b	1	1	1
+a	2	2	2
+a	3	5	4
+b	4	5	6
+
+query II
+EXPLAIN SELECT
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x),
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x)
+FROM (VALUES ('a', 'p', 3), ('b', 'p', 1), ('a', 'q', 2), ('b', 'q', 4)) t(k, g, x);
+----
+physical_plan	<!REGEX>:.*Vgi Streaming Window.*
+
+# Same PARTITION BY, different ORDER BY direction.
+query IIII
+SELECT k, x,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s_asc,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x DESC) AS s_desc
+FROM (VALUES ('a', 2), ('a', 3), ('a', 1)) t(k, x)
+ORDER BY x;
+----
+a	1	1	6
+a	2	3	5
+a	3	6	3
+
+# Different key counts: previously an InternalException in OpenSessions.
+query IIII
+SELECT k, x,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s_k,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (ORDER BY x) AS s_all
+FROM (VALUES ('a', 1), ('b', 2), ('a', 3)) t(k, x)
+ORDER BY x;
+----
+a	1	1	1
+b	2	2	3
+a	3	4	6
+
+# Mixed with a built-in window function: the whole node stays on PhysicalWindow.
+query IIII
+SELECT k, x,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS vgi_s,
+       sum(x::BIGINT) OVER (ORDER BY x) AS builtin_s
+FROM (VALUES ('a', 1), ('b', 2), ('a', 3)) t(k, x)
+ORDER BY x;
+----
+a	1	1	1
+b	2	2	3
+a	3	4	6
+
+# Identical keys still take the streaming path.
+query II
+EXPLAIN SELECT
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x),
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x)
+FROM (VALUES ('a', 1), ('a', 2)) t(k, x);
+----
+physical_plan	<REGEX>:.*Vgi Streaming Window.*

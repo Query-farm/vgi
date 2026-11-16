@@ -68,10 +68,6 @@ using namespace duckdb_yyjson; // NOLINT
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// VgiTableFunctionLocalState out-of-line definitions
-// ============================================================================
-
 namespace {
 
 bool ReadCancelEnabledSetting(ClientContext &ctx) {
@@ -96,14 +92,11 @@ VgiTableFunctionLocalState::VgiTableFunctionLocalState(
 }
 
 VgiTableFunctionLocalState::~VgiTableFunctionLocalState() noexcept {
-	// Signal any in-flight prefetch task to discard its result once it
-	// wakes up. Racy by design — a task already mid-RPC will finish;
-	// the slot's shared_ptr keeps the connection alive for it.
+	// Racy by design: a task already mid-RPC finishes, kept alive by the slot.
 	prefetch_slot_->cancelled.store(true, std::memory_order_release);
 
-	// If a prefetch task still holds a reference, we can't touch the
-	// connection without corrupting the subprocess stream. Defer all
-	// further work — pool release and cancel alike.
+	// A prefetch task still holds the slot: touching the connection would
+	// corrupt its stream, so skip both pool release and cancel.
 	if (prefetch_slot_.use_count() != 1) {
 		return;
 	}
@@ -113,26 +106,21 @@ VgiTableFunctionLocalState::~VgiTableFunctionLocalState() noexcept {
 		return;
 	}
 
-	// Early-exit path: stream is not done and cancel is enabled —
-	// hand the connection to the dispatcher instead of returning it
-	// to the pool. A cancelled connection's state is unsafe to reuse.
+	// Early exit: hand the connection to the cancel dispatcher, never the pool.
 	if (!done && cancel_enabled) {
 		if (auto *dispatcher = FindVgiCancelDispatcher(db_)) {
 			auto token = connection->GetLastStateToken();
 			CancelRequest req;
 			req.connection = std::move(connection);
 			req.state_token = !token.empty() ? std::move(token) : prefetch_slot_->last_state_token;
-			// Enqueue takes the request by value, so whether or not it is
-			// accepted the connection is gone from here: on saturation, after
-			// shutdown, or before the WASM worker runs, it is dropped without a
-			// cancel. That is the right outcome — a stream that isn't done must
-			// not go back to the pool — and the server's stream expires by TTL.
+			// Accepted or not, the connection is gone; if refused it is dropped
+			// without a cancel and the server's stream expires by TTL.
 			(void)dispatcher->Enqueue(std::move(req));
 			return;
 		}
 	}
 
-	// Natural-end or cancel-disabled: return to pool as before.
+	// Natural end or cancel disabled: return to the pool.
 	if (attach_params_ && attach_params_->use_pool() && connection) {
 		auto worker_pid = connection->GetSubprocessPid().value_or(-1);
 		auto conn_id = connection->GetConnIdHex();
@@ -151,15 +139,9 @@ VgiTableFunctionLocalState::~VgiTableFunctionLocalState() noexcept {
 	}
 }
 
-// ============================================================================
-// Perform Bind - Common bind logic for VGI table functions
-// ============================================================================
-
-// Apply a freshly-built BindResult to bind_data and derive return_types /
-// names. Shared by the on-demand RPC path and the inline-bind short-circuit
-// so both populate bind_data identically. `conn_id` and `worker_pid` are
-// included on the table_function.bind_result log for parity with downstream
-// trace tooling; the inline path passes empty/-1.
+// Apply a BindResult to bind_data and derive return_types / names. Shared by
+// the RPC path and the inline-bind short-circuit (which passes conn_id ""
+// and worker_pid -1; they are only logged).
 static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBindData &bind_data,
                                        BindResult bind_result, const std::string &conn_id,
                                        int worker_pid, vector<LogicalType> &return_types,
@@ -184,11 +166,7 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
 	if (bind_data.rowid_worker_col_index >= 0) {
 		auto idx = static_cast<size_t>(bind_data.rowid_worker_col_index);
 		if (idx < return_types.size()) {
-			// Capture the rowid field name BEFORE erasing it — a pushed filter on
-			// the rowid virtual column (COLUMN_IDENTIFIER_ROW_ID) must carry this
-			// name so the worker can match/apply it. all_column_names below has
-			// the rowid removed, so indexing it by rowid_worker_col_index would
-			// resolve to the wrong (shifted) column.
+			// Capture the name BEFORE erasing (see rowid_column_name).
 			bind_data.rowid_column_name = names[idx].GetIdentifierName();
 			return_types.erase(return_types.begin() + idx);
 			names.erase(names.begin() + idx);
@@ -229,7 +207,6 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	result->projection_response_bytes = projection_response_bytes;
 	result->query_preparation = query_preparation;
 
-	// Worker identification + invocation inputs (shared_ptr / value copies).
 	result->attach_params = attach_params;
 	result->attach_opaque_data = attach_opaque_data;
 	result->transaction_opaque_data = transaction_opaque_data;
@@ -240,20 +217,18 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	result->required_secrets = required_secrets;
 	result->secret_dependent = secret_dependent;
 
-	// Arrow conversion state. arrow_table holds shared_ptr<ArrowType> entries
-	// that are immutable and self-contained, so copy-by-value is safe and needs
-	// no ClientContext. The C-ABI export is rebuilt from the (copyable) arrow
-	// schema so the clone owns its own ArrowSchema lifetime.
+	// arrow_table's shared_ptr<ArrowType> entries are immutable, so sharing is
+	// safe; the clone gets its own C-ABI schema export.
 	result->arrow_table = arrow_table;
 	if (bind_result.output_schema) {
 		ExportSchema(bind_result.output_schema, result->c_schema);
 	}
 
-	// Execution hints + capability flags.
 	result->max_processes = max_processes;
 	result->fixed_order = fixed_order;
 	result->supports_batch_index = supports_batch_index;
 	result->supports_splits = supports_splits;
+	result->split_token_ttl_seconds = split_token_ttl_seconds;
 	result->partition_kind = partition_kind;
 	result->partition_column_indices = partition_column_indices;
 	result->cardinality_estimate = cardinality_estimate;
@@ -270,44 +245,34 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	result->rowid_type = rowid_type;
 	result->rowid_column_name = rowid_column_name;
 	result->bind_result = bind_result;
-	// Base TableFunctionData::column_ids — the VGI bind path leaves this empty
-	// (column ids live on the local state from input.column_ids, not here), but
-	// copy it for robustness so a future writer can't silently lose it on clone.
+	// Empty on the VGI bind path (column ids live on the local state); copied
+	// so a future writer can't lose it on clone.
 	result->column_ids = column_ids;
 
-	// statistics_mutex / statistics_cache / statistics_fetched are deliberately
-	// left fresh — the clone re-fetches per-column stats lazily on demand.
-
-	// order_by_hint / table_sample_hint are intentionally NOT copied. They are
-	// per-plan-node optimizer hints (set by RowGroupPruner / SamplingPushdown
-	// for the original scan position). The late-materialization clone is a
-	// distinct plan node — propagating a stale ORDER BY + LIMIT hint onto it
-	// would wrongly cap the cloned scan's row output.
+	// The statistics cache starts fresh. order_by_hint / table_sample_hint are
+	// NOT copied: they belong to the original plan node, and a stale ORDER BY +
+	// LIMIT hint would wrongly cap the clone's output.
 
 	result->at_unit = at_unit;
 	result->at_value = at_value;
+	result->copy_from = copy_from;
 
 	return std::move(result);
 }
 
 void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindData &bind_data,
                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
-	// Log the invocation
 	VGI_LOG(context, "table_function.bind",
 	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"num_args", bind_data.arguments ? std::to_string(bind_data.arguments.length()) : "0"}});
 
-	// Validate that arguments type is a struct (defensive check)
 	D_ASSERT(!bind_data.arguments || (bind_data.arguments.batch->num_columns() == 1 &&
 	                                  std::strcmp(bind_data.arguments.batch->schema()->field(0).format, "+s") == 0));
 
-	// Inline-bind short-circuit: when the catalog-routed scan has a
-	// `bind_result` carried on TableInfo (worker pre-bound at
-	// schema_contents time), build equivalent bind_request_bytes locally
-	// and skip the bind RPC entirely. Cardinality / statistics / init all
-	// read through bind_data.bind_result.* — same shape as the RPC path.
-	// On any deserialize/parse error, fall through to the on-demand RPC.
+	// Inline-bind short-circuit: a catalog table whose TableInfo carries a
+	// pre-bound `bind_result` builds bind_request_bytes locally and skips the
+	// bind RPC. On any error, fall through to the RPC.
 	if (bind_data.table_entry) {
 		auto &tinfo = bind_data.table_entry->Cast<VgiTableEntry>().GetTableInfo();
 		if (tinfo.bind_result.has_value()) {
@@ -348,8 +313,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 		}
 	}
 
-	// Create connection to worker and perform bind handshake.
-	// Uses helper that handles pool acquire and stale connection retry.
+	// AcquireAndBindConnection handles pool acquire and stale-connection retry.
 	FunctionConnectionParams params;
 	params.attach_params = bind_data.attach_params;
 	params.attach_opaque_data = bind_data.attach_opaque_data;
@@ -369,11 +333,9 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	auto bind_worker_pid = result.connection ? result.connection->GetSubprocessPid().value_or(-1) : -1;
 	auto bind_conn_id = result.connection ? result.connection->GetConnIdHex() : "";
 
-	// Release the bind worker to the pool. Bind is a unary RPC; the worker
-	// has looped back to its accept loop and is available to serve other
-	// planner RPCs (e.g. table_function_cardinality) and the eventual init
-	// in InitGlobal. Init re-binds on whichever pooled worker it acquires —
-	// the bind RPC is cheap relative to a fresh spawn.
+	// Bind is a unary RPC, so the worker can serve other planner RPCs and the
+	// eventual init. Init carries bind_request_bytes, so any pooled worker can
+	// serve it.
 	if (bind_data.use_pool() && result.connection) {
 		if (auto pooled = result.connection->ReleaseForPooling()) {
 			auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
@@ -399,9 +361,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	                          bind_conn_id, bind_worker_pid, return_types, names);
 }
 
-// ============================================================================
-// Expression Filter Pushdown Support
-// ============================================================================
+// --- Expression filter pushdown ---------------------------------------------
 
 namespace {
 
@@ -589,13 +549,10 @@ bool VgiTableInOutPushdownExpression(ClientContext &context, const LogicalGet &g
 	                          bind_data.additional_filter_functions);
 }
 
-// ============================================================================
-// FilterSerializer - Builds JSON filter structure and collects values
-// ============================================================================
+// --- FilterSerializer: builds the JSON filter document and collects values --
 
 namespace {
 
-//! Convert ExpressionType to operator string for JSON
 const char *ExpressionTypeToOp(ExpressionType type) {
 	switch (type) {
 	case ExpressionType::COMPARE_EQUAL:
@@ -628,19 +585,14 @@ struct JoinKeysInfo {
 	vector<Value> values; // owned while the external-set batch is built
 };
 
-} // namespace (anonymous) — break out so VgiContainsDynamicFilter gets
-  // external linkage matching its declaration in vgi_table_function_impl.hpp.
-  // The VgiRequiredFiltersOptimizer in vgi_extension.cpp calls it across TU.
+} // namespace (anonymous) — closed so VgiContainsDynamicFilter has external
+  // linkage matching its header declaration.
 
-//! Returns true if any descendant of ``filter`` is a DynamicFilter (Top-N
-//! tick-time bound). The static filter serializer must skip an entire
-//! OptionalFilter subtree when this is true: the DynamicFilter has no value
-//! at init time, so any partial serialization (e.g. OR(IsNull, DynamicFilter)
-//! collapsing to a one-child OR(IsNull) when DynamicFilter is elided) yields
-//! a *stricter* filter than the OptionalFilter promised, and consumers can
-//! drop rows that were supposed to flow. The dynamic-filter mechanism in
-//! TickFilterPushdown re-pushes the filter at tick time once Top-N has
-//! established its threshold.
+//! Runtime-valued internal filter functions (Top-N dynamic filter, bloom
+//! filter, prefix range). Static serialization must skip a whole
+//! OptionalFilter subtree containing one: e.g. OR(IsNull, DynamicFilter) with
+//! the dynamic child elided becomes OR(IsNull), a *stricter* filter that drops
+//! rows. Top-N bounds are pushed at tick time instead.
 static bool ContainsVgiDynamicExpression(const Expression &expr) {
 	return ExpressionFilter::ContainsInternalFunction(expr, DynamicFilterScalarFun::NAME) ||
 	       ExpressionFilter::ContainsInternalFunction(expr, BloomFilterScalarFun::NAME) ||
@@ -659,9 +611,9 @@ static bool VgiAdvisoryFilterCanThrow(const Expression &expr) {
 	return expr.CanThrow();
 }
 
-namespace { // reopen anonymous namespace for the file-local FilterSerializer.
+namespace {
 
-//! FilterSerializer walks the filter tree, builds JSON, and collects values
+//! Walks the filter tree, builds JSON, and collects the literal values.
 class FilterSerializer {
 public:
 	FilterSerializer(const string &worker_path, idx_t join_keys_max_bytes, bool allow_external_sets = true,
@@ -950,9 +902,7 @@ private:
 
 } // anonymous namespace
 
-// ============================================================================
-// Serialize Filters - Convert TableFilterSet to Arrow IPC bytes for worker
-// ============================================================================
+// --- Filter serialization to Arrow IPC --------------------------------------
 
 //! DuckDB's Arrow export of `chunk` (all rows) as a batch with fields `names`.
 static VgiBatchPtr AppendChunkToBatch(ClientContext &context, DataChunk &chunk, const vector<LogicalType> &types,
@@ -1035,7 +985,6 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
                                       int64_t rowid_worker_col_index, const std::set<idx_t> *exclude_filter_keys,
                                       VgiFilterColumnIndexDomain index_domain,
                                       const std::vector<VgiFilterFunctionCapability> &additional_functions) {
-	// Return empty if no filters
 	if (!filters || !filters->HasFilters()) {
 		return {nullptr, {}};
 	}
@@ -1044,7 +993,6 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		throw InvalidInputException("VGI multi-column filter serialization is not supported");
 	}
 
-	// Read byte size limit for join keys from settings
 	idx_t join_keys_max_bytes = defaults::JOIN_KEYS_MAX_BYTES;
 	Value max_bytes_val;
 	if (context.TryGetCurrentSetting("vgi_join_keys_max_bytes", max_bytes_val) && !max_bytes_val.IsNull()) {
@@ -1065,8 +1013,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		idx_t col_idx = entry.GetIndex().GetIndex();
 		auto &filter = entry.Filter();
 
-		// Residual serialization (per-partition cache): skip the partition-column
-		// predicate keys so the residual filter reflects only non-partition constraints.
+		// Residual serialization (per-partition cache) skips partition-column keys.
 		if (exclude_filter_keys && exclude_filter_keys->count(col_idx)) {
 			continue;
 		}
@@ -1084,13 +1031,10 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 			}
 			original_col_idx = column_ids[col_idx];
 		}
-		// A filter on the rowid virtual column carries the COLUMN_IDENTIFIER_ROW_ID
-		// sentinel (UINT64_MAX). Without remapping, col_name would become the literal
-		// "18446744073709551615" and the worker — which resolves pushed/join-key columns
-		// by name — would silently drop it (the late-materialization semi-join still
-		// guarantees correctness, but the rowid IN-list / min-max pushdown is lost).
-		// Resolve to the worker's actual rowid field name (passed explicitly because
-		// column_names has the rowid column erased — indexing it would mis-resolve).
+		// A rowid filter carries the COLUMN_IDENTIFIER_ROW_ID sentinel; the worker
+		// resolves columns by name, so use the rowid field name (passed explicitly:
+		// column_names has the rowid erased). Ordinary columns at or after the
+		// erased rowid shift up by one in the worker schema.
 		string col_name;
 		idx_t worker_col_idx;
 		if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID && !rowid_column_name.empty()) {
@@ -1186,7 +1130,6 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	// Top-N deltas. Keep that envelope even when every static predicate was optional.
 	yyjson_mut_obj_add_val(serializer.GetDoc(), document, "predicates", predicates);
 
-	// Write JSON string
 	char *json_str = serializer.WriteJson(document);
 	if (!json_str) {
 		throw IOException("Failed to serialize filters to JSON");
@@ -1194,12 +1137,11 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	string filter_spec(json_str);
 	free(json_str);
 
-	// Build Arrow RecordBatch with filter_spec + value columns
+	// One-row batch: filter_spec + the literal value columns.
 	auto &values = serializer.GetValues();
 	auto &value_types = serializer.GetValueTypes();
 	auto &value_names = serializer.GetValueNames();
 
-	// Build types and names: filter_spec (VARCHAR) + value columns
 	vector<LogicalType> types;
 	vector<string> names;
 	types.push_back(LogicalType::VARCHAR);
@@ -1209,7 +1151,6 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		names.push_back(value_names[i]);
 	}
 
-	// Create single-row DataChunk and populate
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), types);
 	chunk.SetCardinality(1);
@@ -1218,16 +1159,14 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		chunk.SetValue(i + 1, 0, values[i]);
 	}
 
-	ClientProperties client_props = context.GetClientProperties();
+	ClientProperties client_props = VgiWireClientProperties(context);
 	auto record_batch = MakeFilterSpecBatch(context, chunk, types, names, client_props, "Failed to import filter RecordBatch");
 
-	// Serialize to Arrow IPC stream format (schema + record batch)
 	auto filter_bytes = SerializeIpcStream(*record_batch, "Failed to create IPC stream writer",
 	                                       "Failed to write filter RecordBatch to IPC stream",
 	                                       "Failed to close IPC stream writer");
 
-	// Build one IPC buffer per join key column (each is a single-column batch).
-	// Each IN filter gets its own batch, so different cardinalities are supported.
+	// One single-column IPC batch per external IN set (cardinalities may differ).
 	std::vector<VgiBufferPtr> join_keys_buffers;
 	if (serializer.HasJoinKeys()) {
 		auto &key_columns = serializer.GetJoinKeyColumns();
@@ -1235,7 +1174,6 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		for (auto &kc : key_columns) {
 			idx_t count = kc.values.size();
 
-			// Build single-column DataChunk
 			vector<LogicalType> types = {kc.type};
 			vector<string> names = {kc.column_name};
 			DataChunk chunk;
@@ -1245,7 +1183,6 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 				chunk.SetValue(0, row, kc.values[row]);
 			}
 
-			// Convert to Arrow via ArrowAppender
 			VgiBatchPtr key_batch;
 			try {
 				key_batch = AppendChunkToBatch(context, chunk, types, names, client_props);
@@ -1254,10 +1191,8 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 				                  ErrorData(e).RawMessage());
 			}
 
-			// Add version metadata
 			key_batch = key_batch->WithSchema(key_batch->schema()->WithMetadata(VgiMetadata {{"vgi_join_keys_version", "2"}}));
 
-			// Serialize to Arrow IPC
 			join_keys_buffers.push_back(SerializeIpcStream(*key_batch, "Failed to create IPC writer for join keys",
 			                                               "Failed to write join keys RecordBatch",
 			                                               "Failed to close join keys IPC writer"));
@@ -1267,13 +1202,6 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	return {std::move(filter_bytes), std::move(join_keys_buffers)};
 }
 
-// ============================================================================
-// VgiTableFunctionGlobalState::EnsureInitApplied
-// ============================================================================
-// Folds the deferred init RPC's result back into the gstate. Called from
-// init_local (and any other code that needs `global_execution_id` /
-// `primary_connection` populated). First caller pays the wait; the rest
-// see `init_applied=true` and return immediately.
 void VgiTableFunctionGlobalState::EnsureInitApplied() const {
 	if (init_applied.load(std::memory_order_acquire)) {
 		return;
@@ -1286,55 +1214,38 @@ void VgiTableFunctionGlobalState::EnsureInitApplied() const {
 		auto applied = pending_init.get();  // blocks until RPC completes
 		global_execution_id = std::move(applied.first.execution_id);
 		max_processes = static_cast<idx_t>(applied.first.max_workers);
-		// Captured for forwarding to secondary inits — see init_opaque_data
-		// field comment for why this matters.
 		init_opaque_data = std::move(applied.first.opaque_data);
-		// primary_connection is uninitialized when async init kicks off —
-		// the lambda returns the connection alongside the InitResult.
+		// The async init returns the connection alongside the InitResult.
 		std::lock_guard<std::mutex> conn_lk(connection_mutex);
 		primary_connection = std::move(applied.second);
 	}
 	init_applied.store(true, std::memory_order_release);
 }
 
-// ============================================================================
-// Init Global Function - Performs init handshake with existing connection
-// ============================================================================
-
-// ============================================================================
-// Result cache — key computation, eligibility, capture commit (milestone 1)
-// ============================================================================
+// --- Result cache: key computation, eligibility, capture commit -------------
+// SerializeSettingsForKey / SerializeProjectionForKey live in
+// vgi_exchange_cache_key.cpp so both caches compute keys byte-identically.
 namespace {
 
-// SerializeSettingsForKey / SerializeProjectionForKey moved to
-// vgi_exchange_cache_key.{hpp,cpp} (shared with the exchange-mode cache key so
-// both compute the key byte-identically). They are reached here via the header's
-// duckdb::vgi declarations.
-
-//! Result of a v1 cache-eligibility check for a scan.
 struct CacheEligibility {
 	bool eligible = false;                  //! query is a cache candidate (opt-in gates pass)
 	const char *ineligible_reason = nullptr; //! set when !eligible (for logging)
 	VgiResultCacheKey key;                  //! populated when eligible (catalog-scoped: txn_id empty)
 	std::string catalog_name;
 	bool catalog_version_frozen = false;
-	//! Current transaction identifier. The KEY stays catalog-scoped (txn_id empty)
-	//! because scope is worker-advertised on the first batch, not known here — but a
-	//! `scope=transaction` result folds this into its key at commit and a lookup
-	//! probes both the catalog key and (key + this txn_id).
+	//! Current transaction id. The KEY stays catalog-scoped (scope is advertised
+	//! only on the first batch); a `scope=transaction` result folds this in at
+	//! commit, and lookups probe both the catalog key and key + this txn_id.
 	std::string transaction_id;
 
 	// --- Per-partition cache classification (SINGLE_VALUE_PARTITIONS) ---------
-	//! Splittable: eligible to split the captured result by partition value AND (if
-	//! enumerable) serve a `=`/`IN` scan from per-partition entries. False when the
-	//! function isn't partition-scope-eligible, the setting is off, or a partition
-	//! column carries a non-`=`/`IN` (range/other) predicate. When false the whole
-	//! per-partition layer is skipped (the whole-scan cache still operates normally).
+	//! Splittable: the captured result may be split into per-partition entries.
+	//! False when not partition-scope-eligible, the setting is off, or a partition
+	//! column has a non-`=`/`IN` predicate; the whole-scan cache is unaffected.
 	bool partition_splittable = false;
-	//! Enumerable: every partition column is constrained by `=`/`IN`, so the requested
-	//! partition set is finite and known here (in `partition_enumerated_tuples`). Only
-	//! an enumerable scan can be SERVED from per-partition entries; a non-enumerable
-	//! splittable scan only POPULATES them.
+	//! Enumerable: every partition column is `=`/`IN`-constrained, so the requested
+	//! tuples are known (`partition_enumerated_tuples`). Only an enumerable scan
+	//! can be SERVED from per-partition entries; otherwise it only POPULATES them.
 	bool partition_enumerable = false;
 	std::vector<std::vector<Value>> partition_enumerated_tuples; // parallel to partition_types
 	std::string partition_residual_filter_bytes;                 // filter_bytes minus the partition predicate
@@ -1344,11 +1255,9 @@ struct CacheEligibility {
 	uint64_t partition_max = defaults::RESULT_CACHE_PARTITION_MAX_ENUMERATED;                               // cap on distinct/enumerated partitions
 };
 
-//! Resolve partition column names (from the Arrow bind output schema — the index
-//! space of `partition_column_indices`, which INCLUDES the rowid column) and their
-//! DuckDB types (matched BY NAME into all_column_names/all_column_types, whose index
-//! space has the rowid erased). Returns false if any partition column can't be
-//! resolved. Keeps `names`/`types` in declared partition order.
+//! Resolve partition column names from the bind output schema (the index space
+//! of `partition_column_indices`, which INCLUDES the rowid) and their types BY
+//! NAME from all_column_names/types (rowid erased). False if any is unresolved.
 static bool ResolvePartitionColumns(const VgiTableFunctionBindData &bind_data,
                                     std::vector<std::string> &names, std::vector<LogicalType> &types) {
 	const auto &out_schema = bind_data.bind_result.output_schema;
@@ -1376,10 +1285,8 @@ static bool ResolvePartitionColumns(const VgiTableFunctionBindData &bind_data,
 	return true;
 }
 
-//! Returns true iff `filter` constrains its (single) column to a FINITE enumerable set
-//! of constants — an `=`, an `IN`, or an `OR` of those — appending the constants to
-//! `out`. Returns false for any range / NULL / AND / other shape (not enumerable). A
-//! TableFilterSet entry is per-column, so an OR here is `col=a OR col=b` on one column.
+//! True iff the (single-column) filter is an `=`, an `IN`, or an `OR` of those,
+//! appending its constants to `out`; false for range / NULL / AND / other shapes.
 static bool ExtractPartitionEqualityExpression(const Expression &expr, std::vector<Value> &out) {
 	if (auto child = ExpressionFilter::GetOptionalFilterChild(expr)) {
 		return ExtractPartitionEqualityExpression(*child, out);
@@ -1417,12 +1324,8 @@ static bool ExtractPartitionEqualityValues(const TableFilter &filter, std::vecto
 	return ExtractPartitionEqualityExpression(*ExpressionFilter::GetExpressionFilter(filter, "VGI partition cache").expr, out);
 }
 
-//! Classify the pushed filter for per-partition caching, filling the partition_* fields
-//! of `e`. Called only when the base scan is already cache-eligible (so dynamic filters
-//! were rejected upstream). Sets `partition_splittable` (may populate per-partition
-//! entries) and, when every partition column is `=`/`IN`-constrained, `partition_enumerable`
-//! + `partition_enumerated_tuples` (may serve). A non-`=`/`IN` (range/other) predicate on
-//! ANY partition column disables the whole per-partition layer (leaves it false).
+//! Fill the partition_* fields of `e` for per-partition caching. Called only once
+//! the base scan is cache-eligible (dynamic filters already rejected).
 static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                                      TableFunctionInitInput &input, CacheEligibility &e) {
 	if (bind_data.partition_kind != VgiPartitionKind::SingleValuePartitions) {
@@ -1433,9 +1336,8 @@ static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunct
 	    !pv.GetValue<bool>()) {
 		return;
 	}
-	// Ordered/sampled scans can't use the combined per-partition serve (concatenation
-	// can't honor a global ORDER BY; per-partition sampling semantics differ), so the
-	// whole per-partition layer is skipped — the whole-scan cache handles them.
+	// Concatenated per-partition entries can't honor a global ORDER BY, and
+	// sampling semantics differ per partition: leave these to the whole-scan cache.
 	if (bind_data.order_by_hint || bind_data.table_sample_hint) {
 		return;
 	}
@@ -1495,12 +1397,10 @@ static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunct
 	}
 	e.partition_splittable = true;
 
-	// Residual = the pushed filters MINUS the partition predicates. CRITICAL: when EVERY
-	// pushed filter is a partition predicate (all excluded), the residual must be the
-	// empty string — byte-identical to a full/no-filter scan's residual — so a
-	// `WHERE part=X` scan reuses the per-partition entry a full scan stored. Serializing
-	// an all-excluded set would still emit a non-empty empty-filter IPC batch and never
-	// match. So only serialize when a NON-excluded filter remains.
+	// Residual = pushed filters MINUS partition predicates. CRITICAL: if every
+	// filter is a partition predicate the residual must be "" (as for an unfiltered
+	// scan) so `WHERE part=X` reuses entries a full scan stored; serializing the
+	// all-excluded set would yield a non-empty IPC batch that never matches.
 	bool has_residual_filter = false;
 	if (input.filters) {
 		for (auto &entry : *input.filters) {
@@ -1562,19 +1462,16 @@ static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunct
 	e.partition_enumerable = true;
 }
 
-//! The "p:"-prefixed input_hash discriminator for one partition-value tuple. Both the
-//! serve side (filter constants) and the capture side (decoded partition min-values)
-//! call this with the same `partition_types`, so identical tuples produce identical
-//! discriminators (the per-partition-cache correctness linchpin).
+//! "p:"-prefixed input_hash discriminator for a partition tuple. Serve (filter
+//! constants) and capture (decoded partition values) MUST both use this with the
+//! same `partition_types` so identical tuples match.
 static std::string PartitionDiscriminator(ClientContext &context, const std::vector<Value> &tuple,
                                           const std::vector<LogicalType> &partition_types) {
 	return "p:" + VgiSha256Hex(vgi::CanonicalPartitionTupleKey(context, tuple, partition_types));
 }
 
-//! Build a per-partition cache key from the base (whole-scan) key: swap filter_bytes for
-//! the residual (partition predicate stripped), set the "p:" input_hash discriminator,
-//! and clear order/sample/transaction dimensions (partition entries are catalog-scoped,
-//! order/sample-free by construction).
+//! Per-partition key from the whole-scan key: residual filter, "p:" discriminator,
+//! and no order/sample/transaction dimensions (catalog-scoped by construction).
 static VgiResultCacheKey BuildPartitionKey(const VgiResultCacheKey &base, const std::string &residual,
                                            const std::string &disc) {
 	VgiResultCacheKey k = base;
@@ -1586,7 +1483,7 @@ static VgiResultCacheKey BuildPartitionKey(const VgiResultCacheKey &base, const 
 	return k;
 }
 
-//! Human-readable "name=value, name2=value2" label of a partition tuple (diagnostics).
+//! "name=value, name2=value2" label of a partition tuple (diagnostics).
 static std::string PartitionLabel(const std::vector<std::string> &names, const std::vector<Value> &tuple) {
 	std::string out;
 	for (idx_t i = 0; i < names.size() && i < tuple.size(); i++) {
@@ -1600,9 +1497,7 @@ static std::string PartitionLabel(const std::vector<std::string> &names, const s
 	return out;
 }
 
-//! Evaluate v1 cache eligibility for a table scan and build the cache key.
-//! v1 policy: catalog-attached path only, unfiltered full scans only (no
-//! filter / order / sample / dynamic pushdown), known catalog version.
+//! Evaluate result-cache eligibility for a scan and build its key.
 CacheEligibility EvaluateCacheEligibility(ClientContext &context,
                                           const VgiTableFunctionBindData &bind_data,
                                           TableFunctionInitInput &input,
@@ -1618,39 +1513,34 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 		e.ineligible_reason = "expression_projection";
 		return e;
 	}
-	// Global master switch.
 	Value master;
 	if (context.TryGetCurrentSetting("vgi_result_cache", master) && !master.GetValue<bool>()) {
 		e.ineligible_reason = "disabled_global";
 		return e;
 	}
-	// Per-catalog opt-out.
 	if (!bind_data.attach_params->cache()) {
 		e.ineligible_reason = "disabled_attach";
 		return e;
 	}
 	// A secret-dependent result is keyed on a fingerprint of the secrets its bind
-	// resolved (never the values) — the bind whose request init replays to the
-	// worker — so a rotated or dropped secret misses. Without that fingerprint
-	// there is nothing to key on: fail closed.
+	// sent (never the values), so a rotated or dropped secret misses. No
+	// fingerprint: fail closed.
 	const std::string &secret_scope = bind_data.bind_result.secret_scope;
 	if (bind_data.secret_dependent && secret_scope.empty()) {
 		e.ineligible_reason = "secret_fingerprint_missing";
 		return e;
 	}
-	// Identity + version dimensions. Two paths (M5 adds the direct one):
-	//   - catalog-attached (bind_data.table_entry set): identity = catalog name,
-	//     freshness bounded by the runtime catalog_version (0 = unknown → never
-	//     cache, since a version bump is how catalog data invalidates).
-	//   - direct vgi_table_function() (no table_entry): no VgiCatalog and no
-	//     version dimension; identity = worker_path, freshness is TTL-only.
+	// Identity + version dimensions:
+	//   - catalog table (table_entry set): identity = catalog name + principal,
+	//     bounded by catalog_version (0 = unknown → never cache: a version bump is
+	//     how catalog data invalidates).
+	//   - table-function call (no table_entry): identity = worker_path +
+	//     principal, no version dimension, TTL-only freshness.
 	std::string identity_scope;
 	int64_t version = 0;
 	std::string catalog_label;
 	if (bind_data.table_entry) {
-		// ParentCatalog() comes through the const bind_data; the catalog is
-		// logically mutable (a live attached catalog) — const_cast to call the
-		// non-const GetCatalogType()/Cast().
+		// const_cast: GetCatalogType()/Cast() are non-const.
 		auto &catalog = const_cast<Catalog &>(bind_data.table_entry->ParentCatalog());
 		if (catalog.GetCatalogType() != "vgi") {
 			e.ineligible_reason = "not_vgi";
@@ -1674,9 +1564,8 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 			return e;
 		}
 	} else {
-		// Direct path: worker-path identity, TTL-only (version stays 0 here,
-		// which means "no version dimension", NOT "unknown version"). No auth on
-		// this path — anonymous scope.
+		// version stays 0 here: "no version dimension", NOT "unknown version".
+		// The auth principal is still folded in; "" fails closed.
 		catalog_label = bind_data.worker_path();
 		std::string principal =
 		    vgi::ComputeCatalogIdentityFingerprint(bind_data.attach_params->auth());
@@ -1687,12 +1576,9 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 		identity_scope = "worker:" + bind_data.worker_path() + "\x1f" + principal;
 	}
 
-	// Static pushdowns are KEY COMPONENTS (M3): a filtered/ordered/sampled scan
-	// caches under a key that includes the pushdown, so it can never be served
-	// to a differently-shaped scan. Two classes still DISABLE caching:
-	//   - dynamic filters (join-key IN pushdown / Top-N): their values arrive
-	//     via ticks during the scan, so there's no stable key at decision time.
-	//   - unseeded TABLESAMPLE: non-deterministic, must not be frozen.
+	// Static pushdowns (filter / order / sample) are KEY COMPONENTS. Two kinds
+	// DISABLE caching: runtime-valued filters (no stable key at init) and
+	// unseeded TABLESAMPLE (non-deterministic).
 	std::string filter_key;
 	if (input.filters) {
 		for (auto &kv : *input.filters) {
@@ -1702,8 +1588,7 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 			}
 		}
 		if (input.filters->HasFilters()) {
-			// Serialize the STATIC filters deterministically for the key. If the
-			// serializer can't represent a filter, fail closed (skip caching).
+			// Unserializable filter: fail closed.
 			try {
 				auto sf = VgiSerializeFilters(context, input.column_ids, input.filters,
 				                              bind_data.all_column_names, bind_data.worker_path(),
@@ -1735,14 +1620,12 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	if (bind_data.table_sample_hint) {
 		const auto &s = *bind_data.table_sample_hint;
 		if (s.seed < 0) {
-			// Unseeded sample is non-deterministic — never cache.
 			e.ineligible_reason = "unseeded_sample";
 			return e;
 		}
 		sample_key = std::to_string(s.sample_percentage) + "/" + std::to_string(s.seed);
 	}
 
-	// Build the key (projection IN the key; transaction scope deferred).
 	e.key.identity_scope = identity_scope;
 	e.key.worker_path = bind_data.worker_path();
 	e.key.function_name = bind_data.function_name;
@@ -1757,23 +1640,16 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	e.key.at_unit = bind_data.at_unit;
 	e.key.at_value = bind_data.at_value;
 	e.key.secret_scope = bind_data.secret_dependent ? secret_scope : "";
-	// Static pushdown key components (M3).
 	e.key.filter_bytes = std::move(filter_key);
 	e.key.order_by_hint = std::move(order_key);
 	e.key.sample_hint = std::move(sample_key);
-	// The key stays catalog-scoped here (txn_id empty); the current transaction id
-	// is carried separately for the scope=transaction commit + two-key lookup.
 	e.transaction_id = std::to_string(static_cast<uint64_t>(context.ActiveTransaction().global_transaction_id));
 	e.catalog_name = catalog_label;
-	// Per-partition classification piggybacks on the base eligibility (same identity /
-	// version / opt-out). Populates the partition_* fields; harmless when the function
-	// isn't SINGLE_VALUE_PARTITIONS or the setting is off.
 	ClassifyPartitionFilters(context, bind_data, input, e);
 	e.eligible = true;
 	return e;
 }
 
-//! Log a result_cache.* event.
 void LogResultCache(ClientContext &context, const string &event,
                     const vector<pair<string, string>> &fields) {
 	VGI_LOG(context, event, fields);
@@ -1781,15 +1657,14 @@ void LogResultCache(ClientContext &context, const string &event,
 
 } // namespace
 
-// Drain a RAM substream's buffered batches into the spill writer (freeing them as
-// it goes). Returns false if the writer refused (per-entry disk budget exceeded).
+// Drain a RAM substream into the spill writer, freeing it. False if the writer
+// refused (per-entry disk budget exceeded).
 static bool DrainSubstreamToWriter(CachedStream &s, VgiCaptureDiskWriter &w) {
 	bool ok = true;
 	for (auto &cb : s.batches) {
 		if (ok && cb.ipc) {
-			// These pre-threshold batches were serialized uncompressed (the live
-			// RecordBatch is gone), so transcode to the writer's codec here. logical_len
-			// is the uncompressed size (no-op transcode when codec=="none").
+			// Pre-threshold batches are uncompressed bytes: transcode to the
+			// writer's codec; the logical length stays the uncompressed size.
 			auto payload = TranscodeIpcWithCodec(cb.ipc, w.CodecName(), w.Level());
 			ok = w.AppendBatch(cb.has_batch_index, cb.batch_index, cb.rows, cb.partition_values_bytes,
 			                   payload->data(), static_cast<int64_t>(payload->size()),
@@ -1802,8 +1677,6 @@ static bool DrainSubstreamToWriter(CachedStream &s, VgiCaptureDiskWriter &w) {
 	return ok;
 }
 
-// Per-partition split-at-commit (SINGLE_VALUE_PARTITIONS). Defined after
-// ConvertPartitionValuesBatch; forward-declared here so the commit dtor can call it.
 static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCtx &cap,
                                           const VgiResultCacheEntry &meta, bool allow_disk);
 
@@ -1812,32 +1685,24 @@ static void InstallProtocolSplitPartitionData(ClientContext &context,
                                               const VgiScanPlan &plan,
                                               VgiTableFunctionGlobalState &global_state);
 
-// Commit a completed capture to the result cache. Called from the gstate
-// destructor. Enforces the never-partial invariant: only commits when the full
-// result was drained (every launched local state reached EOS) and the worker
-// advertised a cacheable result.
+// Commits only a fully drained capture the worker advertised as cacheable.
 VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 	if (!capture) {
 		return;
 	}
 	auto &cap = *capture;
-	// [S6] Release this capture's in-flight budget on EVERY teardown path (commit,
-	// abort, incomplete) — the transient capture buffers are done being resident
-	// (either committed into the LRU, whose bytes are accounted separately, or
-	// freed). Do it first so no early-return leaks the reservation.
+	// Release the in-flight budget first so no early return leaks it.
 	int64_t reserved = cap.reserved_inflight_bytes.exchange(0, std::memory_order_relaxed);
 	if (reserved > 0) {
 		(*cap.cache).ReleaseInflightCapture(reserved);
 	}
-	// Any path that does NOT commit must discard a streamed temp blob (no ref is
-	// written, so an un-aborted temp would linger until the reaper sweeps it).
+	// Every non-commit path must discard a streamed temp blob.
 	auto abort_stream = [&]() {
 		if (cap.disk_writer) {
 			(*cap.cache).AbortStreamingCapture(*cap.disk_writer);
 		}
 	};
-	// Best-effort store diagnostics. The dtor runs during query teardown while the
-	// ClientContext is still alive (same assumption as dynamic_to_string); guard + swallow.
+	// Best-effort diagnostics; the ClientContext is alive during query teardown.
 	auto log_store = [&](const string &event, const vector<pair<string, string>> &fields) {
 		if (client_context_for_explain) {
 			try {
@@ -1851,29 +1716,18 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 		          {{"function", cap.key.function_name}, {"key_hash", cap.key.HexDigest()}, {"reason", reason}});
 	};
 
-	// ``eos == launched`` means "every reader that started also finished". On the
-	// split path that is necessary but NOT sufficient: a reader destroyed by
-	// cancellation mid-split consumed a claim without reading it, and every
-	// surviving reader's completion papers over the hole — committing a partial
-	// result as though it were whole, which is exactly what cache/poison*.test
-	// exists to catch, reached through a path those tests do not exercise.
-	//
-	// So the split path additionally requires that every split was both claimed
-	// AND drained. completed_splits is incremented only at a split's true EOS.
+	// The split path also needs every split drained (see
+	// VgiResultCaptureCtx::split_path).
 	const bool splits_all_drained =
 	    !cap.split_path || (cap.total_splits > 0 && cap.completed_splits.load() == cap.total_splits);
 	const bool complete = cap.cc_seen && cap.cc.Cacheable() && !cap.aborted.load() &&
 	                      cap.launched.load() > 0 && cap.eos.load() == cap.launched.load() &&
 	                      splits_all_drained;
-	// v1: transaction-scoped results are not cached (transaction keying is a later
-	// milestone). Refuse rather than mis-key.
 	if (!complete) {
 		abort_stream();
 		return;
 	}
-	// scope=transaction: reusable only within THIS transaction. Fold the txn id into
-	// the key so a different transaction (different id) misses it. Refuse if we have
-	// no txn id to isolate by (shouldn't happen).
+	// scope=transaction: fold the txn id into the key so other transactions miss.
 	const bool txn_scoped = cap.cc.TransactionScoped();
 	if (txn_scoped && cap.transaction_id.empty()) {
 		skip("no_transaction_id");
@@ -1891,9 +1745,8 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 	entry->last_modified = cap.cc.last_modified;
 	entry->revalidatable = cap.cc.revalidatable;
 	entry->stored_at = std::chrono::steady_clock::now();
-	// Freshness: ttl wins over expires; frozen/at-pinned may never expire. The
-	// worker ttl was already clamped at parse; clamp the settings-derived default
-	// too so `stored_at + seconds(ttl)` can never overflow the time_point.
+	// ttl wins over expires; frozen/at-pinned may never expire. Clamp the
+	// settings default too so `stored_at + seconds(ttl)` cannot overflow.
 	int64_t ttl = cap.cc.ttl_seconds.value_or(static_cast<int64_t>(cap.default_ttl_seconds));
 	if (ttl > VGI_CACHE_MAX_TTL_SECONDS) {
 		ttl = VGI_CACHE_MAX_TTL_SECONDS;
@@ -1902,43 +1755,34 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 		if (cap.catalog_version_frozen || !cap.key.at_value.empty()) {
 			entry->never_expires = true;
 		} else if (cap.cc.revalidatable && !cap.cc.etag.empty()) {
-			// "no-cache" semantic (HTTP): ttl=0 + a validator + revalidatable
-			// stores the payload but marks it immediately stale, so every read
-			// revalidates via a conditional request (a not_modified reply reuses
-			// the stored bytes without re-streaming). expires_at == stored_at.
+			// HTTP "no-cache": store immediately stale (expires_at == stored_at)
+			// so every read revalidates with a conditional request.
 		} else {
 			skip("no_freshness");
 			abort_stream();
-			return; // no freshness basis — refuse (shouldn't happen: Cacheable() gate)
+			return; // no freshness basis (Cacheable() should have refused)
 		}
 	}
 	entry->expires_at = entry->stored_at + std::chrono::seconds(ttl > 0 ? ttl : 0);
 
 	if (cap.streaming()) {
-		// A spilled entry is disk-only, and conditional revalidation
-		// (LookupForRevalidation) only probes the in-memory index — so a disk-only
-		// entry can never be revalidated. An immediately-stale "no-cache" result
-		// (ttl=0 + etag + revalidatable, expires_at == stored_at) would therefore be
-		// written un-loadable (both disk loaders reject `now >= expires`) and orphan
-		// one blob per scan. Refuse to spill it — recompute is the correct behavior.
+		// A spilled entry is disk-only, but LookupForRevalidation probes only
+		// memory and the disk loaders reject expired entries: an immediately-stale
+		// result would be an unloadable orphan blob. Refuse.
 		if (!entry->never_expires && entry->expires_at <= entry->stored_at) {
 			skip("immediately_stale");
 			abort_stream();
 			return;
 		}
-		// Transaction-scoped entries are memory-only (the txn id is process-local and
-		// ephemeral; a disk blob would orphan after the txn and be meaningless
-		// cross-process). A spilled one has no RAM copy → refuse (recompute).
+		// Transaction-scoped entries are memory-only (process-local txn id), and a
+		// spilled one has no RAM copy.
 		if (txn_scoped) {
 			skip("transaction_scoped_spill");
 			abort_stream();
 			return;
 		}
-		// Spilled path: most batches already streamed to the disk blob. Drain any
-		// substreams whose producer finished BEFORE the spill (their RAM batches were
-		// never streamed) — single-threaded here, all producers done. Then finalize
-		// (hash → rename → ref); the entry is disk-only, discovered via its ref and
-		// adopted into memory on a small serve. A failed drain/commit caches nothing.
+		// Drain substreams that finished BEFORE the spill (all producers are done),
+		// then finalize. A failed drain/commit caches nothing.
 		for (auto &sp : cap.streams) {
 			if (!sp->batches.empty() && !DrainSubstreamToWriter(*sp, *cap.disk_writer)) {
 				skip("drain_failed");
@@ -1953,26 +1797,21 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 			                                 {"rows", std::to_string(cap.disk_writer->Rows())},
 			                                 {"bytes", std::to_string(cap.disk_writer->Bytes())}});
 		}
-		// A spilled capture is disk-only and its RAM batches were drained — no per-batch
-		// bytes remain to split by partition. Skip the per-partition layer (v1 boundary).
+		// No RAM batches remain to split by partition.
 		if (cap.partition_split_requested && cap.cc.partition_scope) {
 			skip("partition_spilled");
 		}
 		return;
 	}
-	// Per-partition split (additive): store one entry per distinct partition value BEFORE
-	// the whole-scan move consumes the substreams. Gated on the worker's first-batch
-	// opt-in (cc.partition_scope) and skipped for transaction-scoped results (their key
-	// is process-local; partition entries are catalog-scoped). Copies batch shared_ptrs.
-	// MEMORY-ONLY (allow_disk=false): the combined serve probes only the memory tier
-	// (LookupBatch), so a disk copy would never be read back — and persisting an
-	// input_hash-keyed entry would wrongly route it into the packed EXCHANGE store + its
-	// ref-count cap. The whole-scan entry above still persists to disk for cross-process
-	// warmth of full/identical-filter repeats.
+	// Per-partition split, BEFORE the whole-scan move consumes the substreams.
+	// Skipped for transaction-scoped results (partition entries are
+	// catalog-scoped). MEMORY-ONLY: the combined serve probes only memory
+	// (LookupBatch), and a persisted input_hash-keyed entry would be routed into
+	// the packed exchange store.
 	if (cap.partition_split_requested && cap.cc.partition_scope && !txn_scoped) {
 		SplitAndStorePartitionEntries(client_context_for_explain, cap, *entry, /*allow_disk=*/false);
 	}
-	// RAM-buffered path (disk tier off): move the substreams in + insert into memory.
+	// Not spilled: move the substreams into the entry.
 	int64_t rows = 0;
 	int64_t bytes = 0;
 	for (auto &sp : cap.streams) {
@@ -1983,15 +1822,15 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 	entry->rows = rows;
 	entry->total_bytes = bytes;
 	const std::string stored_key_hash = entry->key.HexDigest();
-	// Transaction-scoped entries never persist to disk (ephemeral, process-local id).
 	if ((*cap.cache).Insert(std::move(entry), /*allow_disk=*/!txn_scoped)) {
 		log_store("result_cache.store", {{"function", cap.key.function_name},
 		                                 {"key_hash", stored_key_hash},
-		                                 {"tier", "memory"},
+		                                 // Insert writes through to disk when allowed.
+		                                 {"tier", txn_scoped ? "memory" : "memory_or_disk"},
 		                                 {"rows", std::to_string(rows)},
 		                                 {"bytes", std::to_string(bytes)}});
 	} else {
-		skip("too_large_for_memory"); // > max_entry_bytes with disk off (or memory-only txn)
+		skip("too_large_for_memory");
 	}
 }
 
@@ -2036,7 +1875,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	auto input = PhysicalCatalogScanInput(logical_input);
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 
-	// Read TABLESAMPLE pushdown from DuckDB optimizer (SYSTEM_SAMPLE percentage only)
+	// TABLESAMPLE pushdown (SYSTEM_SAMPLE percentage only).
 	if (input.sample_options) {
 		double pct = input.sample_options->sample_size.GetValue<double>();
 		int64_t seed = input.sample_options->seed.IsValid()
@@ -2044,40 +1883,21 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		bind_data.table_sample_hint = TableSampleHint{pct, seed};
 	}
 
-	// Extract projection IDs from input.column_ids for the worker.
-	// Only send projection IDs when the function supports projection pushdown.
-	//
-	// When unsupported this vector stays empty, and BuildInitRequest encodes an
-	// empty vector as NULL on the wire (vgi_rpc_types.cpp, "append null
-	// projection_ids") — not as an empty list. A receiver reads null as "no
-	// projection pushdown", i.e. send every column, which is what we want.
-	//
-	// (The previous comment here said we send an "empty list meaning all
-	// columns". That was the pre-vgi_rpc convention; it arrived with the
-	// migration in 3f81f4b already describing code that no longer existed.)
-	//
-	// A consequence worth knowing: because an empty vector is spoken for by
-	// null, there is currently NO way to express a genuine zero-column
-	// projection — the count(*) shape, where only the row count is wanted and
-	// no column data need be read. vgi-python already distinguishes the two
-	// (`projection_ids: list[int] | None`, where [] means "project nothing"),
-	// and its table-function fixtures handle the empty-output_schema case. To
-	// reach it, this vector and the PerformInit / BuildInitRequest chain would
-	// have to carry std::optional, with nullopt -> null and an empty vector ->
-	// an empty list. Note DuckDB was measured pushing one column
-	// (projection_ids=[0]) even for a bare count(*), so that plumbing alone
-	// would not make counts cheaper without a DuckDB-side change too.
+	// Worker projection ids, only when the function supports projection
+	// pushdown. BuildInitRequest encodes an empty vector as NULL ("no projection
+	// pushdown": send every column), not an empty list. Known limitation: a
+	// genuine zero-column projection (`[]`, which vgi-python accepts) cannot be
+	// expressed without making this chain carry std::optional.
 	std::vector<int32_t> projection_ids;
 	if (bind_data.projection_pushdown) {
 		projection_ids.reserve(input.column_ids.size());
 		for (auto col_id : input.column_ids) {
 			if (col_id == COLUMN_IDENTIFIER_ROW_ID && bind_data.rowid_worker_col_index >= 0) {
-				// Map rowid request to the actual worker column index
 				projection_ids.push_back(static_cast<int32_t>(bind_data.rowid_worker_col_index));
 			} else if (bind_data.rowid_worker_col_index >= 0 &&
 			           col_id != COLUMN_IDENTIFIER_ROW_ID &&
 			           col_id >= static_cast<idx_t>(bind_data.rowid_worker_col_index)) {
-				// Shift to account for the excluded row_id column in worker's schema
+				// Shift past the rowid column erased from DuckDB's column list.
 				projection_ids.push_back(static_cast<int32_t>(col_id + 1));
 			} else {
 				projection_ids.push_back(static_cast<int32_t>(col_id));
@@ -2086,48 +1906,31 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	}
 
 	// --- Result cache: eligibility + serve (cache hit short-circuits worker) ---
-	// Sync the process-global cache config from this query's settings so SET on any
-	// cap / the disk dir / the packed backend takes effect. Shared with the exchange
-	// path (single source of truth — no drift). [S1] ConfigureIfChanged skips the
-	// global lock + evict entirely when the settings are unchanged (the steady state).
+	// Sync the process-global cache config from this query's settings (shared
+	// with the exchange path; a no-op when unchanged).
 	SyncResultCacheSettings(context);
 	auto cache_eval = EvaluateCacheEligibility(context, bind_data, input, projection_ids);
-	// A stale-but-revalidatable entry the worker can cheaply confirm via a
-	// conditional request. Set below the eligible block; consumed when the
-	// gstate is built (miss path) to arm revalidation mode. Null otherwise.
+	// A stale-but-revalidatable entry, set below; arms revalidation mode when the
+	// gstate is built on the miss path.
 	std::shared_ptr<const VgiResultCacheEntry> revalidation_entry;
-	// INVARIANT: never revalidate on the split path.
+	// INVARIANT: never revalidate on the split path. ``revalidating`` clamps
+	// MaxThreads() to 1, so one local state drains EVERY split; a not_modified on
+	// the first split would swap in a replay of the WHOLE entry and splits 1..N
+	// would duplicate it. The probe itself is skipped because
+	// LookupForRevalidation() arms revalidation mode as a side effect.
 	//
-	// ``revalidating`` clamps MaxThreads() to 1, so a single local state would
-	// drain EVERY split. A 304 on the first split then swaps in a
-	// CachedReplayConnection over the WHOLE stored entry, and splits 1..N would
-	// stream on top of a complete replay — duplicating the entire result. The
-	// probe is skipped entirely rather than handled downstream, because
-	// LookupForRevalidation() has the side effect of arming revalidation mode.
-	//
-	// Per-split revalidation is a separate design (it needs per-split validators,
-	// which the entry does not carry).
-	//
-	// An ORDINARY hit is a different matter and IS allowed on the split path: it
-	// short-circuits before the plan RPC is ever issued (the hit branch below
-	// returns the gstate outright), so no split is planned, claimed or redeemed.
-	// The scan simply never becomes a split scan. Gating the whole block on
-	// !split_path — as this once did — cost every split-capable function its
-	// result cache: it populated on every run and served on none, so an identical
-	// repeat re-ran the worker and inserted again.
+	// An ORDINARY hit IS allowed on the split path: it returns before the plan RPC,
+	// so the scan never becomes a split scan. Do not gate the whole block on
+	// !split_path, or split-capable functions never serve from cache.
 	const bool split_path = bind_data.supports_splits;
 	if (cache_eval.eligible) {
 		auto now_tp = std::chrono::steady_clock::now();
-		// Conditional revalidation takes precedence: probe for a stale
-		// revalidatable entry FIRST, because Lookup() drops stale entries.
-		// Skipped entirely on the split path per the invariant above — and skipped
-		// rather than handled downstream, because LookupForRevalidation() has the
-		// side effect of arming revalidation mode.
+		// Probe for a stale revalidatable entry FIRST: Lookup() drops stale
+		// entries. Never on the split path (see above).
 		auto reval = split_path ? nullptr
 		                        : GetResultCache(context).LookupForRevalidation(cache_eval.key, now_tp);
 		if (reval) {
-			// Only worth a conditional round-trip when re-streaming would cost
-			// more than the check — gate on the payload size threshold.
+			// Only worth a conditional round-trip for a large enough payload.
 			Value rmv;
 			uint64_t reval_min_bytes =
 			    context.TryGetCurrentSetting("vgi_result_cache_revalidate_min_bytes", rmv) && !rmv.IsNull()
@@ -2144,23 +1947,19 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			// else: too small — fall through to a plain refetch (capture below).
 		}
 		if (!revalidation_entry) {
-			auto entry = GetResultCache(context).Lookup(cache_eval.key, now_tp);
+			const char *hit_tier = "memory";
+			auto entry = GetResultCache(context).Lookup(cache_eval.key, now_tp, &hit_tier);
 			if (!entry && !cache_eval.transaction_id.empty()) {
-				// The catalog key (txn_id empty) didn't match; a scope=transaction
-				// result stored earlier in THIS transaction lives under (key + txn_id),
-				// so probe that too. A different transaction has a different id → miss.
+				// A scope=transaction result from THIS transaction lives under
+				// key + txn_id.
 				VgiResultCacheKey txn_key = cache_eval.key;
 				txn_key.transaction_id = cache_eval.transaction_id;
-				entry = GetResultCache(context).Lookup(txn_key, now_tp);
+				entry = GetResultCache(context).Lookup(txn_key, now_tp, &hit_tier);
 			}
 			if (entry) {
 				// HIT — serve from cache; no worker acquire / init RPC / pool touch.
 				auto gstate = make_uniq<VgiTableFunctionGlobalState>();
 				gstate->serving_from_cache = true;
-				// [S8] A disk-backed entry streams off disk (never materialized); a
-				// memory / adopted entry replays from RAM. Surface which so tests can
-				// prove the flat-RAM streaming path was taken.
-				const bool disk_streaming = entry->disk_backed;
 				gstate->serving_entry = std::move(entry);
 				gstate->max_processes = 1;
 				gstate->init_applied.store(true, std::memory_order_release);
@@ -2169,7 +1968,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 				               {{"catalog", cache_eval.catalog_name},
 				                {"function", bind_data.function_name},
 				                {"key_hash", cache_eval.key.HexDigest()},
-				                {"tier", disk_streaming ? "disk_streaming" : "memory"}});
+				                {"tier", hit_tier}});
 				return unique_ptr<GlobalTableFunctionState>(std::move(gstate));
 			}
 			LogResultCache(context, "result_cache.miss",
@@ -2177,12 +1976,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			                {"function", bind_data.function_name},
 			                {"key_hash", cache_eval.key.HexDigest()}});
 
-			// Per-partition serve (additive): the whole-scan key missed, but if this scan
-			// enumerates its requested partition set (`=`/`IN` on every partition column)
-			// AND every per-partition entry is an in-memory hit, serve the union without
-			// the worker. Row-exact: each entry keys on the same residual filter, the
-			// enumerated set equals the requested set, and SINGLE_VALUE guarantees each
-			// cached row belongs to exactly its entry's partition (no super/subset).
+			// Per-partition serve: if the scan enumerates its partition set and every
+			// per-partition entry is an in-memory hit, serve the union. Row-exact:
+			// every entry keys on the same residual filter, the enumerated set equals
+			// the requested set, and SINGLE_VALUE puts each row in exactly one entry.
 			if (cache_eval.partition_enumerable && !cache_eval.partition_enumerated_tuples.empty()) {
 				std::vector<VgiResultCacheKey> pkeys;
 				pkeys.reserve(cache_eval.partition_enumerated_tuples.size());
@@ -2195,18 +1992,16 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 				bool all_hit = !pkeys.empty();
 				int64_t missing = 0;
 				for (auto &h : hits) {
-					// Combined serve is memory-only: a disk-backed (streaming) entry can't
-					// be aggregated into one replay stream, so treat it as a miss.
+					// A disk-backed entry can't join the combined replay: a miss.
 					if (!h || h->disk_backed) {
 						all_hit = false;
 						++missing;
 					}
 				}
 				if (all_hit) {
-					// Aggregate every partition entry's batches into ONE partition-contiguous
-					// replay stream with fresh sequential batch_index — so the sort in
-					// CachedReplayConnection keeps each partition's batches together (required
-					// by PhysicalPartitionedAggregate) regardless of the stored indices.
+					// One partition-contiguous stream with fresh sequential batch_index,
+					// so CachedReplayConnection's sort keeps each partition together
+					// (PhysicalPartitionedAggregate requires it).
 					auto combined = std::make_shared<VgiResultCacheEntry>();
 					combined->key = cache_eval.key;
 					combined->catalog_name = cache_eval.catalog_name;
@@ -2263,10 +2058,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		                {"reason", cache_eval.ineligible_reason}});
 	}
 
-	// Acquire a connection for the init/scan phase. The planner-phase BindResult
-	// is already cached on bind_data; PerformInit's payload carries it inline,
-	// so no second on-wire bind is needed. AcquireConnectionForInit pool-hits
-	// when possible (subprocess) or constructs a fresh HTTP connection.
+	// No second bind: PerformInit carries the cached BindResult inline.
 	FunctionConnectionParams acquire_params;
 	acquire_params.attach_params = bind_data.attach_params;
 	acquire_params.attach_opaque_data = bind_data.attach_opaque_data;
@@ -2282,9 +2074,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	auto connection = std::move(acquired.connection);
 	const auto &bind_result = bind_data.bind_result;
 
-	// A required TableFilter reaches this point only after DuckDB has delegated
-	// evaluation to the scan. Serialization failure must therefore fail closed;
-	// silently continuing would run the remote scan without the removed residual.
+	// DuckDB has delegated required filters to the scan, so a serialization
+	// failure must fail closed rather than drop them.
 	auto serialized_filters =
 	    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names,
 	                        bind_data.worker_path(), bind_data.rowid_column_name, bind_data.rowid_worker_col_index,
@@ -2308,10 +2099,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	auto &filter_bytes = serialized_filters.filter_bytes;
 	auto &join_keys_buffers = serialized_filters.join_keys_buffers;
 
-	// Capture DynamicFilter references for tick-based pushdown.
-	// Recognize optional dynamic comparisons and optional OR(IS NULL, dynamic)
-	// expressions from Top-N, including those inside a conjunction with ordinary
-	// predicates. Other expression shapes cannot be reduced to a threshold.
+	// Capture Top-N DynamicFilters for tick-based pushdown: optional dynamic
+	// comparisons and optional OR(IS NULL, dynamic), also inside a conjunction.
+	// Other shapes cannot be reduced to a threshold.
 	vector<VgiDynamicFilterInfo> dynamic_filters;
 	if (input.filters) {
 		auto capture = [&](idx_t column_index, const string &column_name, const Expression &root) {
@@ -2373,11 +2163,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			auto &filter = entry.Filter();
 
 			idx_t original_col_idx = col_idx < input.column_ids.size() ? input.column_ids[col_idx] : col_idx;
-			// Same rowid-sentinel remap as VgiSerializeFilters: name the rowid
-			// column with the worker's actual field name. Defensive — the rowid
-			// late-mat filter is a concrete CONJUNCTION_AND/InFilter, not a captured
-			// DynamicFilter, so it normally doesn't reach this loop, but a future
-			// rowid DynamicFilter would otherwise be misnamed.
+			// Same rowid / column-shift remap as VgiSerializeFilters.
 			string col_name;
 			idx_t worker_col_idx;
 			if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID && !bind_data.rowid_column_name.empty()) {
@@ -2412,46 +2198,28 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		         {"count", std::to_string(dynamic_filters.size())}});
 	}
 
-	// Create shared tick filter state if we have dynamic filters.
-	// This is shared between the global state (which updates it from DynamicFilterData)
-	// and the connection (which reads it when building tick batches).
+	// Updated from DynamicFilterData by the scan, read by the connection for ticks.
 	shared_ptr<TickFilterState> tick_filter_state;
 	if (!dynamic_filters.empty()) {
 		tick_filter_state = make_shared_ptr<TickFilterState>();
 		connection->SetTickFilterState(tick_filter_state);
 	}
 
-	// Build the gstate up front (everything that doesn't depend on the init
-	// RPC result) and defer PerformInit to a background thread. The future
-	// is awaited lazily by EnsureInitApplied (driven by MaxThreads() and
-	// init_local).
+	// Build everything that doesn't depend on the init RPC now; PerformInit runs
+	// on a background thread and is awaited by EnsureInitApplied.
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->client_context_for_explain = &context;
 	global_state->supports_splits = bind_data.supports_splits;
-	// Provisional reader count. On the ordinary path EnsureInitApplied folds in
-	// the worker's max_workers once the init future resolves; the split path
-	// takes it from the plan below and sets init_applied, so this has to be set
-	// BEFORE the plan rather than after it — assigning it later overwrote the
-	// plan's value and silently collapsed every split scan to one reader.
+	// Provisional; EnsureInitApplied or the split plan below sets the real
+	// value. Must be assigned BEFORE the plan, or it would overwrite the plan's.
 	global_state->max_processes = 1;
 
-	// Split path: plan the scan into named units BEFORE any reader starts, then let
-	// readers claim them. The plan is built from STATIC filters only — dynamic
-	// join-key values are not initialized yet at this point, and continue to reach
-	// the worker per-tick exactly as they do on the non-split path. That is not a
-	// regression (today nothing is pruned at split granularity either way), just an
-	// optimization not claimed here.
+	// Split path: plan the scan into splits BEFORE any reader starts. The plan uses
+	// STATIC filters only; dynamic values still reach the worker per tick.
 	if (bind_data.supports_splits) {
-		// Refuse a plan whose tokens expire sooner than this client can use them,
-		// BEFORE issuing it. Nothing re-plans when a split token expires — a
-		// distributed engine retries the serialized task it was handed and has no
-		// path back to the planner — so an expired token fails the query outright.
-		// Discovering that at read time means discovering it after the work was
-		// scheduled; discovering it here costs one comparison.
-		//
-		// An absent TTL means UNBOUNDED and always passes: assuming a TTL exists
-		// would foreclose long-running streams, whose whole point is a token that
-		// outlives any fixed window.
+		// Refuse, BEFORE planning, a token lifetime shorter than this client needs:
+		// nothing re-plans when a split token expires, so the query would fail
+		// partway. An absent TTL means UNBOUNDED and always passes.
 		if (bind_data.split_token_ttl_seconds.has_value()) {
 			Value min_ttl_value;
 			int64_t min_ttl = defaults::SPLIT_TOKEN_MIN_TTL_SECONDS;
@@ -2476,9 +2244,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		if (filter_bytes) {
 			filter_bytes_vec.assign(filter_bytes->data(), filter_bytes->data() + filter_bytes->size());
 		}
-		// min_splits = this instance's thread count: the one sizing fact DuckDB
-		// genuinely knows. target_split_bytes only when the operator set it —
-		// DuckDB has no basis to invent a byte target.
+		// min_splits = thread count (the one sizing fact DuckDB knows);
+		// target_split_bytes only when the operator set it.
 		const int64_t min_splits = static_cast<int64_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 		int64_t target_split_bytes = 0;
 		Value tsb;
@@ -2500,8 +2267,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		if (!plan.init_opaque_data.empty()) {
 			global_state->init_opaque_data = plan.init_opaque_data;
 		}
-		// The plan supplies everything the primary init would have, so there is no
-		// primary init on this path — readers init per split instead.
+		// No primary init on this path: readers init per split.
 		global_state->init_applied = true;
 
 		VGI_LOG(context, "scan.plan",
@@ -2518,13 +2284,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->join_keys_buffers = join_keys_buffers;
 	global_state->order_by_hint = bind_data.order_by_hint;
 	global_state->table_sample_hint = bind_data.table_sample_hint;
-	// Propagated from bind so MaxThreads() can clamp the source to one
-	// thread for FIXED_ORDER functions even after EnsureInitApplied folds
-	// in the worker's max_workers.
 	global_state->fixed_order = bind_data.fixed_order;
 
-	// Result cache: eligible MISS → set up capture. Each local state captures
-	// its own substream; commit happens in the gstate destructor (never-partial).
+	// Eligible MISS: set up capture (committed by the gstate destructor).
 	if (cache_eval.eligible) {
 		auto cap = std::make_shared<VgiResultCaptureCtx>();
 		cap->cache = &GetResultCache(context);
@@ -2532,10 +2294,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		cap->catalog_name = cache_eval.catalog_name;
 		cap->catalog_version_frozen = cache_eval.catalog_version_frozen;
 		cap->transaction_id = cache_eval.transaction_id;
-		// The split arm of the commit gate. Without these the gate read a
-		// default-constructed `split_path == false` and degenerated to plain
-		// `eos == launched` — which is exactly the check it was added to
-		// strengthen, so the guard existed and could never fire.
+		// Required for the split arm of the commit gate.
 		cap->split_path = bind_data.supports_splits;
 		cap->total_splits = global_state->splits.size();
 		Value sv;
@@ -2549,16 +2308,11 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		    context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", sv)
 		        ? sv.GetValue<uint64_t>()
 		        : 0;
-		// Disk config for the threshold spill: when a RAM capture would exceed
-		// max_entry_bytes AND the disk tier is on, capture spills to a streaming disk
-		// blob (RAM-flat) instead of aborting. Captured here; the writer is created
-		// lazily in InstallBatch on the first threshold cross.
+		// Disk config for the threshold spill (see VgiResultCaptureCtx).
 #ifndef __EMSCRIPTEN__
-		// WASM is memory-only: leave cap->disk_dir empty so a >max_entry_bytes capture
-		// aborts to uncached (streams to DuckDB) rather than spilling to a disk blob —
-		// the spill writer's incremental hash (MbedTlsWrapper::SHA256State) is not
-		// resolvable from the emscripten side-module. The singleton disk tier is gated
-		// in parallel at VgiResultCache::Configure. Native is unchanged.
+		// WASM is memory-only (an oversized capture aborts to uncached): the spill
+		// writer's MbedTlsWrapper::SHA256State is not resolvable from the side
+		// module. VgiResultCache::Configure gates the disk tier likewise.
 		if (context.TryGetCurrentSetting("vgi_result_cache_dir", sv) && !sv.IsNull()) {
 			cap->disk_dir = sv.GetValue<std::string>();
 		}
@@ -2572,8 +2326,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		if (context.TryGetCurrentSetting("vgi_result_cache_disk_compression_level", sv) && !sv.IsNull()) {
 			cap->disk_compression_level = sv.GetValue<uint64_t>();
 		}
-		// Arm the per-partition split (SINGLE_VALUE_PARTITIONS). The actual split at
-		// commit is ADDITIONALLY gated on the worker's first-batch cc.partition_scope.
+		// Arm the per-partition split (also gated on cc.partition_scope at commit).
 		if (cache_eval.partition_splittable) {
 			cap->partition_split_requested = true;
 			cap->partition_column_indices = cache_eval.partition_column_indices;
@@ -2585,9 +2338,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		global_state->capture = std::move(cap);
 	}
 
-	// Conditional revalidation: arm the gstate so the init request carries the
-	// stored validators and GetNextBatch can honor a not_modified reply. The
-	// capture set up just above still records fresh data on the changed path.
+	// Arm revalidation: init carries the validators, GetNextBatch honors a
+	// not_modified reply, and the capture above records fresh data otherwise.
 	if (revalidation_entry) {
 		global_state->revalidating = true;
 		global_state->revalidate_if_none_match = revalidation_entry->etag;
@@ -2595,12 +2347,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		global_state->revalidation_entry = std::move(revalidation_entry);
 	}
 
-	// The split path is done here. Readers initialize per split with the token
-	// they claimed, so there is no primary init to run — and running one anyway
-	// is not merely wasteful: it inits a connection with NO split token, which a
-	// split-only worker rejects, and on success leaves that worker streaming a
-	// whole unsplit scan into a pipe nobody reads until teardown. init_applied is
-	// already true, so the future's exception would never even be observed.
+	// Split path: readers init per split. A primary init here would carry NO
+	// split token (a split-only worker rejects it, others stream a whole unsplit
+	// scan nobody reads), and with init_applied set its error is never observed.
 	if (bind_data.supports_splits) {
 		return std::move(global_state);
 	}
@@ -2618,8 +2367,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	        bool from_pool) mutable
 	    -> std::pair<InitResult, std::unique_ptr<IFunctionConnection>> {
 		auto run = [&](IFunctionConnection &c) {
-			// Arm conditional-revalidation validators (M6) before init; no-op
-			// when both are empty (the common non-revalidation path).
+			// Conditional-revalidation validators, when armed.
 			if (!reval_inm.empty() || !reval_ims.empty()) {
 				c.SetConditionalRequest(reval_inm, reval_ims);
 			}
@@ -2645,17 +2393,12 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		}
 	};
 
-	// Kick off PerformInit on a background thread. The lambda owns the
-	// connection until init returns (then EnsureInitApplied folds the
-	// result + connection back into gstate). Multiple pipelines hit this
-	// path back-to-back during scheduling and run their RPCs concurrently
-	// instead of serializing on the main thread.
+	// PerformInit on a background thread; the lambda owns the connection until
+	// EnsureInitApplied folds it back into the gstate.
 #if VGI_ASYNC_INIT_ENABLED
 #  ifdef __EMSCRIPTEN__
-	// Dispatch onto the pre-spawned VgiWasmAsyncPool. pthread_create after
-	// side modules are dlopen'd is unreliable in MAIN_MODULE=1 builds, so
-	// std::async(launch::async) would crash; the pool's workers were
-	// spawned once at extension load.
+	// The pre-spawned VgiWasmAsyncPool: std::async would pthread_create after
+	// side-module dlopen, which is unreliable in MAIN_MODULE=1 builds.
 	global_state->pending_init = duckdb::vgi::VgiWasmAsyncPool::Instance().Submit(
 	    [run = std::move(perform_init_with_retry),
 	     conn = std::move(connection),
@@ -2671,13 +2414,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	                                          });
 #  endif
 #else
-	// Synchronous init: run the RPC inline and fold the result straight into
-	// the gstate, mirroring EnsureInitApplied()'s fold step. pending_init
-	// stays default-constructed (invalid future), so subsequent
-	// EnsureInitApplied() calls hit the `if (pending_init.valid())` branch
-	// and no-op. Selected on WASM by default to dodge the emsdk
-	// pthread-after-dlopen bug (#19425/#19199/#13303); flipping
-	// -DVGI_ASYNC_INIT_ENABLED=1 restores the async path.
+	// Synchronous init (WASM default; see vgi_platform.hpp): fold the result in
+	// as EnsureInitApplied() would. pending_init stays invalid, so
+	// EnsureInitApplied() is a no-op.
 	auto applied = perform_init_with_retry(std::move(connection), acquired.from_pool);
 	global_state->global_execution_id = std::move(applied.first.execution_id);
 	global_state->max_processes = static_cast<idx_t>(applied.first.max_workers);
@@ -2717,10 +2456,6 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	return global_state;
 }
 
-// ============================================================================
-// Init Local Function - Create local state for scanning
-// ============================================================================
-
 unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &context,
                                                               TableFunctionInitInput &logical_input,
                                                               GlobalTableFunctionState *global_state_p) {
@@ -2728,11 +2463,6 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	auto &global_state = global_state_p->Cast<VgiTableFunctionGlobalState>();
 
-	// Block on the deferred init RPC if init_global hand-off was async.
-	// This is the latest point we can wait — running on a task-scheduler
-	// worker thread, not the main thread that schedules events. Multiple
-	// pipelines reach here concurrently so their RPCs effectively ran in
-	// parallel.
 	global_state.EnsureInitApplied();
 
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
@@ -2746,11 +2476,8 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	// its complete physical schema. Worker projection remains an independent flag.
 	if (bind_data.projection_pushdown || HasGeneratedCatalogColumns(bind_data)) {
 		local_state->column_ids = input.column_ids;
-		// When a rowid column exists, remap column_ids to match the worker's full schema indices.
-		// COLUMN_IDENTIFIER_ROW_ID maps to the actual worker column index.
-		// Physical columns at or after the rowid position shift by +1.
-		// This allows ArrowToDuckDB to look up the correct type info in arrow_convert_data
-		// (which was built from the full worker schema including the rowid column).
+		// Remap to worker-schema indices (rowid → its worker index, later columns
+		// +1): ArrowToDuckDB's type info was built from the full worker schema.
 		if (bind_data.rowid_worker_col_index >= 0) {
 			for (auto &col_id : local_state->column_ids) {
 				if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
@@ -2762,11 +2489,8 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		}
 	}
 
-	// Result cache serve: replace the worker connection with a cached-replay
-	// connection that returns the cached batches. Only the FIRST local state to
-	// claim replays the full result; any extra local state (should not occur
-	// with MaxThreads()==1, but guard anyway) gets an empty replay so rows are
-	// never duplicated.
+	// Cache serve: only the FIRST local state replays the entry; any extra one
+	// (not expected with MaxThreads()==1) gets an empty replay.
 	if (global_state.serving_from_cache) {
 		const bool first = !global_state.serve_claimed.exchange(true);
 		std::shared_ptr<const VgiResultCacheEntry> entry =
@@ -2780,7 +2504,6 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		return unique_ptr<LocalTableFunctionState>(std::move(local_state));
 	}
 
-	// Try to claim the primary connection from global_state (thread-safe check-and-move)
 	std::unique_ptr<IFunctionConnection> primary_connection;
 	{
 		std::lock_guard<std::mutex> lock(global_state.connection_mutex);
@@ -2790,7 +2513,6 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	}
 
 	if (primary_connection) {
-		// Primary worker: use connection from bind phase
 		{
 			auto &conn = *primary_connection;
 			vector<pair<string, string>> fields;
@@ -2808,11 +2530,8 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		if (bind_data.explicit_query) {
 			throw IOException("vgi_query cannot initialize a secondary reader");
 		}
-		// Secondary worker: acquire a connection without firing a redundant
-		// bind RPC. The cached planner-phase BindResult on bind_data is what
-		// PerformInit needs; the global_execution_id is threaded via
-		// FunctionConnectionParams and PerformInit places it in the
-		// InitRequest. Stale-pool detection lives on the init RPC.
+		// Secondary worker: no bind RPC (PerformInit carries the cached
+		// BindResult and global_execution_id). Stale-pool retry is on the init.
 		FunctionConnectionParams params;
 		params.attach_params = bind_data.attach_params;
 		params.attach_opaque_data = bind_data.attach_opaque_data;
@@ -2830,34 +2549,16 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		local_state->prefetch_slot_->connection = std::move(acquired.connection);
 		const auto &secondary_bind_result = bind_data.bind_result;
 
-		// Secondary workers must receive the same projection / filter / hint
-		// pushdown info as the primary so they emit batches with a matching
-		// shape. Without this, secondary workers emit the full unprojected
-		// schema while the primary emits projected batches, and ArrowToDuckDB
-		// (which assumes projected layout when projection_pushdown=true)
-		// reads the wrong column positions from the unprojected secondary
-		// batches.
-		// Forward the primary's init_response.opaque_data so the worker's
-		// secondary-init branch (which echoes init_opaque_data straight into
-		// the response and skips on_init) sees the same bytes the primary's
-		// on_init produced — required by any function that round-trips state
-		// through init opaque data (e.g. tx_cached_value).
+		// Secondaries get the primary's pushdowns and init_opaque_data; see the
+		// VgiTableFunctionGlobalState fields for why.
 		auto secondary_init = [&]() {
-			// Tick filter state is unconditional. It used to sit inside the
-			// projection_pushdown branch, which meant a function with DYNAMIC
-			// FILTERS but no projection pushdown got none on its secondary
-			// connections — right answers, no join-key pushdown, and nothing to
-			// show for it in the results. Every connection needs it.
+			// Every connection needs the tick filter state, projection or not.
 			local_state->connection()->SetTickFilterState(global_state.tick_filter_state);
 
-			// Split path: acquire only. There is no primary init to mirror, and each
-			// reader initializes per split in AdvanceToNextSplit with the token it
-			// claimed. Initializing here would burn a claim-less init the worker has
-			// no work for.
+			// Split path: acquire only; each reader inits per split in
+			// AdvanceToNextSplit. The stale-pool retry below wraps an init this
+			// path skips, so hand the reader a reacquire for its first split.
 			if (bind_data.supports_splits) {
-				// ...which is also why the stale-pool retry below cannot help here:
-				// it wraps an init this path does not perform. Hand the reader the
-				// means to run it itself at the first split's init instead.
 				if (acquired.from_pool) {
 					local_state->reacquire_fresh_connection =
 					    [params](ClientContext &ctx) mutable -> std::unique_ptr<IFunctionConnection> {
@@ -2910,19 +2611,13 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		}
 	}
 
-	// Result cache capture: give this local state its own substream to append
-	// to (increments launched). InstallBatch appends; the gstate destructor
-	// commits when every launched local state reached EOS.
+	// This local state's capture substream (increments `launched`).
 	if (global_state.capture) {
 		local_state->capture_stream = global_state.capture->NewStream();
 	}
 
 	return local_state;
 }
-
-// ============================================================================
-// Helper: Get next batch from worker and convert to Arrow C ABI
-// ============================================================================
 
 VgiBufferPtr VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
                                                               const vector<VgiDynamicFilterDeltaUpdate> &updates) {
@@ -2977,27 +2672,18 @@ VgiBufferPtr VgiSerializeDynamicFilterDelta(ClientContext &context, const string
 		chunk.SetValue(i + 1, 0, values[i]);
 	}
 
-	auto client_props = context.GetClientProperties();
+	auto client_props = VgiWireClientProperties(context);
 	auto batch = MakeFilterSpecBatch(context, chunk, types, names, client_props, "Failed to import dynamic filter delta");
 	return SerializeIpcStream(*batch, "Failed to create dynamic filter delta writer",
 	                          "Failed to write dynamic filter delta", "Failed to close dynamic filter delta");
 }
 
-//! Update the TickFilterState with current DynamicFilter values.
-//! Called before each ReadDataBatch so the next tick can carry the latest filter.
-//!
-//! A new delta is produced ONLY when some filter actually changed since the last
-//! one: a revision identifies a value, so re-sending an unchanged value under a
-//! bumped revision is a no-op the worker still has to decode, validate and
-//! remember. It used to happen on every tick, and it was not merely wasted work:
-//! an HTTP worker carries the deltas it has applied in its per-turn state and
-//! replays them on every turn, so a 100-tick Top-N scan paid 5,050 predicate
-//! validations and dynamic_filter.test took ~200 s (vgi-python now compacts what
-//! it carries as well, which covers a filter that really does move every tick).
-//! Each delta still describes
-//! EVERY emitted filter (at its current revision), so a stream that skipped
-//! intermediate deltas converges from the latest one alone; which delta a given
-//! connection has already sent is tracked per connection by `generation`.
+//! Refresh the TickFilterState from current DynamicFilter values before each
+//! ReadDataBatch. A new delta is produced ONLY when some filter changed: a
+//! revision identifies a value, and HTTP workers replay applied deltas every
+//! turn, so re-sending unchanged values costs quadratic validation. Each delta
+//! describes EVERY emitted filter, so a stream that skipped deltas converges
+//! from the latest; per-connection progress is tracked by `generation`.
 static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, ClientContext &context,
                                      const VgiTableFunctionBindData &bind_data) {
 	if (global_state.dynamic_filters.empty() || !global_state.tick_filter_state) {
@@ -3080,15 +2766,14 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 	}
 }
 
-//! Per-DuckDB-pipeline cap on the batch_index space. Lives at
-//! ``duckdb/src/include/duckdb/parallel/pipeline.hpp:51`` (``BATCH_INCREMENT``).
-//! Returning a source-side index ``>= BATCH_INCREMENT - 1`` triggers an
-//! ``InternalException`` from ``Pipeline::ScheduleEventsInternal``'s
-//! ``NextBatch`` shift (see ``pipeline_executor.cpp:140-143``). We reject
-//! before threading the value into ``GetPartitionData`` so the error
-//! names the worker contract directly instead of surfacing as an opaque
-//! DuckDB internal error.
+//! ``PipelineBuildState::BATCH_INCREMENT``: an out-of-range source batch index
+//! throws an opaque ``InternalException`` in
+//! ``PipelineExecutor::ToPipelinePartitionData``, so InstallBatch rejects it
+//! first with an error naming the worker contract.
 static constexpr idx_t VGI_BATCH_INDEX_CAP = 10000000000000ULL;  // 10^13
+//! That function maps source index i to base + i + 1 and throws when the result
+//! is >= base + CAP - 1, so the largest index it accepts is CAP - 3.
+static constexpr idx_t VGI_MAX_BATCH_INDEX = VGI_BATCH_INDEX_CAP - 3;
 
 //! Type equality with Arrow C++ ``DataType::Equals`` semantics: a node's own
 //! nullability belongs to its field, not its type, so only nested children compare it.
@@ -3111,24 +2796,13 @@ static bool SameDataType(const ArrowSchema &a, const ArrowSchema &b) {
 	return !a.dictionary || SameDataType(*a.dictionary, *b.dictionary);
 }
 
-//! Convert a 1-row exact-value or 2-row ``(min, max)`` batch per
-//! partition column into a ``vector<ColumnPartitionData>`` via the
-//! established VGI Arrow-conversion machinery (the same path
-//! ``VgiTableFunctionScan`` uses for data batches —
-//! ``ArrowSchemaToDuckDBTypes`` + ``ArrowTableFunction::ArrowToDuckDB``).
-//! Reusing this code path is what guarantees lossless type handling
-//! for timestamps-with-tz, decimals, dictionary-encoded strings,
-//! extension types like ``geoarrow.wkb``, etc.
-//!
-//! Caller has already validated row-count, column-count, and column
-//! name/type alignment against the bind schema's partition fields.
-//! On failure (e.g. an Arrow type the conversion utility can't
-//! handle) any exception bubbles up.
+//! Convert a 1-row exact-value or 2-row ``(min, max)`` batch per partition
+//! column into ``ColumnPartitionData`` through the same Arrow conversion as data
+//! batches, for lossless handling of every type. The caller has validated the
+//! shape against the bind schema's partition fields; conversion errors throw.
 static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
     ClientContext &context,
     const VgiBatchPtr &pv_batch) {
-	// Build an ArrowTableSchema + DuckDB LogicalTypes for the
-	// partition_values schema. ``names`` is filled too but unused.
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> types;
@@ -3137,16 +2811,12 @@ static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
 	const idx_t row_count = static_cast<idx_t>(pv_batch->num_rows());
 	D_ASSERT(row_count == 1 || row_count == 2);
 
-	// Export the record batch to the Arrow C ABI and stash it on
-	// a local scan state — the same shape ``VgiTableFunctionScan`` uses
-	// for the main data batch (vgi_table_function_impl.cpp:1757).
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(pv_batch, *chunk_wrapper);
 
 	ArrowScanLocalState local_scan_state(std::move(chunk_wrapper), context);
 	local_scan_state.chunk_offset = 0;
 
-	// Convert into a DataChunk via DuckDB's standard Arrow path.
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), types, row_count);
 	chunk.SetCardinality(row_count);
@@ -3154,9 +2824,7 @@ static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
 	                                  /*arrow_scan_is_projected=*/false,
 	                                  COLUMN_IDENTIFIER_ROW_ID);
 
-	// Row 0 = min; the last row is max. A one-row exact key therefore
-	// naturally becomes min == max. Pull as ``Value`` and
-	// build the ``ColumnPartitionData`` vector.
+	// Row 0 = min, last row = max (a one-row exact key gives min == max).
 	duckdb::vector<ColumnPartitionData> out;
 	out.reserve(chunk.ColumnCount());
 	for (idx_t col = 0; col < chunk.ColumnCount(); ++col) {
@@ -3291,10 +2959,9 @@ static bool DecodePartitionMinTuple(ClientContext &context, const std::string &p
 	return true;
 }
 
-// Per-partition split-at-commit: bucket the captured batches by partition-value tuple
-// and Insert one entry per distinct partition, keyed by (static key + residual filter)
-// with a "p:" discriminator. Additive to the whole-scan entry. Best-effort — any decode
-// failure or an over-cap partition count skips the split (the whole-scan entry stands).
+// Bucket the captured batches by partition tuple and insert one entry per partition
+// (see BuildPartitionKey). Best-effort: a decode failure or too many partitions
+// skips the split; the whole-scan entry stands.
 static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCtx &cap,
                                           const VgiResultCacheEntry &meta, bool allow_disk) {
 	if (!ctx || cap.partition_types.empty()) {
@@ -3342,8 +3009,8 @@ static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCt
 		pe->key = BuildPartitionKey(cap.key, cap.residual_filter_bytes, kv.first);
 		pe->catalog_name = meta.catalog_name;
 		pe->scope = meta.scope;
-		// v1: per-partition entries are non-revalidatable (the combined serve never issues
-		// conditional requests). Freshness mirrors the whole-scan entry.
+		// Non-revalidatable (the combined serve never sends conditional requests);
+		// freshness mirrors the whole-scan entry.
 		pe->revalidatable = false;
 		pe->stored_at = meta.stored_at;
 		pe->expires_at = meta.expires_at;
@@ -3369,17 +3036,15 @@ static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCt
 	}
 }
 
-//! Install arrow_batch as the active chunk. Returns false on EOS (null batch).
-//! Caller is responsible for having already obtained arrow_batch either
-//! synchronously (via ReadDataBatch) or from the prefetch slot.
+//! Install arrow_batch (from ReadDataBatch or the prefetch slot) as the active
+//! chunk. Returns false on EOS (null batch). Runs on the pipeline thread.
 static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                          VgiTableFunctionGlobalState &global_state,
                          VgiTableFunctionLocalState &local_state,
                          VgiBatchPtr arrow_batch) {
 	if (!arrow_batch) {
 		local_state.done = true;
-		// Result-cache capture: this local state fully drained its stream. The
-		// gstate destructor commits iff eos == launched (never-partial).
+		// Capture: this local state reached clean EOS.
 		if (global_state.capture && local_state.capture_stream) {
 			global_state.capture->eos.fetch_add(1, std::memory_order_relaxed);
 		}
@@ -3395,12 +3060,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		return false;
 	}
 
-	// batch_index validation + monotonicity check. The raw uint64 was
-	// parsed off the wire's custom_metadata inside ``ReadDataBatch`` and
-	// stashed on the connection; here on the consumer thread we apply the
-	// contract (missing-tag, cap, monotonicity) and only then assign to
-	// local_state. Writing inside ReadDataBatch / VgiPrefetchTask::Execute
-	// would race with VgiGetPartitionData on the pipeline-executor thread.
+	// batch_index contract (present, under the cap, monotone), applied here on
+	// the pipeline thread; see current_batch_index for why not in ReadDataBatch.
 	const idx_t parsed_index = local_state.connection()->GetLastBatchIndex();
 	// extra_info for a worker that broke a wire-metadata contract.
 	auto metadata_violation = [&](const char *metadata_key) {
@@ -3416,13 +3077,13 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			                  "batch without vgi_batch_index metadata",
 			                  bind_data.function_name);
 		}
-		if (parsed_index >= VGI_BATCH_INDEX_CAP - 1) {
+		if (parsed_index > VGI_MAX_BATCH_INDEX) {
 			throw IOException(metadata_violation("vgi_batch_index")
-			                      .Set(error_key::kLimit, static_cast<int64_t>(VGI_BATCH_INDEX_CAP - 1)),
+			                      .Set(error_key::kLimit, static_cast<int64_t>(VGI_MAX_BATCH_INDEX)),
 			                  "VGI function '%s' emitted vgi_batch_index %llu that exceeds DuckDB's "
-			                  "per-pipeline cap (%llu); choose a smaller index space",
+			                  "per-pipeline cap (maximum %llu); choose a smaller index space",
 			                  bind_data.function_name, static_cast<unsigned long long>(parsed_index),
-			                  static_cast<unsigned long long>(VGI_BATCH_INDEX_CAP));
+			                  static_cast<unsigned long long>(VGI_MAX_BATCH_INDEX));
 		}
 		if (local_state.current_batch_index != DConstants::INVALID_INDEX &&
 		    parsed_index < local_state.current_batch_index) {
@@ -3435,15 +3096,10 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		}
 		local_state.current_batch_index = parsed_index;
 	}
-	// If the function did not opt in but the worker emitted vgi_batch_index
-	// anyway, we silently ignore — non-opted-in functions shouldn't be
-	// tagging, but the harmless-passthrough behaviour matches our other
-	// metadata keys.
+	// A vgi_batch_index from a function that did not opt in is ignored.
 
-	// PartitionColumns: decode the 2-row IPC RecordBatch (raw bytes were
-	// base64-decoded on the connection's reader thread; IPC decode +
-	// validation happen here on the consumer thread for uniform error
-	// reporting across transports).
+	// PartitionColumns: decode + validate the 2-row partition-values batch here
+	// on the pipeline thread for uniform error reporting across transports.
 	if (bind_data.partition_kind != VgiPartitionKind::NotPartitioned &&
 	    !local_state.partition_data_from_split) {
 		const std::string &pv_bytes = local_state.connection()->GetLastPartitionValuesBytes();
@@ -3506,9 +3162,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			                  bind_data.function_name, pv_batch->num_columns(),
 			                  static_cast<unsigned long long>(declared_indices.size()));
 		}
-		// Schema name + type cross-check against the bind output schema.
-		// We do this BEFORE the conversion so a typed error names the
-		// column rather than surfacing from deep inside ArrowToDuckDB.
+		// Name + type check against the bind schema BEFORE conversion, so the
+		// error names the column.
 		const auto &bind_schema = bind_data.bind_result.output_schema;
 		for (idx_t i = 0; i < declared_indices.size(); ++i) {
 			const int declared_idx = static_cast<int>(declared_indices[i]);
@@ -3538,17 +3193,11 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			}
 		}
 
-		// Convert the 2-row Arrow batch into ``vector<ColumnPartitionData>``
-		// via the established ``ArrowSchemaToDuckDBTypes`` +
-		// ``ArrowTableFunction::ArrowToDuckDB`` path — same machinery that
-		// converts data batches in ``VgiTableFunctionScan``. Reusing this
-		// is what gives lossless type handling for timestamps-with-tz,
-		// decimals, dictionary-encoded strings, extension types, etc.
 		local_state.current_partition_data =
 		    ConvertPartitionValuesBatch(context, pv_batch);
 
 		// Defense in depth for SINGLE_VALUE_PARTITIONS: DuckDB's own
-		// assertion at physical_partitioned_aggregate.cpp:104 is
+		// assertion in ``PhysicalPartitionedAggregate::Sink`` is
 		// ``D_ASSERT`` (debug only); we re-check in release.
 		if (bind_data.partition_kind == VgiPartitionKind::SingleValuePartitions) {
 			for (idx_t i = 0; i < local_state.current_partition_data.size(); ++i) {
@@ -3566,30 +3215,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				}
 			}
 		}
-		// Synthetic per-batch batch_index for PartitionColumns mode.
-		// DuckDB's pipeline executor only fires the sink's ``NextBatch``
-		// (which is what copies ``partition_data`` into the sink's local
-		// state) when the source-returned ``batch_index`` *changes* from
-		// the previous chunk (pipeline_executor.cpp:147-149). For
-		// PartitionColumns-only functions the worker doesn't emit
-		// ``vgi_batch_index``, so ``current_batch_index`` would stay
-		// INVALID forever and the sink would never refresh its
-		// ``partition_data``.
-		//
-		// The value MUST come from a GLOBAL monotonic counter, not a
-		// per-local-state one that restarts at 0. DuckDB initializes each
-		// scan thread's sink ``partition_info.batch_index`` from the global
-		// batch-index pool (``Pipeline::RegisterNewBatchIndex`` returns the
-		// current minimum), so a thread that registers after peers have
-		// advanced inherits a value > 0. A per-thread 0 would map (via
-		// ``base + value + 1`` in ``PipelineExecutor::NextBatch``) onto that
-		// inherited minimum, ``NextBatch`` would see "no change", the
-		// never-installed ``partition_data`` would be dereferenced empty in
-		// ``PhysicalPartitionedAggregate::Sink`` -> "index 0 within vector of
-		// size 0". A global counter guarantees every batch's index strictly
-		// exceeds any thread's inherited minimum, so the first chunk always
-		// refreshes. See ``synthetic_batch_index`` in the gstate header for
-		// the full rationale.
+		// Synthetic per-batch index so NextBatch refreshes the sink's
+		// partition_data; it MUST be global (see synthetic_batch_index).
 		if (!bind_data.supports_batch_index) {
 			local_state.current_batch_index =
 			    global_state.synthetic_batch_index.fetch_add(1, std::memory_order_relaxed);
@@ -3612,14 +3239,11 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 
 	local_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
 	local_state.chunk_offset = 0;
-	// Reset() clears owned_data in array_states, which is REQUIRED so that ArrowToDuckDB
-	// will update owned_data to point to the new chunk. Without this, owned_data still
-	// points to the previous chunk, and when that chunk is released, the data becomes invalid.
+	// REQUIRED: Reset() clears array_states' owned_data so ArrowToDuckDB repoints
+	// it at the new chunk instead of the released previous one.
 	local_state.Reset();
 
-	// Batch-shape accounting for EXPLAIN ANALYZE. TotalBufferSize walks the
-	// batch's buffer list (O(columns), not O(rows)), so this is cheap enough to
-	// run unconditionally — unlike the log below, it has no sink to check.
+	// Batch-shape accounting for EXPLAIN ANALYZE; TotalBufferSize is O(columns).
 	const auto batch_rows = static_cast<idx_t>(arrow_batch->num_rows());
 	const auto batch_bytes = static_cast<idx_t>(arrow_batch->TotalBufferSize());
 	global_state.RecordBatchStats(batch_rows, batch_bytes);
@@ -3636,13 +3260,11 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		VGI_LOG(context, "table_function.batch_received", fields);
 	}
 
-	// Result-cache capture: append this batch to the local state's substream.
 	if (global_state.capture && local_state.capture_stream) {
 		auto &cap = *global_state.capture;
 		if (!cap.aborted.load(std::memory_order_relaxed)) {
 			auto *conn = local_state.connection();
-			// First batch this thread sees: latch the cache-control advertisement
-			// (a worker advertises on the first batch of its stream).
+			// A worker advertises cache control on its stream's first batch.
 			if (!local_state.capture_checked_first_batch) {
 				local_state.capture_checked_first_batch = true;
 				VgiCacheControl cc = conn->GetLastCacheControl();
@@ -3654,9 +3276,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					}
 				}
 			}
-			// If a non-cacheable advertisement was latched (no_store / no
-			// freshness key), abort — never commit. Buffered bytes are freed at
-			// gstate teardown (bounded by max_entry_bytes).
+			// A non-cacheable advertisement aborts the capture.
 			bool not_cacheable = false;
 			{
 				std::lock_guard<std::mutex> lk(cap.mu);
@@ -3679,8 +3299,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				                {"bytes_seen", std::to_string(cap.disk_writer->Bytes())}});
 			};
 			if (not_cacheable) {
-				// Worker advertised no_store / no freshness key. Log the skip once
-				// (exchange → only the first thread to flip `aborted` logs).
+				// Only the first thread to flip `aborted` logs.
 				if (!cap.aborted.exchange(true, std::memory_order_relaxed)) {
 					LogResultCache(context, "result_cache.store_skipped",
 					               {{"function", cap.key.function_name},
@@ -3688,9 +3307,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					                {"reason", "not_cacheable"}});
 				}
 			} else if (cap.streaming()) {
-				// Capture has SPILLED to disk. This thread first drains its own RAM
-				// substream (once), then appends straight to disk — one batch resident
-				// at a time, RAM flat at ~max_entry_bytes no matter the result size.
+				// SPILLED: drain this thread's RAM substream once, then append to disk.
 				if (!local_state.capture_spilled) {
 					if (!DrainSubstreamToWriter(*local_state.capture_stream, *cap.disk_writer)) {
 						log_disk_too_large();
@@ -3698,21 +3315,10 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					local_state.capture_spilled = true;
 				}
 				if (!cap.aborted.load(std::memory_order_relaxed)) {
-					// Compress AT SOURCE (the live batch is here) — one serialize pass, no
-					// transcode round-trip on the multi-GB spill path. logical_len is the
-					// uncompressed IPC size (cheap, no extra serialize).
-					//
-					// NOTE (bytes= unit): this uses the batch's buffer bytes (batch_bytes,
-					// already computed above for the batch-shape stats — the IPC body size
-					// minus padding and the message header) whereas the memory-capture path (and the pre-threshold
-					// spill drain) uses SerializeRecordBatch(uncompressed)->size(), which also
-					// counts any IPC stream framing. So the ref's logical bytes= can differ by
-					// a few hundred bytes/batch of framing between a spilled-live entry and a
-					// memory-persisted one. Deliberately NOT unified: matching it would add an
-					// uncompressed serialize to this hot path, or shift reported total_bytes for
-					// every memory entry — not worth it for a sub-batch-of-framing delta. The
-					// disk byte CAP uses the on-disk COMPRESSED size (consistent), so only the
-					// advisory logical bytes= / materialize-vs-stream threshold is affected.
+					// Compress at source (one serialize pass). logical_len is the batch's
+					// buffer bytes, not the uncompressed IPC size the memory path counts,
+					// so the advisory logical bytes= may differ by IPC framing; the disk
+					// CAP uses the compressed on-disk size either way.
 					const int64_t logical_len = static_cast<int64_t>(batch_bytes);
 					auto ipc = SerializeRecordBatch(arrow_batch, nullptr, cap.disk_writer->CodecName(),
 					                                cap.disk_writer->Level());
@@ -3725,9 +3331,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				const int64_t sz = static_cast<int64_t>(ipc->size());
 				const int64_t running = cap.total_bytes.fetch_add(sz, std::memory_order_relaxed) + sz;
 				if (running > cap.max_entry_bytes) {
-					// Over the memory-tier per-entry cap. If the disk tier is on, SPILL
-					// to a streaming disk blob instead of aborting — RAM stays flat from
-					// here (a >max_entry_bytes result caches to disk, not uncached).
+					// Over the per-entry memory cap: SPILL to disk if the tier is on.
 					bool spilled = false;
 					if (!cap.disk_dir.empty() && cap.disk_max > 0) {
 						std::lock_guard<std::mutex> lk(cap.mu);
@@ -3742,8 +3346,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 						spilled = cap.disk_writer != nullptr;
 					}
 					if (spilled) {
-						// Buffer THIS batch into my substream, then drain the whole
-						// substream (my earlier RAM batches + this one) to disk, in order.
+						// Append THIS batch, then drain the whole substream in order.
 						VgiCachedBatch cb;
 						cb.ipc = std::move(ipc);
 						cb.rows = arrow_batch->num_rows();
@@ -3759,7 +3362,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 						}
 						local_state.capture_spilled = true;
 					} else {
-						// No disk tier → abort to uncached, keep streaming to DuckDB.
+						// No disk tier: abort the capture; the scan continues.
 						cap.aborted.store(true, std::memory_order_relaxed);
 						GetResultCache(context).NoteCaptureAbort();
 						LogResultCache(context, "result_cache.abort",
@@ -3768,9 +3371,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 						                {"bytes_seen", std::to_string(running)}});
 					}
 				} else if (!GetResultCache(context).TryReserveInflightCapture(sz)) {
-					// [S6] Global in-flight capture budget exhausted (too many
-					// concurrent captures) — abort THIS one to uncached, keep
-					// streaming. Bounds total transient capture RAM under load.
+					// Database-wide in-flight capture budget exhausted: abort this
+					// capture; the scan continues.
 					cap.aborted.store(true, std::memory_order_relaxed);
 					GetResultCache(context).NoteCaptureAbort();
 					LogResultCache(context, "result_cache.abort",
@@ -3799,18 +3401,15 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	return true;
 }
 
-// On a 304 not_modified reply, re-insert the stored entry with a slid TTL so
-// future lookups hit fresh. The cached batches are unchanged; only freshness
-// (and any refreshed validators) is updated. Best-effort — a failed re-insert
-// just means the next scan revalidates again.
+// On not_modified, re-insert the stored entry with a slid TTL (and any refreshed
+// validators). Best-effort: a failed insert means the next scan revalidates.
 static void MaybeSlideRevalidatedEntry(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                                        VgiTableFunctionGlobalState &global_state,
                                        const VgiCacheControl &cc) {
 	const auto &orig = *global_state.revalidation_entry;
 	auto fresh = std::make_shared<VgiResultCacheEntry>(orig); // shallow copy (shared Buffers)
 	fresh->stored_at = std::chrono::steady_clock::now();
-	// Fresh ttl/expires on the not_modified batch wins; else reuse the prior
-	// lifetime duration so a validator-only 304 still slides forward.
+	// A ttl on the not_modified batch wins; else reuse the prior lifetime.
 	int64_t ttl = cc.ttl_seconds.value_or(0);
 	if (ttl <= 0 && cc.expires_rfc3339.empty() && !orig.never_expires) {
 		auto prior = std::chrono::duration_cast<std::chrono::seconds>(orig.expires_at - orig.stored_at).count();
@@ -3834,22 +3433,11 @@ static void MaybeSlideRevalidatedEntry(ClientContext &context, const VgiTableFun
 	                {"outcome", "not_modified"}});
 }
 
-//! Claim and initialize the next split for this reader.
-//!
-//! Returns true when a new split was claimed and the connection re-initialized
-//! (so the caller should keep reading), false when this reader is out of work.
-//!
-//! Greedy per-split claiming: each reader takes ONE split at a time via
-//! `fetch_add(1)`. That needs no cost model and self-balances — a fast reader
-//! simply claims more — which matters because the client cannot see per-split
-//! cost. `estimated_bytes` is a nullable hint a worker may never populate, and for
-//! a worker doing per-split inference or mixing warm cache with cold object
-//! storage it is uncorrelated with time. Any client-side grouping would be a guess
-//! about costs invisible to it.
-//!
-//! `fetch_add` is ALSO what keeps `batch_index` monotone per reader: it hands out
-//! strictly ascending indices, and the worker derives batch_index from the split's
-//! position in a globally-ordered space. Nothing else enforces that.
+//! Claim (``next_split``) and initialize the next split for this reader. True
+//! when a split was claimed and the connection re-initialized; false when out of
+//! work. One split per claim: the client cannot see per-split cost
+//! (`estimated_bytes` is an optional, often uncorrelated hint), so it does no
+//! grouping.
 static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                                VgiTableFunctionGlobalState &global_state,
                                VgiTableFunctionLocalState &local_state) {
@@ -3857,15 +3445,11 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 		return false;
 	}
 
-	// The split we were reading (if any) is now fully drained. Counted separately
-	// from `next_split` because a claim consumed by a reader that then died is NOT
-	// a drained split, and conflating them would let a partial result commit.
+	// The split we were reading (if any) is fully drained (see completed_splits).
 	const bool had_split = local_state.has_split;
 	if (had_split) {
 		global_state.completed_splits.fetch_add(1, std::memory_order_relaxed);
-		// The capture's own counter is what the commit gate compares against; the
-		// gstate copy above is for diagnostics. They are separate objects and
-		// incrementing only one silently disarmed the gate.
+		// The capture's counter is the one the commit gate reads; bump both.
 		if (global_state.capture) {
 			global_state.capture->completed_splits.fetch_add(1, std::memory_order_relaxed);
 		}
@@ -3877,8 +3461,7 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 		return false; // out of work — the caller ends this reader
 	}
 
-	// Ascending-claim contract (see above). Cheap to assert, and the batch_index
-	// monotonicity check downstream depends on it.
+	// Ascending-claim contract; batch_index monotonicity depends on it.
 	D_ASSERT(!local_state.has_split || idx > local_state.last_split_index);
 	local_state.last_split_index = idx;
 	if (global_state.split_partition_data_enabled) {
@@ -3893,9 +3476,8 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 		local_state.partition_data_from_split = false;
 	}
 
-	// A pooled worker that died while idle surfaces HERE — this is the split
-	// path's first init — so absorb it exactly as the non-split path does, once,
-	// on the first claim only.
+	// A pooled worker that died while idle surfaces at the first split's init;
+	// retry once, on the first claim only (see reacquire_fresh_connection).
 	auto retry_stale_pooled = [&](const IOException &e) {
 		if (had_split || !local_state.reacquire_fresh_connection) {
 			return false;
@@ -3911,25 +3493,16 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 		return true;
 	};
 
-	// Wrapped so the retry above can re-run it against a DIFFERENT connection —
-	// which is why the connection is re-read from the local state each time
-	// rather than bound once outside.
+	// Re-reads the connection each call: the retry swaps it.
 	auto do_split_init = [&]() {
 		auto &conn = *local_state.connection();
 		try {
-			// Only reset when there IS a prior stream. On this reader's first claim the
-			// connection was merely acquired (InitLocal is acquire-only on the split
-			// path), so there is nothing to close or drain yet.
+			// The first claim has no prior stream (InitLocal only acquired).
 			if (had_split) {
 				conn.ResetForNextSplit();
 			}
-			// Every per-init input has to be re-supplied: this is a fresh init on the
-			// same connection, so nothing from the previous split carries over except
-			// the transport itself.
-			//
-			// tick_filter_state_ is the exception and is deliberately NOT re-set here —
-			// it is a plain member that the init never touches, so dynamic join-key
-			// pushdown survives into the next split on a reused connection.
+			// A fresh init: every input is re-supplied. The tick filter state is a
+			// connection member the init never touches, so it carries over.
 			conn.PerformInit(bind_data.bind_result,       // bind
 			                 global_state.projection_ids, // projection
 			                 global_state.static_filter_bytes,
@@ -3941,12 +3514,8 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 			                 std::nullopt,                // finalize_state_id
 			                 {global_state.splits[idx].token}); // one split per claim
 		} catch (...) {
-			// Poison HERE. The comment used to claim this had already happened, and it
-			// had not: the only thing setting the flag was a failed input-writer close
-			// inside ResetForNextSplit, so an init that threw — an interrupt, a partial
-			// write, a worker that died between reset and response — left the
-			// connection looking idle and pooled it with an unanswered init on the
-			// wire. Every path out of a split init now marks it.
+			// Poison on EVERY failed split init, or the connection could be pooled
+			// with an unanswered init on the wire.
 			conn.MarkSplitInitFailed();
 			throw;
 		}
@@ -3971,72 +3540,46 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	if (local_state.done) {
 		return false;
 	}
-	// Split path: claim the FIRST split before reading anything. InitLocal only
-	// acquires a connection on this path — there is no primary init to mirror — so
-	// without this the first ReadDataBatch would fire against an uninitialized
-	// connection.
-	//
-	// NOT on a cache serve: the connection is a CachedReplayConnection with the
-	// whole result already in hand, and the gstate carries no splits because the
-	// hit short-circuited before the plan RPC. Claiming here would find nothing
-	// and end the reader immediately — turning a hit into an EMPTY RESULT, which
-	// is why serving a split-capable function from cache stayed switched off
-	// until this guard existed.
+	// Split path: claim the FIRST split before reading (InitLocal only acquired).
+	// NOT on a cache serve: the hit planned no splits, so claiming would end the
+	// reader and turn the hit into an EMPTY result.
 	if (bind_data.supports_splits && !global_state.serving_from_cache && !local_state.has_split) {
 		if (!AdvanceToNextSplit(context, bind_data, global_state, local_state)) {
-			// No splits at all, or none left for this reader. Legal: a fully-pruned
-			// scan plans zero splits and must yield an empty result, not an error.
+			// Zero splits (fully pruned) is legal: an empty result.
 			return InstallBatch(context, bind_data, global_state, local_state, nullptr);
 		}
 	}
-	// Read from the worker, skipping empty non-log batches. Log batches
-	// (vgi_rpc.log_* metadata) are already consumed inside ReadDataBatch via
-	// HandleBatchLogMessage, so any 0-row batch surfaced here is a real empty
-	// response from the worker — pointless for producer-mode table functions.
+	// Skip empty batches (log batches are already consumed in ReadDataBatch).
 	while (true) {
 		// Empty batches and split claims loop here without returning to DuckDB,
 		// whose own interrupt check runs only between chunks.
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-		// Update dynamic filter state before each tick is sent
 		UpdateDynamicFilterState(global_state, context, bind_data);
 		auto arrow_batch = local_state.connection()->ReadDataBatch();
 		if (bind_data.explicit_query) {
 			ValidateVgiQueryResultBatch(arrow_batch, bind_data.bind_result.output_schema);
 		}
 		if (!arrow_batch) {
-			// End of THIS stream. On the split path that is the end of one split,
-			// not the end of the scan: claim the next one and keep going.
-			//
-			// Doing it here rather than in the scan function keeps the claim on the
-			// one path that reads batches synchronously. It is NOT a funnel for the
-			// async prefetch path — that path reads the connection directly from a
-			// task and would drop every split after the first — which is why the
-			// split path disables async prefetch outright (see VgiTableFunctionScan).
-			//
-			// It also means a ZERO-ROW split is handled by construction: an empty
-			// split reaches EOS immediately, we claim the next one, and no 0-row
-			// chunk is ever returned mid-scan. That matters because DuckDB reads a
-			// 0-row chunk under IMPLICIT as FINISHED, so returning one here would
-			// end the reader and silently drop every remaining split.
+			// End of THIS stream; on the split path, claim the next split. Only this
+			// synchronous path claims, so the split path disables async prefetch
+			// (see VgiTableFunctionScan). An empty split loops on instead of
+			// returning a 0-row chunk, which DuckDB treats as FINISHED.
 			if (AdvanceToNextSplit(context, bind_data, global_state, local_state)) {
 				continue;
 			}
 			return InstallBatch(context, bind_data, global_state, local_state, nullptr);
 		}
 		if (arrow_batch->num_rows() == 0) {
-			// Conditional revalidation (M6): a 0-row vgi.cache.not_modified batch
-			// is a 304 — the stored payload is still fresh. Slide its TTL and swap
-			// this (single) local state to replay the stored entry. Single-threaded
-			// (MaxThreads()==1 while revalidating) makes the swap race-free.
+			// A 0-row vgi.cache.not_modified batch: slide the stored entry's TTL and
+			// replay it (race-free: MaxThreads()==1 while revalidating).
 			if (global_state.revalidating && global_state.revalidation_entry &&
 			    !global_state.revalidation_served.exchange(true)) {
 				auto cc = local_state.connection()->GetLastCacheControl();
 				if (cc.not_modified) {
 					MaybeSlideRevalidatedEntry(context, bind_data, global_state, cc);
-					// Serve the stored entry from here on; abandon the live worker
-					// connection and disable the (now-irrelevant) capture.
+					// Abandon the live connection and the capture.
 					local_state.prefetch_slot_->connection =
 					    make_uniq<CachedReplayConnection>(global_state.revalidation_entry);
 					if (global_state.capture) {
@@ -4060,28 +3603,18 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	}
 }
 
-// ============================================================================
-// Async Prefetch Helpers
-// ============================================================================
-
 void VgiPrefetchTask::Execute() {
-	// If the local_state was torn down (query cancellation) before we ran,
-	// the cancelled flag is set. We skip the RPC and let the slot — which we
-	// still hold via shared_ptr — go out of scope normally, releasing the
-	// connection at the end. We leave the state as IN_FLIGHT since nothing
-	// is going to read it.
+	// Local state torn down (cancellation): skip the RPC and leave the state
+	// IN_FLIGHT; nothing will read it.
 	if (slot_->cancelled.load(std::memory_order_acquire)) {
 		return;
 	}
 	try {
-		// Skip 0-row batches here so the consumer always sees either EOS or a
-		// non-empty batch, matching the sync path's invariant.
+		// Skip 0-row batches, as the sync path does.
 		VgiBatchPtr batch;
 		while (true) {
-			// Thrown into the catch below: the consumer rethrows it from the
-			// ERROR slot, and a torn-down consumer never reads it. Either way
-			// this task returns now instead of after the next RPC — DuckDB
-			// waits for every executor task before an interrupted query ends.
+			// Return now rather than after the next RPC: DuckDB waits for every
+			// executor task before an interrupted query ends.
 			if (context_.IsInterrupted()) {
 				throw InterruptException();
 			}
@@ -4115,10 +3648,6 @@ static void ConsumePrefetchedBatch(ClientContext &context, const VgiTableFunctio
 	InstallBatch(context, bind_data, global_state, local_state, std::move(arrow_batch));
 }
 
-// ============================================================================
-// Helper: Convert current batch slice to DuckDB output
-// ============================================================================
-
 static void ConvertCurrentBatch(const VgiTableFunctionBindData &bind_data,
                                 VgiTableFunctionGlobalState &global_state,
                                 VgiTableFunctionLocalState &local_state, DataChunk &output) {
@@ -4132,15 +3661,9 @@ static void ConvertCurrentBatch(const VgiTableFunctionBindData &bind_data,
 		                    bind_data.rowid_worker_col_index >= 0)
 		                      ? static_cast<idx_t>(bind_data.rowid_worker_col_index)
 		                      : COLUMN_IDENTIFIER_ROW_ID;
-		// Defense in depth: ArrowTableFunction::ArrowToDuckDB dereferences
-		// arrow_array.children[arrow_array_idx] per output column, using the same
-		// projection / rowid-shift mapping replicated below. If the worker emitted
-		// a batch with fewer children than that mapping reaches — a runtime
-		// inconsistency the bind-time schema check in GetScanFunctionImpl didn't
-		// catch (e.g. a worker whose scan-time output disagrees with its own
-		// declared bind output_schema) — core walks off the end of the children
-		// array and the client SIGSEGVs (arrow_conversion.cpp). Bounds-check here
-		// so the failure surfaces as a clear IOException naming the function.
+		// ArrowToDuckDB indexes arrow_array.children with this same projection /
+		// rowid mapping and would read past the end (SIGSEGV) for a batch with
+		// fewer columns than declared, so bounds-check first.
 		const int64_t n_children = local_state.chunk->arrow_array.n_children;
 		for (idx_t idx = 0; idx < output.ColumnCount(); idx++) {
 			idx_t col_idx = local_state.column_ids.empty() ? idx : local_state.column_ids[idx];
@@ -4178,22 +3701,16 @@ static void ConvertCurrentBatch(const VgiTableFunctionBindData &bind_data,
 	output.Verify();
 }
 
-//! Check whether the current batch has been fully consumed
 static bool BatchExhausted(const VgiTableFunctionLocalState &local_state) {
 	return !local_state.chunk || !local_state.chunk->arrow_array.release ||
 	       local_state.chunk_offset >= static_cast<idx_t>(local_state.chunk->arrow_array.length);
 }
-
-// ============================================================================
-// Scan Function
-// ============================================================================
 
 void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	auto &global_state = input.global_state->Cast<VgiTableFunctionGlobalState>();
 	auto &local_state = input.local_state->Cast<VgiTableFunctionLocalState>();
 
-	// Determine whether async prefetch is enabled for this scan
 	bool is_async = (input.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR);
 	if (is_async) {
 		Value async_val;
@@ -4201,34 +3718,25 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 			is_async = async_val.GetValue<bool>();
 		}
 	}
-	// Never on the split path. Only the FIRST batch goes through GetNextBatch;
-	// every later one is fetched by VgiPrefetchTask, which reads the connection
-	// directly and so never claims the next split. At split 0's EOS the task
-	// stores a null batch, the reader is marked done, and splits 1..N are dropped
-	// — a correct-looking answer with missing rows, and (since every reader ends
-	// cleanly) one the commit gate would happily cache. Prefetching per split is
-	// a real option, but it needs the claim moved into the task along with the
-	// interrupt and poisoning handling that lives around PerformInit.
+	// Never on the split path: VgiPrefetchTask reads the connection directly and
+	// never claims the next split, so splits 1..N would be silently dropped (and
+	// the clean-looking result even cached).
 	is_async = is_async && !bind_data.supports_splits;
-	// Explicit SQL has one ordered reader. Keep every batch, including empty
-	// batches, on the validation and cancellation path above before conversion.
+	// Explicit SQL: one ordered reader; every batch goes through GetNextBatch's
+	// validation and cancellation checks.
 	is_async = is_async && !bind_data.explicit_query;
 
-	// Fast path: current batch still has rows to consume
 	if (!BatchExhausted(local_state)) {
 		ConvertCurrentBatch(bind_data, global_state, local_state, output);
 		return;
 	}
 
-	// Need a new batch
 	if (local_state.done) {
 		output.SetCardinality(0);
 		return;
 	}
 
-	// Synchronous fallback: inline blocking I/O (original behavior).
-	// GetNextBatch now guarantees a non-empty batch on success, so a single
-	// call is sufficient — it internally loops past any empty worker batches.
+	// Synchronous: GetNextBatch returns a non-empty batch or EOS.
 	if (!is_async) {
 		if (!GetNextBatch(context, bind_data, global_state, local_state)) {
 			output.SetCardinality(0);
@@ -4238,7 +3746,6 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 		return;
 	}
 
-	// --- Async path ---
 	auto state = local_state.prefetch_slot_->state.load();
 
 	if (state == PrefetchState::ERROR) {
@@ -4263,8 +3770,7 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 
 	if (state == PrefetchState::IDLE) {
 		if (local_state.first_scan_call_) {
-			// First batch: fetch synchronously to avoid an extra BLOCKED round-trip.
-			// GetNextBatch loops past empty batches internally.
+			// First batch synchronously, avoiding an extra BLOCKED round-trip.
 			local_state.first_scan_call_ = false;
 			if (!GetNextBatch(context, bind_data, global_state, local_state)) {
 				output.SetCardinality(0);
@@ -4276,27 +3782,22 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 			}
 			return;
 		}
-		// Update dynamic filter state before the prefetch task sends a tick
 		UpdateDynamicFilterState(global_state, context, bind_data);
-		// Subsequent batches: launch prefetch and return BLOCKED
+		// Later batches: launch a prefetch and return BLOCKED.
 		LaunchPrefetch(context, input, local_state);
 		output.SetCardinality(0);
 		return;
 	}
 
-	// IN_FLIGHT: should be impossible — DuckDB won't call scan while task is running
+	// DuckDB does not call scan while the task runs.
 	D_ASSERT(state != PrefetchState::IN_FLIGHT);
 	throw InternalException("VgiTableFunctionScan: unexpected prefetch state IN_FLIGHT");
 }
 
-// ============================================================================
-// Cardinality Function - Returns row count estimate from bind
-// ============================================================================
-
 unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, const FunctionData *bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
 
-	// Lazy fetch: make a single table_function_cardinality RPC call on first invocation
+	// One lazy table_function_cardinality RPC.
 	if (!bind_data.cardinality_fetched && !bind_data.bind_result.bind_request_bytes.empty()) {
 		bind_data.cardinality_fetched = true;
 		try {
@@ -4308,7 +3809,7 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 			bind_data.cardinality_estimate = result.estimate;
 			bind_data.cardinality_max = result.max;
 		} catch (const std::exception &e) {
-			// Not critical — continue with unknown cardinality
+			// Not critical: cardinality stays unknown.
 			VGI_LOG(context, "table_function.cardinality_error",
 			        {{"worker_path", bind_data.worker_path()},
 			         {"function_name", bind_data.function_name},
@@ -4325,7 +3826,6 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 	         {"cardinality_max", have_max ? std::to_string(bind_data.cardinality_max) : "unknown"}});
 
 	if (have_est && have_max) {
-		// NodeStatistics(idx_t estimated, idx_t max) sets both flags.
 		return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.cardinality_estimate),
 		                                  static_cast<idx_t>(bind_data.cardinality_max));
 	}
@@ -4333,8 +3833,7 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 		return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.cardinality_estimate));
 	}
 	if (have_max) {
-		// max-only: build NodeStatistics manually so the optimizer can use the
-		// upper bound even without a point estimate.
+		// max-only: still give the optimizer the upper bound.
 		auto stats = make_uniq<NodeStatistics>();
 		stats->has_max_cardinality = true;
 		stats->max_cardinality = static_cast<idx_t>(bind_data.cardinality_max);
@@ -4342,10 +3841,6 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 	}
 	return make_uniq<NodeStatistics>();
 }
-
-// ============================================================================
-// Progress Function - Returns scan progress as percentage
-// ============================================================================
 
 double VgiTableFunctionProgress(ClientContext &context, const FunctionData *bind_data_p,
                                 const GlobalTableFunctionState *global_state_p) {
@@ -4360,13 +3855,8 @@ double VgiTableFunctionProgress(ClientContext &context, const FunctionData *bind
 		return progress;
 	}
 
-	// No estimate available
 	return -1.0;
 }
-
-// ============================================================================
-// ToString Function - Returns info for EXPLAIN output
-// ============================================================================
 
 InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
@@ -4389,22 +3879,11 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 	return result;
 }
 
-// ============================================================================
-// DynamicToString Function - Returns post-execution diagnostics for EXPLAIN ANALYZE
-// ============================================================================
-//
-// DuckDB calls this once per parallel scan thread inside
-// `OperatorProfiler::FinishSource`. We always emit the intrinsic keys
-// (`Worker`, `Function`, `Rows Read`, `Threads`) cheap from gstate, and
-// additionally issue a unary RPC asking the worker to surface user-defined
-// diagnostics under the global execution id. The RPC goes through the worker
-// pool — same path `cardinality` and `statistics` use — so we don't have to
-// multiplex on the per-stream `IFunctionConnection`.
-//
-// DuckDB merges per-thread maps with last-write-wins semantics, so doing this
-// on every thread is fine: every call returns the same intrinsic values, and
-// the user keys reflect whatever the user persisted up to that thread's
-// FinishSource (the *last* finisher will have the most complete view).
+// --- EXPLAIN ANALYZE metrics (get_metrics) ----------------------------------
+// Called once per scan thread from OperatorProfiler::FinishSource; per-thread
+// maps merge last-write-wins, so every call reports the same gstate-wide
+// values. The user-diagnostics RPC goes through the worker pool (like
+// cardinality/statistics), not the per-stream connection.
 
 static InsertionOrderPreservingMap<string> CollectVgiTableFunctionMetrics(TableFunctionGetMetricsInput &input) {
 	InsertionOrderPreservingMap<string> result;
@@ -4414,34 +3893,21 @@ static InsertionOrderPreservingMap<string> CollectVgiTableFunctionMetrics(TableF
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	auto &global_state = input.global_state->Cast<VgiTableFunctionGlobalState>();
 
-	// Intrinsic keys, cheap and always available. ``Rows Read`` and
-	// ``Threads`` are deliberately omitted: DuckDB already prints the
-	// operator's row count in the profile box ("N rows"), and the
-	// worker-advertised ``max_workers`` is an upper bound rather than the
-	// actual concurrency DuckDB used — both add noise without insight.
-	// Workers that want a specific row count or thread/worker view can
-	// return one from their own ``dynamic_to_string``.
+	// Intrinsic keys. No row count (DuckDB prints it) or thread count
+	// (max_workers is only an upper bound); workers may add their own.
 	result["Worker"] = bind_data.worker_path();
 	result["Function"] = bind_data.function_name;
 
-	// Result-cache serve indicator: a HIT skips the worker entirely, so EXPLAIN
-	// ANALYZE should say so (and which tier). The worker RPC below is also skipped
-	// on a hit (no global_execution_id), so surface this before the early return.
+	// Before the early return: a hit has no global_execution_id.
 	if (global_state.serving_from_cache) {
 		result["Cache"] = (global_state.serving_entry && global_state.serving_entry->disk_backed)
 		                      ? "hit (disk_streaming)"
 		                      : "hit (memory)";
 	} else if (global_state.cache_eligible) {
-		// Eligible but not served → a genuine miss (the worker ran; the result may
-		// have been captured for next time). An ineligible scan gets no Cache line.
 		result["Cache"] = "miss";
 	}
 
-	// Worker batch shape. Workers differ enormously in how they chunk a result —
-	// one 2M-row batch versus two thousand 1k-row batches produce the same "N
-	// rows" in the profile box but very different memory and latency profiles —
-	// so report the count and the row distribution. Cache hits replay through
-	// the same InstallBatch path, so a served entry reports its stored shape.
+	// Worker batch shape (a cache hit reports its stored shape).
 	const auto batches = global_state.batches_received.load(std::memory_order_relaxed);
 	if (batches > 0) {
 		const auto rows = global_state.batch_rows_total.load(std::memory_order_relaxed);
@@ -4456,10 +3922,8 @@ static InsertionOrderPreservingMap<string> CollectVgiTableFunctionMetrics(TableF
 		result["Batch Bytes"] = StringUtil::BytesToHumanReadableString(bytes);
 	}
 
-	// User-defined diagnostics via worker RPC. Skip if we don't have enough
-	// context to make the call — happens for direct vgi_table_function() invocations
-	// before bind has populated bind_request_bytes, or if InitGlobal wasn't
-	// reached (cached ClientContext is null).
+	// User-defined diagnostics via worker RPC, when there is enough context
+	// (bind request, execution id, and the context captured at InitGlobal).
 	if (bind_data.bind_result.bind_request_bytes.empty() || global_state.global_execution_id.empty() ||
 	    global_state.client_context_for_explain == nullptr) {
 		return result;
@@ -4474,14 +3938,11 @@ static InsertionOrderPreservingMap<string> CollectVgiTableFunctionMetrics(TableF
 		auto user_map = InvokeTableFunctionDynamicToString(
 		    rpc_ctx, bind_data.bind_result.bind_request_bytes, bind_data.bind_result.opaque_data,
 		    global_state.global_execution_id, *global_state.client_context_for_explain);
-		// Merge user keys after intrinsics — user can override an intrinsic by
-		// returning the same key (DuckDB's map semantics for duplicate keys
-		// is "replace existing", which is what we want here).
+		// User keys may override intrinsic ones.
 		for (const auto &it : user_map) {
 			result[it.first] = it.second;
 		}
 	} catch (const std::exception &e) {
-		// Best-effort: any failure surfaces only the intrinsic keys.
 		VGI_LOG(*global_state.client_context_for_explain, "table_function.dynamic_to_string_error",
 		        {{"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
@@ -4496,9 +3957,7 @@ void VgiTableFunctionGetMetrics(TableFunctionGetMetricsInput &input) {
 	}
 }
 
-// ============================================================================
-// Virtual Column Callbacks for Row ID Support
-// ============================================================================
+// --- Bind info / virtual (rowid) column callbacks ---------------------------
 
 BindInfo VgiTableScanGetBindInfo(TableFunctionGetBindInfoInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
@@ -4531,20 +3990,14 @@ vector<column_t> VgiTableScanGetRowIdColumns(ClientContext &context, optional_pt
 	return {COLUMN_IDENTIFIER_ROW_ID};
 }
 
-// ============================================================================
-// set_scan_order callback — captures ORDER BY + LIMIT hint from optimizer
-// ============================================================================
-
 void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_ptr<FunctionData> bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
 
-	// Bounds-check column index against known column names
 	auto col_idx = order_options->column_idx.GetPrimaryIndex();
 	if (col_idx >= bind_data.all_column_names.size()) {
 		return;
 	}
 
-	// Map OrderType to string
 	std::string direction;
 	switch (order_options->order_type) {
 	case OrderType::ASCENDING:
@@ -4554,11 +4007,10 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 		direction = "DESC";
 		break;
 	default:
-		// ORDER_DEFAULT or INVALID — skip (planner should resolve before optimizer)
+		// ORDER_DEFAULT / INVALID: the planner should have resolved it.
 		return;
 	}
 
-	// Map OrderByNullType to string
 	std::string null_order;
 	switch (order_options->null_order) {
 	case OrderByNullType::NULLS_FIRST:
@@ -4568,14 +4020,14 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 		null_order = "NULLS_LAST";
 		break;
 	case OrderByNullType::ORDER_DEFAULT:
-		// DuckDB default is NULLS_LAST unconditionally
+		// DuckDB's default is NULLS_LAST.
 		null_order = "NULLS_LAST";
 		break;
 	default:
 		return;
 	}
 
-	// Extract row_limit (combined limit+offset, or -1 if invalid)
+	// Combined limit+offset, -1 when absent.
 	int64_t row_limit = -1;
 	if (order_options->row_limit.IsValid()) {
 		row_limit = static_cast<int64_t>(order_options->row_limit.GetIndex());
@@ -4589,52 +4041,11 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 	};
 }
 
-// ============================================================================
-// get_partition_data callback — batch_index for ordered-sink reassembly
-// ============================================================================
-//
-// Registered ONLY for table functions that opt in to
-// ``Meta.supports_batch_index = True`` on the worker side (see
-// ``vgi_table_function_set.cpp`` for the registration site). Called by
-// ``PhysicalTableScan::GetPartitionData`` once per source chunk pulled by
-// the pipeline executor; ordered sinks
-// (BatchCollector / BatchInsert / BatchCopyToFile / Limit) use the
-// returned batch_index to reassemble parallel output in worker-defined
-// partition order.
-//
-// ``local_state.current_batch_index`` was set by ``InstallBatch`` on the
-// consumer thread when the corresponding data batch arrived — see the
-// ``current_batch_index`` field comment in vgi_table_function_impl.hpp
-// for the thread-safety rationale.
-//
-// INVALID is unreachable here. DuckDB's
-// ``pipeline_executor.cpp:130`` gates ``GetPartitionData`` on
-// ``source_chunk.size() > 0``, which means ``InstallBatch`` already fired
-// at least once with a tagged data batch.
-//
-// Both halves of ``OperatorPartitionData`` are populated when the
-// function opts in to the respective mode; sinks pick what they need.
-// For batch_index-only functions, ``current_partition_data`` is empty
-// and ignored. For PartitionColumns-only functions,
-// ``current_batch_index`` stays INVALID and is ignored (sinks that
-// request ``PartitionColumns()`` don't read ``batch_index``).
-//
-// IMPORTANT: the sink (``PhysicalPartitionedAggregate::Sink``) reads
-// ``partition_data[i]`` indexed by its OWN partition columns position
-// (i.e. by GROUP BY column index 0..N-1), NOT by the source's
-// declared partition column index. So we must return
-// ``partition_data`` re-ordered to match
-// ``input.partition_info.partition_columns`` — the column indices the
-// sink is asking about.
-//! Map a DuckDB BASE (table) column index to a WORKER-schema index.
-//!
-//! The two spaces differ by the hidden rowid pseudocolumn: DuckDB's table
-//! column list excludes it, while ``partition_column_indices`` are positions in
-//! the worker's output schema, which INCLUDES it. Same shift
-//! ``VgiSerializeFilters`` applies for filter columns. Without it, a table whose
-//! rowid sits BEFORE a partition column resolves to the wrong column — which
-//! ``VgiGetPartitionInfo`` reports as NOT_PARTITIONED, silently disabling the
-//! partitioned aggregate rather than failing.
+//! Map a DuckDB BASE (table) column index to a WORKER-schema index: the worker
+//! schema (and ``partition_column_indices``) INCLUDES the hidden rowid column
+//! that DuckDB's column list omits. Same shift as ``VgiSerializeFilters``;
+//! without it a rowid before a partition column silently disables the
+//! partitioned aggregate.
 static idx_t WorkerIndexFromBaseColumn(const VgiTableFunctionBindData &bind_data, column_t base_col) {
 	if (base_col == COLUMN_IDENTIFIER_ROW_ID) {
 		return bind_data.rowid_worker_col_index >= 0
@@ -4649,38 +4060,30 @@ static idx_t WorkerIndexFromBaseColumn(const VgiTableFunctionBindData &bind_data
 	return worker_col;
 }
 
+// get_partition_data: see the header. Called by
+// ``PhysicalTableScan::GetPartitionData`` per source chunk; the values were
+// set by ``InstallBatch`` (see ``current_batch_index`` for thread safety and
+// why INVALID is unreachable for batch_index functions).
+//
+// IMPORTANT: ``PhysicalPartitionedAggregate::Sink`` reads ``partition_data[i]``
+// by ITS partition-column position, so ``partition_data`` must be re-ordered
+// to match ``input.partition_info.partition_columns``.
 OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetPartitionInput &input) {
 	auto &local_state = input.local_state->Cast<VgiTableFunctionLocalState>();
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	OperatorPartitionData result(local_state.current_batch_index);
 
-	// Re-order ``current_partition_data`` (indexed by declared order)
-	// into ``result.partition_data`` (indexed by the sink's requested
-	// column order). Only emit entries the sink asked for; ignore
-	// declared partition columns the sink doesn't care about.
+	// Re-order from declared order to the sink's requested order, emitting only
+	// the requested columns.
 	if (!local_state.current_partition_data.empty() &&
 	    !input.partition_info.partition_columns.empty()) {
-		// The sink's column indices and ours live in DIFFERENT SPACES, and
-		// DuckDB only maps between them on the planning side:
-		// ``CanUsePartitionedAggregate`` (plan_aggregate.cpp) maps the group
-		// columns through ``projection_ids`` and then ``column_ids`` to build
-		// ``base_columns``, and asks ``VgiGetPartitionInfo`` about THOSE —
-		// worker-schema indices, which is what ``partition_column_indices``
-		// holds. But it stores the un-``column_ids``-mapped vector on
-		// ``PhysicalPartitionedAggregate``, so what comes back here is
-		// SCAN-LOCAL (a position in this scan's ``column_ids``). Comparing the
-		// two directly matches only when the scan projects every column in
-		// order; any projected scan — i.e. the normal case, since GROUP BY
-		// projects just the grouping column — mismatched and threw the
-		// InternalException below, which is FATAL (it invalidates the
-		// database). So map scan-local -> worker-schema here first.
-		//
-		// ``GlobalState::projection_ids`` is exactly that mapping: InitGlobal
-		// built it from ``input.column_ids``, already shifted for the hidden
-		// rowid column. It is empty when the function has no projection
-		// pushdown, in which case the scan-local index IS the table column
-		// index and only the rowid shift applies (same rule as
-		// ``VgiSerializeFilters``).
+		// The sink's indices are SCAN-LOCAL (positions in this scan's
+		// column_ids): DuckDB maps them to base columns only while planning
+		// (PhysicalPlanGenerator::HasSingleValuePartitions) and keeps the
+		// unmapped vector on the aggregate. Map to worker-schema indices first,
+		// or a projected scan hits the FATAL InternalException below. The
+		// gstate's projection_ids is that mapping (rowid shift included); it is
+		// empty without projection pushdown, where only the rowid shift applies.
 		optional_ptr<VgiTableFunctionGlobalState> gstate;
 		if (input.global_state) {
 			gstate = &input.global_state->Cast<VgiTableFunctionGlobalState>();
@@ -4697,17 +4100,12 @@ OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetParti
 				}
 				return requested_col;
 			}
-			// No projection pushdown: the scan emits every base column in
-			// schema order, so the sink's index IS the base-column index and
-			// only the rowid gap remains. (DuckDB reaches this shape only once
-			// duckdb/duckdb#24557 is present — before it, the planner crashes
-			// mapping these indices; see the guard in CanUsePartitionedAggregate.)
+			// No projection pushdown: the sink's index IS the base-column index.
 			return WorkerIndexFromBaseColumn(bind_data, requested_col);
 		};
 
 		result.partition_data.reserve(input.partition_info.partition_columns.size());
 		for (column_t requested_col : input.partition_info.partition_columns) {
-			// Find this column in the declared partition indices.
 			const idx_t worker_col = to_worker_index(requested_col);
 			idx_t declared_pos = DConstants::INVALID_INDEX;
 			for (idx_t i = 0; i < bind_data.partition_column_indices.size(); ++i) {
@@ -4717,10 +4115,8 @@ OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetParti
 				}
 			}
 			if (declared_pos == DConstants::INVALID_INDEX) {
-				// Should not happen: ``VgiGetPartitionInfo`` returns
-				// NOT_PARTITIONED when the planner asks about a column
-				// we didn't declare, so the planner shouldn't pick
-				// PartitionedAggregate. Belt-and-suspenders.
+				// Unexpected: VgiGetPartitionInfo answers NOT_PARTITIONED for
+				// undeclared columns, so the planner should not get here.
 				throw InternalException(
 				    "VGI function '%s': sink requested partition column %llu "
 				    "(worker-schema %llu) that is not in the declared partition set",
@@ -4734,23 +4130,15 @@ OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetParti
 	return result;
 }
 
-// get_partition_info: tells the planner whether the source guarantees a
-// particular partition shape over a given set of columns. Called from
-// ``CanUsePartitionedAggregate`` (plan_aggregate.cpp:108) during
-// GROUP BY planning.
+// get_partition_info: see the header; called during GROUP BY planning.
 TablePartitionInfo VgiGetPartitionInfo(ClientContext &, TableFunctionPartitionInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	if (bind_data.partition_kind == VgiPartitionKind::NotPartitioned) {
 		return TablePartitionInfo::NOT_PARTITIONED;
 	}
-	// Every column the planner asks about must be in our declared
-	// partition set, otherwise we can't guarantee the partition shape.
-	//
-	// ``partition_ids`` are BASE (table) column indices — DuckDB built them by
-	// mapping through column_ids — while the declared set is in worker-schema
-	// space. Normalize before comparing, or a table whose rowid precedes a
-	// partition column answers NOT_PARTITIONED for a column it does partition
-	// on, quietly losing the optimization with nothing to debug.
+	// Every requested column must be declared. ``partition_ids`` are BASE
+	// column indices; the declared set is worker-schema (see
+	// WorkerIndexFromBaseColumn).
 	for (auto col_id : input.partition_ids) {
 		const idx_t worker_col = WorkerIndexFromBaseColumn(bind_data, col_id);
 		bool found = false;
@@ -4777,22 +4165,11 @@ TablePartitionInfo VgiGetPartitionInfo(ClientContext &, TableFunctionPartitionIn
 	}
 }
 
-// ============================================================================
-// Statistics Callback — column stats per column
-// ============================================================================
-//
-// Two sources, in order of preference:
-//   1. Catalog-declared stats via VgiTableEntry::GetStatistics (table_entry path).
-//      These are cached on the table entry and shared across queries.
-//   2. Function-level stats via table_function_statistics RPC (direct path). These
-//      are cached on the bind data for the lifetime of the query.
-//
-// For catalog-backed scans, the entry path is tried first. If it returns null
-// (e.g. `supports_column_statistics=False`, or the column just isn't declared
-// in the catalog stats), we fall back to asking the scan function for its own
-// stats. This lets a catalog-registered table declare "my rows come from
-// sequence(123456)" without also having to repeat the sequence's stats — the
-// function computes them from its bind arguments.
+// --- Statistics callback -----------------------------------------------------
+// Catalog tables try VgiTableEntry::GetStatistics first (cached on the entry);
+// unless TableInfo inlined column_statistics, a null falls back to the
+// function's table_function_statistics RPC (cached on the bind data), so a
+// catalog table backed by a function need not repeat the function's stats.
 
 static unique_ptr<BaseStatistics> FetchFunctionStatistics(ClientContext &context,
                                                           const VgiTableFunctionBindData &bind_data,
@@ -4839,15 +4216,12 @@ unique_ptr<BaseStatistics> VgiTableFunctionStatistics(ClientContext &context, co
 		if (entry_stats) {
 			return entry_stats;
 		}
-		// When the catalog inlined column_statistics on TableInfo, the entry
-		// path is authoritative — a per-column null means "no stats for this
-		// column", not "ask the function". Skip the function-level fallback
-		// to avoid one table_function_statistics RPC per scan.
+		// Inlined column_statistics are authoritative: a null means "no stats",
+		// not "ask the function".
 		auto *vgi_entry = dynamic_cast<VgiTableEntry *>(&entry);
 		if (vgi_entry && vgi_entry->GetTableInfo().column_statistics.has_value()) {
 			return nullptr;
 		}
-		// Fall through to function-level stats if the catalog declined to answer.
 	}
 
 	if (column_index >= bind_data.all_column_names.size()) {

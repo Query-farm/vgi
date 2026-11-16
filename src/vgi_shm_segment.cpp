@@ -1,10 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// Shared-memory side-channel. POSIX uses shm_open/mmap; Windows uses
-// CreateFileMapping/MapViewOfFile (page-file-backed named mapping). Under
-// Emscripten this translation unit is empty. The allocator/IPC logic below is
-// platform-independent; only Create/dtor/GenerateName differ. Opt-in via
-// VGI_RPC_SHM_SIZE_BYTES. See vgi_platform.hpp.
+// Shared-memory side channel. Only Create/dtor/GenerateName differ between
+// POSIX and Windows; empty under Emscripten. See vgi_shm_segment.hpp.
 
 #include "vgi_platform.hpp"
 
@@ -58,11 +55,8 @@ VgiBufferPtr MakeShmSlotBuffer(const uint8_t *data, int64_t size, std::shared_pt
 	return std::make_shared<const VgiBuffer>(std::shared_ptr<const void>(std::move(lease)), data, size);
 }
 
-// Virtually concatenates a list of byte regions and exposes them as a single
-// input stream — no allocation, no copy of the regions themselves.
-// Used to splice together [schema_msg | mmap_slice | EOS] when reading a
-// dictionary-encoded batch out of the shm segment, instead of memcpy'ing the
-// whole 16 MiB slice into a fresh buffer.
+// One input stream over several byte regions without copying them; splices
+// [schema_msg | mmap_slice | EOS] for dictionary-encoded batches.
 class ChainedBufferInputStream final : public VgiInputStream {
 public:
 	explicit ChainedBufferInputStream(std::vector<VgiBufferPtr> regions)
@@ -113,8 +107,7 @@ public:
 			region_idx_++;
 			region_pos_ = 0;
 		}
-		// Fast path: if the requested range is entirely within the current
-		// region, return a zero-copy slice sharing that region's owner.
+		// Within one region: zero-copy slice sharing that region's owner.
 		if (region_idx_ < regions_.size()) {
 			const auto &r = regions_[region_idx_];
 			int64_t avail = r->size() - region_pos_;
@@ -129,7 +122,7 @@ public:
 				return sliced;
 			}
 		}
-		// Slow path: allocate and copy across regions.
+		// Across regions: copy.
 		return VgiInputStream::ReadBuffer(nbytes);
 	}
 
@@ -165,8 +158,7 @@ inline void StoreU64LE(uint8_t *p, uint64_t v) {
 	std::memcpy(p, &v, 8);
 }
 
-// Generate a unique posix shm name. Python's SharedMemory uses
-// "/wnsm_<8-hex>"; we match the leading-slash convention.
+// Unique POSIX shm name with a leading slash, like Python's "/wnsm_<hex>".
 std::string GenerateName() {
 	static std::atomic<uint64_t> counter {0};
 	uint64_t n = counter.fetch_add(1, std::memory_order_relaxed);
@@ -231,9 +223,8 @@ std::shared_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 		throw IOException(ErrorInfo(error_subtype::kLocalResource).Set(error_key::kErrno, ErrnoName(err)), "VgiShmSegment: ftruncate failed: " + std::string(std::strerror(err)));
 	}
 
-	// stat to learn the actual mapped size — POSIX may round up to page
-	// boundary, and we want the header's data_size field to match what a
-	// Python peer attaching with shm.size will see.
+	// POSIX may round up to a page; data_size must match what a Python peer
+	// attaching with shm.size sees.
 	struct stat st;
 	if (::fstat(fd, &st) != 0) {
 		int err = errno;
@@ -253,7 +244,6 @@ std::shared_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 	auto *base = static_cast<uint8_t *>(map);
 #endif
 
-	// Initialize header: magic, version, data_size, num_allocs=0, padding.
 	std::memcpy(base, VGI_SHM_MAGIC, 4);
 	StoreU32LE(base + 4, VGI_SHM_VERSION);
 	StoreU64LE(base + 8, static_cast<uint64_t>(actual_size - VGI_SHM_HEADER_SIZE));
@@ -350,10 +340,7 @@ void VgiShmSegment::Unlink() {
 }
 
 void VgiShmSegment::FreeAllocation(uint64_t offset) {
-	// Mirrors ShmAllocator.free in vgi_rpc/shm.py: scan the (offset,length)
-	// entries in the header, drop the one whose offset matches, and shift
-	// the remainder down. Lockstep guarantees the worker isn't mid-allocate
-	// while we do this.
+	// Mirrors ShmAllocator.free in vgi_rpc/shm.py.
 	if (!base_) {
 		return;
 	}
@@ -368,7 +355,6 @@ void VgiShmSegment::FreeAllocation(uint64_t offset) {
 	for (uint32_t i = 0; i < num; i++) {
 		uint64_t entry_off = LoadU64LE(entries + i * 16);
 		if (entry_off == offset) {
-			// Shift remaining entries left by one slot.
 			if (i + 1 < num) {
 				std::memmove(entries + i * 16, entries + (i + 1) * 16, (num - i - 1) * 16);
 			}
@@ -376,16 +362,11 @@ void VgiShmSegment::FreeAllocation(uint64_t offset) {
 			return;
 		}
 	}
-	// Unknown offset — nothing to free. Silent no-op.
 }
 
 std::optional<uint64_t> VgiShmSegment::Allocate(size_t len) {
-	// First-fit allocate, the inverse of FreeAllocation. Mirrors
-	// ShmAllocator.allocate in vgi_rpc/shm.py: scan the sorted (offset,length)
-	// entries for the first gap >= len starting at HEADER_SIZE, insert the new
-	// entry keeping the table sorted. Reserves the slot only; the caller copies
-	// or serializes its bytes into MutableData(offset). Lockstep guarantees the
-	// worker isn't mutating the header concurrently.
+	// First-fit from HEADER_SIZE over the offset-sorted table, inserting the new
+	// entry in order. Mirrors ShmAllocator.allocate in vgi_rpc/shm.py.
 	if (!base_ || len == 0) {
 		return std::nullopt;
 	}
@@ -415,8 +396,6 @@ std::optional<uint64_t> VgiShmSegment::Allocate(size_t len) {
 	if (cursor + len > size_) {
 		return std::nullopt; // no contiguous gap large enough → inline fallback
 	}
-	// Make room at `ins` and write the new (offset,length) entry, keeping the
-	// table sorted by offset so the next first-fit scan stays correct.
 	if (ins < num) {
 		std::memmove(entries + (ins + 1) * 16, entries + ins * 16, (num - ins) * 16);
 	}
@@ -469,11 +448,9 @@ VgiBatchPtr VgiShmSegment::MaybeResolveBatch(const VgiBatchPtr &batch, const Vgi
 		                  ", length=" + std::to_string(length) + ", size=" + std::to_string(size_) + ")");
 	}
 
-	// Wrap the segment slice as a buffer whose owner is a lease on the slot.
-	// The IPC reader hands out zero-copy slices that share this owner
-	// (VgiBufferReader and ChainedBufferInputStream both slice it), so every
-	// array of the resolved batch pins the slot — and the mapping — for as
-	// long as it lives. Nothing downstream has to know it is shm.
+	// The slice's owner is the slot lease; every zero-copy slice the IPC reader
+	// cuts shares it, so each array of the resolved batch pins the slot and the
+	// mapping. Nothing downstream needs to know it is shm.
 	auto lease = std::make_shared<VgiShmSlotLease>(VgiShmSlotLease {shared_from_this(), offset});
 	// Per vgi_rpc/shm.py:
 	//   * Non-dictionary schemas: shm slice is a complete IPC stream
@@ -498,16 +475,10 @@ VgiBatchPtr VgiShmSegment::MaybeResolveBatch(const VgiBatchPtr &batch, const Vgi
 	auto slice_buffer = MakeShmSlotBuffer(base_ + offset, static_cast<int64_t>(length), lease);
 	std::shared_ptr<VgiInputStream> input;
 	if (!has_dict) {
-		// Non-dict: shm slice is already a complete IPC stream
-		// (schema + record batch + EOS). Read it in place — zero copy.
 		input = std::make_shared<VgiBufferReader>(std::move(slice_buffer));
 	} else {
-		// Dict path: build/cache the schema message bytes once per scan
-		// (the same schema repeats across every batch), then virtually
-		// concatenate [schema_msg | mmap_slice | EOS] via a chained
-		// input stream — no allocation, no copy of the slice.
 		VgiBufferPtr schema_msg;
-		if (cached_schema_ptr_ == schema.get() && cached_schema_msg_) {
+		if (cached_schema_ == schema && cached_schema_msg_) {
 			schema_msg = cached_schema_msg_;
 		} else {
 			try {
@@ -517,7 +488,7 @@ VgiBatchPtr VgiShmSegment::MaybeResolveBatch(const VgiBatchPtr &batch, const Vgi
 				throw IOException("VgiShmSegment: schema message serialization failed: " +
 				                  ErrorData(e).RawMessage());
 			}
-			cached_schema_ptr_ = schema.get();
+			cached_schema_ = schema;
 			cached_schema_msg_ = schema_msg;
 		}
 
@@ -557,4 +528,4 @@ VgiBatchPtr VgiShmSegment::MaybeResolveBatch(const VgiBatchPtr &batch, const Vgi
 } // namespace vgi
 } // namespace duckdb
 
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SHM_TRANSPORT

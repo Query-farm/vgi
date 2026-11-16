@@ -3,12 +3,10 @@
 
 #include "vgi_logging.hpp"
 
+#include "duckdb/main/client_context.hpp"
+
 namespace duckdb {
 namespace vgi {
-
-//===--------------------------------------------------------------------===//
-// PooledWorker
-//===--------------------------------------------------------------------===//
 
 PooledWorker::PooledWorker(std::unique_ptr<SubProcess> proc, PoolKey key,
                             std::unique_ptr<StderrDrainer> drainer)
@@ -17,8 +15,6 @@ PooledWorker::PooledWorker(std::unique_ptr<SubProcess> proc, PoolKey key,
 }
 
 PooledWorker::~PooledWorker() {
-	// drainer_ destructor stops the reader thread and closes the stderr fd.
-	// SubProcess destructor handles process cleanup.
 }
 
 PooledWorker::PooledWorker(PooledWorker &&other) noexcept
@@ -40,8 +36,6 @@ bool PooledWorker::IsAlive() const {
 	if (!proc_) {
 		return false;
 	}
-	// TryWait returns true if the process has exited
-	// So if it returns false, the process is still running
 	return !proc_->TryWait();
 }
 
@@ -57,46 +51,45 @@ pid_t PooledWorker::GetPid() const {
 	return proc_ ? proc_->GetPid() : -1;
 }
 
-//===--------------------------------------------------------------------===//
-// VgiWorkerPool
-//===--------------------------------------------------------------------===//
-
 VgiWorkerPool &VgiWorkerPool::Instance() {
-	// Intentionally leaked: pooled workers hold IPC stream objects and
-	// threads whose destructors may run after other function-local statics
-	// have been destroyed (this used to crash inside the Arrow memory pool
-	// at exit). Leaking sidesteps the whole destruction-order question.
+	// Intentionally leaked: pooled workers' streams and threads must not be
+	// destroyed after other statics they depend on at exit.
 	static VgiWorkerPool *instance = new VgiWorkerPool();
 	return *instance;
 }
 
-void VgiWorkerPool::SetDefaultSettings(const PoolSettings &settings) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	default_settings_ = settings;
+PoolSettings PoolSettingsFromSession(ClientContext &context) {
+	PoolSettings settings;
+	settings.max_pool_size = static_cast<size_t>(defaults::WORKER_POOL_MAX);
+	Value max_val;
+	if (context.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
+		settings.max_pool_size = static_cast<size_t>(max_val.GetValue<int64_t>());
+	}
+	Value idle_val;
+	if (context.TryGetCurrentSetting("vgi_worker_pool_idle_limit_seconds", idle_val)) {
+		settings.idle_timeout_seconds = static_cast<size_t>(idle_val.GetValue<int64_t>());
+	}
+	return settings;
 }
 
 VgiWorkerPool::VgiWorkerPool() {
 #if VGI_SUBPROCESS_TRANSPORT
-	// Start the cleanup thread. Runs wherever a subprocess pool exists (POSIX +
-	// Windows). Emscripten is single-threaded and HTTP-only, so the pool stays
-	// empty there and no cleanup thread is needed.
+	// No cleanup thread without a subprocess transport (Emscripten): the pool
+	// stays empty there.
 	cleanup_thread_ = std::thread(&VgiWorkerPool::CleanupThread, this);
 #endif
 }
 
 VgiWorkerPool::~VgiWorkerPool() {
-	// Signal shutdown
 	shutdown_.store(true);
 	cleanup_cv_.notify_all();
 
 #if VGI_SUBPROCESS_TRANSPORT
-	// Wait for cleanup thread
 	if (cleanup_thread_.joinable()) {
 		cleanup_thread_.join();
 	}
 #endif
 
-	// Clear all pools (workers will be destroyed)
 	std::lock_guard<std::mutex> lock(mutex_);
 	pools_.clear();
 }
@@ -115,22 +108,18 @@ std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const PoolKey &key) {
 		return nullptr;
 	}
 
-	// MRU affinity: pop from the back so the most-recently-released worker
-	// is reused first. Keeps expensive per-process state warm (e.g. Kafka
-	// librdkafka Consumer + TLS+SASL connection, Schema Registry HTTP
-	// client). Fall through to the next-newest if the MRU has died.
+	// MRU: reuse the most-recently-released worker first to keep expensive
+	// per-process state (connections, clients) warm; skip dead ones.
 	auto &pool = it->second;
 	while (!pool.empty()) {
 		auto worker = std::move(pool.back());
 		pool.pop_back();
 
 		if (worker->IsAlive()) {
-			// Record hit (stats keyed by worker_path for backward-compatible display)
 			stats_[key.worker_path].first++;
 			VGI_STDERR_DEBUG("[VGI] pool.try_acquire found_alive pid=%d\n", worker->GetPid());
 			return worker;
 		}
-		// Worker died while pooled, discard and try next
 		VGI_STDERR_DEBUG("[VGI] pool.try_acquire worker_died pid=%d\n", worker->GetPid());
 	}
 
@@ -146,7 +135,7 @@ VgiWorkerPool::ReleaseResult VgiWorkerPool::Release(std::unique_ptr<PooledWorker
 
 	if (!worker->IsAlive()) {
 		result.skip_reason = "dead";
-		return result; // Don't pool dead workers
+		return result;
 	}
 
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -154,11 +143,18 @@ VgiWorkerPool::ReleaseResult VgiWorkerPool::Release(std::unique_ptr<PooledWorker
 	const auto &key = worker->GetKey();
 	const std::string &path = key.worker_path;
 
-	// Resolve settings: per-path config if available (from ATTACH), otherwise default settings.
-	// Pool-size/timeout settings are still per-path — a worker's version is
-	// orthogonal to its pool sizing.
+	// Sizing is per worker_path, shared by all version buckets of that path.
+	const PoolSettings *settings_ptr = &default_settings_;
 	auto config_it = path_configs_.find(path);
-	const auto &settings = (config_it != path_configs_.end()) ? config_it->second : default_settings_;
+	if (config_it != path_configs_.end()) {
+		settings_ptr = &config_it->second;
+	} else {
+		auto discovery_it = discovery_configs_.find(path);
+		if (discovery_it != discovery_configs_.end()) {
+			settings_ptr = &discovery_it->second;
+		}
+	}
+	const auto &settings = *settings_ptr;
 
 	if (settings.max_pool_size == 0) {
 		result.skip_reason = "disabled";
@@ -218,11 +214,15 @@ void VgiWorkerPool::ConfigurePath(const std::string &path, const PoolSettings &s
 	path_configs_[path] = settings;
 }
 
+void VgiWorkerPool::ConfigureDiscoveryPath(const std::string &path, const PoolSettings &settings) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	discovery_configs_[path] = settings;
+}
+
 void VgiWorkerPool::CleanupThread() {
 	while (!shutdown_.load()) {
 		{
 			std::unique_lock<std::mutex> lock(cleanup_mutex_);
-			// Wait for 1 second or until shutdown
 			cleanup_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return shutdown_.load(); });
 		}
 
@@ -230,7 +230,6 @@ void VgiWorkerPool::CleanupThread() {
 			break;
 		}
 
-		// Remove stale workers
 		std::lock_guard<std::mutex> lock(mutex_);
 		RemoveStaleWorkersLocked();
 	}
@@ -241,18 +240,15 @@ void VgiWorkerPool::RemoveStaleWorkersLocked() {
 
 	for (auto &[key, pool] : pools_) {
 		(void)key;
-		// Remove dead or stale workers
 		auto it = pool.begin();
 		while (it != pool.end()) {
 			auto &worker = *it;
 
-			// Check if dead
 			if (!worker->IsAlive()) {
 				it = pool.erase(it);
 				continue;
 			}
 
-			// Check if stale (idle too long) — uses per-worker timeout
 			auto age = std::chrono::duration_cast<std::chrono::seconds>(now - worker->GetPooledAt());
 			if (age >= worker->GetIdleTimeout()) {
 				it = pool.erase(it);

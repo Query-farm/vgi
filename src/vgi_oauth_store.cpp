@@ -38,49 +38,6 @@ namespace {
 
 constexpr const char *kKeychainService = "com.queryfarm.vgi.oauth";
 
-void AppendField(std::string &out, const std::string &value) {
-	uint32_t n = static_cast<uint32_t>(value.size());
-	for (int i = 0; i < 4; ++i)
-		out.push_back(static_cast<char>((n >> (i * 8)) & 0xff));
-	out.append(value);
-}
-
-bool ReadField(const std::string &in, size_t &offset, std::string &value) {
-	if (offset + 4 > in.size())
-		return false;
-	uint32_t n = 0;
-	for (int i = 0; i < 4; ++i)
-		n |= static_cast<uint32_t>(static_cast<unsigned char>(in[offset++])) << (i * 8);
-	if (n > in.size() - offset)
-		return false;
-	value.assign(in.data() + offset, n);
-	offset += n;
-	return true;
-}
-
-std::string EncodeRecord(const OAuthRefreshContext &ctx, const std::string &token) {
-	std::string out("VGI1", 4);
-	AppendField(out, ctx.issuer);
-	AppendField(out, ctx.resource.empty() ? ctx.resource_metadata_url : ctx.resource);
-	AppendField(out, ctx.client_id);
-	AppendField(out, ctx.scope);
-	AppendField(out, token);
-	return out;
-}
-
-bool DecodeRecord(const std::string &data, const OAuthRefreshContext &expected, std::string &token) {
-	if (data.size() < 4 || data.compare(0, 4, "VGI1") != 0)
-		return false;
-	size_t off = 4;
-	std::string issuer, resource, client, scope;
-	if (!ReadField(data, off, issuer) || !ReadField(data, off, resource) || !ReadField(data, off, client) ||
-	    !ReadField(data, off, scope) || !ReadField(data, off, token) || off != data.size())
-		return false;
-	const auto expected_resource = expected.resource.empty() ? expected.resource_metadata_url : expected.resource;
-	return issuer == expected.issuer && resource == expected_resource && client == expected.client_id &&
-	       scope == expected.scope && !token.empty();
-}
-
 bool WantsPersistence(const std::string &mode) {
 	if (mode == "none" || mode == "memory")
 		return false;
@@ -356,7 +313,7 @@ std::unique_ptr<OAuthCredentialLease> AcquireOAuthCredentialLease(const std::str
 }
 
 bool LoadOAuthRefreshToken(const std::string &key, const OAuthRefreshContext &expected, const std::string &mode,
-                           std::string &token) {
+                           std::string &token, OAuthRefreshContext *issued) {
 	if (!WantsPersistence(mode))
 		return false;
 #if defined(__APPLE__) || defined(_WIN32)
@@ -364,10 +321,13 @@ bool LoadOAuthRefreshToken(const std::string &key, const OAuthRefreshContext &ex
 		std::string data;
 		if (!PlatformLoad(key, data))
 			return false;
-		if (!DecodeRecord(data, expected, token)) {
+		OAuthRefreshContext resolved;
+		if (!DecodeOAuthRefreshRecord(data, expected, token, resolved)) {
 			PlatformDelete(key); // corrupt or rebound record: fail closed
 			return false;
 		}
+		if (issued)
+			*issued = std::move(resolved);
 		return true;
 	} catch (...) {
 		if (mode == "auto")
@@ -385,7 +345,7 @@ void StoreOAuthRefreshToken(const std::string &key, const OAuthRefreshContext &b
 		return;
 #if defined(__APPLE__) || defined(_WIN32)
 	try {
-		PlatformStore(key, EncodeRecord(binding, token));
+		PlatformStore(key, EncodeOAuthRefreshRecord(binding, token));
 		PlatformPrune();
 	} catch (...) {
 		if (mode != "auto")

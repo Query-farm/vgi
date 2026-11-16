@@ -6,14 +6,11 @@
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_metadata.hpp"
 #include "vgi_exception.hpp"
-#include "vgi_exchange_cache_key.hpp" // exchange-mode result cache (M1)
+#include "vgi_exchange_cache_key.hpp" // exchange-mode result cache
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
-// VgiSerializeFilters lives in vgi_table_function_impl.hpp — public utility
-// (declared at line 528 of that header). C3b reuses it on the streaming
-// TableInOut bind path; same serialization as the pure-table path so a
-// single filter format flows to all worker shapes.
+// VgiSerializeFilters: the same filter serialization as the pure-table path.
 #include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
@@ -32,14 +29,9 @@
 namespace duckdb {
 namespace vgi {
 
-// Mint a stable, process-unique id for one streaming table-in-out substream.
-// Layout: 8-byte process salt (random, once per process) || 8-byte monotonic
-// counter, little-endian. The salt makes ids unique ACROSS DuckDB processes
-// that share one HTTP worker fleet + shared storage (so two processes' substream
-// #1 never collide); the counter makes them unique WITHIN a process (across
-// substreams and across queries reusing the same attach). Per-substream worker
-// state is additionally attach-sharded worker-side, so uniqueness only has to
-// hold within a shared-storage namespace — this comfortably does.
+// Layout: 8-byte random process salt || 8-byte monotonic counter, both
+// little-endian. The salt keeps ids unique across DuckDB processes sharing one
+// HTTP worker fleet and storage; the counter, within a process.
 std::vector<uint8_t> MintSubstreamId() {
 	static const uint64_t salt = [] {
 		std::random_device rd;
@@ -55,9 +47,7 @@ std::vector<uint8_t> MintSubstreamId() {
 	return id;
 }
 
-// ============================================================================
 // Bind Data for Table-In-Out Functions
-// ============================================================================
 
 VgiTableInOutBindData::VgiTableInOutBindData() = default;
 
@@ -105,9 +95,7 @@ bool VgiTableInOutBindData::Equals(const FunctionData &other_p) const {
 	       schema_name == other.schema_name && attach_opaque_data == other.attach_opaque_data;
 }
 
-// ============================================================================
 // Global State for Table-In-Out Functions
-// ============================================================================
 
 VgiTableInOutGlobalState::VgiTableInOutGlobalState(DatabaseInstance *db_p) : db(db_p) {
 }
@@ -116,8 +104,7 @@ VgiTableInOutGlobalState::~VgiTableInOutGlobalState() {
 	if (!connection) {
 		return;
 	}
-	// Stream reached a natural end or cancel was already sent —
-	// no further action needed. connection drops via unique_ptr.
+	// Natural end, or cancel disabled/unavailable: the connection just drops.
 	if (stream_finished || !cancel_enabled || !db) {
 		return;
 	}
@@ -137,22 +124,17 @@ VgiTableInOutGlobalState::~VgiTableInOutGlobalState() {
 	}
 }
 
-// ============================================================================
 // Local State for Table-In-Out Functions
-// ============================================================================
 
 VgiTableInOutLocalState::~VgiTableInOutLocalState() = default;
 
-// ============================================================================
 // Bind Function
-// ============================================================================
 
 unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<Identifier> &names,
                                             const VgiTableInOutBindParams &params) {
 	auto bind_data = make_uniq<VgiTableInOutBindData>();
 
-	// Copy connection parameters
 	bind_data->attach_params = params.attach_params;
 	bind_data->attach_opaque_data = params.attach_opaque_data;
 	bind_data->transaction_opaque_data = params.transaction_opaque_data;
@@ -169,24 +151,15 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->filter_pushdown = params.filter_pushdown;
 	bind_data->filter_semantic_profiles = params.filter_semantic_profiles;
 	bind_data->additional_filter_functions = params.additional_filter_functions;
-	// Phase A: a streaming table-in-out function is a per-substream map, so it
-	// parallelizes by default — one worker per substream (per PipelineExecutor).
-	// This holds EVEN with a finalize callback: with per-substream workers each
-	// FinalExecute runs on the substream's OWN worker over its OWN state, so the
-	// per-substream finalize is correct (the DuckDB #18222 corruption was a
-	// *shared* worker seeing N FinalExecutes; that is exactly what per-substream
-	// fan-out removes). A global cross-substream combine is NOT a streaming
-	// table-in-out — it is a TableBufferingFunction. `has_finalize` (derived from
-	// the actual registered callback, the single source of truth) tells Execute
-	// to leave the connection open at input-EOS so the per-substream FINALIZE can
-	// reuse it. `max_workers=1` (A3) is the serial opt-out for a not-yet-migrated
-	// worker.
+	// A streaming table-in-out function is a per-substream map: one worker per
+	// substream, even with a finalize callback, because each FinalExecute then runs
+	// on its substream's own worker over its own state (DuckDB #18222 corrupted
+	// only a *shared* worker seeing N FinalExecutes). A cross-substream combine is
+	// a TableBufferingFunction instead. `has_finalize` keeps the connection open at
+	// input-EOS for the FINALIZE phase.
 	bind_data->has_finalize = static_cast<bool>(input.table_function.in_out_function_final);
-	// A3 serial opt-out: Meta.max_workers=1 forces the single-shared-worker path
-	// (MaxThreads()=1). 0/unset or >1 keeps the parallel-by-default per-substream
-	// fan-out. (A hard N-worker cap for max_workers>1 is not modeled here — the
-	// per-substream model spawns one worker per substream; only the ==1 serial
-	// case is honored, matching the pure-table path's use of the same field.)
+	// Meta.max_workers = 1 is the serial opt-out (single shared worker,
+	// MaxThreads() = 1). Larger values are not a cap: one worker per substream.
 	bind_data->parallel_safe = (params.max_workers != 1);
 
 	bind_data->input_from_args = params.input_from_args;
@@ -203,18 +176,13 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 		bind_data->input_rows_per_call = static_cast<idx_t>(params.input_rows_per_call.value());
 	}
 
-	// Build arguments from the regular (non-TABLE) inputs.
-	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL.
-	// We skip NULL values since they represent the TABLE input (not a scalar argument).
-	// Named arguments are in input.named_parameters.
-	//
-	// BLENDED (input_from_args): the positional inputs ARE the per-row input
-	// columns (delivered by DuckDB's synthesized input chunk), NOT bind arguments —
-	// skip ALL of them. Only named args survive as bind-time scalars.
+	// Bind arguments: the positional inputs, minus NULLs (the TABLE argument's
+	// slot), plus input.named_parameters. For a BLENDED function the positional
+	// inputs are the per-row input columns, not bind arguments: only named args
+	// remain.
 	vector<Value> positional_args;
 	if (!params.input_from_args) {
 		for (auto &val : input.inputs) {
-			// Skip NULL values - these represent TABLE arguments
 			if (val.IsNull()) {
 				continue;
 			}
@@ -227,14 +195,10 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	}
 	bind_data->arguments = BuildArgumentsFromValues(context, positional_args, named_args);
 
-	// Build the input schema.
-	//
-	// BLENDED: use the DECLARED positional arg names (the worker reads columns by
-	// those names) with the input-provided types. IGNORE input.input_table_names —
-	// it is empty in the literal shape (f(52,13) -> ["",""]) and would otherwise
-	// name the worker's input columns after the referenced columns in the column
-	// shape. For a pure-VARARGS blended function the declared names don't cover the
-	// N runtime columns, so fall back to generated col0..colN-1.
+	// BLENDED input schema: the DECLARED positional arg names (the worker reads
+	// columns by name), never input.input_table_names — empty in the literal shape
+	// (f(52,13) -> ["",""]) and the referenced columns' names in the column shape.
+	// Pure-VARARGS functions get generated names col0..colN-1.
 	if (params.input_from_args) {
 		vector<string> in_names;
 		vector<LogicalType> in_types;
@@ -243,20 +207,10 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 		for (idx_t i = 0; i < n_cols; i++) {
 			// Names: declared arg names for fixed arity, else generated col0..colN-1.
 			in_names.push_back(fixed_names_match ? params.positional_input_names[i] : ("col" + std::to_string(i)));
-			// Types: the DECLARED arg types, NOT input.input_table_types — so the
-			// worker always receives its declared arg types (a literal delivers the
-			// constant's natural type, e.g. DECIMAL for 52.0 / INTEGER for 52, while
-			// a column already casts to the signature). Fixed args use their declared
-			// type; varargs columns use the vararg element type; fall back to the
-			// incoming type only if neither is available (shouldn't happen).
-			//
-			// An ANY-typed arg (AnyArrow on the worker) declares no concrete type:
-			// ANY is a binder placeholder, not something Arrow can carry, so forcing
-			// it here fails the schema build with "Unsupported Arrow type ANY". DuckDB
-			// has already resolved the real type into input.input_table_types, so use
-			// that — for a literal, the constant's natural type is the right answer
-			// for an arg that accepts anything. Nested ANY (LIST(ANY), ...) likewise.
-			// Mirrors the declared-is-ANY handling in vgi_scalar_function_impl.cpp.
+			// Types: the DECLARED arg types (see VgiTableInOutBindParams), the vararg
+			// element type for varargs columns, else the incoming type. An ANY (or
+			// nested ANY) declaration has no Arrow form, so it takes the type DuckDB
+			// resolved into input.input_table_types — as the scalar path does.
 			const auto resolve_declared = [&](const LogicalType &declared) -> LogicalType {
 				return TypeVisitor::Contains(declared, LogicalTypeId::ANY) ? input.input_table_types[i] : declared;
 			};
@@ -294,8 +248,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	         {"single_row_scan", bind_data->single_row_scan ? "true" : "false"},
 	         {"input_columns", std::to_string(input.input_table_types.size())}});
 
-	// Create the connection and perform bind
-	// Try pool first (only for subprocess transport)
+	// Pool first (subprocess transport only).
 	std::unique_ptr<IFunctionConnection> connection;
 	bool from_pool = false;
 	if (bind_data->use_pool() && !IsHttpTransport(bind_data->worker_path())) {
@@ -332,40 +285,27 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 		}
 	}
 
-	// Set the input schema for table-in-out functions
 	connection->SetInputSchema(bind_data->input_schema);
 
-	// Name the owning schema on the bind request. The runtime paths below
-	// (InitGlobal / AcquireSubstreamConnection / AcquireBlendedInputConnection,
-	// and the buffering operator's BuildAcquireParams) carry it via
-	// FunctionConnectionParams::schema_name, which AcquireAndBindConnection
-	// applies — but this bind-time connection is built directly, so it needs
-	// the explicit call or the worker resolves the function by bare name and
-	// cannot tell two same-named table-in-out functions in different schemas
-	// apart. Empty stays permitted (serialises as null).
+	// The runtime paths pass the schema via FunctionConnectionParams::schema_name;
+	// this directly built bind connection must set it, or the worker cannot tell
+	// same-named functions in different schemas apart. Empty serializes as null.
 	connection->SetSchemaName(bind_data->schema_name);
 
-	// Perform bind
 	auto bind_result = connection->PerformBindRpc();
 	bind_data->secret_dependent = bind_data->secret_dependent || bind_result.secret_dependent;
 
-	// Store output schema (max_processes and cardinality_estimate set from init result later)
 	bind_data->output_schema = bind_result.output_schema;
 	bind_data->max_processes = 1;
 	bind_data->cardinality_estimate = -1;
 
-	// Retain the full BindResult so InitGlobal can call PerformInit without
-	// re-running a redundant bind RPC.
 	bind_data->bind_result = bind_result;
 
-	// Convert Arrow schema to DuckDB return types (stored for ArrowToDuckDB in scan)
 	ArrowSchemaToDuckDBTypes(context, bind_data->output_schema, bind_data->c_schema, bind_data->arrow_table,
 	                         return_types, names);
 
-	// Release the bind worker back to the pool. InitGlobal will re-acquire
-	// (typically pool-hit, paying only a cheap bind RPC) and then call
-	// PerformInit(phase=INPUT). Holding the worker through init would force
-	// ancillary planner RPCs to spawn fresh workers.
+	// Release the bind worker; init re-acquires (usually a pool hit). Holding it
+	// through planning would make other planner RPCs spawn fresh workers.
 	if (bind_data->use_pool()) {
 		auto bind_worker_pid = connection->GetSubprocessPid().value_or(-1);
 		auto bind_conn_id = connection->GetConnIdHex();
@@ -389,14 +329,12 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	return bind_data;
 }
 
-// ============================================================================
 // Init Functions
-// ============================================================================
 
 unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableInOutBindData>();
 	auto global_state = make_uniq<VgiTableInOutGlobalState>(context.db.get());
-	// Phase A: MaxThreads() reads this. Derived at bind from the finalize callback.
+	// MaxThreads() reads this.
 	global_state->parallel_safe = bind_data.parallel_safe;
 	{
 		Value v;
@@ -407,18 +345,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 
 	global_state->bind_result = bind_data.bind_result;
 
-	// Capture projection + filter pushdown from the TableFunctionInitInput.
-	// Mirrors the streaming pure-table path at
-	// ``vgi_table_function_impl.cpp:1023-1090``. The capability flags
-	// (advertised in ``vgi_table_function_set.cpp``) gate whether DuckDB
-	// populated ``input.column_ids`` / ``input.filters`` with non-trivial
-	// pushdown state; without them, column_ids is a single virtual column
+	// Capture projection (+ filter) pushdown, as VgiTableFunctionInitGlobal does.
+	// Without the advertised capability, column_ids is a single virtual-column
 	// placeholder and filters is null.
 	if (bind_data.projection_pushdown && !input.column_ids.empty()) {
-		// Save the DuckDB-side column_ids list. Threaded onto LocalState
-		// at InitLocal so ``ProduceOutputFromBatch`` can drive
-		// ``ArrowToDuckDB`` with arrow_scan_is_projected=true and
-		// the right per-column-type lookups.
 		global_state->column_ids.reserve(input.column_ids.size());
 		for (auto col_id : input.column_ids) {
 			global_state->column_ids.push_back(col_id);
@@ -428,19 +358,11 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 			global_state->projection_ids.push_back(static_cast<int32_t>(col_id));
 		}
 	}
-	// Note: DuckDB's planner discards ``LogicalGet.table_filters`` for the
-	// InOut path (see plan_get.cpp:37-83), so ``input.filters`` is always
-	// null here even when ``bind_data.filter_pushdown`` is True. The
-	// streaming TableInOut path therefore only supports projection
-	// pushdown end-to-end; filters fall back to a separate FILTER node
-	// above the operator. The serialization below is guarded on
-	// ``input.filters != nullptr`` so the branch is a no-op today but
-	// ready if upstream DuckDB grows InOut filter-pushdown support.
+	// Streaming InOut never advertises filter pushdown (vgi_table_function_set.cpp:
+	// DuckDB would hand the filters to init with no FILTER above the operator), so
+	// input.filters is null in practice and this branch is a no-op.
 	if (bind_data.filter_pushdown && bind_data.output_schema && input.filters) {
-		// VgiSerializeFilters indexes filter column refs through
-		// ``column_ids`` → ``column_names``. The streaming pure-table
-		// path passes ``bind_data.all_column_names``; the InOut path's
-		// equivalent is the worker's full output schema.
+		// Filter column refs index column_ids -> names: the full output schema here.
 		vector<string> output_names;
 		output_names.reserve(bind_data.output_schema->num_fields());
 		for (int i = 0; i < bind_data.output_schema->num_fields(); ++i) {
@@ -457,16 +379,11 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		}
 	}
 
-	// Phase A: a parallel (no-finalize) function fans out one worker PER SUBSTREAM
-	// — each VgiTableInOutLocalState lazily acquires + inits its own pooled worker
-	// in VgiTableInOutFunction (no shared global connection, no exchange mutex),
-	// so skip the shared-connection acquire here. A finalize function keeps the
-	// single shared connection (serial path below).
+	// The parallel path acquires one worker per substream lazily in
+	// VgiTableInOutFunction; only the serial (max_workers = 1) path shares one
+	// global connection, acquired here.
 	if (!global_state->parallel_safe) {
-		// Acquire a connection without firing a redundant bind RPC. The
-		// planner-phase BindResult is already cached on bind_data; PerformInit's
-		// payload carries it inline. AcquireConnectionForInit pool-hits when
-		// possible (subprocess) or constructs a fresh HTTP connection.
+		// No bind RPC: PerformInit carries the cached BindResult inline.
 		FunctionConnectionParams acquire_params;
 		acquire_params.attach_params = bind_data.attach_params;
 		acquire_params.attach_opaque_data = bind_data.attach_opaque_data;
@@ -482,9 +399,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		auto acquired = AcquireConnectionForInit(context, acquire_params);
 		auto connection = std::move(acquired.connection);
 
-		// Perform init with phase=INPUT. Init is the first RPC after acquire, so
-		// stale-pool detection lives here: a pooled subprocess that died while idle
-		// surfaces as IOException, and we retry once with a forced-fresh connection.
+		// Init is the first RPC after acquire, so a pooled worker that died while
+		// idle surfaces here as IOException: retry once on a fresh connection.
 		InitResult init_result;
 		try {
 			init_result = connection->PerformInit(global_state->bind_result, global_state->projection_ids,
@@ -513,12 +429,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	VGI_LOG(context, "table_in_out.init_global",
 	        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
 
-	// Exchange-mode result cache (M1): eligible only for a parallel, no-finalize
-	// streaming map (output depends solely on the current input batch — a pure
-	// per-batch function; the worker asserts this by advertising vgi.cache.*). The
-	// serial/finalize path (shared worker, cross-batch state) and the literal
-	// scan-mode path are excluded. Build the STATIC key once; the per-batch input
-	// hash is folded in at each exchange.
+	// Exchange-mode result cache: only a parallel, no-finalize map, whose output
+	// depends solely on the current input batch (the worker asserts this by
+	// advertising vgi.cache.*); not the serial path, finalize functions or the
+	// literal scan mode. The per-batch input hash is folded in per exchange.
 	if (bind_data.parallel_safe && !bind_data.has_finalize && !bind_data.single_row_scan) {
 		const char *reason = nullptr;
 		int64_t catalog_version = 0; // out param; already folded into cache_key
@@ -547,33 +461,23 @@ unique_ptr<LocalTableFunctionState> VgiTableInOutInitLocal(ExecutionContext &con
                                                             GlobalTableFunctionState *global_state_p) {
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableInOutLocalState>(std::move(current_chunk), context.client);
-	// Thread projection state captured at InitGlobal onto the local scan
-	// state so ``ProduceOutputFromBatch`` can drive ``ArrowToDuckDB`` with
-	// ``arrow_scan_is_projected=true`` and the right per-column-type
-	// lookups. ``ArrowScanLocalState::column_ids`` (inherited) is what
-	// ``ArrowToDuckDB`` reads to remap output positions to worker-original
-	// column indices. Empty list means "no projection" — positional read.
+	// ArrowScanLocalState::column_ids is what ArrowToDuckDB reads to remap output
+	// positions to worker-original column indices; empty means a positional read.
 	if (global_state_p != nullptr) {
 		auto &gstate = global_state_p->Cast<VgiTableInOutGlobalState>();
 		if (!gstate.column_ids.empty()) {
 			local_state->column_ids = gstate.column_ids;
 		}
 	}
-	// Phase A: mint this substream's stable id (one InitLocal call == one
-	// substream == one PipelineExecutor; the spike proved Execute↔FinalExecute
-	// run on the SAME local state, so a single mint here is stable across the
-	// substream's whole life). See MintSubstreamId for the encoding / uniqueness
-	// rationale, and VgiTableInOutLocalState::substream_id for the contract.
+	// One InitLocal == one substream; Execute and FinalExecute run on the same
+	// local state, so this id is stable for the substream's life.
 	local_state->substream_id = MintSubstreamId();
 	return local_state;
 }
 
-// ============================================================================
 // Arrow Batch to DuckDB DataChunk Conversion Helpers
-// ============================================================================
 
-//! Load a batch into the ArrowScanLocalState for consumption.
-//! Must call Reset() to clear stale owned_data references before loading a new batch.
+//! Resets the scan state first, clearing stale owned_data references.
 void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
                             const VgiBatchPtr &batch) {
 	auto chunk = make_uniq<ArrowArrayWrapper>();
@@ -583,24 +487,15 @@ void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
 	local_state.Reset();
 }
 
-//! Check whether the local state has remaining rows to produce from the current batch.
 bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state) {
 	return local_state.chunk && local_state.chunk->arrow_array.release &&
 	       local_state.chunk_offset < static_cast<idx_t>(local_state.chunk->arrow_array.length);
 }
 
-//! Produce one DataChunk (up to STANDARD_VECTOR_SIZE rows) from the current batch,
-//! advancing chunk_offset. Returns the number of rows produced.
-//!
-//! The destination ``output`` chunk may have MORE columns than the worker's
-//! output (e.g., under LATERAL, DuckDB's PhysicalTableInOutFunction appends
-//! correlated/projected-input columns to the chunk and expects the table
-//! in-out function to leave them alone). ``ArrowTableFunction::ArrowToDuckDB``
-//! iterates all of ``output.ColumnCount()`` columns, which would walk off the
-//! end of the Arrow batch's child array. To handle that, we build a temporary
-//! ``DataChunk`` that references only the first ``n_children`` vectors of
-//! ``output`` and convert into that. Writes land in the shared underlying
-//! vector buffers; the trailing correlated columns stay untouched.
+//! Advances chunk_offset; returns the rows produced. ``output`` may have more
+//! columns than the worker emits (LATERAL appends the correlated columns), and
+//! ArrowToDuckDB would iterate all of them, so the trailing ones are handled
+//! below.
 idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTableSchema &arrow_table,
                              DataChunk &output, bool projection_pushdown) {
 	idx_t remaining = static_cast<idx_t>(local_state.chunk->arrow_array.length) - local_state.chunk_offset;
@@ -609,35 +504,19 @@ idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTa
 
 	idx_t fn_columns = static_cast<idx_t>(local_state.chunk->arrow_array.n_children);
 	D_ASSERT(fn_columns <= output.ColumnCount());
-	// Under projection_pushdown, the worker emitted a narrow Arrow batch
-	// (positional columns matching the projection_ids order). The arrow
-	// type map ``arrow_table.GetColumns()`` is keyed by *worker-original*
-	// column index (built from the full output schema at bind), so reading
-	// it requires the remap-via-column_ids that
-	// ``arrow_scan_is_projected=true`` enables (see
-	// ``duckdb/src/function/table/arrow_conversion.cpp`` —
-	// ``ArrowToDuckDB`` reads ``col_idx = column_ids[idx]`` for the type
-	// map and ``arrow_array_idx = idx`` for the data).
+	// Under projection_pushdown the batch is narrow (projection_ids order), but
+	// arrow_table's type map is keyed by worker-original column index, hence
+	// arrow_scan_is_projected=true: ArrowToDuckDB then reads the type at
+	// column_ids[idx] and the data at idx.
 	if (fn_columns == output.ColumnCount()) {
 		ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), output, projection_pushdown);
 	} else {
-		// LATERAL / projected-input path: DuckDB's PhysicalTableInOutFunction
-		// appended correlated outer columns at ``[fn_columns, ColumnCount)``
-		// and pre-filled them before calling us. ``ArrowToDuckDB`` iterates
-		// ``output.ColumnCount()`` and during zero-copy conversion *rebinds*
-		// each destination Vector's buffer (see
-		// ``duckdb/src/function/table/arrow_conversion.cpp``), so a
-		// ``Reference``-based view over the leading columns of ``output``
-		// would leave ``output.data[c]`` unchanged — the rebind would land on
-		// the view's Vector object and never propagate back.
-		//
-		// Instead, convert into a freshly-allocated scratch chunk and then
-		// ``output.data[c].Reference(scratch.data[c])``. Vector buffer
-		// refcounting keeps the Arrow data alive after ``scratch`` goes out
-		// of scope, and the trailing LATERAL-projected columns are
-		// untouched. With projection_pushdown the scratch's types come
-		// from ``output.data[c]`` which are the post-projection slot
-		// types — already correct.
+		// LATERAL: PhysicalTableInOutFunction pre-filled the correlated columns at
+		// [fn_columns, ColumnCount). Zero-copy conversion *rebinds* each destination
+		// Vector's buffer, so converting into a view over output's leading columns
+		// would never reach output.data[c]. Convert into a scratch chunk and
+		// Reference() its vectors instead; buffer refcounting keeps the data alive.
+		// The scratch types come from output.data[c], already post-projection.
 		DataChunk scratch;
 		vector<LogicalType> scratch_types;
 		scratch_types.reserve(fn_columns);
@@ -656,9 +535,7 @@ idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTa
 	return output.size();
 }
 
-// ============================================================================
-// Phase A: per-substream worker helpers (parallel, no-finalize path)
-// ============================================================================
+// Per-substream worker helpers (parallel path)
 
 // Acquire + init a fresh worker for ONE substream (one VgiTableInOutLocalState).
 // Mirrors the serial InitGlobal acquire, reading the already-captured
@@ -706,7 +583,7 @@ AcquireSubstreamConnection(ClientContext &context, const VgiTableInOutBindData &
 // (worker-original column indices) is threaded when the function supports
 // projection pushdown so it emits only the referenced columns; the operator sets
 // the scan state's column_ids to match for the projected read. No filter pushdown
-// (DuckDB's InOut path discards table_filters). Mirrors AcquireSubstreamConnection.
+// (streaming InOut does not advertise it). Mirrors AcquireSubstreamConnection.
 std::unique_ptr<IFunctionConnection>
 AcquireBlendedInputConnection(ClientContext &context, const VgiTableInOutBindData &bind_data,
                               const std::vector<uint8_t> &substream_id,
@@ -828,9 +705,7 @@ static void RefuseSharedContinuation(const VgiTableInOutBindData &bind_data, boo
 	}
 }
 
-// ============================================================================
 // In-Out Function (Main Processing)
-// ============================================================================
 
 OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctionInput &data,
                                           DataChunk &input, DataChunk &output) {
@@ -857,10 +732,9 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		    "streaming TableInOutGenerator shape.", bind_data.function_name);
 	}
 
-	// Phase A: select the exchange connection. A parallel (no-finalize) function
-	// uses THIS substream's own worker (per-substream fan-out) — acquired lazily
-	// here on first use, and NOT shared, so no exchange mutex. A finalize function
-	// uses the single shared global connection under exchange_mutex (serial path).
+	// Parallel path: this substream's own worker, acquired lazily, no mutex.
+	// Serial (max_workers = 1) path: the shared global connection under
+	// exchange_mutex.
 	const bool parallel = global_state.parallel_safe;
 	if (parallel) {
 		if (!local_state.connection) {
@@ -873,7 +747,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	IFunctionConnection &conn = parallel ? *local_state.connection : *global_state.connection;
 
 	// ------------------------------------------------------------------------
-	// Phase B — blended LITERAL scan-mode (single_row_scan).
+	// Blended LITERAL scan mode (single_row_scan).
 	// ------------------------------------------------------------------------
 	// DuckDB drives the childless call shape (f(52,13) / pure-varargs childless)
 	// through PhysicalTableScan, which acts as a SOURCE: it re-invokes this
@@ -948,13 +822,10 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			if (!output_batch) {
 				output.SetCardinality(0);
 				if (parallel) {
-					// Input was closed in step 2 and the output is now read to EOS, so a
-					// no-finalize worker is back at its accept loop: pool it, as the
-					// column-shape EOS below and the batched-lateral operator do. This
-					// used to drop the connection, which cost every literal call
-					// (`f('x')`) a fresh worker spawn. A finalize function still owes
-					// the worker its FINALIZE handshake, and a worker that broke the
-					// stream is never pooled.
+					// Input closed and output read to EOS: a no-finalize worker is back at
+					// its accept loop, so pool it (dropping it would cost every literal
+					// call a spawn). A finalize function still owes the FINALIZE
+					// handshake, and a worker that broke the stream is never pooled.
 					if (!bind_data.has_finalize && !worker_exited) {
 						ReleaseSubstreamConnection(local_state.connection, bind_data, client_context);
 					} else {
@@ -1027,7 +898,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		input_batch = ConvertInputToArrow(client_context, input, bind_data);
 	}
 
-	// Exchange-mode result cache (M1). Key this input batch (ordered — the output is
+	// Exchange-mode result cache. Key this input batch (ordered — the output is
 	// positionally aligned to the input) on the static key + input-batch hash. A HIT
 	// replays the cached output batch and SKIPS the worker exchange (no write_input
 	// log = proof of hit); a MISS runs the exchange and, once the worker's cc is
@@ -1052,7 +923,8 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			reval_entry = reval;
 			conn.SetConditionalRequest(reval->etag, reval->last_modified);
 		} else {
-			auto entry = GetResultCache(client_context).Lookup(batch_key, now);
+			const char *hit_tier = "memory";
+			auto entry = GetResultCache(client_context).Lookup(batch_key, now, &hit_tier);
 			if (entry && !entry->streams.empty() && !entry->streams[0].batches.empty()) {
 				output_batch = DeserializeCachedRecordBatch(*entry, entry->streams[0].batches[0]);
 				cache_hit = true;
@@ -1060,18 +932,14 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 				VGI_LOG(client_context, "result_cache.hit",
 				        {{"function", bind_data.function_name},
 				         {"key_hash", batch_key.HexDigest()},
-				         {"tier", "memory"}});
+				         {"tier", hit_tier}});
 			}
 		}
 	}
 
 	if (!cache_hit) {
-		// The 1:1 write→read exchange. SERIAL (finalize) path: the ONE shared
-		// `connection` is fed by multiple source sub-pipelines under UNION ALL whose
-		// PipelineExecutors may run concurrently, so hold `exchange_mutex` across the
-		// whole write→read (else their calls interleave on the single IPC stream and
-		// desync the worker's schema-first reader). PARALLEL path: this substream owns
-		// its connection exclusively, so no lock is needed.
+		// The 1:1 write→read exchange; the serial path holds exchange_mutex across it
+		// (see VgiTableInOutGlobalState::exchange_mutex).
 		std::unique_lock<std::mutex> exchange_guard;
 		if (!parallel) {
 			exchange_guard = std::unique_lock<std::mutex>(global_state.exchange_mutex);
@@ -1083,7 +951,6 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		         {"function_name", bind_data.function_name},
 		         {"input_rows", std::to_string(input_batch->num_rows())}});
 
-		// Write the input batch to the worker
 		if (timing) {
 			ScopedNs _t(ClientTiming::Instance().write_ns);
 			conn.WriteInputBatch(input_batch);
@@ -1091,7 +958,6 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			conn.WriteInputBatch(input_batch);
 		}
 
-		// Read output batch (1:1 lockstep in exchange mode)
 		if (timing) {
 			ScopedNs _t(ClientTiming::Instance().read_ns);
 			output_batch = conn.ReadDataBatch();
@@ -1222,9 +1088,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	                                                                         : OperatorResultType::NEED_MORE_INPUT;
 }
 
-// ============================================================================
 // Finalize Function
-// ============================================================================
 
 OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<VgiTableInOutBindData>();
@@ -1243,7 +1107,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		    "streaming TableInOutGenerator shape.", bind_data.function_name);
 	}
 
-	// Phase A: select the connection this substream finalizes on. PARALLEL path:
+	// Select the connection this substream finalizes on. PARALLEL path:
 	// each substream drives the FINALIZE phase on its OWN worker (the one that saw
 	// this substream's input), so its per-substream finalize reads its own state.
 	// SERIAL path: the single shared global connection. A parallel substream that
@@ -1284,9 +1148,8 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		}
 	};
 
-	// Perform finalize init (only once per substream)
-	// This closes current data streams and opens new init with phase=FINALIZE
-	// The worker enters producer mode (tick-based) to emit any finalize output
+	// FINALIZE init, once per substream: closes the input stream and puts the
+	// worker in producer (tick) mode for its finalize output.
 	if (conn->IsTableInOut() && !conn->IsFinished() && !finalize_sent) {
 		conn->PerformFinalizeInit(global_state.bind_result);
 		finalize_sent = true;
@@ -1305,8 +1168,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		         {"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"output_rows", std::to_string(rows_copied)}});
-		// Always return HAVE_MORE_OUTPUT — next call will either continue this batch
-		// or read the next one from the worker
+		// The next call continues this batch or reads the next one.
 		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 	}
 
@@ -1315,28 +1177,13 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	        {{"conn", conn->GetConnIdHex()},
 	         {"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name}});
-	// EOS is a NULL batch. A 0-ROW batch is not — it is a producer turn that
-	// carried no data, and treating it as end-of-stream silently truncated every
-	// multi-batch FINALIZE over HTTP.
-	//
-	// How it presented: the FINALIZE init response buffers its batches, and the
-	// last one is empty. Over subprocess that empty batch never arrives (the IPC
-	// reader returns null at EOS), so the bug was invisible there; over HTTP the
-	// first read returned the data batch and the second returned the empty one,
-	// which ended the stream while `stream_state_token_` was still live. The
-	// continuation request was never issued at all — measured as 2 reads, 1
-	// emitted batch and 0 producer exchanges for a flush of 200. A worker whose
-	// finalize emits one batch was unaffected, which is every other fixture, in
-	// every SDK.
-	//
-	// It failed SILENTLY rather than loudly: the rows that did arrive were
-	// correct, so only a count betrayed the missing ones.
-	//
-	// Skipping empties here rather than returning HAVE_MORE_OUTPUT keeps the
-	// decision inside this call, so it does not depend on how DuckDB treats an
-	// empty output chunk from FinalExecute. The loop terminates because an
-	// exhausted producer returns null: over HTTP once the response carries no
-	// continuation token, over subprocess at IPC EOS.
+	// EOS is a NULL batch. A 0-ROW batch is a producer turn with no data (over
+	// HTTP the FINALIZE init response's last buffered batch is empty while a
+	// continuation is still owed); ending on it silently truncates multi-batch
+	// finalize output. Empties are skipped here, not returned as
+	// HAVE_MORE_OUTPUT, so this does not depend on how DuckDB treats an empty
+	// FinalExecute chunk. The loop ends because an exhausted producer returns
+	// null (HTTP: no continuation token; subprocess: IPC EOS).
 	VgiBatchPtr output_batch;
 	for (;;) {
 		output_batch = conn->ReadDataBatch();
@@ -1346,7 +1193,6 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	}
 
 	if (!output_batch) {
-		// End of stream - clean up
 		release_and_finish();
 		return OperatorFinalizeResultType::FINISHED;
 	}
@@ -1359,7 +1205,6 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		                                bind_data.function_name);
 	}
 
-	// Load batch into scan state and produce output
 	LoadBatchIntoScanState(local_state, output_batch);
 	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
 

@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
@@ -26,6 +27,7 @@
 using duckdb::vgi::BuildContainerRunCommandTemplate;
 using duckdb::vgi::ContainerConnMode;
 using duckdb::vgi::ContainerConnModeName;
+using duckdb::vgi::ContainerOwnerPidIsGone;
 using duckdb::vgi::ContainerSpec;
 using duckdb::vgi::ContainerSpecHash;
 using duckdb::vgi::ContainerVolume;
@@ -311,4 +313,22 @@ TEST_CASE("ContainerRuntimeUnavailableReason recognises a stopped daemon", "[con
 	                                                    "resource is denied")
 	            .empty());
 	REQUIRE(ContainerRuntimeUnavailableReason("docker", "").empty());
+}
+
+TEST_CASE("ContainerOwnerPidIsGone is true only for a pid that no longer exists", "[container]") {
+	// Self and init are alive; init is another user's (EPERM) unless run as root,
+	// and EPERM must not count as gone or the reaper removes a live owner's container.
+	CHECK_FALSE(ContainerOwnerPidIsGone(static_cast<long long>(getpid())));
+	CHECK_FALSE(ContainerOwnerPidIsGone(1));
+	CHECK_FALSE(ContainerOwnerPidIsGone(0));
+	CHECK_FALSE(ContainerOwnerPidIsGone(-1));
+
+	pid_t child = fork();
+	REQUIRE(child >= 0);
+	if (child == 0) {
+		_exit(0);
+	}
+	int status = 0;
+	REQUIRE(waitpid(child, &status, 0) == child);
+	CHECK(ContainerOwnerPidIsGone(static_cast<long long>(child)));
 }

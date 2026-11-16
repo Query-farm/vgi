@@ -37,35 +37,32 @@ std::vector<uint8_t> BuildBindRequestBytes(
     const std::string &schema_name,
     const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
 
-	// 1. Convert arguments to IPC bytes (Python expects a struct column "args";
-	// ArrowArguments::batch already is that one-row {args: struct} batch).
+	// ArrowArguments::batch already is the one-row {args: struct} batch.
 	std::vector<uint8_t> arguments_bytes;
 	if (arguments_batch) {
 		arguments_bytes = SerializeToIpcBytes(arguments_batch);
 	} else {
-		static const VgiBatchPtr empty_args =
-		    VgiBatch::MakeEmpty(MakeSchema({type::Struct({}).Named("args")}));
-		arguments_bytes = SerializeToIpcBytes(empty_args);
+		// One valid empty row: Python's Arguments.deserialize_from_bytes reads row 0.
+		VgiBatchBuilder builder(MakeSchema({type::Struct({}).Named("args")}));
+		append::FinishElement(builder.column(0));
+		builder.FinishRow();
+		arguments_bytes = SerializeToIpcBytes(builder.Finish());
 	}
 
-	// 2. Serialize settings if non-empty
 	std::vector<uint8_t> settings_bytes;
 	if (!settings.empty()) {
 		auto settings_batch = BuildSettingsBatch(context, settings);
 		settings_bytes = SerializeToIpcBytes(settings_batch);
 	}
 
-	// 3. Serialize input_schema if set
 	std::vector<uint8_t> input_schema_bytes;
 	if (input_schema) {
 		input_schema_bytes = SerializeSchemaToIpcBytes(input_schema);
 	}
 
-	// 4. Build secrets bytes from already-resolved secrets (BuildSecretsBatch
-	// returns IPC bytes directly, despite its name).
+	// BuildSecretsBatch returns IPC bytes, despite its name.
 	auto secrets_bytes = BuildSecretsBatch(context, resolved_secrets);
 
-	// 5. Build BindRequest and serialize.
 	auto bind_request = BuildBindRequest(function_name, arguments_bytes, function_type,
 	                                     input_schema_bytes, settings_bytes, secrets_bytes,
 	                                     attach_opaque_data, transaction_opaque_data, resolved_secrets_provided,
@@ -77,18 +74,14 @@ BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_byt
                                            const std::vector<uint8_t> &bind_response_bytes,
                                            const std::string &worker_label, bool secret_dependent,
                                            const std::map<std::string, std::map<std::string, Value>> &resolved_secrets) {
-	// Deserialize the inlined BindResponse blob.
 	auto bind_response_batch = DeserializeFromIpcBytes(
 	    bind_response_bytes.data(), bind_response_bytes.size());
 	if (!bind_response_batch || bind_response_batch->num_rows() == 0) {
 		throw IOException("Inlined bind_result is empty or malformed [worker: %s]", worker_label);
 	}
 
-	// Reject secret-scope responses inline-bound — those require an RPC retry
-	// dance that the inlined path cannot drive. The worker shouldn't have
-	// produced one in this position, but if it did, fall back is the right
-	// behavior; surfacing as an exception lets PerformVgiTableFunctionBind's
-	// try/catch route through the on-demand RPC path.
+	// A secret-scope request needs the RPC retry; throwing lets the caller fall
+	// back to the on-demand bind RPC.
 	auto scope_request = TryParseBindSecretScopeResponse(bind_response_batch);
 	if (scope_request) {
 		throw IOException(
@@ -130,8 +123,8 @@ BindResult PerformBindProtocol(
     const std::string &schema_name,
     const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
 
-	// Resolve unscoped + static-scope/name secrets up front. Scoped secrets
-	// requested by the worker mid-bind are merged in below if needed.
+	// Resolve declared secrets up front; scoped secrets the worker requests
+	// mid-bind are merged in below.
 	const bool query_executor = function_name == VGI_QUERY_EXECUTOR;
 	if (query_executor && !required_secrets.empty()) {
 		throw IOException("vgi_query does not allow external secret resolution");
@@ -139,18 +132,15 @@ BindResult PerformBindProtocol(
 	auto secrets = ExtractVgiSecrets(context, required_secrets);
 	bool secret_dependent = !required_secrets.empty();
 
-	// First-attempt request bytes (resolved_secrets_provided=false).
 	auto bind_request_bytes = BuildBindRequestBytes(
 	    context, function_name, function_type, arguments_batch, input_schema,
 	    attach_opaque_data, transaction_opaque_data, settings, secrets,
 	    /*resolved_secrets_provided=*/false, worker_label, at_unit, at_value, copy_from, copy_to, schema_name,
 	    argument_names);
 
-	// Send first bind and read response.
 	auto bind_response_batch = transport_fn(bind_request_bytes);
 
-	// Two-phase secret-scope bind: worker can request additional scoped
-	// secrets, we resolve them and re-send with resolved_secrets_provided=true.
+	// Two-phase bind: resolve the requested scoped secrets and resend once.
 	auto scope_request = TryParseBindSecretScopeResponse(bind_response_batch);
 	if (scope_request) {
 		if (query_executor) {
@@ -190,8 +180,8 @@ BindResult PerformBindProtocol(
 	auto bind_response = ParseBindResponse(bind_response_batch, worker_label);
 	auto output_schema_bytes = SerializeSchemaToIpcBytes(bind_response.output_schema);
 
-	// `secrets` is now exactly what the final bind_request_bytes carried —
-	// including any scoped secrets merged in by the two-phase retry.
+	// `secrets` is exactly what the final bind_request_bytes carried, including
+	// scoped secrets merged by the retry.
 	return BindResult {bind_response.output_schema,
 	                   bind_response.opaque_data,
 	                   std::move(bind_request_bytes),

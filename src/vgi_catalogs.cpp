@@ -6,6 +6,7 @@
 #include "vgi_location_policy.hpp"
 #include "vgi_iroh_config.hpp"
 #include "vgi_oauth.hpp"
+#include "vgi_worker_pool.hpp"
 
 #include <string>
 #include <vector>
@@ -59,8 +60,7 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("data_version_spec");
 
-	// Attach-time options declared by this catalog (for pre-attach discovery).
-	// Each element describes one option; type/default rendered as VARCHAR for display.
+	// Attach-time options declared by this catalog; type/default rendered as VARCHAR.
 	child_list_t<LogicalType> option_fields;
 	option_fields.emplace_back("name", LogicalType::VARCHAR);
 	option_fields.emplace_back("description", LogicalType::VARCHAR);
@@ -93,6 +93,9 @@ static unique_ptr<GlobalTableFunctionState> VgiCatalogsInitGlobal(ClientContext 
 	auto state = make_uniq<VgiCatalogsGlobalState>();
 
 	vgi::CheckLocationPolicy(context, bind_data.worker_path, vgi::LocationEntryPoint::VGI_CATALOGS);
+	// No ATTACH may have configured this path: size its pool from this session.
+	vgi::VgiWorkerPool::Instance().ConfigureDiscoveryPath(bind_data.worker_path,
+	                                                      vgi::PoolSettingsFromSession(context));
 	state->catalogs = vgi::InvokeCatalogs(bind_data.worker_path, context, /*worker_debug=*/false, /*use_pool=*/true,
 	                                      bind_data.auth, std::nullopt, std::nullopt, /*worker_artifact_anchor=*/nullptr,
 	                                      /*tcp_proxy=*/"", bind_data.iroh);
@@ -120,7 +123,6 @@ static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, D
 		output.data[1].SetValue(count, Value(info.implementation_version));
 		output.data[2].SetValue(count, Value(info.data_version_spec));
 
-		// Build LIST(STRUCT(...)) of attach options.
 		child_list_t<LogicalType> struct_child_types;
 		struct_child_types.emplace_back("name", LogicalType::VARCHAR);
 		struct_child_types.emplace_back("description", LogicalType::VARCHAR);
@@ -146,7 +148,6 @@ static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, D
 		}
 		output.data[3].SetValue(count, Value::LIST(struct_type, std::move(option_values)));
 
-		// Build LIST(STRUCT(...)) of releases.
 		child_list_t<LogicalType> release_child_types;
 		release_child_types.emplace_back("version", LogicalType::VARCHAR);
 		release_child_types.emplace_back("released_at", LogicalType::TIMESTAMP_TZ);
@@ -307,7 +308,6 @@ void RegisterVgiCatalogsFunction(ExtensionLoader &loader) {
 	// Same authentication and iroh_* options as ATTACH (and vgi_protocols()).
 	vgi::AddDiscoveryNamedParameters(func);
 
-	// Enable EXPLAIN output
 	func.to_string = VgiCatalogsToString;
 
 	CreateTableFunctionInfo info(func);

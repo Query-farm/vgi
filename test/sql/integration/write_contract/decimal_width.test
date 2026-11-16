@@ -1,0 +1,54 @@
+# name: test/sql/integration/write_contract/decimal_width.test
+# description: INSERT into a table whose worker declares decimal32 / decimal64 /
+#              decimal128 columns. VGI exports every DECIMAL as decimal128;
+#              ReconcileBatchToSchema re-encodes each value at the declared
+#              width. It used to fail with "failed to cast
+#              decimal128(7, 2) -> decimal32(7, 2)". The wcfix fixture's
+#              amounts_insert refuses any batch whose widths differ.
+# group: [vgi_integration_write_contract]
+
+require-env VGI_WRITE_CONTRACT_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'wcfix' AS w (TYPE vgi, LOCATION '${VGI_WRITE_CONTRACT_WORKER}');
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'w' AND table_name = 'amounts' ORDER BY column_index;
+----
+id	BIGINT
+d32	DECIMAL(7,2)
+d64	DECIMAL(15,3)
+d128	DECIMAL(9,2)
+
+# decimal128 from DuckDB: d32 and d64 narrow, d128 (rebuilt with them) stays.
+query I
+INSERT INTO w.main.amounts VALUES
+    (1, 12345.67, -123456789012.345, 1234567.89),
+    (2, -99999.99, 999999999999.999, -9999999.99),
+    (3, NULL, 0.001, NULL);
+----
+3
+
+# arrow_output_version 1.5 must not change what reaches the worker: VGI exports
+# with wire-stable options (no view layouts, which the write_options BLOB would
+# otherwise use), so the batch is decimal128 and narrows as above.
+statement ok
+SET arrow_output_version = '1.5';
+
+query I
+INSERT INTO w.main.amounts VALUES (4, -0.01, -0.001, 0.01);
+----
+1
+
+statement ok
+RESET arrow_output_version;
+
+query ITTT
+SELECT id, d32::VARCHAR, d64::VARCHAR, d128::VARCHAR FROM w.main.amounts WHERE id <= 4 ORDER BY id;
+----
+1	12345.67	-123456789012.345	1234567.89
+2	-99999.99	999999999999.999	-9999999.99
+3	NULL	0.001	NULL
+4	-0.01	-0.001	0.01

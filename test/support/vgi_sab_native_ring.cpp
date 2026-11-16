@@ -458,6 +458,9 @@ void vgi_sab_native_worker_fail_claim(int region_offset, int slot, int claim, in
 int vgi_sab_native_w2c_closed_claim(int region_offset, int slot) {
 	return slot_at(region_offset, slot).w2c_closed_claim.load(std::memory_order_acquire);
 }
+int vgi_sab_native_c2w_closed(int region_offset, int slot) {
+	return slot_at(region_offset, slot).c2w_closed.load(std::memory_order_acquire);
+}
 int vgi_sab_native_slot_reservation(int region_offset, int slot) {
 	return slot_at(region_offset, slot).reservation.load(std::memory_order_acquire);
 }

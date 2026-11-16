@@ -17,10 +17,7 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// vgi_table_statistics(catalog, schema, table) — diagnostic table function
-// Returns per-column statistics with UNION-typed min/max
-// ============================================================================
+// vgi_table_statistics(catalog, schema, table): per-column statistics with UNION-typed min/max.
 
 struct VgiTableStatisticsData : public TableFunctionData {
 	struct ColumnStat {
@@ -34,7 +31,6 @@ struct VgiTableStatisticsData : public TableFunctionData {
 	mutable idx_t current_idx = 0;
 };
 
-// Extract min Value from BaseStatistics (type-aware)
 static Value ExtractMinValue(const BaseStatistics &stats) {
 	switch (stats.GetStatsType()) {
 	case StatisticsType::NUMERIC_STATS:
@@ -54,7 +50,6 @@ static Value ExtractMinValue(const BaseStatistics &stats) {
 	return Value();
 }
 
-// Extract max Value from BaseStatistics (type-aware)
 static Value ExtractMaxValue(const BaseStatistics &stats) {
 	switch (stats.GetStatsType()) {
 	case StatisticsType::NUMERIC_STATS:
@@ -80,14 +75,12 @@ static unique_ptr<FunctionData> VgiTableStatisticsBind(ClientContext &context, T
 	auto schema_name = input.inputs[1].GetValue<string>();
 	auto table_name = input.inputs[2].GetValue<string>();
 
-	// Look up the table entry
 	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 	auto table_entry = catalog.GetEntry<TableCatalogEntry>(context, Identifier(schema_name), Identifier(table_name),
 	                                                        OnEntryNotFound::THROW_EXCEPTION);
 
 	auto data = make_uniq<VgiTableStatisticsData>();
 
-	// Collect statistics for each column and track distinct types for the UNION
 	auto &columns = table_entry->GetColumns();
 	std::map<string, uint8_t> type_tag_map; // type name → UNION tag
 
@@ -98,9 +91,8 @@ static unique_ptr<FunctionData> VgiTableStatisticsBind(ClientContext &context, T
 		cs.column_type = col.GetType();
 		cs.stats = table_entry->GetStatistics(context, i);
 
-		// Track type for UNION construction.
-		// Geometry stats are displayed as VARCHAR (bounding box text), so map
-		// GEOMETRY → VARCHAR in the union to avoid type issues.
+		// Geometry stats are displayed as VARCHAR (bounding box text), so the union
+		// member for a GEOMETRY column is VARCHAR.
 		auto display_type = col.GetType();
 		if (display_type.id() == LogicalTypeId::GEOMETRY) {
 			display_type = LogicalType::VARCHAR;
@@ -116,13 +108,11 @@ static unique_ptr<FunctionData> VgiTableStatisticsBind(ClientContext &context, T
 		data->columns.push_back(std::move(cs));
 	}
 
-	// Build the UNION type (or use a single VARCHAR if no columns)
 	if (data->union_members.empty()) {
 		data->union_members.push_back({Identifier("varchar"), LogicalType::VARCHAR});
 	}
 	data->union_type = LogicalType::UNION(data->union_members);
 
-	// Return schema
 	return_types = {
 	    LogicalType::VARCHAR,     // column_name
 	    LogicalType::VARCHAR,     // column_type
@@ -148,15 +138,13 @@ static void VgiTableStatisticsScan(ClientContext &context, TableFunctionInput &i
 		auto &cs = data.columns[data.current_idx++];
 
 		if (!cs.stats) {
-			// No stats for this column — skip
 			continue;
 		}
 
 		output.SetValue(0, count, Value(cs.column_name));
 		output.SetValue(1, count, Value(cs.column_type.ToString()));
 
-		// Build UNION values for min/max
-		// For geometry, use VARCHAR display type; for others, use column type
+		// Same GEOMETRY -> VARCHAR display mapping as in the bind.
 		auto display_type = cs.column_type;
 		if (display_type.id() == LogicalTypeId::GEOMETRY) {
 			display_type = LogicalType::VARCHAR;
@@ -186,15 +174,13 @@ static void VgiTableStatisticsScan(ClientContext &context, TableFunctionInput &i
 			output.SetValue(3, count, Value());
 		}
 
-		// Null flags
 		output.SetValue(4, count, Value::BOOLEAN(cs.stats->CanHaveNull()));
 		output.SetValue(5, count, Value::BOOLEAN(cs.stats->CanHaveNoNull()));
 
-		// Distinct count
+		// DuckDB uses 0 for "unknown".
 		auto dc = cs.stats->GetDistinctCount();
-		output.SetValue(6, count, Value::BIGINT(static_cast<int64_t>(dc)));
+		output.SetValue(6, count, dc > 0 ? Value::BIGINT(static_cast<int64_t>(dc)) : Value());
 
-		// String-specific fields: contains_unicode and max_string_length
 		if (cs.stats->GetStatsType() == StatisticsType::STRING_STATS) {
 			output.SetValue(7, count, Value::BOOLEAN(StringStats::CanContainUnicode(*cs.stats)));
 			if (StringStats::HasMaxStringLength(*cs.stats)) {

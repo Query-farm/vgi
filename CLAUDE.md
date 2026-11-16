@@ -15,7 +15,7 @@ Feature-level documentation lives in `docs/` — see *Feature reference* at the 
 
 `~/Development/vgi` on **`v2.0`** is the primary DuckDB 2.0/nanoarrow checkout.
 The `vgi-nano` migration is incorporated here. The `duckdb` submodule pins Haybarn's
-2.0 engine at `54f8340a3ede`; `extension_config.cmake` pins its matching HTTPFS fork.
+2.0 engine at `81e301d620bf`; `extension_config.cmake` pins its matching HTTPFS fork.
 Use the committed submodule revision, not `git submodule update --remote`.
 
 The wire contract is **`vgi.v3` / `3.3.0`** (`FunctionInfo.visibility`, see
@@ -226,8 +226,8 @@ cmake --build build/release --target vgi_unit_tests
 ```
 
 These cache paths affect only `vgi_unit_tests`. The default fixtures use the
-registry VGI 0.48 SDK (`vgi.v3` / `3.0.0`), vgi-rpc 0.32 and Arrow 60, pinned by
-both lockfiles. The lock guard also checks the matching `vgi-protocol` package
+registry VGI 0.51 SDK (`vgi.v3` / `3.3.0`), vgi-rpc 0.32.4 and Arrow 59, pinned by
+both lockfiles (Arrow 59 matches the Rust SDK, which tracks DataFusion's Arrow). The lock guard also checks the matching `vgi-protocol` package
 and Arrow versions. Before a SAB worker thread starts, its linked SDK identity
 must match the native generated protocol name/version. Candidate-library
 results prove candidate interoperability, not a published-dependency release.
@@ -399,13 +399,14 @@ remain supported. Preserve this rule when changing pool/connection cleanup.
 
 1. `VGI_LOG(context, "event", {{"key", "val"}})` — DuckDB log manager.
 2. `VGI_STDERR_DEBUG(...)` — no context needed, enabled by `VGI_STDERR_LOG=1`.
-3. In-band worker logs — 0-row batches with `vgi_rpc.log_level` metadata; `EXCEPTION` throws
-   `IOException`.
+3. In-band worker logs — 0-row batches with `vgi_rpc.log_level` metadata; `EXCEPTION` throws via
+   `ThrowVgiUserException` (`InvalidInputException`, or `VgiRpcException` with an error kind/code),
+   deliberately not `IOException` so it is never retried.
 
 ### Concurrency
 
-- `VgiCatalogSet` guards entries with `entry_lock_`; `LoadEntries()` overrides call
-  `CreateEntryLocked()` with the lock held.
+- `VgiCatalogSet` guards entries with `entry_lock_`. `LoadEntries()` runs under `load_lock_`, not
+  `entry_lock_`; overrides take `entry_lock_` themselves around each `CreateEntryLocked()` call.
 - `VgiWorkerPool` uses `mutex_` (pool ops) and `cleanup_mutex_` (cleanup thread).
 - A `FunctionConnection` is single-threaded (one per query thread).
 

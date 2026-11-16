@@ -57,16 +57,13 @@ std::vector<uint8_t> PackValidityMask(const ValidityMask &mask, idx_t row_count)
 	return out;
 }
 
-// Convert the partition's ColumnDataCollection into a batch.
-// Handles the inputs=nullptr edge case (no-column aggregate — rare but legal).
+// Handles inputs=nullptr (a no-column aggregate) with a 0-column batch.
 VgiBatchPtr PartitionToArrow(ClientContext &context,
                                                      const WindowPartitionInput &partition) {
 	if (!partition.inputs || partition.column_ids.empty()) {
-		// No input columns — return an empty 0-column batch with just the row count.
 		return VgiBatch::FromColumns(VgiSchema::Empty(), static_cast<int64_t>(partition.count), {});
 	}
 
-	// Project only the columns this aggregate cares about.
 	const auto &all_types = partition.inputs->Types();
 	vector<LogicalType> proj_types;
 	vector<string> proj_names;
@@ -79,9 +76,8 @@ VgiBatchPtr PartitionToArrow(ClientContext &context,
 
 	auto arrow_schema = BuildArrowSchemaFromDuckDB(context, proj_types, proj_names);
 
-	// Scan the ColumnDataCollection into a single DataChunk sized to the
-	// partition row count. For very large partitions this materialises the
-	// whole thing in memory — an explicitly accepted tradeoff (see plan).
+	// Materializes the whole partition in one DataChunk (accepted tradeoff for
+	// very large partitions).
 	DataChunk chunk;
 	chunk.Initialize(context, proj_types, partition.count);
 	chunk.SetCardinality(partition.count);
@@ -102,15 +98,9 @@ VgiBatchPtr PartitionToArrow(ClientContext &context,
 	return DataChunkToArrow(context, chunk, arrow_schema);
 }
 
-// ============================================================================
-// Request builders
-// ============================================================================
-
-// The owning catalog schema rides on every window RPC for the same reason it
-// rides on the aggregate ones: a function name is unique only within a schema,
-// so a bare-name re-resolve on the worker can land on a different schema's
-// implementation than the bind did. Empty string serialises as null (the
-// legitimate "no schema named" form) — the field stays nullable.
+// Every window RPC carries the owning schema: a function name is unique only
+// within a schema, so a bare-name re-resolve on the worker could pick another
+// schema's implementation. An empty schema serializes as null ("no schema").
 VgiBatchPtr BuildAggregateWindowInitRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
@@ -154,10 +144,8 @@ VgiBatchPtr BuildAggregateWindowRequest(
 	return generated::BuildAggregateWindowParams(SerializeRecord(request));
 }
 
-// Batched window request — sends all (rid, subframes) tuples for one
-// Evaluate() call in a single RPC. The frames_per_row array gives the
-// subframe cardinality per row so the worker can unflatten frame_starts /
-// frame_ends (flat arrays of length sum(frames_per_row)).
+// frames_per_row gives each row's subframe count so the worker can unflatten
+// frame_starts / frame_ends (flat, length sum(frames_per_row)).
 VgiBatchPtr BuildAggregateWindowBatchRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
@@ -197,10 +185,7 @@ VgiBatchPtr BuildAggregateWindowDestructorRequest(
 
 } // anonymous namespace
 
-// ============================================================================
-// Window destructor helper (called from VgiAggregateDestroy)
-// ============================================================================
-
+// Called from VgiAggregateDestroy.
 void SendAggregateWindowDestructorRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
                                        int64_t partition_id) {
 	auto request = BuildAggregateWindowDestructorRequest(
@@ -211,10 +196,6 @@ void SendAggregateWindowDestructorRpc(ClientContext &context, const VgiAggregate
 	InvokeAggregateRpc(context, bind_data, "aggregate_window_destructor", request, /*enable_logging=*/false);
 }
 
-// ============================================================================
-// VgiAggregateWindowInit — called once per OVER partition
-// ============================================================================
-
 void VgiAggregateWindowInit(AggregateInputData &aggr_input_data, const WindowPartitionInput &partition,
                              data_ptr_t g_state) {
 	auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
@@ -224,9 +205,7 @@ void VgiAggregateWindowInit(AggregateInputData &aggr_input_data, const WindowPar
 	}
 	auto &context = *context_lock;
 
-	// Initialize the buffer as a window state (overwrites whatever
-	// VgiAggregateInitialize left there; VgiAggregateState is trivially
-	// destructible so no explicit destructor call needed).
+	// Overwrites the VgiAggregateState VgiAggregateInitialize left here.
 	auto *ls = new (g_state) VgiAggregateWindowLocalState();
 	ls->tag = VgiAggregateStateTag::WINDOW;
 	ls->bind_data = &bind_data;
@@ -246,17 +225,11 @@ void VgiAggregateWindowInit(AggregateInputData &aggr_input_data, const WindowPar
 	InvokeAggregateRpc(context, bind_data, "aggregate_window_init", request);
 }
 
-// ============================================================================
-// VgiAggregateWindow — one RPC per output row
-// ============================================================================
-
 void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartitionInput &partition,
                          const_data_ptr_t g_state, data_ptr_t /*l_state*/,
                          const SubFrames &subframes, Vector &result, idx_t rid) {
-	// partition_id lives on the GLOBAL state (set by VgiAggregateWindowInit).
-	// The per-thread local state is unused here — DuckDB still allocates it
-	// and calls our initialize on it, but we pull the partition_id from the
-	// global state because that's where window_init ran.
+	// partition_id lives in g_state, where VgiAggregateWindowInit ran; the
+	// per-thread l_state is unused.
 	auto *global = reinterpret_cast<const VgiAggregateWindowLocalState *>(g_state);
 	if (!global || global->tag != VgiAggregateStateTag::WINDOW) {
 		throw IOException("VGI aggregate_window called without a matching window_init");
@@ -282,7 +255,6 @@ void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartiti
 		throw IOException(AggregateViolation(bind_data, "aggregate_window"), "VGI aggregate_window returned invalid one-row result");
 	}
 
-	// Convert the one-row Arrow result to a DuckDB Vector and copy into result[rid].
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> out_types;
@@ -305,14 +277,6 @@ void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartiti
 	VectorOperations::Copy(one_row.data[0], result, 1, 0, rid);
 }
 
-// ============================================================================
-// VgiAggregateWindowBatch — one RPC per Evaluate()
-// ============================================================================
-// DuckDB invokes this once per WindowCustomAggregator::Evaluate call with all
-// `count` subframe arrays pre-collected. We ship them in a single batched RPC
-// and fill `result[0..count)` from the returned batch. Reduces total RPCs per
-// partition from N to ~N/STANDARD_VECTOR_SIZE.
-
 void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPartitionInput &partition,
                               const_data_ptr_t g_state, data_ptr_t /*l_state*/,
                               const SubFrames *subframes_per_row, idx_t count,
@@ -321,6 +285,9 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 	if (!global || global->tag != VgiAggregateStateTag::WINDOW) {
 		throw IOException("VGI aggregate_window_batch called without a matching window_init");
 	}
+	if (count == 0) {
+		return;
+	}
 
 	auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
 	auto context_lock = bind_data.context.lock();
@@ -328,6 +295,14 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 		throw IOException("VGI aggregate window: ClientContext is gone");
 	}
 	auto &context = *context_lock;
+
+	if (VgiInfoLogActive(context)) {
+		VGI_LOG(context, "aggregate.window_batch",
+		        {{"function", bind_data.function_name},
+		         {"partition_id", std::to_string(global->partition_id)},
+		         {"row_idx", std::to_string(row_idx)},
+		         {"rows", std::to_string(count)}});
+	}
 
 	auto request = BuildAggregateWindowBatchRequest(
 	    bind_data.function_name, bind_data.schema_name, bind_data.exec_state->execution_id,
@@ -350,7 +325,6 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 		                  bind_data.function_name.c_str());
 	}
 
-	// Convert the count-row Arrow batch to a DataChunk and copy into result[0..count).
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> out_types;

@@ -37,13 +37,11 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 	AggregateFunctionSet func_set {Identifier(registered_name)};
 
 	for (const auto &func_info : overloads) {
-		// Parse argument types
 		vgi::FunctionArgumentTypes arg_types;
 		if (func_info.arguments_schema) {
 			arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
 		}
 
-		// Determine return type (must have exactly 1 field)
 		if (!func_info.output_schema) {
 			throw InvalidInputException("Aggregate function '%s' missing required output_schema", func_info.name);
 		}
@@ -52,7 +50,6 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 			                            func_info.name, func_info.output_schema->num_fields());
 		}
 
-		// Check if output type is dynamic (ANY)
 		auto metadata = func_info.output_schema->field_metadata(0);
 		bool is_any_output = false;
 		if (!metadata.empty()) {
@@ -79,13 +76,11 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 			return_type = output_types[0];
 		}
 
-		// Determine null handling
 		FunctionNullHandling null_handling = FunctionNullHandling::DEFAULT_NULL_HANDLING;
 		if (func_info.null_handling.has_value()) {
 			null_handling = func_info.null_handling.value();
 		}
 
-		// Create AggregateFunction with all VGI callbacks
 		AggregateFunction agg_func(Identifier(registered_name),   // name
 		                           arg_types.positional_types,    // argument types
 		                           return_type,                   // return type
@@ -100,31 +95,23 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 		                           vgi::VgiAggregateDestroy       // destructor
 		);
 
-		// Set varargs if this function accepts variable arguments
 		if (arg_types.has_varargs) {
 			agg_func.GetSignature().AddArgs("args", arg_types.varargs_type);
 		}
 
-		// Set order/distinct dependence from metadata
 		agg_func.SetOrderDependent(func_info.order_dependent);
 		agg_func.SetDistinctDependent(func_info.distinct_dependent);
 
-		// Wire the optional window callbacks when the worker advertises
-		// supports_window. DuckDB's WindowCustomAggregator::CanAggregate
-		// picks the window path automatically for OVER queries; the
-		// standard update/combine/finalize path remains for GROUP BY.
+		// DuckDB's WindowCustomAggregator picks the window callbacks for OVER
+		// queries; GROUP BY keeps the update/combine/finalize path.
 		if (func_info.supports_window) {
 			agg_func.SetWindowInitCallback(vgi::VgiAggregateWindowInit);
-			// SetWindowBatchCallback is a post-v1.5.2 addition (DuckDB main
-			// commit 9677176756 "Add aggregate_window_batch_t"). On v1.5.2
-			// we fall back to the per-row SetWindowCallback path.
-#ifdef DUCKDB_HAS_AGGREGATE_WINDOW_BATCH
+			// Both engines (Haybarn and upstream v2.0.0) prefer the batch callback
+			// when set: one RPC per Evaluate() chunk instead of one per row.
 			agg_func.SetWindowBatchCallback(vgi::VgiAggregateWindowBatch);
-#endif
 			agg_func.SetWindowCallback(vgi::VgiAggregateWindow);
 		}
 
-		// Create and attach VgiAggregateFunctionInfo
 		auto agg_func_info = make_shared_ptr<vgi::VgiAggregateFunctionInfo>();
 		agg_func_info->attach_params = target.attach_params;
 		agg_func_info->attach_opaque_data = target.attach_opaque_data;
@@ -134,11 +121,9 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 		// Dispatch always uses the worker's own name, never the (possibly
 		// prefixed) name the function is registered under.
 		agg_func_info->function_name = func_info.name;
-		// Owning schema — the same source the scalar/table paths use. An
-		// aggregate name declared in two schemas of one catalog is two
-		// distinct implementations, so every aggregate RPC has to name the
-		// schema or the worker re-resolves by bare name and can pick the
-		// other one.
+		// Every aggregate RPC names the owning schema: the same name in two
+		// schemas is two implementations, and a bare-name lookup could pick
+		// the wrong one.
 		agg_func_info->schema_name = target.DispatchSchema(func_info);
 		agg_func_info->output_schema = func_info.output_schema;
 		agg_func_info->positional_is_const = arg_types.positional_is_const;
@@ -156,7 +141,6 @@ AggregateFunctionSet BuildVgiAggregateFunctionSet(ClientContext &context, const 
 		vgi::SetVgiFunctionArgumentNames(agg_func, arg_types.positional_names);
 		func_set.AddFunction(agg_func);
 
-		// Create function description
 		FunctionDescription desc;
 		desc.parameter_types = arg_types.positional_types;
 		desc.parameter_names = arg_types.positional_names;
@@ -197,8 +181,8 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::AGGREGATE_FUNCTION_ENTRY, context);
 
-	// Group functions by name (overloads). std::map (not unordered_map)
-	// for stable iteration order — see B43 note in vgi_table_function_set.cpp.
+	// Group overloads by name; std::map for a stable registration order (see
+	// VgiTableFunctionSet::LoadEntries).
 	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
 	for (auto &func_info : function_list) {
 		if (func_info.function_type != vgi::VgiFunctionType::Aggregate) {
@@ -209,18 +193,16 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 			                  "VGI worker returned '%s' function_type when 'aggregate' was requested (function: %s)",
 			                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 		}
-		// table_only only means something for the table functions a table names
-		// (vgi_table_function_set.cpp); a aggregate one is reachable by nothing.
+		// table_only applies to table functions a table names; a table_only
+		// aggregate is unreachable.
 		if (func_info.visibility == vgi::VgiFunctionVisibility::TableOnly) {
 			continue;
 		}
 		functions_by_name[func_info.name].push_back(std::move(func_info));
 	}
 
-	// Registration target: this catalog's own schema. Aggregates dispatch on the
-	// function's own declared schema (an aggregate name declared in two schemas
-	// of one catalog is two distinct implementations), so schema_name is left
-	// empty and DispatchSchema() falls through to func_info.schema_name.
+	// schema_name stays empty so DispatchSchema() uses each function's own
+	// declared schema.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
 	target.catalog_name = catalog_.GetName().GetIdentifierName();
@@ -241,11 +223,9 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 		    catalog_, schema_, info.Cast<CreateAggregateFunctionInfo>());
 
 		// DuckDB's FunctionEntry constructor does not copy comment/tags from the
-		// CreateInfo the way schema/table/view/macro entries do, so the worker's
-		// tags must be set on the constructed entry directly — otherwise they
-		// never reach duckdb_functions().tags. Tags are an entry-level concept
-		// (not per-overload), so union them across overloads. comment is a
-		// single value (not per-overload either); take the first non-empty one.
+		// CreateInfo, so set them on the entry or duckdb_functions() never shows
+		// them. Both are entry-level: union tags across overloads, take the first
+		// non-empty comment.
 		for (const auto &func_info : pair.second) {
 			for (const auto &[key, val] : func_info.tags) {
 				function_entry->tags[key] = val;

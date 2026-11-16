@@ -8,6 +8,7 @@
 #include "nanoarrow/nanoarrow.h"
 
 #include <cstring>
+#include <limits>
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -20,9 +21,7 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
 // Settings Extraction
-// ============================================================================
 
 std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
                                                 const std::vector<std::string> &setting_names) {
@@ -36,9 +35,7 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
 	return settings;
 }
 
-// ============================================================================
 // Schema Conversions
-// ============================================================================
 
 static void RejectUnsupportedLogicalField(const ArrowSchema &field) {
 	const auto metadata = VgiMetadata::FromC(field.metadata);
@@ -67,7 +64,7 @@ static void RejectUnsupportedLogicalField(const ArrowSchema &field) {
 }
 
 void ExportSchema(const VgiSchemaPtr &schema, ArrowSchemaWrapper &out) {
-	// Preserve protocol semantic guards on every Arrow-to-DuckDB conversion.
+	// Every Arrow-to-DuckDB conversion goes through here, so the guard does too.
 	for (int i = 0; i < schema->num_fields(); ++i) {
 		RejectUnsupportedLogicalField(schema->field(i));
 	}
@@ -79,9 +76,7 @@ void ExportRecordBatch(const VgiBatchPtr &batch, ArrowArrayWrapper &out) {
 	batch->ExportTo(out);
 }
 
-// ============================================================================
 // DuckDB Type Extraction
-// ============================================================================
 
 void GetDuckDBTypesFromArrowTable(const ArrowTableSchema &arrow_table, const ArrowSchema &c_schema,
                                   vector<LogicalType> &types, vector<string> &names) {
@@ -92,19 +87,15 @@ void GetDuckDBTypesFromArrowTable(const ArrowTableSchema &arrow_table, const Arr
 	for (int64_t i = 0; i < c_schema.n_children; i++) {
 		auto &child = *c_schema.children[i];
 
-		// Get column name (with fallback)
 		string col_name = child.name ? child.name : "column" + to_string(i);
 		names.push_back(col_name);
 
-		// Get DuckDB type from ArrowTableSchema
 		auto arrow_type = columns.at(i);
 		types.push_back(arrow_type->GetDuckType(true));
 	}
 }
 
-// ============================================================================
 // High-Level Conversion Utilities
-// ============================================================================
 
 void ArrowSchemaToDuckDBTypes(ClientContext &context, const VgiSchemaPtr &schema, ArrowSchemaWrapper &c_schema_out,
                               ArrowTableSchema &arrow_table_out, vector<LogicalType> &types, vector<string> &names) {
@@ -202,9 +193,7 @@ VgiSchemaPtr DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList
 	return result;
 }
 
-// ============================================================================
 // DuckDB DataChunk / Type to Arrow Conversion
-// ============================================================================
 
 namespace {
 VgiBatchPtr AppendChunk(DataChunk &chunk, const vector<LogicalType> &types, const vector<string> &names,
@@ -228,6 +217,16 @@ VgiBatchPtr AppendChunk(DataChunk &chunk, const vector<LogicalType> &types, cons
 }
 } // namespace
 
+ClientProperties VgiWireClientProperties(ClientContext &context) {
+	ClientProperties props = context.GetClientProperties();
+	props.produce_arrow_string_view = false;
+	props.arrow_use_list_view = false;
+	if (props.arrow_output_version > ArrowFormatVersion::V1_3) {
+		props.arrow_output_version = ArrowFormatVersion::V1_3;
+	}
+	return props;
+}
+
 VgiBatchPtr DataChunkToArrow(ClientContext &context, DataChunk &chunk, const VgiSchemaPtr &schema) {
 	if (chunk.size() == 0) {
 		return VgiBatch::MakeEmpty(schema);
@@ -238,11 +237,10 @@ VgiBatchPtr DataChunkToArrow(ClientContext &context, DataChunk &chunk, const Vgi
 		types.push_back(chunk.data[i].GetType());
 		names.push_back(schema->field_name(static_cast<int>(i)));
 	}
-	ClientProperties client_props = context.GetClientProperties();
+	ClientProperties client_props = VgiWireClientProperties(context);
 	return AppendChunk(chunk, types, names, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
 }
 
-// Cached-input fast path: see header for contract.
 VgiBatchPtr DataChunkToArrowCached(
     ClientContext &context, DataChunk &chunk, const VgiSchemaPtr &schema, const vector<LogicalType> &cached_types,
     const vector<string> &cached_names, const ClientProperties &cached_client_props,
@@ -259,14 +257,12 @@ VgiBatchPtr DataChunkToArrowCached(
 VgiSchemaPtr BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
                                         const vector<string> &names) {
 	ArrowSchema c_schema;
-	ClientProperties client_props = context.GetClientProperties();
+	ClientProperties client_props = VgiWireClientProperties(context);
 	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
 	return VgiSchema::Adopt(&c_schema);
 }
 
-// ============================================================================
 // DuckDB Value Settings to a batch
-// ============================================================================
 
 VgiBatchPtr BuildSettingsBatch(ClientContext &context, const std::map<std::string, Value> &settings) {
 	vector<LogicalType> field_types;
@@ -288,9 +284,7 @@ VgiBatchPtr BuildSettingsBatch(ClientContext &context, const std::map<std::strin
 	return DataChunkToArrow(context, chunk, schema);
 }
 
-// ============================================================================
 // DuckDB Value Secrets to a batch
-// ============================================================================
 
 namespace {
 
@@ -392,9 +386,7 @@ std::vector<uint8_t> BuildSecretsBatch(ClientContext &context,
 	return SerializeToIpcBytes(batch);
 }
 
-// ============================================================================
 // Function Argument Schema Parsing
-// ============================================================================
 
 FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const VgiSchemaPtr &schema) {
 	FunctionArgumentTypes result;
@@ -403,7 +395,6 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const 
 		return result;
 	}
 
-	// Export schema to C ABI and get DuckDB types
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	ExportSchema(schema, c_schema);
@@ -415,33 +406,28 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const 
 		auto metadata = schema->field_metadata(field_idx);
 		auto &child = c_schema.arrow_schema.children[field_idx];
 
-		// Get column name
 		string col_name = child->name ? child->name : "column" + to_string(field_idx);
 
-		// Get DuckDB type
 		auto arrow_type = columns.at(field_idx);
 		LogicalType duckdb_type = arrow_type->GetDuckType();
 
-		// Check metadata for special markers
 		bool is_named = false;
 		bool is_varargs = false;
 		bool is_table_input = false;
 		bool is_any_type = false;
 		bool is_const = false;
 		if (!metadata.empty()) {
-			// Check for named argument marker
 			auto named_idx = metadata.FindKey(VGI_ARG_METADATA_KEY);
 			if (named_idx >= 0) {
 				is_named = (metadata.value(named_idx) == VGI_ARG_NAMED_VALUE);
 			}
 
-			// Check for varargs marker (on field, not schema)
+			// The varargs marker is on the field, not the schema.
 			auto varargs_idx = metadata.FindKey(VGI_VARARGS_METADATA_KEY);
 			if (varargs_idx >= 0) {
 				is_varargs = (metadata.value(varargs_idx) == VGI_VARARGS_TRUE_VALUE);
 			}
 
-			// Check for vgi_type metadata (table input or any type)
 			auto type_idx = metadata.FindKey(VGI_TYPE_METADATA_KEY);
 			if (type_idx >= 0) {
 				auto &value = metadata.value(type_idx);
@@ -449,40 +435,32 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const 
 				is_any_type = (value == VGI_TYPE_ANY_VALUE);
 			}
 
-			// Check for const parameter marker
 			auto const_idx = metadata.FindKey(VGI_CONST_METADATA_KEY);
 			if (const_idx >= 0) {
 				is_const = (metadata.value(const_idx) == VGI_CONST_TRUE_VALUE);
 			}
 		}
 
-		// Override DuckDB type if this is an "any" type field
 		if (is_any_type) {
 			duckdb_type = LogicalType::ANY;
 		}
 
 		if (is_varargs) {
-			// Varargs field - set flag and use declared type (or ANY for untyped/any)
+			// Declared type, or ANY for untyped/any.
 			result.has_varargs = true;
 			result.varargs_type = (is_any_type || duckdb_type == LogicalType::SQLNULL)
 			                          ? LogicalType::ANY
 			                          : duckdb_type;
-			// Don't add varargs to positional_types - it's a sentinel
+			// Not a positional slot.
 		} else if (is_table_input) {
-			// Table input field - record position and name for table-in-out function registration
-			// Store the current position (in terms of positional args only)
 			result.table_input_position = static_cast<int>(result.positional_types.size());
 			result.table_input_name = col_name;
-			// Add TABLE type placeholder - this will be replaced with actual TABLE type
-			// during function registration
 			result.positional_types.push_back(LogicalType::TABLE);
 			result.positional_names.push_back(col_name);
 			result.positional_is_const.push_back(false); // Table inputs are never const
 		} else if (is_named) {
-			// Named argument - add to named_parameters map
 			result.named_parameters[col_name] = duckdb_type;
 		} else {
-			// Positional argument
 			result.positional_types.push_back(duckdb_type);
 			result.positional_names.push_back(col_name);
 			result.positional_is_const.push_back(is_const);
@@ -492,30 +470,25 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const 
 	return result;
 }
 
-// ============================================================================
 // DuckDB Value to Arrow Conversion (using ArrowAppender)
-// ============================================================================
 
 ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Value> &positional_args,
                                         const vector<std::pair<string, Value>> &named_args) {
-	// Build the struct type with named fields
 	vector<LogicalType> field_types;
 	vector<string> field_names;
 
-	// Add positional arguments (prefixed with VGI_POSITIONAL_PREFIX per VGI protocol)
 	for (idx_t i = 0; i < positional_args.size(); i++) {
 		field_names.push_back(VGI_POSITIONAL_PREFIX + to_string(i));
 		field_types.push_back(positional_args[i].type());
 	}
 
-	// Add named arguments (prefixed with VGI_NAMED_PREFIX per VGI protocol)
 	for (auto &[name, value] : named_args) {
 		field_names.push_back(VGI_NAMED_PREFIX + name);
 		field_types.push_back(value.type());
 	}
 
-	// Handle empty arguments case - a null struct<> row: table-in-out functions that only
-	// have a TABLE argument.
+	// No arguments (e.g. a table-in-out function whose only argument is TABLE):
+	// a null struct<> row.
 	if (field_types.empty()) {
 		auto schema = MakeSchema({type::Struct({}).Named("args")});
 		VgiBatchBuilder builder(schema);
@@ -524,7 +497,6 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 		return ArrowArguments {builder.Finish()};
 	}
 
-	// Create a single-row DataChunk with the values
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), field_types);
 	chunk.SetCardinality(1);
@@ -538,7 +510,7 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 	}
 
 	// ArrowAppender gives a struct array of the fields; it becomes the "args" column.
-	ClientProperties client_props = context.GetClientProperties();
+	ClientProperties client_props = VgiWireClientProperties(context);
 	ArrowAppender appender(field_types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, field_types));
 	appender.Append(chunk, 0, 1, 1);
 	std::vector<ArrowArray> columns;
@@ -563,9 +535,7 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 	return ArrowArguments {VgiBatch::FromColumns(VgiSchema::Adopt(&outer), 1, std::move(columns))};
 }
 
-// ============================================================================
 // Schema Reconciliation
-// ============================================================================
 
 namespace {
 
@@ -581,13 +551,18 @@ ArrowSchemaView ViewOf(const ArrowSchema &schema) {
 	return view;
 }
 
+bool IsDecimal(::ArrowType type) {
+	return type == NANOARROW_TYPE_DECIMAL32 || type == NANOARROW_TYPE_DECIMAL64 || type == NANOARROW_TYPE_DECIMAL128 ||
+	       type == NANOARROW_TYPE_DECIMAL256;
+}
+
 bool HasUnit(::ArrowType type) {
 	return type == NANOARROW_TYPE_TIMESTAMP || type == NANOARROW_TYPE_TIME32 || type == NANOARROW_TYPE_TIME64 ||
 	       type == NANOARROW_TYPE_DURATION;
 }
 
-// Whether `src`'s buffers can be read as `dst` unchanged: everything but names,
-// nullability flags, metadata, a timestamp's timezone and a decimal's precision may differ.
+// Whether `src`'s buffers can be read as `dst` unchanged: only names, nullability
+// flags, metadata, a timestamp's timezone and a decimal's precision may differ.
 bool SameLayout(const ArrowSchema &src, const ArrowSchema &dst) {
 	if ((src.dictionary == nullptr) != (dst.dictionary == nullptr) || src.n_children != dst.n_children) {
 		return false;
@@ -600,8 +575,7 @@ bool SameLayout(const ArrowSchema &src, const ArrowSchema &dst) {
 	if (HasUnit(sv.type) && sv.time_unit != dv.time_unit) {
 		return false;
 	}
-	if ((sv.type == NANOARROW_TYPE_DECIMAL128 || sv.type == NANOARROW_TYPE_DECIMAL256) &&
-	    sv.decimal_scale != dv.decimal_scale) {
+	if (IsDecimal(sv.type) && sv.decimal_scale != dv.decimal_scale) {
 		return false;
 	}
 	if (sv.fixed_size != dv.fixed_size) {
@@ -649,6 +623,61 @@ int64_t Rescale(int64_t value, ArrowTimeUnit from, ArrowTimeUnit to) {
 
 [[noreturn]] void CannotReconcile(const ArrowSchema &src, const ArrowSchema &dst) {
 	throw IOException("VGI schema reconciliation: failed to cast %s -> %s", TypeToString(src), TypeToString(dst));
+}
+
+// Re-encode decimal element `row` at the destination's bit width. DuckDB exports
+// DECIMAL as decimal128 (or 32/64 by storage under arrow_output_version >= 1.5),
+// while a worker may declare any width for the same precision and scale.
+void AppendDecimalWidened(ArrowArray *dst, const ArrowSchemaView &dv, const VgiColumn &values, int64_t row,
+                          const ArrowSchemaView &sv, const ArrowSchema &dst_schema) {
+	if (sv.decimal_scale != dv.decimal_scale) {
+		CannotReconcile(values.schema(), dst_schema);
+	}
+	ArrowDecimal src;
+	ArrowDecimalInit(&src, sv.decimal_bitwidth, sv.decimal_precision, sv.decimal_scale);
+	ArrowArrayViewGetDecimalUnsafe(&values.view(), row + values.shift(), &src);
+	// Sign-extended two's complement, least-significant word first.
+	uint64_t words[4];
+	if (src.n_words == 0) {
+		words[0] = static_cast<uint64_t>(ArrowDecimalGetIntUnsafe(&src));
+	} else {
+		for (int k = 0; k < src.n_words; k++) {
+			words[k] = src.words[src.low_word_index == 0 ? k : src.n_words - 1 - k];
+		}
+	}
+	const int src_words = src.n_words == 0 ? 1 : src.n_words;
+	const uint64_t fill = static_cast<int64_t>(words[src_words - 1]) < 0 ? ~uint64_t(0) : 0;
+	for (int k = src_words; k < 4; k++) {
+		words[k] = fill;
+	}
+
+	ArrowDecimal out;
+	ArrowDecimalInit(&out, dv.decimal_bitwidth, dv.decimal_precision, dv.decimal_scale);
+	// The value must fit the narrower width: every dropped word is the sign
+	// extension of the kept top bit.
+	const int dst_words = out.n_words == 0 ? 1 : out.n_words;
+	const uint64_t top_fill = static_cast<int64_t>(words[dst_words - 1]) < 0 ? ~uint64_t(0) : 0;
+	bool fits = true;
+	for (int k = dst_words; k < 4; k++) {
+		fits = fits && words[k] == top_fill;
+	}
+	if (out.n_words == 0) {
+		const auto v = static_cast<int64_t>(words[0]);
+		fits = fits && v >= std::numeric_limits<int32_t>::min() && v <= std::numeric_limits<int32_t>::max();
+	}
+	if (!fits) {
+		throw IOException("VGI schema reconciliation: decimal value out of range for %s", TypeToString(dst_schema));
+	}
+	if (out.n_words == 0) {
+		ArrowDecimalSetInt(&out, static_cast<int64_t>(words[0]));
+	} else {
+		for (int k = 0; k < out.n_words; k++) {
+			out.words[out.low_word_index == 0 ? k : out.n_words - 1 - k] = words[k];
+		}
+	}
+	if (ArrowArrayAppendDecimal(dst, &out) != NANOARROW_OK) {
+		CannotReconcile(values.schema(), dst_schema);
+	}
 }
 
 // Append element `i` of `src` to `dst` (built from `dst_schema`), converting leaves.
@@ -804,6 +833,15 @@ void AppendConverted(ArrowArray *dst, const ArrowSchema &dst_schema, const VgiCo
 		}
 		append::Int(dst, Rescale(values.GetInt(row), sv.time_unit, dv.time_unit));
 		return;
+	case NANOARROW_TYPE_DECIMAL32:
+	case NANOARROW_TYPE_DECIMAL64:
+	case NANOARROW_TYPE_DECIMAL128:
+	case NANOARROW_TYPE_DECIMAL256:
+		if (!IsDecimal(sv.type)) {
+			CannotReconcile(values.schema(), dst_schema);
+		}
+		AppendDecimalWidened(dst, dv, values, row, sv, dst_schema);
+		return;
 	default:
 		CannotReconcile(values.schema(), dst_schema);
 	}
@@ -815,8 +853,7 @@ VgiBatchPtr ReconcileBatchToSchema(const VgiBatchPtr &batch, const VgiSchemaPtr 
 	if (!batch || !target_schema) {
 		return batch;
 	}
-	// Fast path: schemas already equal (excluding metadata, since ArrowConverter
-	// doesn't preserve it).
+	// Equal ignoring metadata, which ArrowConverter does not preserve.
 	if (batch->schema().get() == target_schema.get() || batch->schema()->Equals(*target_schema)) {
 		return batch;
 	}

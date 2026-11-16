@@ -92,7 +92,24 @@ SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(100000);
 ----
 100000	4999950000
 
-# LoadFromDisk's whole-blob re-hash matched the incrementally-written hash → memory adopt.
+# LoadFromDisk's whole-blob re-hash matched the incrementally-written hash: the
+# hit is served from disk and the entry is adopted into memory.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=disk%'
+    AND message NOT LIKE '%tier=disk_streaming%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(100000);
+----
+100000	4999950000
+
+# The adopted entry now serves from memory.
 query I
 SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
     AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=memory%';

@@ -30,7 +30,7 @@
 | `vgi_table_function_impl.cpp` | Shared table function logic (bind/init/scan) |
 | `vgi_scalar_function_impl.cpp` | Scalar function bind/execute with dynamic types and const params |
 | `vgi_aggregate_function_impl.cpp` | Aggregate function bind / update / combine / finalize / destructor RPC client |
-| `vgi_aggregate_window_impl.cpp` | Aggregate window callbacks (`window_init` / `window` / `window_batch`) for `OVER (...)` queries; partition is materialised + shipped once, frames evaluated per output row |
+| `vgi_aggregate_window_impl.cpp` | Aggregate window callbacks (`window_init` / `window` / `window_batch`) for `OVER (...)` queries; partition is materialised + shipped once, frames evaluated in one `aggregate_window_batch` RPC per evaluated block |
 | `vgi_aggregate_streaming_impl.cpp` | Streaming-partitioned aggregate RPC client (`streaming_open` / `_chunk` / `_close`) — pipes input chunks straight to the worker without DuckDB-side partition materialisation |
 | `vgi_streaming_window_operator.cpp` | `LogicalVgiStreamingWindow` + `PhysicalVgiStreamingWindow` — custom `LogicalExtensionOperator` / pipeline `PhysicalOperator` pair that replaces eligible `LogicalWindow` nodes when the worker opts into the streaming protocol; lives in the extension, no DuckDB-core changes |
 | `vgi_lateral_batch_operator.cpp` | `LogicalVgiLateralBatch` + `PhysicalVgiLateralBatch` + `VgiLateralBatchRewriter` — batches a **correlated** blended (`RowTransformFunction`) call into ONE worker exchange per input chunk instead of DuckDB's row-by-row driver, using per-output-row `vgi_rpc.parent_row` provenance to stamp the correlated columns. Gated on `vgi_batch_lateral`. See *Batched Correlated LATERAL* |

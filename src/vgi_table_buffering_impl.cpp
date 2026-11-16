@@ -15,22 +15,20 @@
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_table_buffering_builders.hpp"
-#include "vgi_cache_control.hpp"        // VgiCacheControl (M3)
-#include "vgi_cached_replay_connection.hpp" // CachedReplayConnection (M3 hit replay)
+#include "vgi_cache_control.hpp"
+#include "vgi_cached_replay_connection.hpp" // CachedReplayConnection (cache-hit replay)
 #include "vgi_cancel_dispatcher.hpp"
-#include "vgi_exchange_cache_key.hpp"   // exchange-mode result cache (M3)
+#include "vgi_exchange_cache_key.hpp"   // exchange-mode result cache
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
-#include "vgi_result_cache.hpp"         // VgiResultCache singleton (M3)
+#include "vgi_result_cache.hpp"
 #include "vgi_unary_rpc.hpp"
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
 // LogicalVgiTableBufferingFunction
-// ============================================================================
 
 LogicalVgiTableBufferingFunction::LogicalVgiTableBufferingFunction(TableIndex table_index_p,
                                                                   vector<LogicalType> return_types_p,
@@ -64,7 +62,6 @@ string LogicalVgiTableBufferingFunction::GetExtensionName() const {
 }
 
 void LogicalVgiTableBufferingFunction::ResolveTypes() {
-	// Output column types are exactly the function's declared return_types.
 	types = return_types;
 }
 
@@ -74,9 +71,9 @@ void LogicalVgiTableBufferingFunction::Serialize(Serializer & /*serializer*/) co
 	    "(plan caching across processes is out of scope for v1)");
 }
 
-// The pipeline that feeds our Sink is sourced by the first operator below us that
-// is itself a source; everything between (projections, filters) just passes chunks
-// along. Mirrors how PhysicalOperator::BuildPipelines picks a pipeline source.
+// The source of the pipeline feeding our Sink: the first operator down the
+// children[0] chain that is itself a source, as PhysicalOperator::BuildPipelines
+// picks it.
 static optional_ptr<const PhysicalOperator> FindPipelineSource(const PhysicalOperator &op) {
 	const PhysicalOperator *current = &op;
 	while (true) {
@@ -92,12 +89,9 @@ static optional_ptr<const PhysicalOperator> FindPipelineSource(const PhysicalOpe
 	}
 }
 
-// Whether a batch index can actually be threaded from this plan's source.
-//
-// DuckDB enforces this hard: Pipeline scheduling throws an InternalException if a
-// sink declares RequiredPartitionInfo()=BatchIndex() and the source does not
-// support it. That happens before any of our own code runs, so a worker that opts
-// in must not be able to take a query down with it — hence the plan-time check.
+// Whether this plan's source can supply a batch index. Checked at plan time
+// because pipeline scheduling throws an InternalException for a BatchIndex sink
+// over a source that cannot, before any of our code runs.
 static bool SourceCanSupplyBatchIndex(const PhysicalOperator &child_plan) {
 	auto source = FindPipelineSource(child_plan);
 	if (!source) {
@@ -108,28 +102,18 @@ static bool SourceCanSupplyBatchIndex(const PhysicalOperator &child_plan) {
 
 PhysicalOperator &LogicalVgiTableBufferingFunction::CreatePlan(ClientContext &context,
                                                                 PhysicalPlanGenerator &planner) {
-	// Plan the child (the table-input subquery) first so its data is
-	// pipelined into our Sink.
+	// The child (table-input subquery) feeds our Sink.
 	D_ASSERT(children.size() == 1);
 	estimated_cardinality = EstimateCardinality(context);
 
 	auto &child_plan = planner.CreatePlan(*children[0]);
 
-	// Cast bind_data to read the ordering flags for the PhysicalOperator's
-	// ParallelSource/SourceOrder + ParallelSink/RequiredPartitionInfo
-	// advertisement.
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	const bool source_order_dependent = bd.source_order_dependent;
 	bool sink_order_dependent = bd.sink_order_dependent;
 	bool requires_input_batch_index = bd.requires_input_batch_index;
-	// A worker asking for a batch index is really asking for *input order*. Only
-	// some sources can hand one out (a base table scan can; range() and VALUES
-	// cannot), and asking anyway makes DuckDB abort the pipeline. So when the
-	// source cannot, give the worker the same guarantee the other way: serialize
-	// the sink, which delivers batches in source order, and number them here.
-	// Slower than a parallel sink, but it works with every source, and the
-	// alternative — telling the caller to wrap their input in a TEMP TABLE — is
-	// not a reasonable thing to require.
+	// A batch index is a request for input order. When the source cannot supply
+	// one (range(), VALUES), serialize the sink instead and number its batches.
 	bool synthesize_batch_index = false;
 	if (requires_input_batch_index && !SourceCanSupplyBatchIndex(child_plan)) {
 		requires_input_batch_index = false;
@@ -144,10 +128,7 @@ PhysicalOperator &LogicalVgiTableBufferingFunction::CreatePlan(ClientContext &co
 	    sink_order_dependent, requires_input_batch_index, synthesize_batch_index,
 	    estimated_cardinality);
 	auto &op = op_base.Cast<PhysicalVgiTableBufferingFunction>();
-	// Thread pushdown state captured by the rewriter onto the physical op
-	// (per-query plan data, not per-bind data). All Sink-side and Source-side
-	// PerformInit calls read these to populate InitRequest's projection_ids
-	// and pushdown_filters fields.
+	// Pushdown state is per-query plan data, not bind data.
 	op.projection_pushdown = projection_pushdown;
 	op.projection_ids = std::move(projection_ids);
 	op.column_ids = std::move(column_ids);
@@ -160,9 +141,7 @@ PhysicalOperator &LogicalVgiTableBufferingFunction::CreatePlan(ClientContext &co
 	return op_base;
 }
 
-// ============================================================================
 // PhysicalVgiTableBufferingFunction
-// ============================================================================
 
 PhysicalVgiTableBufferingFunction::PhysicalVgiTableBufferingFunction(PhysicalPlan &physical_plan,
                                                                     vector<LogicalType> return_types_p,
@@ -192,19 +171,14 @@ InsertionOrderPreservingMap<string> PhysicalVgiTableBufferingFunction::ParamsToS
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	result["Name"] = bd.function_name;
 	result["Source"] = source_order_dependent ? "ordered" : "parallel";
-	// Surface pushed-down projections/filters so users can verify pushdown
-	// via EXPLAIN. The string was pre-built at rewriter time from
-	// TableFilter::ToString (the C++ side has no symmetric deserializer for
-	// the serialized filter IPC bytes).
+	// See LogicalVgiTableBufferingFunction::explain_summary.
 	if (!explain_summary.empty()) {
 		result["Pushdown"] = explain_summary;
 	}
 	return result;
 }
 
-// ============================================================================
-// Global / Local state
-// ============================================================================
+// Global / local state
 
 namespace {
 
@@ -214,19 +188,12 @@ public:
 	}
 	~VgiTableBufferingGlobalSinkState() override;
 
-	// DatabaseInstance is captured at construction so the destructor can
-	// route any still-live connections through the global cancel-dispatcher
-	// (same pattern the streaming InOut path uses on its error path).
+	// For the destructor's cancel-dispatch and result-cache access.
 	DatabaseInstance *db = nullptr;
 
-	// Init coordination. The first Sink thread to arrive runs PerformInit on
-	// its own per-thread worker (no separate coordinator); peer threads wait
-	// here for execution_id to be published, then run their own secondary
-	// inits in parallel. `init_started` is the "someone is running init"
-	// latch; `init_done` flips to true once execution_id is publishable;
-	// `init_failed` lets waiters bail when the init runner threw;
-	// `init_error` is what it threw, so waiters report the real cause.
-	// Both are written and read under init_mutex.
+	// Init coordination (see Sink). init_started: a thread is running the
+	// primary init; init_done: execution_id is published; init_failed /
+	// init_error: the runner threw, and what. All accessed under init_mutex.
 	std::mutex init_mutex;
 	std::condition_variable init_cv;
 	bool init_started = false;
@@ -235,53 +202,42 @@ public:
 	std::atomic<bool> init_done {false};
 	std::vector<uint8_t> execution_id;
 
-	// Per-thread workers handed off from Combine. Available for the source
-	// phase to grab via GetData. Also: state_ids[] runs parallel to workers[]
-	// and is what we ship to the combine RPC.
+	// Sink workers handed off by Combine, plus the combine worker after
+	// Finalize; the Source phase only counts them (it uses fresh workers).
+	// state_ids parallels workers until Finalize and is sent to combine.
 	std::mutex workers_mutex;
 	std::vector<std::unique_ptr<IFunctionConnection>> workers;
 	std::vector<std::vector<uint8_t>> state_ids;
 
-	// Sequential batch numbering for the synthesize_batch_index path. Only read on
-	// a single-threaded sink (ParallelSink() returns false whenever we synthesize),
-	// so the counter is the source order; atomic anyway so the invariant does not
-	// rest on that being true.
+	// synthesize_batch_index numbering; the sink is single-threaded then, so this
+	// is source order (atomic anyway).
 	std::atomic<int64_t> next_synthetic_batch_index {0};
 
-	// Populated by Sink::Finalize after combine returns. Drained by the
-	// source phase under finalize_queue_mutex.
+	// Filled by Finalize after combine; drained by the Source phase.
 	std::mutex finalize_queue_mutex;
 	std::deque<std::vector<uint8_t>> finalize_queue;
 
-	// Function name & attach_id snapshot, captured from bind_data. Used by
-	// the per-RPC wrappers (RpcTableBuffering*) so they don't need to
-	// chase pointers back through the operator.
+	// Snapshots from bind_data for the RPCs. The destructor's
+	// table_buffering_destructor goes out as a pooled unary call, so its
+	// request is the only carrier of schema_name (a bare name could resolve to
+	// a same-named function in another schema).
 	std::string function_name;
-	// Owning catalog schema, snapshotted next to function_name. The
-	// destructor's table_buffering_destructor RPC goes out as a *pooled*
-	// unary call — no bound connection, so the request itself is the only
-	// carrier of the schema and a bare name could resolve to a same-named
-	// function in another schema. Empty = none named; serialises as null.
 	std::string schema_name;
 	std::vector<uint8_t> attach_opaque_data;
 
-	// Captured at GetGlobalSinkState time so the destructor can fire a
-	// best-effort table_buffering_destructor RPC after the source phase
-	// drains. context_weak goes null if the originating session ends
-	// before teardown completes; attach_params keeps the connection
-	// metadata alive (worker_path, auth, pool flags) regardless.
+	// For the destructor's best-effort table_buffering_destructor RPC.
+	// context_weak expires if the session ends first.
 	weak_ptr<ClientContext> context_weak;
 	std::shared_ptr<VgiAttachParameters> attach_params;
 
-	// True once Sink::Finalize has fired (mirrors aggregate gstates).
+	// Set once Finalize has run; Sink asserts on it.
 	std::atomic<bool> finalized {false};
 
-	// ---- Exchange-mode result cache (M3, whole-input memoization) ----
-	// Built once at GetGlobalSinkState. Scoped to !sink_order_dependent (result is a
-	// function of the input MULTISET, so a commutative additive fold of per-row hashes
-	// keys it — order/thread independent). A HIT skips the combine RPC + the Source
-	// finalize-drain and replays the cached result; ingestion (Sink process() RPCs)
-	// still runs (the key is only known after all input is folded).
+	// Exchange-mode result cache (whole-input memoization). Only for
+	// !sink_order_dependent: the result is a function of the input multiset, keyed
+	// by a commutative additive fold of per-row hashes. A hit skips combine and the
+	// finalize drain; the process() RPCs still run, since the key is known only
+	// after all input is folded.
 	bool cache_eligible = false;
 	VgiResultCacheKey cache_key;                 // static; input_hash set at Finalize
 	std::string cache_catalog_name;
@@ -290,13 +246,13 @@ public:
 	std::atomic<uint64_t> digest_lo {0};
 	std::atomic<uint64_t> digest_hi {0};
 	std::atomic<uint64_t> digest_rows {0};
-	// Serve (hit): the cached whole-input result + a single-claim guard (only one
-	// Source thread replays the single entry; the rest are FINISHED immediately).
+	// Hit: the cached result; serving_claimed lets exactly one Source thread
+	// replay it.
 	bool serving_from_cache = false;
 	std::shared_ptr<const VgiResultCacheEntry> serving;
 	std::atomic<bool> serving_claimed {false};
-	// Capture (miss): all Source batches accumulate here under `capture_mu`; committed
-	// in this destructor iff every finalize state reached EOS (never-partial).
+	// Miss: Source batches accumulate under capture_mu; the destructor commits
+	// only if every finalize state reached EOS (never a partial result).
 	std::mutex capture_mu;
 	bool capturing = false;
 	VgiCacheControl capture_cc;
@@ -304,48 +260,32 @@ public:
 	std::vector<VgiBatchPtr> capture_batches;
 	size_t total_finalize_states = 0;
 	std::atomic<size_t> finalize_eos_count {0};
-	// Set if the worker's finalize output is not cacheable (no vgi.cache.* advertised),
-	// so capture stops early and the destructor never stores a partial result.
+	// Finalize output not cacheable, or capture over budget: stop capturing.
 	std::atomic<bool> capture_aborted {false};
-	// [S6/S9] Bound the whole-input RAM capture. Unlike the producer path, buffered
-	// capture accumulates the entire result in RAM (capture_batches) before the dtor
-	// commits — so it must be bounded DURING capture or a multi-GB result blows memory.
-	// A capture crossing max_entry_bytes or the process-global in-flight budget aborts
-	// to uncached (keeps streaming to DuckDB). All three guarded by capture_mu; the
-	// reserved inflight budget is released in the dtor.
+	// The whole result is held in RAM until the destructor commits, so capture is
+	// bounded as it goes: crossing max_entry_bytes or the global in-flight budget
+	// aborts it (output still streams to DuckDB). Guarded by capture_mu; the
+	// reserved in-flight bytes are released in the destructor.
 	int64_t cache_max_entry_bytes = defaults::RESULT_CACHE_MAX_ENTRY_BYTES;
 	int64_t capture_bytes = 0;
 	int64_t reserved_inflight_bytes = 0;
 };
 
 VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
-	// `workers` holds the per-thread Sink workers (handed off by Combine) plus
-	// the combine worker (pushed back by Finalize). The Source phase acquires
-	// *fresh* workers and never drains this vector — those Sink/combine workers
-	// were init'd with phase=TABLE_BUFFERING and would reject a second
-	// PerformInit — so on the HAPPY path `workers` is NOT empty here; it holds
-	// idle, finished, reusable connections owned by this gstate (no thread is
-	// using them).  Return each to the pool first (the canonical happy-path
-	// release the Source phase uses on FINISHED).
-	//
-	// Only if a worker can't be pooled (HTTP transport, pooling disabled, or a
-	// dead connection) do we fall back to cancel-dispatch through the global
-	// VgiCancelDispatcher (same machinery the streaming InOut path uses) so any
-	// worker still parked in a blocking syscall unblocks and is reclaimable
-	// rather than forced-killed on the error path.
+	// Even on the happy path `workers` holds the idle Sink and combine workers
+	// (the Source phase never uses them). Pool each; one that cannot be pooled
+	// (HTTP, pooling off, dead) is cancel-dispatched so a worker parked in a
+	// blocking call is woken rather than left parked.
 	auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
 	auto reclaim_or_cancel = [&](std::unique_ptr<IFunctionConnection> conn) {
 		if (!conn) {
 			return;
 		}
-		// Try pooling first — restores the pooling win the TABLE_BUFFERING
-		// design is built around.  Release() internally skips dead workers.
+		// Release() skips dead workers.
 		if (auto pooled = conn->ReleaseForPooling()) {
 			(void)VgiWorkerPool::Instance().Release(std::move(pooled));
 			return;
 		}
-		// Not poolable (HTTP / pooling off / dead) — cancel-dispatch so a
-		// possibly-blocked worker thread is woken rather than left parked.
 		if (dispatcher) {
 			auto token = conn->GetLastStateToken();
 			CancelRequest req;
@@ -364,15 +304,10 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 	// In-flight LocalSinkState connections (still owned by a thread's lstate)
 	// handle their own cancel-dispatch in ~VgiTableBufferingLocalSinkState.
 
-	// Best-effort table_buffering_destructor RPC. Wipes the worker's
-	// FunctionStorage rows for this execution_id (worker-defined
-	// namespaces under the b"buf*" prefix) and pops any in-process iter
-	// caches. Delivery is best-effort:
-	//   * ClientContext gone (session ended early): skip; cleanup_old_entries
-	//     is the FunctionStorage backstop.
-	//   * execution_id never published (init failed before completing):
-	//     nothing to clean; skip.
-	//   * RPC throws: swallow; we're in a destructor.
+	// Best-effort table_buffering_destructor RPC: the worker clears its
+	// storage for this execution_id. Skipped if init never published an
+	// execution_id or the session is gone (the worker's storage expiry,
+	// cleanup_old_entries in the Python SDK, is then the backstop).
 	if (!execution_id.empty() && attach_params) {
 		auto context_lock = context_weak.lock();
 		if (context_lock) {
@@ -399,19 +334,15 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 				}
 				(void)vgi::InvokePooledUnaryRpc(opts, "table_buffering_destructor", rpc_params);
 			} catch (...) {
-				// Swallow — destructor must not throw. The worker side's
-				// cleanup_old_entries (1-day default) is the long-term
-				// FunctionStorage GC backstop for missed RPCs.
+				// Destructors must not throw.
 			}
 		}
 	}
 
-	// Exchange-mode result cache (M3): commit the captured whole-input result iff
-	// EVERY finalize state reached EOS (never-partial — a mid-drain error or early
-	// LIMIT teardown leaves finalize_eos_count < total_finalize_states, so nothing is
-	// stored). Runs after the Source phase (source shares this sink_state), so all
-	// capture_batches are present. allow_disk=true — one large result, like a producer
-	// entry; Insert rejects it (uncached) if it exceeds the memory cap with disk off.
+	// Commit the captured result only if every finalize state reached EOS (a
+	// mid-drain error or early LIMIT teardown stores nothing). This runs after the
+	// Source phase, which shares this state. allow_disk: one large result, like a
+	// producer entry.
 	if (capturing && !capture_aborted.load() && total_finalize_states > 0 &&
 	    finalize_eos_count.load(std::memory_order_acquire) == total_finalize_states &&
 	    capture_cc.Cacheable()) {
@@ -425,47 +356,32 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 			// Destructor must not throw; a failed cache store is non-fatal.
 		}
 	}
-	// [S6] Release the in-flight capture budget this gstate reserved (0 if it never
-	// captured or aborted early). Held from first captured batch until here — the
-	// transient window that bounds concurrent buffered-capture RAM.
+	// Release the in-flight capture budget (0 if never captured or aborted).
 	GetResultCache(*db).ReleaseInflightCapture(reserved_inflight_bytes);
 }
 
 class VgiTableBufferingLocalSinkState : public LocalSinkState {
 public:
-	// Per-thread worker connection. Acquired lazily on the thread's first
-	// Sink call (which assigns state_id from the global atomic). On the error
-	// path the destructor routes the connection through the cancel-dispatcher
-	// so the worker unblocks instead of being abandoned mid-RPC.
+	// Per-thread worker, acquired on the thread's first Sink call.
 	std::unique_ptr<IFunctionConnection> connection;
-	// Worker-chosen opaque state_id, returned from the first
-	// table_buffering_process RPC on this thread. Empty until then.
+	// Worker-chosen opaque state_id, returned by each process() RPC.
 	std::vector<uint8_t> state_id;
 
-	// Cached at Sink-time so the destructor (which runs on this thread,
-	// possibly after another thread's exception has torn down the pipeline) can
-	// dispatch a cancel without re-walking the operator.
+	// Set at Sink time for the destructor's cancel-dispatch.
 	DatabaseInstance *db = nullptr;
 
-	// M3 result cache: this thread's partial additive input digest, folded per Sink
-	// chunk and merged into the gstate atomics at Combine (associative/commutative).
+	// This thread's partial input digest, merged into the gstate at Combine.
 	uint64_t digest_lo = 0;
 	uint64_t digest_hi = 0;
 	uint64_t digest_rows = 0;
 
 	~VgiTableBufferingLocalSinkState() override {
-		// If Combine already moved our connection into gstate.workers[], `connection`
-		// is null and there's nothing to do — that worker is now the gstate's to
-		// pool/cancel. We only reach the cancel-dispatch below when this lstate is
-		// torn down still owning a connection (an error unwound the pipeline before
-		// Combine ran), which is the sole mechanism that unblocks a peer worker
-		// parked in a blocking process() RPC.
+		// Still owning a connection means an error unwound the pipeline before
+		// Combine moved it to the gstate. Cancel-dispatch it: that is the only
+		// thing that unblocks a worker parked in a blocking process() RPC.
 		if (!connection) {
 			return;
 		}
-		// Cancel-dispatch the connection so a blocked process call (e.g. a
-		// worker thread parked in select() waiting for the next request) gets
-		// woken up promptly.
 		auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
 		if (!dispatcher) {
 			return;
@@ -480,11 +396,7 @@ public:
 
 class VgiTableBufferingGlobalSourceState : public GlobalSourceState {
 public:
-	// Cap reported back to DuckDB's scheduler. Populated by GetGlobalSourceState
-	// from the worker count handed to source — there is no point scheduling
-	// more drainer threads than we have workers. When source_order_dependent
-	// is true the operator also declares ParallelSource()=false, so DuckDB
-	// clamps to 1 regardless.
+	// MaxThreads cap: the number of Sink-phase workers (see GetGlobalSourceState).
 	idx_t worker_count = 0;
 
 	idx_t MaxThreads() override {
@@ -494,53 +406,30 @@ public:
 
 class VgiTableBufferingLocalSourceState : public LocalSourceState {
 public:
-	// Per-thread fresh worker. Source acquires from the pool on first
-	// GetData and per finalize_state_id transition (each new state_id
-	// opens a new TABLE_BUFFERING_FINALIZE init stream that we drain via
-	// ReadDataBatch). We don't reuse the per-thread workers from the
-	// Sink phase because their init_done_ guard would reject a second
-	// PerformInit; cleaner to acquire fresh.
+	// A fresh worker per finalize_state_id (Sink workers would reject a second
+	// PerformInit), draining one TABLE_BUFFERING_FINALIZE stream.
 	std::unique_ptr<IFunctionConnection> worker;
 	std::vector<uint8_t> current_finalize_state_id;
-	// True once PerformInit(TABLE_BUFFERING_FINALIZE) has fired on
-	// `worker` for `current_finalize_state_id`. Subsequent GetData
-	// calls just keep calling ReadDataBatch on the same worker until
-	// EOS (null batch).
+	// The stream for current_finalize_state_id is open (or a cache replay).
 	bool stream_open = false;
-	// Arrow → DuckDB scan plumbing. Rebuilt per emitted batch (the batch
-	// carries its own schema; we don't need to precompute one).
+	// Arrow → DuckDB plumbing, rebuilt per batch from the batch's own schema.
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
-	// The currently-draining emitted batch. Persisted across GetData calls so a
-	// finalize() batch larger than STANDARD_VECTOR_SIZE is emitted over several
-	// vectors (advancing chunk_offset) rather than truncated to the first 2048
-	// rows. Null between batches / before the first one.
+	// The batch being emitted, kept across GetData calls so one larger than
+	// STANDARD_VECTOR_SIZE is emitted over several chunks, not truncated.
 	std::unique_ptr<ArrowScanLocalState> scan_state;
 
-	// Captured at GetData-time alongside the worker acquisition so the
-	// destructor can route an unreleased connection through the global
-	// cancel-dispatcher. Mirrors LocalSinkState's `db` field. nullptr
-	// before the first GetData call, or if the cancel dispatcher isn't
-	// installed (in which case the destructor falls back to dropping
-	// the unique_ptr, same as the gstate destructor's last-resort path).
+	// Set with the worker, for the destructor's cancel-dispatch.
 	DatabaseInstance *db = nullptr;
 
 	~VgiTableBufferingLocalSourceState() override {
 		if (!worker) {
 			return;
 		}
-		// EOS path goes through ReleaseForPooling in GetDataInternal and
-		// leaves `worker` empty before we reach here. So if we're here
-		// holding a worker, something else short-circuited:
-		//   1) PerformInit(TABLE_BUFFERING_FINALIZE) threw (worker died,
-		//      user's initial_finalize_state raised, EPIPE);
-		//   2) ReadDataBatch threw mid-stream;
-		//   3) DuckDB tore down the source pipeline early (LIMIT, user
-		//      break, parent exception) without reaching EOS.
-		// (3) is the on_cancel path — we want to deliver a CANCEL_KEY
-		// batch to the worker so it can run cls.on_cancel(...) before
-		// the pipe closes. (1)/(2) want the same dispatch so a worker
-		// parked in a blocking syscall unblocks promptly.
+		// At EOS GetDataInternal pools the worker, so holding one here means
+		// PerformInit or ReadDataBatch threw, or DuckDB tore the source down
+		// early (LIMIT, interrupt). Cancel-dispatch: the worker gets its
+		// on_cancel and a blocked call unblocks.
 		auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
 		if (!dispatcher) {
 			return;
@@ -553,8 +442,7 @@ public:
 	}
 };
 
-// Helper: build FunctionConnectionParams from bind_data + optional
-// global_execution_id (empty = primary, non-empty = secondary).
+// global_execution_id: empty = primary init, non-empty = secondary.
 FunctionConnectionParams BuildAcquireParams(const VgiTableInOutBindData &bd,
                                              const std::vector<uint8_t> &global_execution_id) {
 	FunctionConnectionParams params;
@@ -571,12 +459,9 @@ FunctionConnectionParams BuildAcquireParams(const VgiTableInOutBindData &bd,
 	return params;
 }
 
-// The init RPC opens a Stream on the wire; for TABLE_BUFFERING we don't use
-// it (all subsequent traffic is unary RPCs). In exchange-mode (which is
-// selected because we pass a non-null input_schema at bind), the worker is
-// blocked waiting for input. Open the input writer and close it (sends EOS)
-// so the worker's exchange loop completes, then drain ReadDataBatch to EOS.
-// After that stdin/stdout are free for the unary table_buffering_* RPCs.
+// A TABLE_BUFFERING init opens an exchange stream that is never used (all
+// later traffic is unary). Close its input (EOS) and drain its output so the
+// connection is free for the table_buffering_* RPCs.
 void DrainBufferingInitStream(IFunctionConnection &conn) {
 	conn.OpenInputWriter();
 	conn.CloseInputWriter();
@@ -586,29 +471,24 @@ void DrainBufferingInitStream(IFunctionConnection &conn) {
 	}
 }
 
-// Emit up to STANDARD_VECTOR_SIZE rows from the scan_state's current batch into
-// `chunk`, advancing chunk_offset. Mirrors ProduceOutputFromBatch in
-// vgi_table_in_out_impl.cpp; the Source phase never has appended LATERAL
-// columns, so the scratch-chunk path isn't needed here.
+// Emit up to STANDARD_VECTOR_SIZE rows of the current batch, advancing
+// chunk_offset. Like ProduceOutputFromBatch (vgi_table_in_out_impl.cpp), minus
+// LATERAL columns.
 void EmitBufferedPage(ArrowScanLocalState &scan_state, const ArrowTableSchema &arrow_table, DataChunk &chunk,
                       bool projection_pushdown) {
 	idx_t length = static_cast<idx_t>(scan_state.chunk->arrow_array.length);
 	idx_t remaining = length - scan_state.chunk_offset;
 	idx_t rows = std::min<idx_t>(remaining, STANDARD_VECTOR_SIZE);
 	chunk.SetCardinality(rows);
-	// column_ids is intentionally left empty so ArrowToDuckDB reads positionally
-	// (children[idx]) — the worker emits a narrow batch already aligned to the
-	// projected output schema. ArrowToDuckDB reads `rows` from chunk_offset; we
-	// advance chunk_offset ourselves afterwards.
+	// column_ids stays empty: ArrowToDuckDB reads positionally, since the worker
+	// emits batches aligned to the projected output.
 	ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), chunk, projection_pushdown);
 	scan_state.chunk_offset += rows;
 }
 
 } // namespace
 
-// ============================================================================
 // Sink
-// ============================================================================
 
 unique_ptr<GlobalSinkState>
 PhysicalVgiTableBufferingFunction::GetGlobalSinkState(ClientContext &context) const {
@@ -618,21 +498,14 @@ PhysicalVgiTableBufferingFunction::GetGlobalSinkState(ClientContext &context) co
 	gstate->function_name = bd.function_name;
 	gstate->schema_name = bd.schema_name;
 	gstate->attach_opaque_data = bd.attach_opaque_data;
-	// Captured for the best-effort destructor RPC fired from
-	// ~VgiTableBufferingGlobalSinkState. context.shared_from_this()
-	// gives us a non-owning observer; if the session ends before teardown
-	// runs the destructor swallows and relies on cleanup_old_entries.
 	gstate->context_weak = context.shared_from_this();
 	gstate->attach_params = bd.attach_params;
 
-	// Exchange-mode result cache (M3): eligible only for an UNORDERED sink (result is a
-	// function of the input multiset — the commutative additive digest keys it). An
-	// order-dependent sink is excluded (its result depends on input order, which the
-	// commutative fold can't capture).
+	// Result cache: unordered sinks only (see cache_eligible).
 	if (!bd.sink_order_dependent) {
 		std::vector<int32_t> proj_key;
 		if (bd.projection_pushdown) {
-			proj_key = projection_ids; // the wire projection the worker was init'd with
+			proj_key = projection_ids; // the projection the worker is init'd with
 		}
 		const char *reason = nullptr;
 		int64_t catalog_version = 0;
@@ -666,55 +539,37 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 	auto &lstate = input.local_state.Cast<VgiTableBufferingLocalSinkState>();
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 
-	// Strict invariant: Sink must not see input after Sink::Finalize ran on
-	// the same GlobalSinkState. DuckDB's MetaPipeline contract already
-	// enforces this in every context we've found; this assertion exists as
-	// belt-and-suspenders so a future planner change that violates it
-	// surfaces loudly instead of silently producing wrong results.
+	// DuckDB never sends input after Finalize; fail loudly if that changes
+	// rather than produce wrong results.
 	if (gstate.finalized.load()) {
 		throw InternalException(
 		    "PhysicalVgiTableBufferingFunction::Sink called after Finalize returned READY — "
 		    "the strict once-per-GlobalSinkState invariant has been violated.");
 	}
 
-	// M3 result cache: fold this chunk into the per-thread additive input digest
-	// (merged into the gstate at Combine). Order/thread independent — the buffered
-	// result is a function of the input multiset (eligibility requires !sink_order_dependent).
 	if (gstate.cache_eligible) {
 		AccumulateInputDigest(chunk, lstate.digest_lo, lstate.digest_hi, lstate.digest_rows);
 	}
 
-	// Init protocol — symmetric, no coordinator. The first Sink thread to
-	// arrive runs PerformInit on its OWN per-thread worker; that init mints
-	// the execution_id. Other threads wait on a CV until execution_id is
-	// publishable, then run their own per-thread secondary inits in parallel.
-	// (Each new connection's init stream is drained with DrainBufferingInitStream.)
-
+	// Init: the first thread's primary init mints execution_id; the others wait
+	// for it, then run secondary inits in parallel (see the class comment).
 	if (!lstate.connection) {
 		bool i_am_runner = false;
 		std::vector<uint8_t> exec_id;
 
 		{
 			std::unique_lock<std::mutex> lk(gstate.init_mutex);
-			// All reads of init_done / init_started / init_failed below
-			// happen under init_mutex, so the mutex provides synchronizes-
-			// with. The release/acquire on init_done is therefore redundant
-			// — kept as documentation that init_done's intent is a one-way
-			// latch, not because it's load-bearing here. If a future caller
-			// reads init_done OUTSIDE the lock they'd also need atomic
-			// access to init_started/init_failed (currently plain bools).
+			// All of these are read under init_mutex; the acquire on init_done is
+			// redundant. Reading them outside the lock would need init_started /
+			// init_failed to become atomics too.
 			if (gstate.init_done.load(std::memory_order_acquire)) {
-				// Init already published — secondary acquire path.
 				exec_id = gstate.execution_id;
 			} else if (!gstate.init_started) {
-				// First arrival — I will run init.
 				gstate.init_started = true;
 				i_am_runner = true;
 			} else {
-				// Init is in flight on another thread — wait it out, polling
-				// the query's interrupted flag every 250ms so a Ctrl-C while
-				// the init runner is blocked (slow worker spawn, OAuth
-				// refresh, etc.) doesn't leave peers hung indefinitely.
+				// Wait for the runner, polling for interrupt every 250 ms so a
+				// cancel is not stuck behind a slow spawn or OAuth refresh.
 				while (!gstate.init_done.load(std::memory_order_acquire) && !gstate.init_failed) {
 					if (context.client.IsInterrupted()) {
 						throw InterruptException();
@@ -731,30 +586,16 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 			}
 		}
 
-		// Cache the gstate/db pointers immediately so the lstate destructor
-		// can cancel-dispatch if anything in the init flow below throws
-		// AFTER the connection is acquired but BEFORE the success path
-		// publishes execution_id. Without this, an exception in PerformInit
-		// (or drain_init_stream) would leave the connection owned by lstate
-		// but its destructor sees `db == nullptr` and falls back to a raw
-		// drop, which closes stdin without giving the worker a chance to
-		// shut down cleanly.
+		// Before acquiring: if PerformInit or the drain throws, the lstate
+		// destructor needs db to cancel-dispatch rather than just drop the
+		// connection.
 		lstate.db = gstate.db;
 
 		if (i_am_runner) {
-			// Acquire MY worker (no global_execution_id; we mint one) and run
-			// init on it. This worker then becomes my per-thread worker —
-			// state_id is assigned exactly as a secondary's would be. No
-			// dedicated coordinator process exists.
-			//
-			// TODO: AcquireConnectionForInit can block in non-interruptible
-			// steps (posix_spawn, worker-pool mutex contention) before
-			// reaching the first fd-based read. Runner cancellation latency
-			// is bounded by the longest such step; peer threads waiting on
-			// init_cv poll interrupted every 250ms, but the runner itself
-			// only checks interrupted at fd-read boundaries. Acceptable
-			// because the steps are short in practice; flagged for future
-			// work if a slow worker spawn becomes a real problem.
+			// Primary init on this thread's own worker, which then serves this
+			// thread like any secondary. Known limitation: the runner only checks
+			// for interrupt at fd reads, so cancellation waits out
+			// non-interruptible acquire steps (posix_spawn, pool contention).
 			std::vector<uint8_t> minted_exec_id;
 			try {
 				auto params = BuildAcquireParams(bd, /*global_execution_id=*/{});
@@ -766,11 +607,8 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 				                                                    /*phase=*/"TABLE_BUFFERING");
 				minted_exec_id = std::move(init_result.execution_id);
 				DrainBufferingInitStream(*lstate.connection);
-				// state_id is now assigned by the worker (returned on the
-				// RpcTableBufferingProcess response in Sink()).
+				// state_id comes from the first process() RPC, so it is logged there.
 				if (VgiInfoLogActive(context.client)) {
-					// state_id is not yet known at init time (worker returns
-					// it from the first process() RPC); log it post-Sink.
 					VGI_LOG(context.client, "table_buffering.init",
 					        {{"conn", lstate.connection->GetConnIdHex()},
 					         {"function_name", bd.function_name},
@@ -792,7 +630,6 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 			}
 			gstate.init_cv.notify_all();
 		} else {
-			// Secondary acquire — runs in parallel with peer secondaries.
 			auto params = BuildAcquireParams(bd, exec_id);
 			auto acquired = AcquireConnectionForInit(context.client, params);
 			lstate.connection = std::move(acquired.connection);
@@ -801,7 +638,6 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 			                                join_keys_buffers,
 			                                /*phase=*/"TABLE_BUFFERING");
 			DrainBufferingInitStream(*lstate.connection);
-			// state_id assigned by worker on first Sink RPC.
 			if (VgiInfoLogActive(context.client)) {
 				VGI_LOG(context.client, "table_buffering.init",
 				        {{"conn", lstate.connection->GetConnIdHex()},
@@ -811,31 +647,17 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 		}
 	}
 
-	// Convert DuckDB chunk → Arrow batch and ship to worker.
 	auto input_batch = DataChunkToArrow(context.client, chunk, bd.input_schema);
 
-	// batch_index plumbing. Two routes, decided in CreatePlan:
-	//
-	//  - The source supports batch-index partitioning, so we declared
-	//    RequiredPartitionInfo()=BatchIndex() and DuckDB threads a globally
-	//    unique monotonic index into lstate.partition_info.
-	//  - It does not (range(), VALUES, ...), so the plan serialized this sink
-	//    instead and we number the batches ourselves; arrival order on one
-	//    thread is source order.
-	//
-	// Either way the worker gets a valid index. The throw below is only a
-	// backstop for a source that claims support and then supplies nothing:
-	// passing nullopt to a worker that opted in to ordering would mean quiet
-	// wrong answers, which is worse than failing.
+	// batch_index, by the route CreatePlan chose: DuckDB's partition_info
+	// (RequiredPartitionInfo()=BatchIndex()), or our own numbering on a
+	// serialized sink. The throw is a backstop for a source that claims support
+	// but supplies nothing: sending nullopt would give quietly wrong answers.
 	std::optional<int64_t> batch_index;
 	if (synthesize_batch_index) {
-		// The source could not supply one, so the plan serialized this sink and we
-		// number the batches in arrival order — which, single-threaded, is source
-		// order. The worker cannot tell this apart from a DuckDB-supplied index,
-		// which is the point: opting in never fails a query.
 		batch_index = gstate.next_synthetic_batch_index.fetch_add(1);
 	} else if (requires_input_batch_index) {
-		// partition_info is on the LocalSinkState BASE, not our subclass.
+		// partition_info is on the LocalSinkState base class.
 		const auto &bi = input.local_state.partition_info.batch_index;
 		if (!bi.IsValid()) {
 			throw IOException(
@@ -848,10 +670,7 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 		batch_index = static_cast<int64_t>(bi.GetIndex());
 	}
 
-	// Worker chooses the state_id and returns it on the response — opaque
-	// bytes the worker can encode any way it wants (8-byte packed pid via
-	// thread_state_id(), UUID4, hash digest, etc.). The C++ side just
-	// shuttles them between phases.
+	// The worker-chosen state_id is opaque bytes, passed through unchanged.
 	lstate.state_id = lstate.connection->RpcTableBufferingProcess(
 	    gstate.function_name, gstate.execution_id, input_batch, batch_index);
 	if (VgiInfoLogActive(context.client)) {
@@ -874,11 +693,6 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 SinkNextBatchType
 PhysicalVgiTableBufferingFunction::NextBatch(ExecutionContext & /*context*/,
                                               OperatorSinkNextBatchInput & /*input*/) const {
-	// Required to be implementable for sinks that declare
-	// RequiredPartitionInfo()=BatchIndex(). DuckDB invokes this when the
-	// per-thread batch_index advances. We don't need to flush anything —
-	// workers receive batch_index per process() call and own their own
-	// ordering logic. PhysicalBatchInsert does the same (no-op).
 	return SinkNextBatchType::READY;
 }
 
@@ -888,23 +702,19 @@ PhysicalVgiTableBufferingFunction::Combine(ExecutionContext & /*context*/,
 	auto &gstate = input.global_state.Cast<VgiTableBufferingGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<VgiTableBufferingLocalSinkState>();
 
-	// M3 result cache: merge this thread's partial additive input digest into the
-	// gstate (associative + commutative → order/thread independent). Done before the
-	// no-input early return (a thread with no input contributes 0, harmlessly).
+	// Merge the thread's digest (commutative, so order-independent).
 	if (gstate.cache_eligible) {
 		gstate.digest_lo.fetch_add(lstate.digest_lo, std::memory_order_relaxed);
 		gstate.digest_hi.fetch_add(lstate.digest_hi, std::memory_order_relaxed);
 		gstate.digest_rows.fetch_add(lstate.digest_rows, std::memory_order_relaxed);
 	}
 
-	// Thread didn't receive any input → nothing to hand off.
+	// No input on this thread: nothing to hand off.
 	if (!lstate.connection) {
 		return SinkCombineResultType::FINISHED;
 	}
 
-	// Move the connection into gstate.workers[]; this nulls lstate.connection, so
-	// ~VgiTableBufferingLocalSinkState sees no connection and won't cancel-dispatch
-	// it (the worker is now the gstate's to pool/cancel at teardown).
+	// The gstate now owns the worker (the lstate destructor sees null).
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 		gstate.workers.push_back(std::move(lstate.connection));
@@ -918,31 +728,27 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
                                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiTableBufferingGlobalSinkState>();
 
-	// M3 result cache: the input digest is now complete (all Combine calls merged).
-	// Fold it into the key and probe the cache. A HIT skips the combine RPC + the
-	// Source finalize-drain — the Source phase replays the cached result instead.
+	// The input digest is complete: probe the result cache. On a hit the Source
+	// phase replays the cached result; no combine, no finalize drain.
 	if (gstate.cache_eligible) {
 		gstate.cache_key.input_hash =
 		    FinalizeInputDigest(gstate.digest_lo.load(), gstate.digest_hi.load(), gstate.digest_rows.load());
-		auto entry = GetResultCache(*gstate.db).Lookup(gstate.cache_key, std::chrono::steady_clock::now());
+		const char *hit_tier = "memory";
+		auto entry = GetResultCache(*gstate.db).Lookup(gstate.cache_key, std::chrono::steady_clock::now(), &hit_tier);
 		if (entry) {
 			GetResultCache(*gstate.db).RecordExchangeHit(entry->total_bytes);
 			VGI_LOG(context, "result_cache.hit",
-			        {{"function", gstate.function_name}, {"key_hash", gstate.cache_key.HexDigest()}, {"tier", "memory"}});
+			        {{"function", gstate.function_name}, {"key_hash", gstate.cache_key.HexDigest()}, {"tier", hit_tier}});
 			gstate.serving_from_cache = true;
 			gstate.serving = entry;
 			gstate.finalized.store(true);
-			return SinkFinalizeType::READY; // Source replays; no combine, no worker drain
+			return SinkFinalizeType::READY;
 		}
-		// Not a hit — the combine below runs (a fresh whole-input miss).
 		GetResultCache(*gstate.db).RecordExchangeMiss();
 	}
 
-	// Snapshot state_ids and pop one worker for the combine RPC, all under
-	// workers_mutex. No special "coordinator" — combine reads peer state
-	// through shared BoundStorage in the worker library, so any worker that
-	// finished init can serve. We pop one to avoid running combine and
-	// source-drain concurrently on the same connection.
+	// Any worker can run combine (state is shared through BoundStorage); pop one
+	// so nothing else uses its connection meanwhile.
 	std::vector<std::vector<uint8_t>> state_ids_snapshot;
 	std::unique_ptr<IFunctionConnection> combine_worker;
 	{
@@ -954,24 +760,13 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 		}
 	}
 	if (!combine_worker) {
-		// Empty input: no Sink thread ever received rows, so no worker was
-		// acquired or inited. Still run the full lifecycle -- init, combine
-		// with an EMPTY state_ids list, then the normal source/finalize drain
-		// -- so whole-input reductions answer for empty input (a row count
-		// emits 0, a sum emits its zero row) instead of returning no rows.
-		// Functions with nothing to say for empty input (sort, top-k, echo)
-		// simply emit nothing from finalize. This matches the reference
-		// Python client and COPY TO (VgiCopyToFinalize).
-		//
-		// The init must be a primary TABLE_BUFFERING-phase init: it mints the
-		// execution_id and is where every worker SDK persists the bind state
-		// (args, schemas) that combine and finalize read back. Finalize runs
-		// single-threaded after every Combine, so no init_mutex handshake with
-		// Sink threads is needed.
-		//
-		// Note: a statically-empty input (e.g. `WHERE false`) never reaches
-		// this operator -- DuckDB's optimizer folds the whole call to an empty
-		// result first. This path covers inputs that are empty at runtime.
+		// Runtime-empty input: no Sink thread got rows. Still run init, combine
+		// with no state_ids, and the finalize drain, so whole-input reductions
+		// answer for empty input (a count emits 0), as the Python client and
+		// COPY TO (VgiCopyToFinalize) do. It must be a primary TABLE_BUFFERING
+		// init: that mints execution_id and is where worker SDKs persist the
+		// bind state combine and finalize read. Finalize runs after every
+		// Combine, so no handshake with Sink threads is needed.
 		auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 		try {
 			auto params = BuildAcquireParams(bd, /*global_execution_id=*/{});
@@ -1003,35 +798,20 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 		}
 	}
 
-	// Run combine outside the lock — it's a network round-trip.
+	// Outside the lock: it is a round trip.
 	VGI_LOG(context, "table_buffering.combine",
 	        {{"conn", combine_worker->GetConnIdHex()},
 	         {"function_name", gstate.function_name},
 	         {"num_state_ids", std::to_string(state_ids_snapshot.size())}});
-	// state_ids flow through opaque-bytes — no packing/unpacking, the
-	// worker chose the encoding when it returned them from process().
 	std::vector<std::vector<uint8_t>> finalize_state_ids;
 	try {
 		finalize_state_ids =
 		    combine_worker->RpcTableBufferingCombine(gstate.function_name, gstate.execution_id,
 		                                              state_ids_snapshot);
 	} catch (...) {
-		// Combine failed. Three things to do before rethrow:
-		//   (a) Set finalized=true so the gstate destructor's "happy path"
-		//       skip is honored — the post-finalize Sink guard at the top
-		//       of Sink() is the only consumer of this flag, and it's
-		//       harmless to flip it here since the pipeline is unwinding.
-		//   (b) Cancel-dispatch combine_worker through the global dispatcher.
-		//       Without this the unique_ptr just drops, leaving the worker
-		//       thread parked in a blocking syscall until its own idle
-		//       reclaim path kicks in (subprocess: pool timeout; HTTP:
-		//       keep-alive expiry). Mirrors the gstate destructor's
-		//       reclaim_or_cancel logic and the LocalSinkState destructor.
-		//   (c) Pop the state_id we held aside for this worker so the
-		//       transient workers/state_ids size imbalance doesn't leak
-		//       past this throw. state_ids is dead after Finalize anyway,
-		//       but keeping the invariant tight makes the destructor
-		//       reasoning easier.
+		// Cancel-dispatch the popped worker (otherwise it stays parked in a
+		// blocking call), and pop one state_id so workers/state_ids stay the
+		// same size.
 		gstate.finalized.store(true);
 		{
 			// (On the empty-input path state_ids is empty, so nothing pops.)
@@ -1048,8 +828,7 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 			req.state_token = std::move(token);
 			(void)dispatcher->Enqueue(std::move(req));
 		}
-		// combine_worker (if dispatcher was null) drops here — last resort,
-		// same as the gstate-destructor fallback.
+		// Without a dispatcher, combine_worker just drops.
 		throw;
 	}
 	VGI_LOG(context, "table_buffering.combine_result",
@@ -1057,13 +836,8 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 	         {"function_name", gstate.function_name},
 	         {"num_finalize_state_ids", std::to_string(finalize_state_ids.size())}});
 
-	// Combine succeeded — push the worker back into the pool so source threads
-	// can use it like any other worker. Note: state_ids is NOT updated here.
-	// After Finalize runs, state_ids is no longer read; the source-phase
-	// routing structure is finalize_queue (populated below). So the transient
-	// invariant `state_ids.size() != workers.size()` between this push and
-	// the gstate destructor is harmless. Don't "fix" this by re-pushing a
-	// state_id — there's no sink state_id to attribute to the combine worker.
+	// Return the worker to gstate.workers. state_ids is not read after this, so
+	// it is left unchanged (it may now be shorter than workers).
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 		gstate.workers.push_back(std::move(combine_worker));
@@ -1073,9 +847,7 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 		for (auto &id : finalize_state_ids) {
 			gstate.finalize_queue.push_back(std::move(id));
 		}
-		// M3 result cache (MISS): arm capture. The Source phase accumulates every
-		// drained batch; the gstate destructor commits iff all finalize states reach
-		// EOS (never-partial). total_finalize_states is the drain target.
+		// Cache miss: arm capture; total_finalize_states is the EOS target.
 		if (gstate.cache_eligible) {
 			gstate.capturing = true;
 			gstate.total_finalize_states = gstate.finalize_queue.size();
@@ -1085,17 +857,12 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 	return SinkFinalizeType::READY;
 }
 
-// ============================================================================
 // Source
-// ============================================================================
 
 unique_ptr<GlobalSourceState>
 PhysicalVgiTableBufferingFunction::GetGlobalSourceState(ClientContext & /*context*/) const {
 	auto gss = make_uniq<VgiTableBufferingGlobalSourceState>();
-	// sink_state is populated by the time GetGlobalSourceState runs (the
-	// pipeline executor materializes the sink before scheduling the source).
-	// Read the worker count *now* so MaxThreads can return a sensible cap and
-	// DuckDB doesn't oversubscribe drainer threads.
+	// The sink has finished by now; its worker count caps MaxThreads.
 	if (sink_state) {
 		auto &gstate = sink_state->Cast<VgiTableBufferingGlobalSinkState>();
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
@@ -1113,9 +880,7 @@ PhysicalVgiTableBufferingFunction::GetLocalSourceState(ExecutionContext & /*cont
 SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                                     OperatorSourceInput &input) const {
 	auto &lstate = input.local_state.Cast<VgiTableBufferingLocalSourceState>();
-	// gstate is the *Sink* global state under DuckDB's sink-to-source
-	// transition — operators that are both Sink and Source share the same
-	// state pointer via sink_state.
+	// The Sink global state, shared with the Source phase via sink_state.
 	auto &gstate = sink_state->Cast<VgiTableBufferingGlobalSinkState>();
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	if (gstate.cache_eligible && QueryProfiler::Get(context.client).IsEnabled()) {
@@ -1123,34 +888,26 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 		    "Cache", gstate.serving_from_cache ? "hit (memory)" : "miss");
 	}
 
-	// Drain any rows still pending from the current emitted batch before
-	// reading a new one. finalize() may emit a batch larger than
-	// STANDARD_VECTOR_SIZE; we split it across GetData calls via the persisted
-	// scan_state.chunk_offset rather than truncating to a single vector.
+	// Finish emitting the current batch first (see scan_state).
 	if (lstate.scan_state &&
 	    lstate.scan_state->chunk_offset < static_cast<idx_t>(lstate.scan_state->chunk->arrow_array.length)) {
 		EmitBufferedPage(*lstate.scan_state, lstate.arrow_table, chunk, projection_pushdown);
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
-	// Current batch (if any) is fully drained; drop it before fetching the next.
 	lstate.scan_state.reset();
 
-	// M3 result cache HIT: replay the single cached whole-input result. Exactly one
-	// Source thread claims it (CachedReplayConnection); the rest are FINISHED. Skips
-	// the finalize_queue + worker acquire + PerformInit entirely.
+	// Cache hit: one Source thread replays the entry; the rest finish.
 	if (gstate.serving_from_cache && !lstate.stream_open) {
 		if (gstate.serving_claimed.exchange(true)) {
 			chunk.SetCardinality(0);
-			return SourceResultType::FINISHED; // another thread is replaying the result
+			return SourceResultType::FINISHED;
 		}
 		lstate.worker = make_uniq<CachedReplayConnection>(gstate.serving);
 		lstate.stream_open = true;
 	}
 
-	// Open a fresh worker + stream for the next finalize_state_id when
-	// the previous stream has hit EOS (or this is the first call).
+	// Open a fresh worker and stream for the next finalize_state_id.
 	if (!lstate.stream_open) {
-		// Pop the next finalize_state_id; if none, we're FINISHED.
 		{
 			std::lock_guard<std::mutex> lk(gstate.finalize_queue_mutex);
 			if (gstate.finalize_queue.empty()) {
@@ -1161,17 +918,11 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 			lstate.current_finalize_state_id = std::move(gstate.finalize_queue.front());
 			gstate.finalize_queue.pop_front();
 		}
-		// Acquire a fresh worker (or reuse the prior one — the unary path
-		// reused workers from gstate.workers, but those were init'd via
-		// phase=TABLE_BUFFERING and would reject a second PerformInit. The
-		// pool keeps subprocess workers warm so this is cheap.).
+		// Fresh, not from gstate.workers (see LocalSourceState::worker); the
+		// pool keeps subprocess workers warm.
 		auto acquire_params = BuildAcquireParams(bd, gstate.execution_id);
 		auto acquired = AcquireConnectionForInit(context.client, acquire_params);
 		lstate.worker = std::move(acquired.connection);
-		// Capture the DatabaseInstance pointer alongside the worker so the
-		// LocalSourceState destructor can cancel-dispatch the worker if a
-		// later step (PerformInit, ReadDataBatch) throws. Without this the
-		// unique_ptr would just drop and leave the worker thread parked.
 		lstate.db = &DatabaseInstance::GetDatabase(context.client);
 		if (VgiInfoLogActive(context.client)) {
 			auto to_hex = [](const std::vector<uint8_t> &b) {
@@ -1189,12 +940,9 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 			         {"function_name", gstate.function_name},
 			         {"finalize_state_id", to_hex(lstate.current_finalize_state_id)}});
 		}
-		// The Source-side init thread must receive the same projection_ids /
-		// pushdown_filters as the Sink-side init thread so the worker's
-		// finalize() emits batches narrowed to the projected output_schema.
-		// Without this, the worker would emit full-width batches but the
-		// post-projection return_types this operator advertises is narrow —
-		// ArrowToDuckDB would read out-of-bounds.
+		// Same projection/filters as the Sink inits: finalize() must emit the
+		// projected (narrow) schema this operator advertises, or ArrowToDuckDB
+		// reads out of bounds.
 		lstate.worker->PerformInit(bd.bind_result, projection_ids,
 		                           pushdown_filters,
 		                           join_keys_buffers,
@@ -1208,10 +956,7 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 
 	auto batch = lstate.worker->ReadDataBatch();
 	if (!batch) {
-		// EOS — this finalize_state_id is exhausted. Release worker back
-		// to the pool; next GetData call will open the next stream.
-		// M3 (MISS capture): count this finalize state as fully drained — the gstate
-		// destructor commits only when finalize_eos_count == total_finalize_states.
+		// EOS for this finalize_state_id: count it for capture and pool the worker.
 		if (gstate.capturing && !gstate.serving_from_cache) {
 			gstate.finalize_eos_count.fetch_add(1, std::memory_order_acq_rel);
 		}
@@ -1225,10 +970,8 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
 
-	// M3 (MISS capture): accumulate the whole-input result. Latch the worker's cache
-	// advertisement off the first batch; if not cacheable, abort capture (nothing is
-	// stored). Capturing 0-row batches would bloat the entry with no rows — skip them
-	// (they're valid "no output yet" ticks, not result data).
+	// Cache miss: capture the result. The first non-empty batch's cache
+	// advertisement decides cacheability; 0-row batches are not captured.
 	if (gstate.capturing && !gstate.serving_from_cache && !gstate.capture_aborted.load() &&
 	    batch->num_rows() > 0) {
 		std::lock_guard<std::mutex> lk(gstate.capture_mu);
@@ -1240,10 +983,7 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 			}
 		}
 		if (!gstate.capture_aborted.load()) {
-			// [S6/S9] Bound the RAM capture. A result crossing the per-entry cap or the
-			// process-global in-flight budget aborts to uncached — drop what we've
-			// accumulated (freeing RAM now) and release any reserved budget; the dtor
-			// then won't commit. The query keeps streaming to DuckDB unaffected.
+			// Over budget (see capture_bytes): abort and free the capture now.
 			int64_t sz = batch->TotalBufferSize();
 			if (gstate.capture_bytes + sz > gstate.cache_max_entry_bytes ||
 			    !GetResultCache(*gstate.db).TryReserveInflightCapture(sz)) {
@@ -1266,24 +1006,17 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
 
-	// Convert the Arrow batch → DuckDB DataChunk via the same helper pair
-	// the streaming InOut path uses (vgi_table_in_out_impl.cpp:306-345).
+	// Convert the Arrow batch → DuckDB DataChunk. Unlike the streaming InOut
+	// path, which builds its type map once at bind, this one is per batch.
 	ExportSchema(batch->schema(), lstate.c_schema);
-	// Reset before repopulating: PopulateArrowTableSchema *appends* columns via
-	// ArrowTableSchema::AddColumn, which D_ASSERTs that a column index isn't
-	// added twice. A finalize() stream that returns multiple batches reaches
-	// here once per batch on the same lstate.arrow_table, so without this reset
-	// the second batch re-adds index 0 and aborts debug builds (in release the
-	// assert is compiled out and the duplicate emplace is a silent no-op). The
-	// schema is rebuilt per batch, as documented on the member.
+	// Reset first: PopulateArrowTableSchema appends via AddColumn, which
+	// D_ASSERTs on a repeated column index.
 	lstate.arrow_table = ArrowTableSchema();
 	ArrowTableFunction::PopulateArrowTableSchema(context.client, lstate.arrow_table,
 	                                              lstate.c_schema.arrow_schema);
 
-	// Type-confusion guard: this path builds its Arrow type map from the batch's
-	// own schema but writes into output vectors of the declared return type, so a
-	// batch whose type disagrees with the bind-declared output_schema is a
-	// misread. Skipped on a cached-replay worker (M3 hit). See
+	// Type-confusion guard: the type map comes from the batch's own schema but
+	// fills vectors of the declared return type. Skipped for cache replay. See
 	// vgi_batch_validation.hpp.
 	if (!lstate.worker->IsCachedReplay()) {
 		vgi::ValidateProjectedWireBatch(&context.client, *batch, bd.output_schema, projection_ids, bd.worker_path(),
@@ -1293,14 +1026,8 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(batch, *chunk_wrapper);
 
-	// Persist the scan_state on the local state so a batch wider than
-	// STANDARD_VECTOR_SIZE is drained over multiple GetData calls (see the
-	// pending-drain check at the top of this function). ``scan_state.column_ids``
-	// is left empty: when projection_pushdown is on the worker emits a narrow
-	// Arrow batch positionally aligned with chunk.ColumnCount(), and
-	// `arrow_scan_is_projected=true` makes ArrowToDuckDB read children[idx]
-	// directly (our ``lstate.arrow_table`` is built per-batch from that narrow
-	// schema, so its column-type map keys are 0..n-1 positional).
+	// Kept on the lstate so a long batch is emitted over several calls; see
+	// EmitBufferedPage for why column_ids stays empty.
 	lstate.scan_state = make_uniq<ArrowScanLocalState>(std::move(chunk_wrapper), context.client);
 	lstate.scan_state->chunk_offset = 0;
 

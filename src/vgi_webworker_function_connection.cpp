@@ -2,12 +2,8 @@
 #include "vgi_webworker_function_connection.hpp"
 #include "vgi_query_rpc.hpp"
 
-// The `worker:` SAB transport is compiled only for the wasm extension
-// (__EMSCRIPTEN__) and the native SAB unit-test binary (-DVGI_SAB_NATIVE_TEST,
-// which provides the ring stubs). The normal native extension link has no ring
-// stubs, so the whole implementation is excluded there. The header carries no
-// such guard — the class is always declarable; only its out-of-line definitions
-// are gated.
+// Only the wasm extension and the native SAB unit test (-DVGI_SAB_NATIVE_TEST,
+// which provides the ring stubs) link the ring functions.
 #if defined(__EMSCRIPTEN__) || defined(VGI_SAB_NATIVE_TEST)
 
 #include "duckdb.hpp"
@@ -45,15 +41,10 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// Stream-based RPC read helpers: the SAB entry points onto the shared
-// ReadWorkerUnaryStream / ReadWorkerStreamHeader (vgi_rpc_client.cpp).
-//
-// SabInputStream::Read already polls the ClientContext for cancellation (parity
-// with FdInputStream), so there is no per-batch readiness wait. The SAB ring is
-// a lenient transport: a stream that ends without the Arrow EOS marker ends the
-// read, and errors while draining after the data batch are ignored.
-// ============================================================================
+// SAB entry points onto ReadWorkerUnaryStream / ReadWorkerStreamHeader.
+// SabInputStream::Read polls the ClientContext for cancellation. The ring is a
+// lenient transport: a stream ending without the Arrow EOS marker ends the read,
+// and errors while draining after the data batch are ignored.
 namespace {
 
 // `function_kind` token for a connection's function_type_ ("TABLE",
@@ -117,9 +108,7 @@ StreamHeaderResult SabReadStreamHeader(int region_offset, int slot, ClientContex
 	                              SabStreamOptions(context, worker_path));
 }
 
-// Decode the outer-envelope response for a buffered-table unary RPC. Mirrors
-// DecodeOuterResponse in vgi_function_connection.cpp: the 'result' column of the
-// outer envelope is a binary blob containing the IPC-serialized inner batch.
+// Inner batch of a buffered-table unary response; null when `result` is null.
 VgiBatchPtr DecodeOuterResponse(const UnaryResponseResult &response, const std::string &method_name,
                                 const std::string &worker_path) {
 	return UnwrapResultEnvelope(response.batch, method_name, ErrorInfo().Worker(worker_path), /*null_result_ok=*/true);
@@ -135,20 +124,15 @@ const VgiBatchPtr &EmptyTickBatch() {
 
 #if defined(__EMSCRIPTEN__)
 namespace {
-// Forward declaration — defined below in its own __EMSCRIPTEN__-guarded
-// anon-namespace block (same TU-local anon namespace, so this links). Needed here
-// because WebWorkerInvokeUnary (below) calls it before that definition.
+// Defined below; WebWorkerInvokeUnary needs it first.
 int EnsureVgiSabRegion(const std::string &canonical_target);
 } // namespace
 
-// Publish the shared channel's byte offset onto the CALLING pthread's JS realm.
-// `vgiSab.base` (the offset the JS ring stubs read through) is per-realm state, but a
-// connection is bound on one pthread while its ring I/O (ReadDataBatch tick/scan,
-// input writes) can be scheduled by DuckDB onto a DIFFERENT pool pthread whose realm
-// never had the offset set — its ring reads then look at the wrong linear-memory
-// location and block forever (an intermittent, thread-scheduling-dependent hang). The
-// SAB stream Read/Write call this first so the current realm is always correct. Cheap:
-// EnsureVgiSabChannel is a cached atomic load and set_channel is a JS field store.
+// Publish the region offset onto the calling pthread's JS realm. The offset the
+// JS ring stubs read through (`vgiSab.base`) is per-realm, and DuckDB can run a
+// connection's ring I/O on a different pthread than the one that bound it; with
+// a stale offset its reads hit the wrong memory and block forever. SabInputStream
+// / SabOutputStream call this before every Read/Write (a cheap JS field store).
 void VgiSabEnsureChannelOnRealm(int region_offset) {
 	vgi_wasm_set_channel(region_offset);
 }
@@ -157,14 +141,8 @@ void VgiSabEnsureChannelOnRealm(int) {
 }
 #endif
 
-// Standalone unary RPC over the `worker:` SAB transport, for catalog RPCs (ATTACH
-// + discovery), which are request -> single response. Spawns/reuses the worker,
-// claims a transient slot, writes the request + EOS on c2w, reads the one response
-// on w2c, releases the slot (RAII). Self-contained (no persistent connection) so
-// InvokePooledUnaryRpc's worker: branch can call it directly. Reuses the same SAB
-// stream helpers as the streaming connection. On the native test the ensure-worker
-// stub is a no-op and the in-process ring backend serves, so this is exercisable
-// natively too.
+// See the header. On the native test the ensure-worker stub is a no-op and the
+// in-process ring backend serves.
 UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::string &worker_path,
                                          const std::string &method_name,
                                          const VgiBatchPtr &params,
@@ -182,7 +160,6 @@ UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::stri
 	if (slot < 0) {
 		ThrowVgiIOException("Failed to open SAB slot (channel exhausted)", location, -1, "");
 	}
-	// RAII: always release the transient slot (the dispatcher then serves the next).
 	struct SlotReleaser {
 		int region_offset;
 		int slot;
@@ -201,15 +178,12 @@ UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::stri
 	} catch (const std::exception &e) {
 		ThrowVgiIOException("Failed to write unary request: %s", location, -1, "", RawMessageOf(e));
 	}
-	// EOS on c2w so the worker's serve loop reads exactly this one request,
-	// responds on w2c, then returns (transient slot = one request lifecycle).
+	// EOS on c2w: the worker serves exactly this one request, then returns.
 	vgi_wasm_slot_write_eos(region_offset, slot);
 	return SabReadUnaryResponse(region_offset, slot, &context, location);
 }
 
-// ============================================================================
 // WebWorkerFunctionConnection
-// ============================================================================
 
 WebWorkerFunctionConnection::WebWorkerFunctionConnection(
     const std::string &location, const std::string &function_name, const ArrowArguments &arguments,
@@ -225,15 +199,10 @@ WebWorkerFunctionConnection::WebWorkerFunctionConnection(
 
 WebWorkerFunctionConnection::~WebWorkerFunctionConnection() {
 	if (slot_ >= 0) {
-		// Ring EOF on client->worker: the worker's serve loop reads it as the end
-		// of the CONVERSATION and returns, which is what lets it free the slot.
-		// This belongs here rather than at the end of a producer stream — a
-		// connection outlives its streams (every split a reader claims re-inits
-		// this same connection), so closing the ring per stream would end the
-		// worker after the first one. Idempotent, so a connection already torn
-		// down through CloseInputWriter is unaffected.
+		// Ring EOF on c2w ends the worker's serve loop for this slot, so it belongs
+		// here, not at the end of a stream: a connection outlives its streams (each
+		// split re-inits it). Idempotent.
 		vgi_wasm_slot_write_eos(region_offset_, slot_);
-		// Release the SAB slot (state -> free). Idempotent; safe if never opened.
 		vgi_wasm_slot_release(region_offset_, slot_);
 		slot_ = -1;
 	}
@@ -241,11 +210,10 @@ WebWorkerFunctionConnection::~WebWorkerFunctionConnection() {
 
 #if defined(__EMSCRIPTEN__)
 namespace {
-// Each canonical target owns an independent ABI-v1 region. A region can be
-// recycled only while every slot is free, so a live connection can never be
-// rebound underneath an operation. Keeping each region byte-compatible with v1
-// lets legacy worker modules continue to serve one region unchanged while an
-// adapter-aware worker may register several offsets.
+// Each canonical target owns an independent ABI-v1 region (byte-compatible with
+// v1, so a legacy worker module serves one region unchanged). Beyond the region
+// limit, the least recently used region is recycled, and only while all its slots
+// are free, so a live connection is never rebound underneath an operation.
 struct SabRegionEntry {
 	int offset;
 	uint64_t last_used;
@@ -660,20 +628,16 @@ Response BrowserPost(ClientContext &context, const std::string &url, const std::
 #endif
 
 void WebWorkerFunctionConnection::EnsureWorkerSpawned() {
-	// Lazy slot open (analog of the subprocess lazy fork/exec). The JS bridge
-	// already ensured the Web Worker exists at attach time (vgi_wasm_ensure_worker);
-	// here we only claim a free duplex slot on its channel.
+	// Lazy slot open (the analog of the subprocess lazy fork/exec).
 	if (slot_ < 0) {
 #if defined(__EMSCRIPTEN__)
-		// Create/reuse the shared channel and push its offset onto this pthread's
-		// JS runtime before the slot stubs touch it. (Native test: static ring.)
+		// Publish the target's region on this pthread before the slot stubs run.
+		// (Native test: static ring.)
 		region_offset_ = EnsureVgiSabRegion(location_);
 		vgi_wasm_set_channel(region_offset_);
 #endif
-		// Ensure the Web Worker for this location exists and is serving the channel
-		// before we claim a slot. Idempotent (spawns once per location); blocks
-		// until the worker booted. On the native test the stub is a no-op (returns
-		// 0) — the in-process ring backend needs no spawn.
+		// Idempotent; spawns once per location and blocks until the worker serves
+		// the region. A no-op on the native test.
 		if (vgi_wasm_ensure_worker(location_.c_str(), region_offset_) != 0) {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kConnectFailed), "Failed to spawn/ready the VGI Web Worker", location_, -1, "");
 		}
@@ -696,7 +660,6 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 		VGI_LOG(context_, "function_connection.bind", fields);
 	}
 
-	// Transport: send bind over the SAB ring (request on c2w, response on w2c).
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> VgiBatchPtr {
 		auto rpc_params = generated::BuildBindParams(request_bytes);
 		ValidateRequestSchema(rpc_params, "bind", location_);
@@ -781,8 +744,6 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 	auto rpc_params = generated::BuildInitParams(init_request_bytes);
 	ValidateRequestSchema(rpc_params, "init", location_);
 
-	// Write the init RPC request onto the client->worker ring. (No shm side-
-	// channel on this transport; the SAB ring is the transfer medium.)
 	{
 		auto request = SerializeRpcRequest("init", rpc_params);
 		auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
@@ -798,13 +759,11 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 	auto init_response = ParseGlobalInitResponse(header.header_batch, location_);
 	execution_id_ = init_response.execution_id;
 
-	// Open data exchange streams based on mode. pyarrow defers writing the IPC
-	// schema until the first write_batch(), so:
-	//   - Producer mode: send the first tick before opening the data reader so
-	//     the worker processes it and flushes the output schema.
-	//   - Exchange mode: defer opening the data reader to the first ReadDataBatch,
-	//     after the caller has written an input batch.
-	// Phase override: FINALIZE / TABLE_BUFFERING_FINALIZE are always producer-mode.
+	// A worker may not write its output schema until it has input, so:
+	//   - Producer mode: send the first tick before opening the data reader.
+	//   - Exchange mode: open the data reader at the first ReadDataBatch, after
+	//     the caller has written an input batch.
+	// The FINALIZE phases always run in producer mode.
 	bool producer_phase_override = (phase == "FINALIZE" || phase == "TABLE_BUFFERING_FINALIZE");
 	if (!input_schema_ || producer_phase_override) {
 		is_producer_mode_ = true;
@@ -820,8 +779,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		}
 		input_writer_opened_ = true;
 
-		// Send the first tick immediately. Conditional-revalidation validators
-		// (M6) ride the FIRST tick's custom_metadata.
+		// Conditional-revalidation validators ride the first tick.
 		std::optional<VgiMetadata> first_tick_metadata;
 		if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
 			first_tick_metadata.emplace();
@@ -839,8 +797,6 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 			                    RawMessageOf(e));
 		}
 
-		// Open the data reader — the worker has processed the tick and flushed
-		// the output schema + first data batch.
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		try {
 			data_reader_ = VgiIpcReader::Open(data_stream_);
@@ -863,7 +819,6 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 			                    RawMessageOf(e));
 		}
 		input_writer_opened_ = true;
-		// data_reader_ opened lazily in ReadDataBatch (after first input batch).
 	}
 
 	init_done_ = true;
@@ -892,7 +847,6 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 		VGI_LOG(context_, "function_connection.finalize_init", fields);
 	}
 
-	// Close current data exchange streams.
 	if (input_writer_ && !input_writer_closed_) {
 		try {
 			input_writer_->Close();
@@ -905,10 +859,9 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	input_writer_opened_ = false;
 	input_writer_closed_ = false;
 
-	// If data_reader_ was never opened (0 input rows), the worker's INPUT-phase
-	// output stream still sits unconsumed on the w2c ring; open + drain it before
-	// sending the FINALIZE init, otherwise SabReadStreamHeader reads leftover
-	// INPUT-phase output instead of the FINALIZE header.
+	// With 0 input rows the reader was never opened and the INPUT phase's output
+	// stream is still on the w2c ring: drain it, or SabReadStreamHeader would read
+	// it as the FINALIZE header.
 	if (!data_reader_ && slot_ >= 0) {
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		try {
@@ -932,7 +885,8 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	init_done_ = false;
 	data_finished_ = false;
 
-	// Clear input_schema_ so PerformInit enters producer mode (tick-based).
+	// Run PerformInit without an input schema, under the INPUT phase's
+	// execution id; both are restored afterwards.
 	auto saved_input_schema = input_schema_;
 	auto saved_global_exec_id = global_execution_id_;
 	input_schema_.reset();
@@ -958,25 +912,15 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 		                    GetExecutionIdHex());
 	}
 
-	// Sibling of PerformFinalizeInit, and deliberately the same sequence: both
-	// re-initialize a LIVE connection for another stream, so both have to leave
-	// the rings between frames rather than mid-frame. Greedy split claiming reuses
-	// one connection across every split a reader claims, so this runs once per
-	// split boundary.
-
-	// FIRST: close the input writer, which writes the IPC end-of-stream so the
-	// worker's tick reader terminates and returns to its dispatch loop. Doing this
-	// late — or not at all — means PerformInit installs a NEW stream writer over
-	// the same ring while the old stream is still open, and the next init request
-	// lands inside an unterminated tick stream.
+	// Same sequence as PerformFinalizeInit; runs at every split boundary.
+	// First close the input writer: its IPC end-of-stream returns the worker's
+	// tick reader to its dispatch loop. Otherwise the next init request would
+	// land inside an unterminated tick stream.
 	if (input_writer_ && !input_writer_closed_) {
 		try {
 			input_writer_->Close();
 		} catch (const std::exception &e) {
-			// No poison flag here, unlike the subprocess connection: the SAB
-			// transport is never pooled (ReleaseForPooling returns nullptr — the JS
-			// bridge owns worker lifecycle), so there is no later checkout to
-			// protect. The throw is the whole remedy.
+			// No poison flag (unlike the subprocess connection): never pooled.
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer between splits: %s", location_, -1, GetExecutionIdHex(),
 			                    RawMessageOf(e));
 		}
@@ -985,12 +929,9 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	input_writer_opened_ = false;
 	input_writer_closed_ = false;
 
-	// A split that produced no rows may never have opened the reader, and the
-	// worker's output stream then sits unconsumed on the w2c ring. Open it just to
-	// drain it: otherwise the next split's SabReadStreamHeader reads THIS split's
-	// leftover output as its own header. Exactly the hazard PerformFinalizeInit
-	// documents for the 0-input-row case, reached here by a different route — an
-	// empty split is the likelier shape, since a filter only has to prune one.
+	// Drain any unconsumed output (e.g. an empty split never opened the reader),
+	// or the next split's SabReadStreamHeader would read it (see
+	// PerformFinalizeInit).
 	if (!data_reader_ && slot_ >= 0) {
 		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		try {
@@ -1011,8 +952,7 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	data_reader_.reset();
 	data_stream_.reset();
 
-	// Per-init stream state — everything scoped to ONE split's stream, which would
-	// otherwise leak into the next.
+	// Per-stream state.
 	init_done_ = false;
 	data_finished_ = false;
 	last_batch_index_ = DConstants::INVALID_INDEX;
@@ -1020,10 +960,9 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	last_cache_control_ = {};
 	last_more_output_ = false;
 
-	// NOT cleared, deliberately: the SAB slot and its rings (the transport),
-	// tick_filter_state_ (a shared gstate object PerformInit never touches, so
-	// dynamic join-key pushdown survives into the next split), and substream_id_
-	// (one reader keeps one identity across every split it claims).
+	// Deliberately kept: the slot, tick_filter_state_ (shared gstate, so dynamic
+	// filter pushdown carries into the next split) and substream_id_ (one reader
+	// keeps one identity across its splits).
 }
 
 VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
@@ -1035,7 +974,7 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 		return nullptr;
 	}
 
-	// Lazily open data reader if not yet opened (exchange mode defers this).
+	// Exchange mode opens the reader lazily.
 	if (!data_reader_) {
 		if (slot_ < 0) {
 			ThrowVgiIOException("WebWorkerFunctionConnection::ReadDataBatch slot is not open", location_, -1,
@@ -1050,10 +989,9 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 		}
 	}
 
-	// Producer mode one-ahead pipeline: the first tick was sent during
-	// PerformInit; here we send the NEXT tick only after we've committed to
-	// returning the current batch (see below), so the worker produces the next
-	// batch while DuckDB consumes this one.
+	// Producer one-ahead pipeline: PerformInit sent the first tick; the next one
+	// goes out once a batch is committed to, so the worker produces the next batch
+	// while DuckDB consumes this one.
 	auto send_next_tick = [this]() {
 		if (!(is_producer_mode_ && input_writer_ && !input_writer_closed_)) {
 			return;
@@ -1071,28 +1009,16 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 		try {
 			input_writer_->Write(*EmptyTickBatch(), tick_metadata ? &*tick_metadata : nullptr);
 		} catch (const std::exception &) {
-			// Tick write can fail if the worker already finished (e.g. finalize
-			// with no output). Not an error — mark the writer closed; the next
-			// read returns EOS.
+			// The worker may already have finished (e.g. finalize with no output):
+			// mark the writer closed; the next read returns EOS.
 			input_writer_closed_ = true;
 		}
 	};
 
-	// At producer EOS the worker's serve turn does a final input_reader.drain(),
-	// so close our tick stream — the Arrow IPC end-of-stream marker is what makes
-	// that drain return.
-	//
-	// It closes the STREAM, not the ring. This used to also close c2w
-	// (vgi_wasm_slot_write_eos), which ends the worker's whole serve loop —
-	// making one producer stream per connection a structural limit, and split
-	// scans impossible on this transport, since greedy claiming re-inits the same
-	// connection per split.
-	//
-	// The ring close was never needed for drain: vgi-rpc's read_message_bytes
-	// treats a continuation marker with size 0 — exactly what Close() writes — as
-	// end-of-stream and returns None, so drain() terminates on the Arrow marker
-	// alone. The ring EOF is a CONNECTION-level signal and now happens where it
-	// belongs, in the destructor.
+	// At producer EOS the worker drains its tick input, so close the tick stream:
+	// the Arrow end-of-stream marker ends that drain. Close the stream only, never
+	// the ring (vgi_wasm_slot_write_eos ends the worker's serve loop, and the
+	// connection is re-inited per split); ring EOF is the destructor's job.
 	auto finish_producer_input = [this]() {
 		if (is_producer_mode_ && input_writer_ && !input_writer_closed_) {
 			try {
@@ -1103,8 +1029,8 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 			input_writer_closed_ = true;
 		}
 	};
-	// Store+notify-only teardown for a throw mid-stream (see the log-batch catch
-	// below for why it must never wait).
+	// Store+notify-only teardown for a throw mid-stream; must never wait (see
+	// the log-batch catch below).
 	auto abandon_slot = [this]() {
 		data_finished_ = true;
 		input_writer_closed_ = true; // abandon the Arrow writer; ring EOS below drives teardown
@@ -1120,10 +1046,8 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 		try {
 			batch = data_reader_->ReadNext();
 		} catch (const InvalidInputException &) {
-			// Malformed / truncated IPC (Arrow's Status::Invalid). There is no
-			// worker process to liveness-probe here (the JS bridge owns
-			// lifecycle), so mirror the tolerant HTTP/no-proc path: treat it as
-			// end-of-stream.
+			// Malformed / truncated IPC. With no worker process to probe, treat it
+			// as end-of-stream, like the tolerant HTTP path.
 			finish_producer_input();
 			data_finished_ = true;
 			return nullptr;
@@ -1131,7 +1055,6 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 			ThrowWebWorkerIOException(WebWorkerFunctionInfo(function_name_, function_type_, nullptr), "Failed to read data batch: %s", location_, -1, GetExecutionIdHex(), RawMessageOf(e));
 		}
 
-		// Null batch = EOS (clean stream end).
 		if (!batch) {
 			finish_producer_input();
 			data_finished_ = true;
@@ -1140,11 +1063,9 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 
 		const VgiMetadataPtr &batch_metadata = batch->metadata();
 
-		// Skip log/error batches. HandleBatchLogMessage THROWS on an EXCEPTION-level
-		// batch (a worker error). On that throw the producer's tick stream is still
-		// open, so the worker's post-turn input_reader.drain() would block forever
-		// (and its serve thread wedge) — close the input first (Arrow EOS + ring EOF)
-		// so the worker's drain returns and the slot frees, then rethrow.
+		// Skip log batches. HandleBatchLogMessage throws on a worker error, with the
+		// tick stream still open, so the worker's post-turn drain would block
+		// forever: abandon the slot (ring EOF) before rethrowing.
 		try {
 			const auto log_error_context = WebWorkerFunctionInfo(function_name_, function_type_);
 			if (HandleBatchLogMessage(batch, batch_metadata, &context_, location_, -1,
@@ -1153,29 +1074,21 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 				continue;
 			}
 		} catch (...) {
-			// CRITICAL: do NO blocking / Atomics.wait work on this path. We are inside a
-			// C++ exception unwind, and under DuckDB-WASM the scan can run on the
-			// Asyncify-instrumented worker thread — an Atomics.wait mid-unwind corrupts
-			// the Asyncify coroutine so the query never resumes and the WHOLE engine
-			// deadlocks (a flaky, load-dependent freeze; a non-Atomics throw never does).
-			// So the teardown here is strictly store+notify, never wait:
-			//   - vgi_wasm_slot_write_eos: set c2w_closed + notify. The worker's next c2w
-			//     read returns ring-EOS, so its serve loop ends and it closes w2c itself —
-			//     no client-side drain needed (a drain read CAN Atomics.wait: forbidden).
-			//   - vgi_wasm_slot_release: set state=0 + notify.
-			// We deliberately skip finish_producer_input()/input_writer_->Close() (an Arrow
-			// EOS write that CAN Atomics.wait if the c2w ring is full). Reuse safety for the
-			// freed slot rides the next slot_open's worker-done handshake (unique claim id +
-			// the worker closing w2c before it re-parks), not a drain here. Freeing now (vs
-			// the deferred destructor) avoids "channel exhausted" for a following scan.
+			// No blocking / Atomics.wait here: under DuckDB-WASM the scan can run on
+			// the Asyncify-instrumented thread, and a wait during exception unwind
+			// corrupts the Asyncify coroutine and deadlocks the whole engine. So only
+			// store+notify: write_eos (the worker's next c2w read ends its serve loop
+			// and it closes w2c itself, so no client drain) and release. No
+			// input_writer_->Close() either (it can wait on a full ring). Slot reuse
+			// safety comes from the next slot_open's worker-done handshake. Freeing
+			// now rather than in the destructor avoids "channel exhausted" for a
+			// following scan.
 			abandon_slot();
 			throw;
 		}
 
-		// External-location pointer batches are an HTTP-storage optimization; a
-		// SAB worker streams its data inline over the ring and does not emit them.
-		// Fail loudly rather than pulling the HTTP/catalog resolution subtree into
-		// this transport (a documented v1 limitation of worker:).
+		// Known limitation: externalized (location pointer) batches are not
+		// supported on worker:; SAB workers stream data inline.
 		if (batch_metadata &&
 		    ClassifyBatch(batch, batch_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
 			throw IOException(WebWorkerFunctionInfo(function_name_, function_type_, error_subtype::kUnsupported)
@@ -1185,8 +1098,7 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 			                  location_);
 		}
 
-		// Validate the batch DuckDB will read; a malformed one fails the scan with
-		// the same non-blocking slot teardown as a worker error.
+		// A malformed batch fails the scan with the same non-blocking teardown.
 		try {
 			ValidateWorkerBatch(&context_, batch.get(), location_);
 		} catch (...) {
@@ -1194,8 +1106,8 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 			throw;
 		}
 
-		// Parse vgi_partition_values#b64 off the wire metadata. Base64-decode
-		// here; IPC decode + validation happen in InstallBatch on the consumer.
+		// vgi_partition_values#b64: base64-decoded here; the consumer
+		// (InstallBatch) decodes and validates the IPC.
 		last_partition_values_bytes_.clear();
 		if (batch_metadata) {
 			int64_t pv_idx = batch_metadata->FindKey("vgi_partition_values#b64");
@@ -1219,7 +1131,6 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 			}
 		}
 
-		// Parse vgi_batch_index off the wire metadata, if present.
 		last_batch_index_ = DConstants::INVALID_INDEX;
 		if (batch_metadata) {
 			int64_t bi_idx = batch_metadata->FindKey("vgi_batch_index");
@@ -1255,23 +1166,18 @@ VgiBatchPtr WebWorkerFunctionConnection::ReadDataBatch() {
 			}
 		}
 
-		// Parse vgi.cache.* cache-control off the wire metadata (first-batch only
-		// in practice; read via GetLastCacheControl on the first batch).
 		last_cache_control_ = ParseVgiCacheControl(batch_metadata);
 		last_more_output_ = HasMoreOutputStatus(batch_metadata);
 
-		// Committed to returning this batch — send the next tick now so the worker
-		// produces the next batch while DuckDB consumes this one.
 		send_next_tick();
 
-		// EOS is signaled by the IPC stream closing (null batch above), not by
-		// 0-row batches. 0-row batches are valid responses in exchange mode.
+		// EOS is the stream ending (null batch), never a 0-row batch.
 		return batch;
 	}
 }
 
 std::unique_ptr<PooledWorker> WebWorkerFunctionConnection::ReleaseForPooling() {
-	return nullptr; // never pooled: the JS bridge owns the worker's lifecycle
+	return nullptr;
 }
 
 std::string WebWorkerFunctionConnection::GetExecutionIdHex() const {
@@ -1312,8 +1218,8 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 		ThrowVgiIOException("WebWorkerFunctionConnection::OpenInputWriter called before PerformInit", location_, -1,
 		                    GetExecutionIdHex());
 	}
-	// Input writer is opened during PerformInit to avoid deadlock (worker waits
-	// for the input schema before writing output).
+	// Normally already opened by PerformInit: the worker waits for the input
+	// schema before writing output.
 	if (input_writer_opened_) {
 		return;
 	}
@@ -1370,9 +1276,7 @@ void WebWorkerFunctionConnection::WriteInputBatch(const VgiBatchPtr &batch) {
 		                    GetExecutionIdHex());
 	}
 
-	// Reconcile the batch's schema to the writer's declared (worker-facing)
-	// schema. DuckDB's ToArrowSchema can't preserve every Arrow attribute, so a
-	// DataChunkToArrow batch may not match the schema the IPC stream opened with.
+	// See HttpFunctionConnection::WriteInputBatch.
 	auto reconciled = batch;
 	if (input_schema_) {
 		reconciled = ReconcileBatchToSchema(batch, input_schema_);
@@ -1395,16 +1299,13 @@ void WebWorkerFunctionConnection::WriteInputBatch(const VgiBatchPtr &batch) {
 
 void WebWorkerFunctionConnection::CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) {
 	(void)state_token;
-	(void)live_context; // SAB cancel writes to the ring; no context-bound logging/HTTP
-	// Best-effort: if the writer isn't open or is already closed, the worker has
-	// already learned the stream is done via EOS / ring close; no cancel needed.
+	(void)live_context;
+	// A closed writer means the worker already saw the stream end.
 	if (!input_writer_opened_ || input_writer_closed_ || !input_writer_) {
 		return;
 	}
-	// Cancel is only supported for producer mode (empty tick_schema_ → a zero-row
-	// no-array batch is well-formed). In exchange mode input_schema_ has fields,
-	// so a zero-array batch would mismatch the writer's schema; those callers
-	// learn about teardown via ring close on the next batch boundary.
+	// Producer mode only: the zero-column cancel tick would not match an
+	// exchange-mode input schema.
 	if (!tick_schema_) {
 		return;
 	}
@@ -1412,7 +1313,7 @@ void WebWorkerFunctionConnection::CancelStream(const std::vector<uint8_t> &state
 	try {
 		input_writer_->Write(*EmptyTickBatch(), &metadata);
 	} catch (const std::exception &) {
-		// best-effort, as before: a failed cancel write is ignored
+		// Best-effort.
 	}
 }
 
@@ -1425,7 +1326,6 @@ void WebWorkerFunctionConnection::CloseInputWriter() {
 		return;
 	}
 
-	// Close the IPC stream writer (writes the Arrow EOS marker into the c2w ring).
 	try {
 		input_writer_->Close();
 	} catch (const std::exception &e) {
@@ -1434,12 +1334,9 @@ void WebWorkerFunctionConnection::CloseInputWriter() {
 	}
 	input_writer_.reset();
 	input_writer_closed_ = true;
-
-	// Signal ring-level EOF on the client->worker direction so the worker's serve
-	// loop for this slot terminates (analog of closing the subprocess stdin pipe).
-	if (slot_ >= 0) {
-		vgi_wasm_slot_write_eos(region_offset_, slot_);
-	}
+	// Stream EOS only (like the subprocess connection, which keeps stdin open):
+	// FINALIZE, buffering RPCs and later splits still use this slot. Ring EOF
+	// ends the worker's serve loop and is the destructor's job.
 
 	{
 		auto fields = BuildConnLogFields(*this);
@@ -1448,13 +1345,8 @@ void WebWorkerFunctionConnection::CloseInputWriter() {
 	}
 }
 
-// ============================================================================
-// Buffered Table Function RPCs (Sink+Source path)
-// ============================================================================
-//
-// Each RPC is a unary request/response over the SAB ring, reusing the shared
-// inner-request builders + outer-response decoder. Bind+init must have run on
-// this connection first (phase "TABLE_BUFFERING"), establishing execution_id.
+// Buffered table function RPCs: unary request/response on this connection's
+// slot, so EnsureWorkerSpawned must have run.
 
 std::vector<uint8_t> WebWorkerFunctionConnection::RpcTableBufferingProcess(
     const std::string &function_name, const std::vector<uint8_t> &execution_id,

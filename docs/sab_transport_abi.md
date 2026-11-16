@@ -164,7 +164,7 @@ int  vgi_wasm_slot_open(const char *location, int region_offset);
 // Returns n on success; negative on cancel/error.
 int  vgi_wasm_slot_write(int region_offset, int slot, const uint8_t *data, int n);
 
-// Signal EOS on the c2w (input) ring — the client is done writing (CloseInputWriter).
+// Signal EOS on the c2w (input) ring — the client is done with the slot (connection teardown).
 void vgi_wasm_slot_write_eos(int region_offset, int slot);
 
 // Blocking read of up to n bytes from the slot's w2c ring.
@@ -184,9 +184,9 @@ void vgi_wasm_slot_release(int region_offset, int slot);
 |---|---|
 | `OpenInputWriter` | (slot already open from bind/init) — no-op or first tick |
 | `WriteInputBatch(b)` | serialize `b` to Arrow IPC, `vgi_wasm_slot_write(region, slot, …)` |
-| `CloseInputWriter` | `vgi_wasm_slot_write_eos(region, slot)` |
+| `CloseInputWriter` | Arrow IPC end-of-stream on c2w only (the slot keeps serving FINALIZE, buffering RPCs and later splits) |
 | `ReadDataBatch` | `vgi_wasm_slot_read(region, slot, …)` into the Arrow IPC `StreamReader`; 0 ⇒ EOS ⇒ return null |
-| connection dtor / release | `vgi_wasm_slot_release(region, slot)` |
+| connection dtor / release | `vgi_wasm_slot_write_eos(region, slot)` (ends the worker's serve loop), then `vgi_wasm_slot_release(region, slot)` |
 
 Application errors surface **in-band** as Arrow error batches (reuse `ClassifyBatch`/
 `HandleBatchLogMessage`). Adapters that negotiate feature bit 0 may additionally report a

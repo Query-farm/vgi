@@ -102,16 +102,13 @@ void MkdirP(const std::string &path) {
 	}
 }
 
-// Short unique suffix for the same-directory atomic-write temp. Kept COMPACT so
-// the transient `<final>.tmp-<suffix>` path stays under Windows' 260-char MAX_PATH:
+// Short unique suffix for the same-directory atomic-write temp. Must stay compact:
 // the final path already carries a 64-char identity shard + a 64-char content name,
-// so appending another 64-char SHA (the old suffix) tipped the tmp path over the
-// limit and `OpenFile(FILE_CREATE)` failed — silently disabling the whole disk tier
-// on Windows. base36(clock)+base36(seq) is ~16 chars and only needs per-directory
-// uniqueness during the brief write window (a cross-process collision self-heals:
-// the loser's CREATE throws, the memory tier still holds the entry, and the winner
-// wrote identical content-addressed bytes). NOT prefixed "stream-", so a crash-
-// orphaned atomic temp gets the reaper's SHORT grace, unlike an in-flight spill.
+// and a longer `<final>.tmp-<suffix>` exceeds Windows' 260-char MAX_PATH, making
+// `OpenFile(FILE_CREATE)` fail and silently disabling the disk tier. It only needs
+// per-directory uniqueness during the write (a cross-process collision self-heals:
+// the loser's CREATE throws and the winner wrote identical content-addressed bytes).
+// NOT prefixed "stream-", so an orphaned atomic temp gets the reaper's short grace.
 std::string ShortTempSuffix() {
 	static const uint64_t base = static_cast<uint64_t>(
 	    std::chrono::steady_clock::now().time_since_epoch().count());
@@ -200,19 +197,13 @@ uint32_t GetU32(const std::string &b, size_t &pos) {
 	return v;
 }
 
-// Flat blob: [magic VRC1][u64 num_batches]{ per batch: [u64 has_index][u64 batch_index]
-//   [u64 rows][u64 pv_len][pv bytes][u64 ipc_len][ipc bytes] }
-// Blob layout: "VRC1" magic + a flat run of batch records to EOF (NO batch-count
-// header). Dropping the count lets the streaming capture writer hash the blob
-// INCREMENTALLY as batches arrive — it never knows the total upfront — while a
-// re-hash of the finished file (integrity check D) still matches. Readers loop
-// until they exhaust the bytes. Per batch:
+// Blob layout: "VRC1" magic + batch records to EOF, with NO batch-count header so
+// the streaming capture writer can hash incrementally without knowing the total.
+// Readers loop until the bytes are exhausted. Per batch:
 //   [u64 has_index][u64 batch_index][u64 rows][u64 pv_len][pv][u64 ipc_len][ipc]
-// `codec`/`level` (already resolved via ResolveDiskCompressionCodec) apply the
-// IPC format's built-in buffer compression to each batch's payload — the per-batch `ipc_len` framing
-// becomes the COMPRESSED length, and the content SHA (taken over this blob) covers the
-// compressed bytes. codec=="none" → TranscodeIpcWithCodec is a passthrough (unchanged
-// format). The ref's logical `bytes=` is entry.total_bytes, set by the caller — not here.
+// `codec`/`level` (already resolved via ResolveDiskCompressionCodec) apply IPC buffer
+// compression to each payload, so `ipc_len` and the content SHA cover the compressed
+// bytes. The ref's logical `bytes=` is entry.total_bytes, set by the caller.
 std::string SerializeEntryBlob(const VgiResultCacheEntry &entry, const std::string &codec, uint64_t level) {
 	std::string b;
 	b.append("VRC1", 4);
@@ -234,13 +225,10 @@ std::string SerializeEntryBlob(const VgiResultCacheEntry &entry, const std::stri
 	return b;
 }
 
-// Parse a flat "VRC1" entry blob (magic + batch records to EOF, the format
-// SerializeEntryBlob writes) into a single CachedStream. Shared by the loose-store
-// LoadFromDisk and the packed-store record loader so the blob format lives in one
-// place. Returns false if the magic is missing/short (caller → clean miss). Assumes
-// the blob passed a content-SHA (loose) / CRC (packed) integrity check first, so a
-// malformed body is a corruption case the caller already guards; still wrapped in the
-// caller's try/catch. `total_bytes` accumulates the per-batch IPC byte lengths.
+// Parse a SerializeEntryBlob "VRC1" blob into a single CachedStream (shared by the
+// loose and packed loaders). Returns false if the magic is missing (clean miss).
+// Callers integrity-check the blob first and wrap this in try/catch.
+// `total_bytes` accumulates the per-batch IPC byte lengths.
 bool ParseEntryBlobIntoStream(const std::string &blob, CachedStream &stream, int64_t &total_bytes) {
 	if (blob.size() < 4 || blob.compare(0, 4, "VRC1") != 0) {
 		return false;
@@ -292,9 +280,8 @@ void WriteRef(const std::string &refs_dir, const std::string &fp, const std::str
 	ref += "catalog=" + meta.catalog_name + "\n";
 	ref += "function=" + meta.key.function_name + "\n"; // for the vgi_result_cache_disk() diagnostic
 	ref += "codec=" + codec + "\n";                     // diagnostic only; batches self-describe
-	// [S9] Mark EXCHANGE entries (input-keyed: input_hash present) so the reaper's
-	// ref-count cap evicts only these — a per-chunk memo flood never evicts a large
-	// producer entry.
+	// Mark EXCHANGE entries (input_hash present) so the reaper's ref-count cap evicts
+	// only these, never a large producer entry.
 	if (!meta.key.input_hash.empty()) {
 		ref += "exch=1\n";
 	}
@@ -314,10 +301,6 @@ std::string UniqueTempSuffix() {
 }
 
 } // namespace
-
-// ============================================================================
-// VgiResultCacheKey
-// ============================================================================
 
 bool VgiResultCacheKey::operator==(const VgiResultCacheKey &o) const {
 	return identity_scope == o.identity_scope && worker_path == o.worker_path &&
@@ -394,19 +377,14 @@ std::string VgiResultCacheKey::Fingerprint() const {
 	add(transaction_id);
 	add(input_hash);
 	add(shape_key);
-	// Appended only when set, so every key without a secret keeps the digest
-	// it had before this field existed (its on-disk entries stay reachable).
-	// Still injective: the length-prefixed stream decodes to a different number
-	// of fields, so no key with a secret_scope can collide with one without.
+	// Appended only when set, so keys without a secret keep their existing digest
+	// (and on-disk entries). Still injective: the length-prefixed stream has a
+	// different field count, so a key with secret_scope never collides with one without.
 	if (!secret_scope.empty()) {
 		add(secret_scope);
 	}
 	return Sha256Hex(m); // "" if SHA-256 unavailable → caller skips disk tier
 }
-
-// ============================================================================
-// ParseVgiCacheControl
-// ============================================================================
 
 VgiCacheControl ParseVgiCacheControl(const VgiMetadataPtr &metadata) {
 	VgiCacheControl cc;
@@ -469,13 +447,7 @@ VgiCacheControl ParseVgiCacheControl(const VgiMetadataPtr &metadata) {
 	return cc;
 }
 
-// ============================================================================
-// VgiResultCache
-// ============================================================================
-
-// ============================================================================
-// Packed small-entry disk backend ([S9] git-style loose-vs-packed)
-// ============================================================================
+// ---- Packed small-entry disk backend (git-style loose-vs-packed) ----
 // Layout (per identity shard, alongside objects/ + refs/):
 //   <dir>/<shard>/packs/<selfid>-<seq>.vpack   append-only concatenated records
 //   <dir>/<shard>/packs/<selfid>-<seq>.vidx    derived index (rebuildable from .vpack)
@@ -1075,21 +1047,17 @@ VgiResultCache::PackStore *VgiResultCache::PackStoreIfExists() {
 }
 
 VgiResultCache &VgiResultCache::Instance() {
-	// Intentionally leaked (same rationale as VgiWorkerPool::Instance): cached
-	// entries hold IPC buffers that may outlive other process-static state;
-	// leaking sidesteps the static-destruction-order question at process exit.
+	// Intentionally leaked: cached IPC buffers may outlive other process-static state,
+	// so this sidesteps static-destruction order at exit.
 	static VgiResultCache *instance = new VgiResultCache();
 	return *instance;
 }
 
 VgiResultCache::VgiResultCache() {
 #if VGI_SUBPROCESS_TRANSPORT
-	// Background TTL/disk reaper. Gated exactly like VgiWorkerPool's cleanup
-	// thread: Emscripten is single-threaded (no pthreads) and HTTP-only, so no
-	// thread is started there. Under WASM, staleness is handled lazily instead
-	// — Lookup() drops stale non-revalidatable entries on access and Insert()
-	// bounds bytes via LRU, so the cache stays correct and bounded without a
-	// reaper (only proactive eviction of never-re-accessed entries is lost).
+	// Background TTL/disk reaper; not started on Emscripten. There, Lookup() drops
+	// stale entries on access and Insert() bounds bytes via LRU, so only proactive
+	// eviction of never-re-accessed entries is lost.
 	cleanup_thread_ = std::thread(&VgiResultCache::CleanupThread, this);
 #endif
 }
@@ -1138,14 +1106,10 @@ void VgiResultCache::Configure(const Settings &settings) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	settings_ = settings;
 #ifdef __EMSCRIPTEN__
-	// WASM is memory-only by construction: the on-disk tier uses DuckDB's local
-	// FileSystem (absent in the browser) and its incremental blob hashing still
-	// calls mbedtls directly (SHA256State), which is not resolvable from the
-	// dlopen'd side-module on emscripten. Force the disk dir empty here — the
-	// single chokepoint every cache disk path (Lookup/Insert/pack/reap) reads
-	// disk_dir_ from — so `SET vgi_result_cache_dir` is a clean no-op on WASM
-	// rather than a latent crash. The producer spill path is gated at its own
-	// setting read (vgi_table_function_impl.cpp). Native is unchanged.
+	// WASM is memory-only: the disk tier needs DuckDB's local FileSystem and calls
+	// mbedtls (SHA256State), which the emscripten side-module cannot resolve. Every
+	// disk path reads disk_dir_, so clearing it here makes `SET vgi_result_cache_dir`
+	// a no-op. The producer spill path is gated separately in vgi_table_function_impl.cpp.
 	disk_dir_.clear();
 #else
 	disk_dir_ = settings.disk_dir;
@@ -1153,8 +1117,7 @@ void VgiResultCache::Configure(const Settings &settings) {
 	disk_max_bytes_ = settings.disk_max_bytes;
 	disk_compression_ = settings.disk_compression;
 	disk_compression_level_ = settings.disk_compression_level;
-	// Shrinking the cap mid-flight is honored on the next Insert / reap tick;
-	// evict now so a lowered cap takes effect immediately.
+	// Evict now so a lowered cap takes effect immediately.
 	EvictToFitLocked(0);
 	// Publish under the configuration lock so concurrent updates cannot leave a
 	// signature describing different settings from those actually installed.
@@ -1162,9 +1125,7 @@ void VgiResultCache::Configure(const Settings &settings) {
 }
 
 void VgiResultCache::ConfigureIfChanged(const Settings &settings) {
-	// [S1] Common case: settings unchanged → no lock, no evict. This is the hot
-	// path (every scan's InitGlobal); making it lock-free is what lets cache
-	// access scale with query concurrency.
+	// Hot path (every scan): settings unchanged → no lock, no evict.
 	uint64_t sig = SettingsSignature(settings);
 	if (config_signature_.load(std::memory_order_relaxed) == sig) {
 		return;
@@ -1173,7 +1134,7 @@ void VgiResultCache::ConfigureIfChanged(const Settings &settings) {
 }
 
 bool VgiResultCache::TryReserveInflightCapture(int64_t bytes) {
-	// [S6] Bound total transient capture RAM across all concurrent captures.
+	// Bound total transient capture RAM across all concurrent captures.
 	uint64_t budget;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -1201,7 +1162,13 @@ void VgiResultCache::ReleaseInflightCapture(int64_t bytes) {
 }
 
 std::shared_ptr<const VgiResultCacheEntry>
-VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::time_point now) {
+VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::time_point now,
+                       const char **served_tier) {
+	auto set_tier = [&](const char *tier) {
+		if (served_tier) {
+			*served_tier = tier;
+		}
+	};
 	std::string disk_dir; // snapshot of disk config, taken under the lock
 	uint64_t max_entry_bytes = 0;
 	{
@@ -1220,6 +1187,7 @@ VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::
 				it->second = lru_.begin();
 				entry->hits++;
 				hits_.fetch_add(1, std::memory_order_relaxed);
+				set_tier("memory");
 				return entry;
 			}
 		}
@@ -1231,11 +1199,9 @@ VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::
 	// In-memory miss — try the disk tier (cross-process / cross-restart). Disk
 	// I/O runs WITHOUT the cache lock, over the config snapshot taken above.
 	if (!disk_dir.empty()) {
-		// [S9 packed] Probe the packed small-entry backend first (in-memory index →
-		// cheap miss; the shard's packs/ dir absence short-circuits). A packed hit is
-		// small, so adopt it into the memory LRU like a small loose entry. Probed
-		// regardless of the current `pack` flag so entries written while it was on
-		// still serve after it's turned off.
+		// Probe the packed backend first (cheap in-memory-index miss); a packed hit is
+		// small, so adopt it into the memory LRU. Probed regardless of the `pack` flag
+		// so entries written while it was on still serve after it is turned off.
 		{
 			int64_t now_unix = static_cast<int64_t>(std::time(nullptr));
 			auto packed = EnsurePackStore().Lookup(disk_dir, key, now_unix);
@@ -1252,20 +1218,19 @@ VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::
 					index_[key] = lru_.begin();
 				}
 				hits_.fetch_add(1, std::memory_order_relaxed);
+				set_tier("disk");
 				return packed;
 			}
 		}
-		// [S8] Peek the entry size (cheap ref read) and route: SMALL entries
-		// materialize + adopt into the memory LRU (fast repeat hits); LARGE
-		// entries (> max_entry_bytes) are served by a disk-backed STREAMING entry
-		// that never materializes the payload — RAM stays flat for results far
-		// larger than the memory cap. Streamed entries are NOT adopted (they'd
-		// defeat the point) — they are re-loaded (TOC only) per hit.
+		// Peek the entry size from the ref and route: small entries materialize and
+		// are adopted into the memory LRU; large ones (> max_entry_bytes) are served as
+		// a disk-backed streaming entry, never adopted, re-loaded (TOC only) per hit.
 		int64_t ref_bytes = PeekDiskRefBytes(key, disk_dir);
 		if (ref_bytes >= 0 && ref_bytes > static_cast<int64_t>(max_entry_bytes)) {
 			auto streaming = LoadFromDiskStreaming(key, disk_dir);
 			if (streaming) {
 				hits_.fetch_add(1, std::memory_order_relaxed);
+				set_tier("disk_streaming");
 				return streaming;
 			}
 		} else if (ref_bytes >= 0) {
@@ -1284,6 +1249,7 @@ VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::
 					index_[key] = lru_.begin();
 				}
 				hits_.fetch_add(1, std::memory_order_relaxed);
+				set_tier("disk");
 				return disk_entry;
 			}
 		}
@@ -1374,10 +1340,8 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 			disk_max = disk_max_bytes_;
 			disk_codec = disk_compression_;
 			disk_level = disk_compression_level_;
-			// [S9 packed] Route SMALL EXCHANGE memos into the packed backend; producer
-			// entries (empty input_hash) and large entries stay loose. Exchange per-chunk
-			// memos are the many-tiny-files case packing exists to solve; producer results
-			// are few-and-large and the loose store (+ its diagnostics) is ideal for them.
+			// Route small EXCHANGE memos into the packed backend (the many-tiny-files
+			// case); producer entries (empty input_hash) and large entries stay loose.
 			if (settings_.pack && !entry->key.input_hash.empty() &&
 			    entry->total_bytes < static_cast<int64_t>(settings_.pack_max_entry_bytes)) {
 				use_pack = true;
@@ -1408,10 +1372,8 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 }
 
 void VgiResultCache::EvictToFitLocked(int64_t incoming_bytes, bool admitting_entry) {
-	// [S5] Evict oldest while over the BYTE cap OR the ENTRY-COUNT cap. The count
-	// cap bounds unbounded small-entry accumulation (a workload with high key
-	// cardinality could otherwise pin ~700k tiny entries under the byte cap),
-	// which in turn keeps the reaper/Snapshot O(N) walks small.
+	// Evict oldest while over the byte cap OR the entry-count cap. The count cap
+	// bounds high-cardinality tiny entries, keeping the reaper/Snapshot O(N) walks small.
 	const bool count_capped = settings_.max_entries > 0;
 	while (!lru_.empty() &&
 	       (incoming_bytes > static_cast<int64_t>(settings_.max_bytes) ||
@@ -1440,8 +1402,8 @@ size_t VgiResultCache::FlushAll() {
 	}
 	// Clear the disk tier too (best-effort; outside the lock).
 	if (disk_enabled) {
-		// [S9 packed] Drop the pack store's in-memory index + open writers FIRST, so we
-		// don't keep writing to files under a directory we're about to remove.
+		// Drop the pack store's index + open writers first, so nothing keeps writing
+		// under the directory about to be removed.
 		if (auto *ps = PackStoreIfExists()) {
 			ps->InvalidateAll();
 		}
@@ -1476,7 +1438,7 @@ size_t VgiResultCache::FlushCatalog(const std::string &catalog_name, const std::
 	// Disk tier: remove this identity's shard (outside the lock — file I/O). Only
 	// when the identity is resolvable — an "" scope means nothing was cached.
 	if (!disk_dir.empty() && !identity_scope.empty()) {
-		// [S9 packed] Drop this shard's pack index + writer before removing its files.
+		// Drop this shard's pack index + writer before removing its files.
 		if (auto *ps = PackStoreIfExists()) {
 			ps->InvalidateShard(disk_dir, IdentityShard(identity_scope));
 		}
@@ -1494,10 +1456,8 @@ VgiResultCache::ReapStats VgiResultCache::ReapNow(int64_t advance_seconds) {
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		pack_dead_pct = settings_.pack_compaction_dead_pct;
-		// Simulate `advance_seconds` of elapsed time for the memory tier
-		// (steady_clock): any non-revalidatable entry stale within the window is
-		// dropped. This is exactly the background thread's per-tick reap, but
-		// synchronous and clock-injectable so tests are deterministic.
+		// Memory tier (steady_clock): drop non-revalidatable entries stale within
+		// the simulated window — the background thread's per-tick reap.
 		stats.memory_reaped =
 		    ReapStaleLocked(std::chrono::steady_clock::now() + std::chrono::seconds(advance_seconds));
 		if (DiskEnabledLocked()) {
@@ -1511,8 +1471,7 @@ VgiResultCache::ReapStats VgiResultCache::ReapNow(int64_t advance_seconds) {
 	if (!disk_dir.empty()) {
 		int64_t now_unix = static_cast<int64_t>(std::time(nullptr)) + advance_seconds;
 		stats.disk_refs_removed = ReapDisk(disk_dir, disk_max, disk_max_refs, now_unix);
-		// [S9 packed] Reap the packed backend too (expiry + byte-cap evict + own-pack
-		// compaction). Its removals count toward disk_refs_removed for observability.
+		// Reap the packed backend too; its removals count toward disk_refs_removed.
 		if (auto *ps = PackStoreIfExists()) {
 			stats.disk_refs_removed += ps->Reap(disk_dir, now_unix, disk_max, pack_dead_pct);
 		}
@@ -1522,9 +1481,8 @@ VgiResultCache::ReapStats VgiResultCache::ReapNow(int64_t advance_seconds) {
 
 std::vector<VgiResultCache::EntryInfo> VgiResultCache::Snapshot() const {
 	auto now = std::chrono::steady_clock::now();
-	// [S3] Copy the entry shared_ptrs under a SHORT lock (O(N) pointer bumps),
-	// then build the EntryInfo rows (string/timestamp work) OUTSIDE the lock so a
-	// large `vgi_result_cache()` never freezes the cache for concurrent queries.
+	// Copy the entry shared_ptrs under a short lock, then build the EntryInfo rows
+	// outside it so a large `vgi_result_cache()` never stalls concurrent queries.
 	std::vector<std::shared_ptr<const VgiResultCacheEntry>> entries;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -1677,12 +1635,9 @@ void VgiResultCache::RecordPartitionStore() {
 	partition_stores_.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Function identity for the per-value advertisement registry. Deliberately COARSER
-// than the full cache key: the input_hash, projection and per-call dimensions vary
-// per chunk/query, but "does this function want per-value memoization" does not.
-// identity_scope is included so one principal's advertisement never arms another's
-// probe (the probe would only ever miss, but keeping the identity split makes the
-// registry safe by construction rather than by argument).
+// Function identity for the per-value advertisement registry — deliberately coarser
+// than the full key (input_hash, projection and per-call dimensions vary per chunk).
+// identity_scope is included so one principal's advertisement never arms another's probe.
 static std::string PerValueOptInIdentity(const VgiResultCacheKey &k) {
 	return k.identity_scope + "\x1f" + k.worker_path + "\x1f" + k.function_name;
 }
@@ -1732,8 +1687,7 @@ void VgiResultCache::CleanupThread() {
 			break;
 		}
 		auto now = std::chrono::steady_clock::now();
-		// Memory reap runs every tick (~1 s) — it's in-RAM (IsStale checks), cheap,
-		// and bounded by the entry-count cap [S5].
+		// Memory reap runs every tick (~1 s); it is cheap and bounded by max_entries.
 		std::string disk_dir; // snapshot of disk config, taken under the lock
 		uint64_t disk_max = 0;
 		uint64_t disk_max_refs = 0;
@@ -1750,10 +1704,8 @@ void VgiResultCache::CleanupThread() {
 				pack_dead_pct = settings_.pack_compaction_dead_pct;
 			}
 		}
-		// [S7] Disk reap is O(total refs) I/O per pass (it reads every ref +
-		// stats every object), so run it on a MUCH coarser cadence than the memory
-		// reap — every `disk_reap_interval_seconds` (default 60) instead of every
-		// 1 s. Expiry is wall-clock, so a slightly later reap is harmless.
+		// Disk reap is O(total refs) I/O, so it runs every `disk_reap_interval_seconds`
+		// (default 60) instead of every tick. Expiry is wall-clock, so lateness is harmless.
 		seconds_since_disk_reap += 1;
 		if (!disk_dir.empty() && seconds_since_disk_reap >= std::max<int64_t>(1, disk_interval)) {
 			seconds_since_disk_reap = 0;
@@ -1766,23 +1718,15 @@ void VgiResultCache::CleanupThread() {
 	}
 }
 
-// ============================================================================
-// Disk tier (M2): content-addressed store, cross-process / cross-restart
-// ============================================================================
+// ---- Disk tier: content-addressed store, cross-process / cross-restart ----
 // Layout (per-identity sharded — see IdentityShard):
 //   <dir>/<shard>/objects/<content_sha256>.vrc  immutable entry blob
-// The content SHA is taken over the entry blob, which embeds each batch's serialized
-// IPC bytes. Those bytes come from nanoarrow's IPC writer since the nanoarrow
-// migration; its encoding can differ byte-wise from Arrow C++'s, so object names (and
-// exchange keys, whose input_hash also hashes IPC bytes) changed once with that
-// migration. Encoding stays deterministic (same batch -> same bytes), so content
-// addressing and key matching are stable from then on; pre-migration objects/refs
-// just miss and are reaped.
 //   <dir>/<shard>/refs/<key_fingerprint>.ref    key -> content + expiry + keyfp
-// The ref filename is the SHA-256 Fingerprint() of the FULL key, and the ref
-// carries `keyfp=` which the loader re-verifies — so a 64-bit HexDigest bucket
-// collision can never cross-serve. Correctness rests on atomic rename + content
-// immutability (no locks).
+// The content SHA covers the blob, which embeds serialized IPC bytes; the IPC
+// writer must stay deterministic (same batch -> same bytes) for content addressing
+// and exchange input_hash matching. The ref filename is the full-key Fingerprint()
+// and the loader re-verifies `keyfp=`, so a HexDigest collision never cross-serves.
+// Correctness rests on atomic rename + content immutability (no locks).
 
 // ---- VgiCaptureDiskWriter (streaming capture — RAM-flat) ----------------
 
@@ -1838,9 +1782,7 @@ bool VgiCaptureDiskWriter::AppendBatch(bool has_batch_index, uint64_t batch_inde
 	if (impl_->failed || impl_->finalized || !impl_->handle) {
 		return false;
 	}
-	// `ipc_data`/`ipc_len` are the ON-DISK (already codec-compressed by the caller)
-	// bytes; `logical_len` is the uncompressed size, accounted separately so the ref
-	// bytes= stays logical. Per-batch record framing (matches SerializeEntryBlob).
+	// Per-batch record framing matches SerializeEntryBlob (see the header for args).
 	std::string rec;
 	PutU64(rec, has_batch_index ? 1 : 0);
 	PutU64(rec, batch_index);
@@ -2164,13 +2106,10 @@ std::shared_ptr<VgiResultCacheEntry> VgiResultCache::LoadFromDiskStreaming(const
 		if (expires_unix != INT64_MAX && now_unix >= expires_unix) {
 			return nullptr;
 		}
-		// [S8] Build the per-batch TOC by reading the header + each batch's small
-		// fixed fields (+ partition_values) via positioned reads and SEEKING past
-		// each IPC payload — the multi-GB payload is never read here. NB: we skip
-		// the whole-blob integrity re-hash (D) that materializing LoadFromDisk does,
-		// because re-hashing would require reading the whole blob — defeating the
-		// point. The content-addressed name + keyfp still bind the object to the
-		// key; a corrupt batch throws cleanly at IPC-decode time on replay.
+		// Build the per-batch TOC via positioned reads of each batch's fixed fields
+		// (+ partition_values), seeking past each IPC payload. The whole-blob re-hash
+		// (D) that LoadFromDisk does is skipped — it would read the whole blob; keyfp
+		// still binds the object to the key, and a corrupt batch throws at IPC decode.
 		const std::string blob_path = base + "/objects/" + content + ".vrc";
 		auto &fs = LocalFs();
 		if (!fs.FileExists(blob_path)) {
@@ -2264,15 +2203,10 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, uint
 		return removed;
 	}
 	static constexpr int64_t kGraceSeconds = 60;
-	// A streaming-capture temp (`.tmp-stream-*`) is written incrementally over the
-	// whole scan — minutes for a multi-GB spill — so the 60 s orphan grace used for
-	// the synchronous WriteFileAtomic temps would race the reaper into unlinking a
-	// LIVE capture's file mid-write (POSIX keeps writing to the unlinked inode, then
-	// the finalize rename fails → the result silently isn't cached). Grace is measured
-	// from the file's mtime (last write), so an actively-progressing capture keeps
-	// resetting it; this only matters for a capture STALLED between batches. An hour is
-	// far beyond any real capture, while a truly-abandoned temp from a crashed process
-	// still eventually gets swept.
+	// A streaming-capture temp (`.tmp-stream-*`) is written over the whole scan, so the
+	// 60 s grace for WriteFileAtomic temps could unlink a live capture stalled between
+	// batches (the finalize rename then fails and the result isn't cached). Grace is
+	// measured from mtime; an hour covers any real stall yet still sweeps crash orphans.
 	static constexpr int64_t kStreamTmpGraceSeconds = 3600;
 	try {
 		auto &fs = LocalFs();
@@ -2296,7 +2230,7 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, uint
 			std::string content;
 			int64_t mtime;
 			int64_t bytes;
-			bool exchange; // [S9] input-keyed memo (exch=1) — subject to the ref-count cap
+			bool exchange; // input-keyed memo (exch=1) — subject to the ref-count cap
 		};
 		std::vector<RefInfo> live_refs;
 		std::map<std::string, std::set<std::string>> live_objects; // shard -> live content shas
@@ -2372,7 +2306,7 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, uint
 			}
 		}
 
-		// Pass 2b [S9] (GLOBAL): LRU-evict oldest EXCHANGE refs while their live count
+		// Pass 2b (GLOBAL): LRU-evict oldest EXCHANGE refs while their live count
 		// exceeds max_refs. Per-input-chunk memos are tiny (so the byte cap barely
 		// bites) but numerous, so this is the real bound on per-chunk file fan-out.
 		// Scoped to exchange refs so a memo flood never evicts a large producer entry.
@@ -2426,8 +2360,7 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, uint
 				} catch (...) {
 					return;
 				}
-				// Long-lived streaming-capture temps get a much longer idle grace so
-				// the reaper never unlinks an in-flight spill (see kStreamTmpGraceSeconds).
+				// See kStreamTmpGraceSeconds.
 				const bool is_stream_tmp = name.find(".tmp-stream-") != std::string::npos;
 				const int64_t grace = is_stream_tmp ? kStreamTmpGraceSeconds : kGraceSeconds;
 				if (now_unix - mt >= grace) {

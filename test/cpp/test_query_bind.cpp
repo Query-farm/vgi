@@ -37,6 +37,18 @@ TEST_CASE("Prepared query binding cannot negotiate external secrets", "[query-rp
 	CHECK(calls == 1);
 }
 
+// Python's Arguments.deserialize_from_bytes reads row 0 of the arguments batch.
+TEST_CASE("A bind request without arguments still carries one args row", "[query-rpc]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto bytes = BuildBindRequestBytes(*con.context, "f", "TABLE", nullptr, nullptr, {}, {}, {}, {}, false,
+	                                   "test-worker");
+	auto request = DecodeIpcRecord<generated::BindRequest>(bytes, "test-worker");
+	auto args = DeserializeFromIpcBytes(request.arguments);
+	REQUIRE(args->num_rows() == 1);
+	CHECK_FALSE(args->GetColumnByName("args").IsNull(0));
+}
+
 TEST_CASE("Prepared query output validates empty schemas and nested required values", "[query-rpc]") {
 	auto schema = MakeSchema({type::Int64().Named("value")}, Metadata({"owner"}, {"prepared"}));
 	CHECK_NOTHROW(ValidateVgiQueryResultBatch(VgiBatch::MakeEmpty(schema), schema));

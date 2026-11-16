@@ -22,71 +22,55 @@
 
 namespace duckdb {
 
-// Forward declaration
 namespace vgi {
 class IFunctionConnection;
 }
 
-// ============================================================================
-// VgiScalarFunctionInfo - Attached to each scalar function during registration
-// ============================================================================
-
+// Attached to each scalar function at registration.
 struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	VgiScalarFunctionInfo() = default;
 	~VgiScalarFunctionInfo() override = default;
 
-	// Worker connection parameters
-	std::shared_ptr<vgi::VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
+	std::shared_ptr<vgi::VgiAttachParameters> attach_params;
 	std::vector<uint8_t> attach_opaque_data;
 	optional_ptr<Catalog> catalog;
-	// Attach alias of the owning catalog. Always set; for a globally-published
-	// function (registered into system.main, where `catalog` is null because the
-	// entry outlives DETACH) it is the key used to re-resolve the live catalog
-	// at bind time — see ResolveVgiGlobalBinding.
+	// Attach alias of the owning catalog. For a global function (system.main,
+	// `catalog` null because it outlives DETACH) the key that re-resolves the
+	// live catalog at bind (ResolveVgiGlobalBinding).
 	std::string catalog_name;
 	//! True when this registration lives in system.main rather than the VGI
 	//! catalog's own schema.
 	bool global = false;
 	std::string function_name;
-	// Catalog schema this function was registered into. The same name may exist
-	// in several schemas of one catalog, so it is carried into the bind request
-	// and the worker resolves (schema_name, function_name).
+	// Owning schema, sent in the bind request (one name may exist in several).
 	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<std::string> setting_names;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
 
-	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }
 	bool worker_debug() const { return attach_params->worker_debug(); }
 	bool use_pool() const { return attach_params->use_pool(); }
 	const std::string &data_version_spec() const { return attach_params->data_version_spec(); }
 	const std::string &implementation_version() const { return attach_params->implementation_version(); }
 
-	// Schema info from catalog registration
-	vgi::VgiSchemaPtr output_schema;  // Single "result" column
+	vgi::VgiSchemaPtr output_schema;  // Single "result" column, from registration
 
-	// Whether this function has a dynamic return type (vgi:any) that needs bind-time resolution
+	// Return type (vgi:any) resolved at bind.
 	bool has_dynamic_return_type = false;
 
-	// Const parameter support: which positional params are constants
+	// Which positional params are constants (passed at bind, erased from the call).
 	std::vector<bool> positional_is_const;
 	std::vector<std::string> positional_names;
-	// Preserved for a future DuckDB optimizer adapter; DuckDB 1.5 has no API
-	// for installing per-argument monotonicity on ScalarFunction.
+	// Parsed and validated but not yet installed on the ScalarFunction.
 	std::optional<std::vector<vgi::VgiArgumentMonotonicity>> argument_monotonicity;
 };
-
-// ============================================================================
-// VgiScalarFunctionBindData - Bind data for scalar functions with dynamic types
-// ============================================================================
 
 struct VgiScalarFunctionBindData : public FunctionData {
 	VgiScalarFunctionBindData() = default;
 	~VgiScalarFunctionBindData() override = default;
 
-	// Copy of function info for execution
-	std::shared_ptr<vgi::VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
+	std::shared_ptr<vgi::VgiAttachParameters> attach_params;
 	std::vector<uint8_t> attach_opaque_data;
 	std::string function_name;
 	// Owning catalog schema; see VgiScalarFunctionInfo::schema_name.
@@ -96,29 +80,25 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	// Sanitized union of metadata-declared and bind-discovered secret usage.
 	bool secret_dependent = false;
 
-	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }
 	bool worker_debug() const { return attach_params->worker_debug(); }
 	bool use_pool() const { return attach_params->use_pool(); }
 	const std::string &data_version_spec() const { return attach_params->data_version_spec(); }
 	const std::string &implementation_version() const { return attach_params->implementation_version(); }
 
-	// Actual output schema resolved during bind (with concrete types)
+	// Output schema resolved at bind (concrete types).
 	vgi::VgiSchemaPtr resolved_output_schema;
 
-	// Input schema built from argument types during bind (after const params erased)
+	// Input schema from the declared argument types (const params erased).
 	vgi::VgiSchemaPtr input_schema;
 	std::optional<std::vector<std::optional<std::string>>> argument_names;
 
-	// DuckDB-side input types corresponding to `input_schema`, captured at
-	// bind time. Used at execute time to cast incoming DataChunk columns back
-	// to the bind-promised types before serializing to Arrow — DuckDB's
-	// optimizer may elide the Cast it inserted at bind time (e.g. skipping a
-	// DECIMAL(3,2)→DOUBLE cast in the physical plan), so args.data[i] can
-	// arrive with a narrower type than the worker was told to expect.
+	// DuckDB types of `input_schema`. Execute casts incoming columns to them:
+	// DuckDB may pass a narrower type than declared (e.g. a DECIMAL(3,2) literal
+	// for a DOUBLE param, with no Cast inserted), and the wire must match bind.
 	vector<LogicalType> input_duckdb_types;
 
-	// Extracted constant values (from const parameters erased at bind time)
+	// Values of the const params erased at bind.
 	vector<Value> const_values;
 
 	unique_ptr<FunctionData> Copy() const override {
@@ -138,66 +118,82 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		return copy;
 	}
 
-	// Intentionally compares only identity fields (worker_path, attach_opaque_data, function_name, etc.)
-	// for DuckDB plan cache matching. Derived fields like schemas and constants are excluded
-	// because they are deterministic given the identity fields and argument types.
+	// Const args are erased from the expression's children, so they (and the
+	// settings sent at bind) must be compared here, or CSE merges f(x, 1) with
+	// f(x, 2). Schemas derive from these and the argument types.
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<VgiScalarFunctionBindData>();
 		return worker_path() == other.worker_path() && attach_opaque_data == other.attach_opaque_data &&
 		       function_name == other.function_name && schema_name == other.schema_name &&
-		       worker_debug() == other.worker_debug() && use_pool() == other.use_pool();
+		       worker_debug() == other.worker_debug() && use_pool() == other.use_pool() &&
+		       data_version_spec() == other.data_version_spec() &&
+		       implementation_version() == other.implementation_version() &&
+		       SameValues(const_values, other.const_values) && SameSettings(settings, other.settings) &&
+		       input_duckdb_types == other.input_duckdb_types && argument_names == other.argument_names;
+	}
+
+private:
+	// BoundConstantExpression::Equals semantics: same type, NOT DISTINCT FROM.
+	static bool SameValue(const Value &a, const Value &b) {
+		return a.type() == b.type() && Value::NotDistinctFrom(a, b);
+	}
+	static bool SameValues(const vector<Value> &a, const vector<Value> &b) {
+		if (a.size() != b.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < a.size(); i++) {
+			if (!SameValue(a[i], b[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+	static bool SameSettings(const std::map<std::string, Value> &a, const std::map<std::string, Value> &b) {
+		if (a.size() != b.size()) {
+			return false;
+		}
+		for (auto ia = a.begin(), ib = b.begin(); ia != a.end(); ++ia, ++ib) {
+			if (ia->first != ib->first || !SameValue(ia->second, ib->second)) {
+				return false;
+			}
+		}
+		return true;
 	}
 };
 
-// ============================================================================
-// VgiScalarFunctionLocalState - Per-thread execution state
-// ============================================================================
-
+// Per-thread execution state.
 struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	VgiScalarFunctionLocalState();
 	~VgiScalarFunctionLocalState() override;
 
-	// Active connection to worker (created lazily on first execute)
+	// Created on first execute.
 	std::unique_ptr<vgi::IFunctionConnection> connection;
 
-	// Whether connection has been initialized
 	bool initialized = false;
 
-	// Cached input schema (built from DataChunk column types on first call)
 	vgi::VgiSchemaPtr input_schema;
 
-	// Pool setting captured during initialization (for use in destructor)
+	// Captured at init for the destructor.
 	bool use_pool = false;
 
-	// Cached output schema parse — populated on the first batch and reused
-	// for every subsequent batch on this thread. The output schema of a
-	// scalar function is fixed at bind time, so re-running
-	// ArrowSchemaToDuckDBTypes per batch (which does ExportSchema +
-	// PopulateArrowTableSchema + GetDuckDBTypesFromArrowTable) is wasted
-	// work. Caching these four fields in local state turns the per-batch
-	// "schema" phase from O(parse) into a member access.
+	// Output schema parse, from the first batch: the output schema is fixed at bind.
 	ArrowSchemaWrapper output_c_schema;
 	ArrowTableSchema output_arrow_table;
 	vector<LogicalType> output_types;
 	vector<string> output_names;
 	bool output_schema_cached = false;
 
-	// Cached input-side conversion state — populated on the first batch and
-	// reused on every subsequent batch by DataChunkToArrowCached. Skips the
-	// per-batch types/names push-back, ClientProperties copy, and
-	// ArrowTypeExtensionData::GetExtensionTypes() lookup that
-	// DataChunkToArrow otherwise does internally.
+	// Input conversion state for DataChunkToArrowCached, from the first batch.
 	vector<LogicalType> input_arrow_types;
 	vector<string> input_arrow_names;
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> input_extension_types;
 	std::optional<ClientProperties> input_client_props;
 	bool input_convert_cached = false;
 
-	// Per-value memoization: the static cache key (identity + worker + fn + const args +
-	// settings + versions) built once on the first batch; per-value keys derive from it by
-	// setting input_hash per distinct input tuple. cache_eligible gates the whole tier.
-	// Execute performs a fresh bind, so keep any newly discovered secret provenance
-	// here rather than mutating shared FunctionData from a parallel executor thread.
+	// Per-value memoization: the static cache key is built once; per-value keys
+	// add each distinct tuple's input_hash. cache_eligible gates the whole tier.
+	// Execute re-binds, so its secret provenance lives here, not in the shared
+	// FunctionData (which parallel threads read).
 	bool secret_dependent = false;
 	// That execute-time bind's BindResult::secret_scope: the cache key's secret
 	// fingerprint, since its secrets are the ones this connection's worker holds.
@@ -206,32 +202,23 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	bool cache_eligible = false;
 	vgi::VgiResultCacheKey cache_static_key;
 	std::string cache_catalog_name;
-	// SHA-256 fingerprint of cache_static_key (input_hash empty) — the per-value arena
-	// registry key. Computed once when the static key is built.
+	// Fingerprint of cache_static_key: the per-value arena registry key.
 	std::string cache_static_fp;
 	int64_t cache_default_ttl_seconds = 0;
-	// Latched `vgi.cache.per_value` advertisement. Per-value memoization is OFF until the
-	// worker asks for it (see VGI_CACHE_PER_VALUE_KEY) — the fixed per-entry probe/decode
-	// cost only pays back for an expensive worker call, and only the author knows.
+	// Latched `vgi.cache.per_value` advertisement (see VGI_CACHE_PER_VALUE_KEY).
 	bool cache_pv_opt_in = false;
 };
 
-// ============================================================================
-// Function Declarations
-// ============================================================================
-
 namespace vgi {
 
-// Initialize local state for scalar function execution
 unique_ptr<FunctionLocalState> VgiScalarFunctionInitLocalState(ExpressionState &state,
                                                                 const BoundFunctionExpression &expr,
                                                                 FunctionData *bind_data);
 
-// Main scalar function execution handler
 void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &result);
 
-// Bind function for scalar functions with dynamic return types
-// Connects to the worker to determine actual return type based on argument types
+// Binds against the worker to resolve the return type for the argument types,
+// and extracts const params.
 unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input);
 
 } // namespace vgi

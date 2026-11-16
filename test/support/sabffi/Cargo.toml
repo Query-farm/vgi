@@ -28,9 +28,9 @@ path = "src/lib.rs"
 # are the pin; `make unit_test_rust_libs` builds with --locked and first runs
 # scripts/check_rust_fixture_locks.sh, which fails naming both versions if they
 # drift apart. Bump this together with sabtable's `vgi`.
-vgi-rpc = { version = "0.32.0", default-features = false, features = ["macros", "stream-codec"] }
-arrow-array = "60"
-arrow-schema = "60"
+vgi-rpc = { version = "0.32.4", default-features = false, features = ["macros", "stream-codec"] }
+arrow-array = "59"
+arrow-schema = "59"
 serde = { version = "1", features = ["derive"] }
 
 [profile.release]

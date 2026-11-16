@@ -108,9 +108,8 @@ bool VgiSchemaEntry::HasSeed(const std::string &kind) {
 }
 
 namespace {
-// One event per seeded kind decoded — each kind of each schema is decoded at
-// most once, on first use. Lets tests (and profiling) see which parts of a
-// catalog_contents snapshot a workload actually touched.
+// One event per seeded kind decoded (at most once per schema and kind), so tests
+// can see which parts of a catalog_contents snapshot a workload touched.
 template <class T>
 std::vector<T> LogSeedDecode(ClientContext &context, const std::string &schema, const char *kind,
                              std::vector<T> items) {
@@ -222,9 +221,7 @@ VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, boo
 		callable_names->insert(macro.name);
 	}
 
-	// The caller only asks for callable names after observing a non-empty macro
-	// inventory. Keep this defensive empty check so future callers cannot turn an
-	// empty macro lookup into three unrelated function-inventory RPCs.
+	// Defensive: an empty macro inventory must not trigger three function-inventory RPCs.
 	if (!callable_names->empty()) {
 		const auto add_functions = [&](std::optional<std::vector<vgi::VgiFunctionInfo>> &inventory,
 		                               const char *function_type) {
@@ -235,12 +232,9 @@ VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, boo
 				callable_names->insert(function.name);
 			}
 		};
-		// Estimated counts are a discovery optimization, not an authority for
-		// names referenced by a macro body. Some workers register executable
-		// functions outside their declarative catalog model and report zero here
-		// even though the function inventory is non-empty. Once a macro exists,
-		// fetch all callable inventories exactly once so owner-relative names are
-		// never left on DuckDB's ambient search path.
+		// Ignore estimated counts here: some workers report zero functions yet
+		// have some. Once a macro exists, fetch every callable inventory once so
+		// owner-relative names never resolve on DuckDB's ambient search path.
 		add_functions(scalar_function_inventory_, "SCALAR_FUNCTION");
 		add_functions(aggregate_function_inventory_, "AGGREGATE_FUNCTION");
 		add_functions(table_function_inventory_, "TABLE_FUNCTION");
@@ -253,12 +247,9 @@ VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, boo
 }
 
 namespace {
-// Push the harvested entries from a child catalog set into the parent
-// VgiCatalog's deferred-drop graveyard so any raw CatalogEntry* held by a
-// bound query/prepared statement stays valid until the catalog itself is
-// destroyed (or vgi_clear_cache() is called explicitly). Without this,
-// schema-level DDL (DROP TABLE, ALTER, etc.) yanks pointers that DuckDB's
-// optimizer/binder may still be holding from a previous LookupEntry.
+// Move harvested entries into VgiCatalog's deferred-drop graveyard: a bound or
+// prepared statement may still hold a raw CatalogEntry* from an earlier
+// LookupEntry, so DDL must not free entries while the catalog lives.
 void DeferDrop(Catalog &catalog, std::vector<unique_ptr<CatalogEntry>> entries) {
 	if (entries.empty()) {
 		return;
@@ -318,10 +309,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 
 	auto on_conflict = vgi::MapOnConflict(create_info.on_conflict);
 
-	// Get transaction ID
 	auto &vgi_tx = VgiTransaction::Get(context, catalog);
 
-	// Send DDL RPC
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
@@ -334,7 +323,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	// response. Drop cached definitions and the empty-table shortcut before
 	// dispatch so failure cannot preserve stale constraints or hide a created table.
 	DeferDrop(catalog, tables_.HarvestEntries());
-	tables_.MarkPopulatedLocked();
+	tables_.MarkPopulated();
 	if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		DeferDrop(catalog, indexes_.HarvestEntries());
 		DeferDrop(catalog, views_.HarvestEntries());
@@ -375,7 +364,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateIndex(CatalogTransaction transa
 	                                  context);
 	// Lost responses cannot leave stale index listings, including a cached empty kind.
 	DeferDrop(catalog, indexes_.HarvestEntries());
-	indexes_.MarkPopulatedLocked();
+	indexes_.MarkPopulated();
 	vgi::InvokeCatalogIndexCreate(rpc, name.GetIdentifierName(), info.GetIndexName().GetIdentifierName(), definition,
 	                              vgi::MapOnConflict(info.on_conflict), context);
 	return nullptr;
@@ -393,7 +382,6 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 
 	auto &context = transaction.GetContext();
 
-	// Extract the SQL definition from the SelectStatement
 	std::string definition;
 	if (info.query) {
 		definition = info.query->ToString();
@@ -415,10 +403,8 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	}
 	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
 
-	// Get transaction ID
 	auto &vgi_tx = VgiTransaction::Get(context, catalog);
 
-	// Send DDL RPC
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
@@ -427,11 +413,9 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	                             IdentifiersToStrings(info.aliases), on_conflict, comment, tags, column_comments,
 	                             context);
 
-	// Invalidate view cache
 	DeferDrop(catalog, views_.HarvestEntries());
-	// Same DDL safety net as CreateTable: clear any cached zero-count
-	// emptiness so the next view lookup doesn't get short-circuited.
-	views_.MarkPopulatedLocked();
+	// Clear cached zero-count emptiness so the next lookup isn't short-circuited.
+	views_.MarkPopulated();
 	return nullptr;
 }
 
@@ -479,7 +463,6 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
 	                                vgi_tx.GetTransactionOpaqueData()};
 
-	// Handle COMMENT ON table or view
 	if (info.type == AlterType::SET_COMMENT) {
 		auto &comment_info = info.Cast<SetCommentInfo>();
 		if (comment_info.entry_catalog_type == CatalogType::TABLE_ENTRY) {
@@ -504,7 +487,6 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		                      EnumUtil::ToString(comment_info.entry_catalog_type));
 	}
 
-	// Handle COMMENT ON COLUMN
 	if (info.type == AlterType::SET_COLUMN_COMMENT) {
 		auto &col_comment = info.Cast<SetColumnCommentInfo>();
 		bool is_null = col_comment.comment_value.IsNull();
@@ -547,7 +529,6 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		return;
 	}
 
-	// Handle ALTER VIEW (rename)
 	if (info.type == AlterType::ALTER_VIEW) {
 		auto &alter_view = info.Cast<AlterViewInfo>();
 		if (alter_view.alter_view_type == AlterViewType::RENAME_VIEW) {
@@ -559,7 +540,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			throw BinderException("ALTER VIEW %s is not supported for VGI catalogs",
 			                      EnumUtil::ToString(alter_view.alter_view_type));
 		}
-		// Dependent views may reference the old name, so clear the entire views cache
+		// Dependent views may reference the old name: clear the whole views cache.
 		DeferDrop(catalog, views_.HarvestEntries());
 		return;
 	}
@@ -594,7 +575,6 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto &add_col = alter_table.Cast<AddColumnInfo>();
 		if (add_col.new_column.Generated())
 			throw NotImplementedException("VGI native ALTER ADD generated columns is not supported");
-		// Convert single column to Arrow schema
 		ColumnList single_col;
 		single_col.AddColumn(add_col.new_column.Copy());
 		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col, schema_name);
@@ -622,7 +602,6 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	}
 	case AlterTableType::ALTER_COLUMN_TYPE: {
 		auto &change_type = alter_table.Cast<ChangeColumnTypeInfo>();
-		// Create a single-column Arrow schema from the column name and new type
 		ColumnList single_col;
 		single_col.AddColumn(ColumnDefinition(change_type.GetColumnName(), change_type.target_type));
 		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col);
@@ -656,13 +635,11 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		if (set_def.column_path.size() != 1)
 			throw NotImplementedException("Native VGI nested column defaults are not yet qualified");
 		if (set_def.expression) {
-			// SET DEFAULT
 			auto expression = vgi::BuildNativeColumnExpression(set_def.expression->ToString(), schema_name,
 			                                                   vgi::VgiQueryEvaluationContext(), false);
 			vgi::InvokeCatalogTableColumnDefaultSet(rpc_ctx, schema_name, table_name,
 			                                        set_def.column_path[0].GetIdentifierName(), expression, context);
 		} else {
-			// DROP DEFAULT (null expression)
 			vgi::InvokeCatalogTableColumnDefaultDrop(rpc_ctx, schema_name, table_name,
 			                                         set_def.column_path[0].GetIdentifierName(), context);
 		}
@@ -703,12 +680,9 @@ void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
                           const std::function<void(CatalogEntry &)> &callback) {
 	switch (type) {
 	case CatalogType::TABLE_ENTRY:
-		// DuckDB stores tables and views in a single CatalogSet, so a TABLE_ENTRY
-		// scan naturally surfaces both — duckdb_tables()/duckdb_constraints() then
-		// skip non-table entries by type, while duckdb_columns() dispatches views
-		// to its ViewColumnHelper (which binds the view to expose its columns and
-		// column comments). VGI keeps views in a separate set, so we must include
-		// them here too; otherwise VGI views never appear in duckdb_columns().
+		// DuckDB keeps tables and views in one CatalogSet, and duckdb_columns()
+		// finds views through a TABLE_ENTRY scan (ViewColumnHelper). VGI keeps
+		// views separately, so include them or they never reach duckdb_columns().
 		tables_.Scan(context, callback);
 		views_.Scan(context, callback);
 		break;
@@ -716,9 +690,8 @@ void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		views_.Scan(context, callback);
 		break;
 	case CatalogType::SCALAR_FUNCTION_ENTRY:
-		// DuckDB's duckdb_functions() only scans SCALAR_FUNCTION_ENTRY, not separate
-		// AGGREGATE or MACRO entries. Include all function types here so they appear
-		// in duckdb_functions().
+		// duckdb_functions() scans SCALAR/TABLE/PRAGMA function entries, never
+		// AGGREGATE or MACRO, so include those here for them to be listed.
 		scalar_functions_.Scan(context, callback);
 		aggregate_functions_.Scan(context, callback);
 		scalar_macros_.Scan(context, callback);
@@ -727,7 +700,7 @@ void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		aggregate_functions_.Scan(context, callback);
 		break;
 	case CatalogType::TABLE_FUNCTION_ENTRY:
-		// Same pattern: table macros must be included in TABLE_FUNCTION_ENTRY scan.
+		// Likewise, table macros are only listed through a TABLE_FUNCTION_ENTRY scan.
 		table_functions_.Scan(context, callback);
 		table_macros_.Scan(context, callback);
 		break;
@@ -741,7 +714,6 @@ void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		indexes_.Scan(context, callback);
 		break;
 	default:
-		// Other types not yet implemented
 		break;
 	}
 }
@@ -870,7 +842,6 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transa
 	case CatalogType::TABLE_MACRO_ENTRY:
 		return table_macros_.GetEntry(context, entry_name);
 	default:
-		// Other types not yet implemented
 		return nullptr;
 	}
 }

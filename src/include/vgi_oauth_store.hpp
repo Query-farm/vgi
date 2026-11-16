@@ -20,8 +20,11 @@ public:
 std::unique_ptr<OAuthCredentialLease> AcquireOAuthCredentialLease(const std::string &canonical_key,
                                                                   const std::string &cache_mode);
 
+// `issued` receives the context to redeem the token with: `expected`, or
+// `expected` switched to its device-code client when the record was issued to it.
 bool LoadOAuthRefreshToken(const std::string &canonical_key, const OAuthRefreshContext &expected,
-                           const std::string &cache_mode, std::string &refresh_token);
+                           const std::string &cache_mode, std::string &refresh_token,
+                           OAuthRefreshContext *issued = nullptr);
 
 void StoreOAuthRefreshToken(const std::string &canonical_key, const OAuthRefreshContext &binding,
                             const std::string &cache_mode, const std::string &refresh_token);

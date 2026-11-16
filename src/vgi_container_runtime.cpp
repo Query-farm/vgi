@@ -64,15 +64,14 @@ const char *const kVgiCportLabel = "farm.query.vgi.cport";
 
 namespace {
 
-// Container name prefix.  The owning DuckDB pid is embedded so the orphan reaper
-// can tell whose containers these are.  Must match the reaper's parser below.
+// Per-process names are vgi-rpc-<pid>-<n> (parsed by ReapOrphanContainers);
+// shared ones are vgi-rpc-<spec hash>.
 constexpr const char *kContainerNamePrefix = "vgi-rpc-";
-// Stable label stamped on every container we start, so the reaper can list ours
-// without scanning unrelated containers.
+// Stamped on every container we start so the reapers can list only ours.
 constexpr const char *kContainerLabel = "farm.query.vgi.worker=1";
 
-// POSIX single-quote shell quoting: wrap in single quotes, escaping any embedded
-// single quote as '\''.  Safe for arbitrary content passed to /bin/sh -c.
+// POSIX single-quote shell quoting ('\'' for embedded quotes); safe for
+// arbitrary content passed to /bin/sh -c.
 std::string ShellQuote(const std::string &s) {
 	std::string out = "'";
 	for (char c : s) {
@@ -91,8 +90,9 @@ struct CommandResult {
 	std::string output;  // combined stdout+stderr
 };
 
-// Run a shell command line, capturing combined stdout+stderr.  Blocking; used
-// only at ATTACH (runtime detect / image inspect / pull), never on a hot path.
+// Run a shell command line, capturing combined stdout+stderr. Blocking: used
+// for runtime detect, image inspect/pull, shared-container introspection and
+// reaping; EnsureSharedContainer's endpoint cache keeps it off the query path.
 CommandResult RunCaptureCommand(const std::string &cmd) {
 	CommandResult result;
 	std::string full = cmd + " 2>&1";
@@ -119,9 +119,7 @@ CommandResult RunCaptureCommand(const std::string &cmd) {
 	return result;
 }
 
-// Fire-and-forget a shell command without blocking teardown.  Best-effort —
-// the caller ignores the result.  Backgrounded so the destructor returns
-// immediately.
+// Best-effort, backgrounded so a destructor never blocks on the runtime.
 void RunDetached(const std::string &cmd) {
 #if VGI_POSIX_TRANSPORT
 	std::string full = cmd + " >/dev/null 2>&1 &";
@@ -134,8 +132,7 @@ void RunDetached(const std::string &cmd) {
 #endif
 }
 
-// Resolve an executable name against PATH.  Returns the absolute path if found
-// and executable, else empty.
+// Absolute path of an executable on PATH, else empty.
 std::string WhichBinary(const std::string &name) {
 	const char *path_env = std::getenv("PATH");
 	if (!path_env) {
@@ -175,8 +172,8 @@ std::string WhichBinary(const std::string &name) {
 	return "";
 }
 
-// 32-bit FNV-1a — stable within a process run, which is all the per-process
-// worker pool needs for disambiguation.
+// 32-bit FNV-1a. Also names shared containers, so it must give the same value
+// in every process: do not replace it with std::hash.
 uint32_t Fnv1a32(const std::string &s) {
 	uint32_t h = 2166136261u;
 	for (unsigned char c : s) {
@@ -190,7 +187,6 @@ std::vector<std::string> kKnownRuntimes() {
 	return {"docker", "podman", "nerdctl", "container"};
 }
 
-// In-place StringUtil::Trim returns void; this returns a trimmed copy.
 std::string TrimCopy(std::string s) {
 	StringUtil::Trim(s);
 	return s;
@@ -349,8 +345,8 @@ std::vector<ContainerVolume> InspectImageVolumes(const ContainerRuntime &runtime
 	if (res.exit_code != 0) {
 		// A stopped daemon fails the inspect too; say so before trying a pull.
 		ThrowIfRuntimeUnavailable(runtime, res.output, image);
-		// Most likely the image isn't present locally.  Pull once (auth deferred
-		// to the runtime's own login), then retry inspect.
+		// Most likely the image is not local: pull once (auth deferred to the
+		// runtime's own login), then retry.
 		std::string pull_cmd = ShellQuote(runtime.binary) + " pull " + ShellQuote(image);
 		CommandResult pull = RunCaptureCommand(pull_cmd);
 		if (pull.exit_code != 0) {
@@ -412,16 +408,12 @@ std::vector<ContainerVolume> InspectImageVolumes(const ContainerRuntime &runtime
 		vol.path = yyjson_get_str(path_v);
 		yyjson_val *name_v = yyjson_obj_get(entry, "name");
 		if (name_v && yyjson_is_str(name_v)) {
-			// SECURITY: the label is attacker-controlled (it ships inside the
-			// image).  Docker treats a `-v` source that looks like a path
-			// (leading '/' or '.') as a *host bind-mount*, not a named volume,
-			// so an unsanitized label name of "/", "/var/run/docker.sock", etc.
-			// would mount arbitrary host paths into the image's own container on
-			// a plain ATTACH.  Run it through SanitizeVolumeToken (which maps '/'
-			// and every other non-[A-Za-z0-9_.-] byte to '_') so a label can only
-			// ever request a named volume.  User-supplied `volumes` via the
-			// struct LOCATION are the local operator's own trusted input and are
-			// intentionally left permissive (merged later in VgiCatalogAttach).
+			// SECURITY: the label ships inside the (untrusted) image. Docker
+			// treats a path-like `-v` source as a host bind mount, so a name like
+			// "/var/run/docker.sock" would expose host paths on a plain ATTACH.
+			// SanitizeVolumeToken maps '/' and every other non-[A-Za-z0-9_.-]
+			// byte to '_', so a label can only name a volume. User-supplied
+			// `volumes` are the operator's own input and stay permissive.
 			vol.host = SanitizeVolumeToken(yyjson_get_str(name_v));
 		} else {
 			// Synthesize a stable named volume so state persists across attaches.
@@ -484,10 +476,6 @@ std::string ContainerSpecHash(const ContainerSpec &spec) {
 	return std::string(hex);
 }
 
-// ---------------------------------------------------------------------------
-// Launch registry
-// ---------------------------------------------------------------------------
-
 namespace {
 
 struct ContainerLaunchInfo {
@@ -519,12 +507,8 @@ bool IsContainerRegistered(const std::string &location) {
 }
 
 void EnsureContainerRegistered(const std::string &location) {
-	// ATTACH pre-registers the (option-suffixed) location with the user's
-	// volumes/env/runtime. Entry points reached *before* ATTACH — vgi_catalogs()
-	// and vgi_catalogs() — pass the raw oci:// location and
-	// never hit that path, so resolve it here with defaults (auto runtime,
-	// image-declared volumes, no extra env/args) on first use. Idempotent; the
-	// registry caches the result so the inspect/pull only happens once.
+	// ATTACH registers the option-suffixed location itself; this covers raw
+	// oci:// locations reached before ATTACH (see the declaration).
 	if (IsContainerRegistered(location)) {
 		return;
 	}
@@ -537,14 +521,21 @@ void EnsureContainerRegistered(const std::string &location) {
 	RegisterContainerLaunch(location, spec.runtime.binary, command_template);
 }
 
+#if VGI_POSIX_TRANSPORT
+bool ContainerOwnerPidIsGone(long long pid) noexcept {
+	if (pid <= 0) {
+		return false; // kill(0 / -n) would probe process groups
+	}
+	return ::kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH;
+}
+#endif
+
 #if VGI_SUBPROCESS_TRANSPORT
 
 namespace {
 
-// Generate a unique container name: vgi-rpc-<duckdb_pid>-<counter>.  The pid lets
-// the reaper attribute the container to this process; the counter keeps
-// concurrent spawns from the same process distinct (so parallel pool misses
-// don't collide on `--name`).
+// vgi-rpc-<pid>-<counter>: the pid lets ReapOrphanContainers attribute the
+// container; the counter keeps concurrent spawns from colliding on `--name`.
 std::string GenerateContainerName() {
 	static std::atomic<uint64_t> counter {0};
 	uint64_t n = counter.fetch_add(1, std::memory_order_relaxed);
@@ -564,9 +555,6 @@ std::unique_ptr<SubProcess> SpawnWorker(const std::string &worker_path, bool wor
 	if (!IsContainerLocation(worker_path)) {
 		return std::make_unique<SubProcess>(worker_path, worker_debug);
 	}
-	// Resolve-on-first-use so pre-ATTACH callers (vgi_catalogs / standalone
-	// vgi_catalogs) work without an explicit registration. No-op when ATTACH
-	// already registered this location.
 	EnsureContainerRegistered(worker_path);
 	ContainerLaunchInfo info;
 	{
@@ -590,11 +578,8 @@ ContainerWorker::ContainerWorker(const std::string &final_command, std::string r
 }
 
 ContainerWorker::~ContainerWorker() {
-	// The base SubProcess dtor will SIGTERM/SIGKILL the `docker run` CLI; with
-	// `--rm` that normally removes the container.  But a SIGKILL of the CLI
-	// detaches the container and leaks it, so force-remove by name as a
-	// best-effort backstop.  Detached + non-blocking so teardown never stalls
-	// on the runtime.
+	// The base dtor signals the `run` CLI and `--rm` normally removes the
+	// container, but a SIGKILL of the CLI leaks it; force-remove as a backstop.
 	if (!runtime_binary_.empty() && !container_name_.empty()) {
 		RunDetached(ShellQuote(runtime_binary_) + " rm -f " + ShellQuote(container_name_));
 	}
@@ -629,28 +614,23 @@ void ReapOrphanContainers(const ContainerRuntime &runtime) noexcept {
 				continue;
 			}
 #if VGI_POSIX_TRANSPORT
-			// Only remove a container whose owning DuckDB process is provably gone.
-			// kill(pid, 0) == 0 => we can still signal it => alive => leave it.
-			if (owner_pid <= 0 || ::kill(static_cast<pid_t>(owner_pid), 0) == 0) {
+			if (!ContainerOwnerPidIsGone(owner_pid)) {
 				continue;
 			}
 			RunDetached(ShellQuote(runtime.binary) + " rm -f " + ShellQuote(name));
 #else
-			// No portable liveness probe here — err on the side of NOT removing a
-			// container that might belong to a live process.
+			// No portable liveness probe: never remove.
 			(void)owner_pid;
 #endif
 		}
 	} catch (...) {
-		// Best-effort — never propagate.
+		// Best-effort.
 	}
 }
 
 #endif // VGI_SUBPROCESS_TRANSPORT
 
-// ============================================================================
-// Shared (transparently reused) container workers
-// ============================================================================
+// ---- Shared container workers ----
 
 ContainerConnMode ParseContainerConnMode(const std::string &s) {
 	auto l = StringUtil::Lower(s);
@@ -1121,7 +1101,7 @@ int ResolveHostPort(const std::string &rt, const std::string &name, int cport) {
 	}
 }
 
-// Append the spec's -v / -e / extra-args tokens (shared with the per-process builder's intent).
+// Same -v / -e / extra-args tokens as BuildContainerRunCommandTemplate.
 void AppendVolEnvExtra(std::ostringstream &cmd, const ContainerSpec &spec) {
 	for (const auto &vol : spec.volumes) {
 		cmd << " -v " << ShellQuote(vol.host + ":" + vol.path);
@@ -1137,9 +1117,8 @@ void AppendVolEnvExtra(std::ostringstream &cmd, const ContainerSpec &spec) {
 } // namespace
 
 namespace {
-// Short-TTL endpoint cache so the ~8 discovery RPCs of a single ATTACH (and
-// back-to-back queries) reuse one resolution instead of re-running docker
-// inspect + a readiness probe each time. Keyed by container name.
+// Short-TTL endpoint cache, keyed by container name, so the several RPCs of one
+// ATTACH and back-to-back queries reuse one `inspect` + `port` resolution.
 struct CachedEndpoint {
 	ContainerEndpoint ep;
 	std::chrono::steady_clock::time_point at;
@@ -1164,7 +1143,6 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 	const std::string &rt = spec.runtime.binary;
 	const std::string name = "vgi-rpc-" + ContainerSpecHash(spec);
 
-	// Fresh cache hit → skip docker inspect + readiness entirely.
 	{
 		std::lock_guard<std::mutex> lock(EndpointCacheMutex());
 		auto it = EndpointCache().find(name);
@@ -1193,7 +1171,8 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 		                         ShellQuote(name));
 	};
 
-	// Parse "Running\tconn\tcport"; returns {running, mode, cport} when present.
+	// Parse "Running\tconn\tcport"; missing/invalid labels fall back to
+	// requested_mode and its default port.
 	auto parse_inspect = [&](const CommandResult &r, bool &exists, bool &running, ContainerConnMode &mode,
 	                         int &cport) {
 		exists = (r.exit_code == 0);
@@ -1223,11 +1202,8 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 		}
 	};
 
-	// Resolve the live endpoint in one shot. We do NOT probe for readiness here —
-	// the dispatch (vgi_unary_rpc.cpp / vgi_function_connection.cpp) connects and
-	// runs the RPC with retry, so the RPC itself is the readiness check. If the
-	// host port isn't published yet (just-created container), throw so that retry
-	// re-resolves.
+	// No readiness probe: the dispatch connects with retry, so the RPC is the
+	// readiness check. An unpublished host port throws so the retry re-resolves.
 	auto finish = [&](ContainerConnMode mode, int cport) -> ContainerEndpoint {
 		int hp = ResolveHostPort(rt, name, cport);
 		if (hp <= 0) {
@@ -1273,9 +1249,8 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 	cmd << " " << ShellQuote(spec.image);
 	cmd << " " << ContainerConnModeName(requested_mode);  // entrypoint mode: http | tcp
 	if (requested_mode == ContainerConnMode::TCP) {
-		// The tcp worker self-shuts-down when idle (native protocol supports it);
-		// the entrypoint forwards --idle-timeout to the worker. http servers may
-		// not support idle-shutdown, so they don't get it.
+		// The tcp worker shuts itself down when idle (the entrypoint forwards
+		// --idle-timeout); http servers may not support it.
 		cmd << " --idle-timeout 300";
 	}
 

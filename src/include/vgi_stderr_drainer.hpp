@@ -15,17 +15,10 @@ class ClientContext;
 
 namespace vgi {
 
-// Background stderr reader/buffer for a subprocess worker.
-//
-// Takes ownership of a file descriptor (typically a pipe read-end connected to
-// the worker's stderr). Spawns a thread that reads lines and stashes them for
-// later retrieval via DrainToLog(). Ownership of the fd can be released with
-// ReleaseFd() when handing the worker back to the pool — the thread stops but
-// the fd stays open.
-//
-// A drainer constructed with fd < 0 is a no-op: no thread, no fd, no buffering.
-// This lets callers uniformly construct one even when the SubProcess was
-// spawned with stderr_passthrough (no pipe).
+// Background stderr reader for a subprocess worker. Owns `fd` (the read end of
+// the worker's stderr pipe) and a thread that buffers lines for DrainToLog().
+// Pooling hands the whole drainer to the pool with the worker. With fd < 0
+// (stderr passthrough, no pipe) it is a no-op.
 class StderrDrainer {
 public:
 	explicit StderrDrainer(int fd);
@@ -36,36 +29,27 @@ public:
 	StderrDrainer(StderrDrainer &&) = delete;
 	StderrDrainer &operator=(StderrDrainer &&) = delete;
 
-	// Stop the reader thread and return the fd to the caller (ownership
-	// transferred; fd remains open). Returns -1 if no fd was held.
-	// After this call the drainer is empty; the destructor is a no-op.
-	int ReleaseFd();
-
-	// Forward any buffered lines to VGI_LOG as worker.stderr events.
-	// Safe to call with no fd (does nothing). Main-thread only.
+	// Forward buffered lines to VGI_LOG as worker.stderr events.
 	void DrainToLog(ClientContext &context, const std::string &worker_path, pid_t worker_pid);
 
-	// Join the reader thread (flushing any final unflushed bytes from a
-	// just-exited worker), then return the buffered stderr as one newline-joined
-	// string. Empty if nothing was captured / no fd. Intended for the error path
-	// only — the reader thread is stopped, so call this when the connection is
-	// about to be torn down (i.e. right before throwing a worker-failure error).
-	// Does NOT close the fd; the destructor still owns it.
+	// Error path only: let the reader drain what is in the pipe, join it, and
+	// return the buffered stderr newline-joined. The reader is stopped
+	// afterwards, so call it just before tearing the connection down. Does NOT
+	// close the fd.
 	std::string CaptureStderrSnapshot();
 
 private:
-	// Bound on the buffered-lines queue. Pooled workers can sit idle for
-	// long periods between queries; a chatty worker would otherwise grow
-	// lines_ unboundedly. When the cap is hit we drop the oldest line and
-	// remember that we did so, surfacing a single "[truncated]" marker on
-	// the next DrainToLog so users notice they lost stderr.
+	// Bound on lines_: an idle pooled worker that keeps writing would otherwise
+	// grow it without limit. Over the cap the oldest line is dropped and counted;
+	// DrainToLog logs a worker.stderr.truncated event, CaptureStderrSnapshot a
+	// "[N earlier stderr line(s) dropped]" prefix.
 	static constexpr size_t kMaxBufferedLines = 1024;
 
 	int fd_ = -1;
 	std::thread thread_;
 	std::atomic<bool> stop_ {false};
 	// Set by CaptureStderrSnapshot: "finish what is in the pipe, then stop".
-	// Distinct from stop_ (hard stop, used by the destructor / ReleaseFd) because
+	// Distinct from stop_ (hard stop, used by the destructor) because
 	// a hard stop checked at the top of the reader loop can race a thread that
 	// has not been scheduled yet and drop the whole capture unread.
 	std::atomic<bool> drain_to_eof_ {false};

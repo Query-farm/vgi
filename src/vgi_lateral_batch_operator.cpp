@@ -29,7 +29,7 @@
 #include "vgi_arrow_utils.hpp"   // BuildArrowSchemaFromDuckDB / ArrowSchemaToDuckDBTypes / DataChunkToArrow
 #include "vgi_cache_control.hpp" // VgiCacheControl
 #include "vgi_exception.hpp"
-#include "vgi_exchange_cache_key.hpp" // exchange-mode result cache (M2)
+#include "vgi_exchange_cache_key.hpp" // exchange-mode result cache
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_input_dedup.hpp" // input dedup (ship distinct tuples; expand back)
 #include "vgi_logging.hpp"
@@ -39,9 +39,7 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
 // LogicalVgiLateralBatch
-// ============================================================================
 
 LogicalVgiLateralBatch::LogicalVgiLateralBatch(unique_ptr<LogicalGet> source, vector<LogicalType> worker_output_types,
                                                vector<ColumnBinding> worker_bindings,
@@ -124,9 +122,7 @@ PhysicalOperator &LogicalVgiLateralBatch::CreatePlan(ClientContext &context, Phy
 	return op;
 }
 
-// ============================================================================
 // Operator state
-// ============================================================================
 
 namespace {
 
@@ -138,14 +134,13 @@ ErrorInfo LateralViolation(const VgiTableInOutBindData &bd) {
 }
 
 struct VgiLateralBatchGlobalState : public GlobalOperatorState {
-	// Shared across this operator's parallel Execute threads; reported post-execution
-	// in EXPLAIN ANALYZE via VgiLateralBatchOperatorState::Finalize (which reads these
-	// off op.op_state). The exchange cache here is PER-INPUT-CHUNK, so a single scan
-	// legitimately mixes hits and misses — hence a rate, not a boolean.
+	// Shared across this operator's parallel Execute threads; reported in EXPLAIN
+	// ANALYZE by VgiLateralBatchOperatorState::Finalize. The cache is per input
+	// chunk, so one scan mixes hits and misses — hence a rate, not a boolean.
 	std::atomic<bool> cache_eligible {false};
-	std::atomic<idx_t> cache_hits {0};    // chunks served without the worker (M2 or full per-value)
+	std::atomic<idx_t> cache_hits {0};    // chunks served without the worker (whole-chunk or full per-value)
 	std::atomic<idx_t> cache_misses {0};  // chunks that invoked the worker
-	std::atomic<idx_t> cache_stores {0};  // entries committed (M2 whole-chunk + per-value)
+	std::atomic<idx_t> cache_stores {0};  // entries committed (whole-chunk + per-value)
 };
 
 // One input chunk's worker exchanges (a MISS). The chunk's worker input — the rows it
@@ -207,17 +202,11 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 		ShutdownConnection();
 	}
 
-	// Close the stream cleanly and hand the worker back to the pool. This used to
-	// just drop the connection, on the theory that a worker left mid-stream can
-	// never be reused — but the operator can END the stream, exactly as the scalar
-	// path does (VgiScalarFunctionLocalState's destructor). Dropping it meant EVERY
-	// lateral query burned a worker process: acquire, use, kill, and the next query
-	// pays a fresh spawn. That showed up as a flat per-query cost independent of row
-	// count — ~60ms against a Rust worker, ~530ms against Python — which dwarfed the
-	// actual work (the same worker handles 1M rows through the scalar path in 18ms).
-	// Safe here because the batched-lateral path only ever handles maps with no
-	// finalize (see the operator's applicability check), so there is no finalize
-	// handshake owed to the worker: closing input is a complete end-of-stream.
+	// End the stream cleanly and return the worker to the pool (as the scalar path
+	// does in VgiScalarFunctionLocalState's destructor) rather than dropping it:
+	// otherwise every lateral query pays a fresh worker spawn. Safe because only
+	// maps without finalize are batched (IsBatchableLateralGet), so closing input
+	// is a complete end-of-stream; no finalize handshake is owed.
 	void ShutdownConnection() noexcept {
 		if (!connection) {
 			return;
@@ -278,7 +267,7 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	// The current input chunk's worker exchanges, while replies remain.
 	ChunkExchange ex;
 
-	// ---- Exchange-mode result cache (M2, per-input-chunk memoization) ----
+	// ---- Exchange-mode result cache (whole-chunk memoization) ----
 	// Built once on the first chunk: the static key + whether caching is eligible.
 	bool cache_key_built = false;
 	bool cache_eligible = false;
@@ -498,8 +487,8 @@ OperatorResultType EmitServedSlice(VgiLateralBatchOperatorState &state, const Ar
 }
 
 // Commit the current input chunk's accumulated POST-STAMP output slices as one
-// memory-only cache entry (allow_disk=false). Clears the capture state. Returns
-// true iff an entry was actually stored (for the EXPLAIN ANALYZE store counter).
+// cache entry (allow_disk=true: the disk tier is used when configured). Clears
+// the capture state. Returns true iff an entry was stored.
 bool CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindData &bd, ClientContext &ctx) {
 	auto sr = StoreExchangeMemoEntry(GetResultCache(ctx), state.capture_key, state.cache_cc, state.cache_catalog_name,
 	                                 state.cache_default_ttl_seconds, state.capture_pending,
@@ -509,7 +498,8 @@ bool CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindD
 		VGI_LOG(ctx, "result_cache.store",
 		        {{"function", bd.function_name},
 		         {"key_hash", state.capture_key.HexDigest()},
-		         {"tier", "memory"},
+		         // Insert picks memory, disk or both (allow_disk=true above).
+		         {"tier", "memory_or_disk"},
 		         {"rows", std::to_string(sr.rows)},
 		         {"bytes", std::to_string(sr.bytes)}});
 	} else if (sr.reason) {
@@ -520,7 +510,7 @@ bool CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindD
 	return sr.stored;
 }
 
-// Publish the shared per-chunk cache counters (M2 + per-value) into EXPLAIN ANALYZE.
+// Publish the shared per-chunk cache counters (whole-chunk + per-value) into EXPLAIN ANALYZE.
 // Only emits when the scan was cache-eligible (else the "misses" would just be
 // every chunk with caching off — misleading). Reached via the pipeline executor's
 // intermediate-operator finalize; op.op_state is the shared VgiLateralBatchGlobalState.
@@ -555,9 +545,7 @@ void VgiLateralBatchOperatorState::Finalize(const PhysicalOperator &op, Executio
 
 } // anonymous namespace
 
-// ============================================================================
 // PhysicalVgiLateralBatch
-// ============================================================================
 
 PhysicalVgiLateralBatch::PhysicalVgiLateralBatch(PhysicalPlan &physical_plan, vector<LogicalType> types,
                                                  unique_ptr<FunctionData> bind_data_p, vector<column_t> projected_input_p,
@@ -589,7 +577,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// Build the STATIC cache key once (per-chunk memoization: a hit replays a chunk's
 	// POST-STAMP output and skips the worker exchange; the key folds in an
 	// order-independent hash of the FULL input chunk — correlated columns are baked
-	// into the cached output so they must be part of the key). See docs/result cache.
+	// into the cached output so they must be part of the key). See docs/result_cache.md.
 	if (!state.cache_key_built) {
 		state.cache_key_built = true;
 		std::vector<int32_t> proj_key;
@@ -653,11 +641,8 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// the worker. Only for a call answered by one reply: that reply then holds each of
 	// the call's tuples' whole output. A tuple with 0 output rows stores an empty batch
 	// (a valid negative memo). `call_parent` is each output row's call-local input row.
-	//
-	// Gated on the LIVE advertisement (the worker asked for per-value memoization), not
-	// on the probe: the probe needs the opt-in before the exchange and so is disarmed on
-	// a function's very first exchange, but by now the worker has told us. Storing anyway
-	// is what makes a single-chunk warm-up query populate the memo for the next query.
+	// Gated on the LIVE advertisement, not the probe's opt-in (unknown before a
+	// function's first exchange), so a single-chunk first query still fills the memo.
 	auto store_per_value = [&](const VgiBatchPtr &batch,
 	                           const std::vector<int32_t> &call_parent) {
 		auto &ex = state.ex;
@@ -865,12 +850,10 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 				continue;
 			}
 
-			// Begin capturing the chunk's POST-STAMP output for the M2 per-chunk cache (if
-			// the worker opted in). ALWAYS store it when eligible — including on a full
-			// per-value hit. The two tiers are not redundant: an M2 serve is ONE decode per
-			// input chunk, while a per-value serve of the same chunk is K decodes + a K-way
-			// assembly (measured ~14x slower on `cached_double`). Per-value's job is
-			// cross-CHUNK / cross-QUERY value reuse the whole-chunk key cannot see.
+			// Capture the chunk's POST-STAMP output for the whole-chunk cache whenever
+			// eligible, even on a full per-value hit: a whole-chunk serve is one decode,
+			// a per-value serve K decodes plus a K-way assembly (much slower). Per-value
+			// exists for cross-chunk / cross-query reuse the whole-chunk key cannot see.
 			if (!ex.capture_decided) {
 				ex.capture_decided = true;
 				state.capturing = state.cache_eligible && state.cache_cc.Cacheable() && !ex.continued;
@@ -952,10 +935,8 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// re-passes the SAME `input` chunk unchanged across HAVE_MORE_OUTPUT, so the held
 	// parent_index still refers to the right rows.
 	if (HasPendingOutput(state)) {
-		// Defense-in-depth: parent_index was range-validated against input.size() at
-		// decode time. If DuckDB ever re-passed a smaller chunk during the drain, a
-		// held index could point past the input's cardinality — an OOB gather. Fail
-		// loudly instead (the invariant is a same-sized re-pass; this should be dead).
+		// Defense in depth (see input_size_at_decode): a smaller re-passed chunk would
+		// make a held index an OOB gather.
 		if (input.size() != state.input_size_at_decode) {
 			throw IOException("vgi_batch_lateral: input chunk resized mid-drain (%llu -> %llu); "
 			                  "worker '%s' function '%s'",
@@ -1002,12 +983,13 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		    reval->total_bytes >= state.cache_revalidate_min_bytes) {
 			reval_entry = reval;
 		} else {
-			auto entry = GetResultCache(client_context).Lookup(state.capture_key, now);
+			const char *hit_tier = "memory";
+			auto entry = GetResultCache(client_context).Lookup(state.capture_key, now, &hit_tier);
 			if (entry) {
 				GetResultCache(client_context).RecordExchangeHit(entry->total_bytes);
-				gstate.cache_hits.fetch_add(1, std::memory_order_relaxed); // whole-chunk (M2) hit
+				gstate.cache_hits.fetch_add(1, std::memory_order_relaxed); // whole-chunk hit
 				VGI_LOG(client_context, "result_cache.hit",
-				        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "memory"}});
+				        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", hit_tier}});
 				if (entry->streams.empty() || entry->streams[0].batches.empty()) {
 					chunk.SetCardinality(0); // cached empty (all-filtered) result — nothing to emit
 					return OperatorResultType::NEED_MORE_INPUT;
@@ -1096,23 +1078,17 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	}
 
 	// [per-value] After dedup, memoize per DISTINCT worker-input tuple — the finer tier
-	// UNDER the M2 per-chunk cache (which already missed here). Batch-look-up each distinct
-	// tuple's key; a FULL hit (every tuple cached) serves without the worker, catching
-	// cross-chunk / cross-query value reuse the whole-chunk key misses. Skipped while
-	// revalidation is armed (the 304 flow owns this chunk). See docs/exchange_dedup_pervalue.md.
+	// under the whole-chunk cache (which already missed here). A FULL hit (every tuple
+	// cached) serves without the worker. Skipped while revalidation is armed (the 304
+	// flow owns this chunk). See docs/exchange_dedup_pervalue.md.
 	//
-	// WORKER OPT-IN (default OFF): the worker must advertise `vgi.cache.per_value` on an
-	// output batch. Per-value memoization only pays when one worker call costs more than
-	// one cache probe + decode + assembly; for a cheap map it is a large net loss, and the
-	// engine cannot tell the two apart from the outside. `vgi_result_cache_per_value` is a
-	// CEILING over the advertisement (it can veto, never enable).
-	//
-	// The advertisement rides an output batch, so it is only visible after an exchange.
-	// `cache_pv_opt_in` is seeded from the process-wide registry (an earlier exchange
-	// against this same function, in this or any previous query) and then latched from
-	// this scan's own first exchange. This gates the PROBE only — the STORE keys off the
-	// live cache-control, so the very first exchange still memoizes what the worker
-	// asked it to, and the next scan probes for it.
+	// Worker opt-in (default off) via `vgi.cache.per_value` on an output batch: it only
+	// pays when a worker call costs more than probe + decode + assembly, which the engine
+	// cannot judge. `vgi_result_cache_per_value` can veto, never enable. The opt-in is
+	// only visible after an exchange, so `cache_pv_opt_in` is seeded from the
+	// process-wide registry (earlier exchanges of this function) and latched from this
+	// scan's first exchange. It gates the PROBE only; the store uses the live
+	// cache-control.
 	if (!state.cache_pv_opt_in && state.cache_eligible) {
 		state.cache_pv_opt_in = GetResultCache(client_context).HasPerValueOptIn(state.cache_static_key);
 	}
@@ -1121,7 +1097,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// Per-value memo probe against the columnar arena. pv_blobs is the raw sort-key blob
 	// per distinct tuple (the arena slot key). Probe returns the cached rows (hits, ascending
 	// distinct order, 1:N expanded) with a parent array (distinct index per row), a per-tuple
-	// hit mask, and the aggregates for the M2 cc-latch.
+	// hit mask, and the aggregates for the whole-chunk cc-latch.
 	std::vector<std::string> pv_blobs;
 	std::vector<char> pv_hit;
 	VgiBatchPtr pv_cached;
@@ -1159,11 +1135,9 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		if (pv_probe.served_bytes) {
 			GetResultCache(client_context).RecordExchangeHit(pv_probe.served_bytes);
 		}
-		// Latch cache-control off the served per-value slots for the coarse whole-chunk (M2)
-		// store, when this operator state has not yet seen an exchange (cache_cc is normally
-		// latched off a worker reply, and there is no worker reply on this path). B1: min
-		// REMAINING lifetime across all hit slots. B2: validators only if all hit slots agree,
-		// else freshness-only.
+		// No worker reply to latch cache_cc from on this path: derive it from the served
+		// per-value slots for the whole-chunk store. TTL = the minimum REMAINING lifetime
+		// across hit slots; validators only if all hit slots agree, else freshness-only.
 		if (!state.cache_cc_latched && pv_hit_count > 0) {
 			VgiCacheControl cc;
 			cc.present = true;
@@ -1287,9 +1261,7 @@ InsertionOrderPreservingMap<string> PhysicalVgiLateralBatch::ParamsToString() co
 	return result;
 }
 
-// ============================================================================
 // OptimizerExtension — VgiLateralBatchRewriter
-// ============================================================================
 
 namespace {
 
@@ -1318,13 +1290,11 @@ void RewriteOne(unique_ptr<LogicalOperator> &op) {
 	vector<ColumnBinding> worker_bindings(all_bindings.begin(), all_bindings.begin() + base_idx);
 	vector<LogicalType> worker_output_types(get.types.begin(), get.types.begin() + base_idx);
 
-	// Capture the worker-original column indices of the leading base_idx output
-	// columns. When the function supports projection pushdown, DuckDB's
-	// UNUSED_COLUMNS pass has narrowed get.column_ids to the referenced worker
-	// columns (the InOut path uses column_ids, not projection_ids — see
-	// plan_get.cpp), so column_ids.size() == base_idx and these are exactly the
-	// columns to request from the worker. Without projection pushdown the worker
-	// emits its full schema in order, so identity indices are used (and never sent).
+	// With projection pushdown, UNUSED_COLUMNS has narrowed get.column_ids to the
+	// referenced worker columns (the InOut path uses column_ids, not
+	// projection_ids; see PhysicalPlanGenerator's LogicalGet planning), so they are
+	// exactly the columns to request. Otherwise the worker emits its full schema in
+	// order: identity indices, never sent.
 	auto *bd = &get.bind_data->Cast<VgiTableInOutBindData>();
 	const bool projection_pushdown = bd->projection_pushdown;
 	auto col_ids = get.GetColumnIds();

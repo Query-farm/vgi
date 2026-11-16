@@ -91,6 +91,33 @@ TEST_CASE("IsLoopbackHttpUrl rejects look-alike and remote hosts", "[oauth]") {
 	CHECK_FALSE(IsLoopbackHttpUrl(""));
 }
 
+TEST_CASE("IsLoopbackHttpUrl parses the authority strictly", "[oauth]") {
+	CHECK(IsLoopbackHttpUrl("http://localhost:8080/x"));
+	CHECK(IsLoopbackHttpUrl("http://[::1]:9/"));
+	CHECK(IsLoopbackHttpUrl("http://LOCALHOST:8080/x"));
+	CHECK(IsLoopbackHttpUrl("HTTP://LocalHost"));
+	CHECK(IsLoopbackHttpUrl("http://localhost?x=1"));
+	CHECK(IsLoopbackHttpUrl("http://127.0.0.1#frag"));
+	// Userinfo makes the host after '@' the real destination.
+	CHECK_FALSE(IsLoopbackHttpUrl("http://127.0.0.1:x@evil.com/"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://localhost@evil.com"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://localhost:80@evil.com/"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://user@localhost.evil.com"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://[::1]@evil.com"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://localhost\\@evil.com"));
+	// Non-numeric, empty or oversized ports.
+	CHECK_FALSE(IsLoopbackHttpUrl("http://localhost:80abc"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://localhost:"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://localhost:123456"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://[::1]x"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://[::1"));
+	// Not http:// at all.
+	CHECK_FALSE(IsLoopbackHttpUrl("localhost"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http:/localhost"));
+	CHECK_FALSE(IsLoopbackHttpUrl("ftp://localhost"));
+	CHECK_FALSE(IsLoopbackHttpUrl("http://"));
+}
+
 //===--------------------------------------------------------------------===//
 // SelectDeviceCodeClient — which client the device-code flow presents
 //===--------------------------------------------------------------------===//
@@ -130,6 +157,84 @@ TEST_CASE("SelectDeviceCodeClient reports nothing when nothing is configured", "
 	// say honestly that it found no client rather than invent one.
 	auto c = duckdb::vgi::SelectDeviceCodeClient("", "", "", "", "");
 	REQUIRE(c.client_id.empty());
+}
+
+//===--------------------------------------------------------------------===//
+// Persisted refresh-token record binding
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+// What DiscoverRefreshContext yields for a resource advertising a separate
+// device-code client: the ordinary client, plus the device client on the side.
+duckdb::vgi::OAuthRefreshContext DiscoveredWithDeviceClient() {
+	duckdb::vgi::OAuthRefreshContext ctx;
+	ctx.token_endpoint = "https://oauth2.example.invalid/token";
+	ctx.issuer = "https://accounts.example.invalid";
+	ctx.resource = "https://worker.example.invalid/vgi";
+	ctx.client_id = "web-client";
+	ctx.client_secret = "web-secret";
+	ctx.scope = "openid email";
+	ctx.device_client_id = "tv-client";
+	ctx.device_client_secret = "tv-secret";
+	return ctx;
+}
+
+} // namespace
+
+TEST_CASE("OAuth refresh record round-trips for the ordinary client", "[oauth][oauth-store]") {
+	auto discovered = DiscoveredWithDeviceClient();
+	auto data = duckdb::vgi::EncodeOAuthRefreshRecord(discovered, "rt-web");
+	std::string token;
+	duckdb::vgi::OAuthRefreshContext issued;
+	REQUIRE(duckdb::vgi::DecodeOAuthRefreshRecord(data, discovered, token, issued));
+	CHECK(token == "rt-web");
+	CHECK(issued.client_id == "web-client");
+	CHECK(issued.client_secret == "web-secret");
+}
+
+TEST_CASE("OAuth refresh record issued to the device client is reused with that client", "[oauth][oauth-store]") {
+	// The device-code flow stores its token bound to the device client; a later
+	// process discovers the ordinary client. The record must still match, and
+	// the refresh must present the device client it was issued to.
+	auto discovered = DiscoveredWithDeviceClient();
+	auto device_ctx = discovered;
+	device_ctx.client_id = "tv-client";
+	device_ctx.client_secret = "tv-secret";
+	auto data = duckdb::vgi::EncodeOAuthRefreshRecord(device_ctx, "rt-tv");
+	std::string token;
+	duckdb::vgi::OAuthRefreshContext issued;
+	REQUIRE(duckdb::vgi::DecodeOAuthRefreshRecord(data, discovered, token, issued));
+	CHECK(token == "rt-tv");
+	CHECK(issued.client_id == "tv-client");
+	CHECK(issued.client_secret == "tv-secret");
+	CHECK(issued.token_endpoint == discovered.token_endpoint);
+}
+
+TEST_CASE("OAuth refresh record rejects a foreign client or session", "[oauth][oauth-store]") {
+	auto discovered = DiscoveredWithDeviceClient();
+	std::string token;
+	duckdb::vgi::OAuthRefreshContext issued;
+
+	auto other_client = discovered;
+	other_client.client_id = "someone-else";
+	CHECK_FALSE(duckdb::vgi::DecodeOAuthRefreshRecord(duckdb::vgi::EncodeOAuthRefreshRecord(other_client, "rt"),
+	                                                  discovered, token, issued));
+
+	// Without an advertised device client, a device-bound record is rebound.
+	auto device_ctx = discovered;
+	device_ctx.client_id = "tv-client";
+	auto no_device = discovered;
+	no_device.device_client_id.clear();
+	CHECK_FALSE(duckdb::vgi::DecodeOAuthRefreshRecord(duckdb::vgi::EncodeOAuthRefreshRecord(device_ctx, "rt"),
+	                                                  no_device, token, issued));
+
+	auto other_scope = discovered;
+	other_scope.scope = "openid";
+	CHECK_FALSE(duckdb::vgi::DecodeOAuthRefreshRecord(duckdb::vgi::EncodeOAuthRefreshRecord(other_scope, "rt"),
+	                                                  discovered, token, issued));
+
+	CHECK_FALSE(duckdb::vgi::DecodeOAuthRefreshRecord("VGI1garbage", discovered, token, issued));
 }
 
 //===--------------------------------------------------------------------===//

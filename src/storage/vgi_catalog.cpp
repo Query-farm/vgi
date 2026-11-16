@@ -114,12 +114,11 @@ VgiCatalog::VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name,
 
 VgiCatalog::~VgiCatalog() = default;
 
-// Release the companion catalogs this VGI attach referenced, so the federation
-// is reversible. Refcount-aware: a companion shared with another still-attached
-// VGI catalog is NOT detached until the last referencer releases it (see
-// ReleaseCompanionCatalogs → VgiStorageExtension::ReleaseCompanions). Called by
-// AttachedDatabase::OnDetach AFTER DetachInternal removed the parent
-// (databases_lock not held) — nested DetachDatabase is safe here.
+// Release the companion catalogs this attach referenced. Refcount-aware: a
+// companion shared with another attached VGI catalog stays until its last
+// referencer releases it (ReleaseCompanionCatalogs). DuckDB calls OnDetach
+// after DetachInternal removed this database, without the database-manager
+// lock, so a nested DetachDatabase is safe here.
 void VgiCatalog::OnDetach(ClientContext &context) {
 	// The attachment owns remote resources independently of individual queries.
 	// DuckDB has already detached this catalog, so a cleanup failure cannot undo
@@ -131,8 +130,8 @@ void VgiCatalog::OnDetach(ClientContext &context) {
 			VGI_LOG(context, "catalog.detach.error", {{"catalog", internal_name_}, {"error_message", error.what()}});
 		}
 	}
-	// The catalog lifetime pin is no longer needed. Running/pooled subprocesses
-	// carry independent leases, so cleanup remains unable to race live code.
+	// Release the catalog's artifact pin; running/pooled subprocesses hold their
+	// own leases, so cleanup cannot race live code.
 	attach_parameters_->ReleaseWorkerArtifactAnchor();
 	if (companion_catalogs_.empty()) {
 		return;
@@ -142,7 +141,7 @@ void VgiCatalog::OnDetach(ClientContext &context) {
 }
 
 void VgiCatalog::Initialize(bool load_builtin) {
-	// Nothing to do - schemas are loaded lazily
+	// Schemas are loaded lazily.
 }
 
 optional<Identifier> VgiCatalog::GetDefaultSchema() const {
@@ -178,9 +177,7 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 	std::map<std::string, std::string> tags(info.tags.begin(), info.tags.end());
 	vgi::InvokeCatalogSchemaCreate(rpc_ctx, info.SchemaName().GetIdentifierName(), on_conflict, comment, tags, context);
 
-	// Invalidate schema cache so re-fetch picks up the new schema. Use the
-	// deferred path so any bound query holding a CatalogEntry* doesn't
-	// dangle.
+	// Invalidate via the deferred path so bound queries' CatalogEntry* stay valid.
 	vgi_tx.ClearSchemaCache();
 	ClearCache(/*force=*/false);
 	return nullptr;
@@ -220,8 +217,8 @@ optional_ptr<SchemaCatalogEntry> VgiCatalog::LookupSchema(CatalogTransaction tra
 
 PhysicalOperator &VgiCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                 LogicalCreateTable &op, PhysicalOperator &plan) {
-	// CREATE TABLE AS SELECT: create table at execution time (inside the transaction),
-	// then insert the SELECT results. Follows the Airport extension pattern.
+	// CTAS: the table is created at execution time (inside the transaction),
+	// then the SELECT results are inserted.
 	auto &insert = planner.Make<VgiPhysicalInsert>(op, op.schema, std::move(op.info));
 	insert.children.push_back(plan);
 	return insert;
@@ -231,14 +228,13 @@ PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGen
                                          optional_ptr<PhysicalOperator> plan) {
 	auto &table = op.table.Cast<VgiTableEntry>();
 	RequireWriteResultMode(table, "insert", op.return_chunk);
-	// Use DuckDB's built-in default resolution: insert a PhysicalProjection child
-	// that evaluates default expressions for omitted columns. This means Sink
-	// always receives full-width rows with defaults already filled in.
+	// DuckDB's default resolution projection fills omitted columns, so Sink
+	// always receives full-width rows.
 	if (plan && !op.column_index_map.empty()) {
 		plan = planner.ResolveDefaultsProjection(op, *plan);
 	}
 	// DuckDB's binder turns every INSERT ... ON CONFLICT / INSERT OR REPLACE into
-	// a MERGE (bind_insert.cpp GenerateMergeInto), so a bound INSERT always
+	// a MERGE (Binder::GenerateMergeInto), so a bound INSERT always
 	// throws on conflict. A deserialized plan could still carry another
 	// action: refuse it before any row reaches the worker.
 	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
@@ -281,10 +277,8 @@ PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGen
 	return upd;
 }
 
-// ============================================================================
-// MERGE INTO (and INSERT ... ON CONFLICT, which DuckDB's binder rewrites to a
-// MERGE before any catalog hook runs: bind_insert.cpp GenerateMergeInto)
-// ============================================================================
+// MERGE INTO (and INSERT ... ON CONFLICT, which Binder::GenerateMergeInto
+// rewrites to a MERGE before any catalog hook runs).
 //
 // VGI emulates MERGE with the table's ordinary write functions: every
 // INSERT/UPDATE/DELETE action becomes one write call fed by PhysicalMergeInto.
@@ -293,10 +287,9 @@ PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGen
 // evaluated (and cast to the column types) in the action's projection
 // (MergeIntoOperator::expressions), and the write operators reference the
 // projected columns. This replicates DuckDB's PlanGenericMergeIntoAction
-// (src/execution/physical_plan/plan_merge_into.cpp, CastActionExpressionsToColumnTypes /
-// PlanMergeRowIdReferences); it is copied here rather than called because the
-// extension must also build against stock DuckDB, and because the generic
-// Catalog::PlanMergeInto refuses RETURNING, which VGI supports.
+// (plan_merge_into.cpp); it is copied rather than called because those helpers
+// are file-static and the generic Catalog::PlanMergeInto refuses RETURNING,
+// which VGI supports.
 
 //! An UPDATE action's `SET col = DEFAULT` arrives as a BoundDefaultExpression,
 //! which a projection cannot execute: substitute the column's bound default.
@@ -407,16 +400,9 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
                                             LogicalMergeInto &op, PhysicalOperator &plan) {
 	auto &table_for_returning = op.table.Cast<VgiTableEntry>();
 
-	// Refuse MERGE on multi-branch tables, regardless of which clauses the
-	// user specified (WHEN MATCHED / WHEN NOT MATCHED). Refusing here catches
-	// the "MERGE WHEN NOT MATCHED THEN INSERT only" edge case that would
-	// otherwise slip through (since the INSERT sub-operator's refusal helper
-	// permits writable multi-branch). MERGE on multi-branch tables remains
-	// unsupported until concrete customer requirements for cross-arm
-	// semantics arrive — see docs/multi_branch.md.
-	//
-	// Short-circuits on the cheap multi-branch hint to avoid an RPC on every
-	// MERGE bind to a single-branch VGI table.
+	// Refuse MERGE on multi-branch tables whatever its clauses: an INSERT-only
+	// MERGE would otherwise pass, since the INSERT refusal permits a writable
+	// arm (docs/multi_branch.md). The single-branch hint skips the RPC.
 	if (!table_for_returning.IsKnownSingleBranchNoAT()) {
 		auto branches_result = table_for_returning.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
 		if (branches_result.branches.size() > 1) {
@@ -518,13 +504,11 @@ std::string VgiCatalog::GetDBPath() {
 }
 
 void VgiCatalog::ClearCache(bool force) {
-	// Drop this catalog's result-cache entries too (both the deferred and
-	// forced paths, and the version-bump caller). Result entries are keyed by
-	// the catalog's ATTACH identity, so a version bump / DDL / manual clear all
-	// invalidate them here.
+	// Every clear (version bump, DDL, vgi_clear_cache()) also drops this
+	// catalog's result-cache entries.
 	if (attach_parameters_) {
-		// identity_scope (catalog name + auth fingerprint) locates the per-identity
-		// disk shard so we drop ONLY this identity's on-disk entries.
+		// The identity scope (catalog name + auth fingerprint) selects this
+		// identity's disk shard, so only its on-disk entries are dropped.
 		auto identity = vgi::BuildCatalogIdentityScope(attach_parameters_->catalog_name(), attach_parameters_->auth());
 		vgi::GetResultCache(GetDatabase()).FlushCatalog(attach_parameters_->catalog_name(), identity);
 	}
@@ -536,15 +520,32 @@ void VgiCatalog::ClearCache(bool force) {
 	}
 	auto harvested = schemas.HarvestEntries();
 	if (force) {
-		// User-facing vgi_clear_cache(): purge the graveyard too. Bound
-		// prepared statements may now dangle — caller's choice.
+		// vgi_clear_cache(): purge the graveyard too; `harvested` is destroyed
+		// on return. Bound prepared statements may now dangle.
 		std::lock_guard<std::mutex> lk(graveyard_mutex_);
 		deferred_dropped_entries_.clear();
 		graveyard_drops_since_last_log_ = 0;
-		// `harvested` falls out of scope here and is destroyed.
 		return;
 	}
 	AbsorbDroppedEntries(std::move(harvested));
+}
+
+void VgiCatalog::TrimGraveyardLocked() {
+	if (deferred_dropped_entries_.size() <= kGraveyardLimit) {
+		return;
+	}
+	const size_t excess = deferred_dropped_entries_.size() - kGraveyardLimit;
+	deferred_dropped_entries_.erase(deferred_dropped_entries_.begin(),
+	                                deferred_dropped_entries_.begin() + static_cast<std::ptrdiff_t>(excess));
+	// Evicted entries may still back bound prepared statements, so report it;
+	// batched to one line per kGraveyardLimit drops to keep DDL storms quiet.
+	graveyard_drops_since_last_log_ += excess;
+	if (!graveyard_overflow_logged_ || graveyard_drops_since_last_log_ >= kGraveyardLimit) {
+		VGI_STDERR_DEBUG("[VGI] catalog graveyard over %zu entries: destroyed %zu oldest dropped entries\n",
+		                 kGraveyardLimit, graveyard_drops_since_last_log_);
+		graveyard_drops_since_last_log_ = 0;
+		graveyard_overflow_logged_ = true;
+	}
 }
 
 void VgiCatalog::AbsorbDroppedEntry(unique_ptr<CatalogEntry> entry) {
@@ -553,10 +554,7 @@ void VgiCatalog::AbsorbDroppedEntry(unique_ptr<CatalogEntry> entry) {
 	}
 	std::lock_guard<std::mutex> lk(graveyard_mutex_);
 	deferred_dropped_entries_.push_back(std::move(entry));
-	while (deferred_dropped_entries_.size() > kGraveyardLimit) {
-		deferred_dropped_entries_.erase(deferred_dropped_entries_.begin());
-		graveyard_drops_since_last_log_++;
-	}
+	TrimGraveyardLocked();
 }
 
 void VgiCatalog::AbsorbDroppedEntries(std::vector<unique_ptr<CatalogEntry>> entries) {
@@ -569,21 +567,16 @@ void VgiCatalog::AbsorbDroppedEntries(std::vector<unique_ptr<CatalogEntry>> entr
 			deferred_dropped_entries_.push_back(std::move(entry));
 		}
 	}
-	while (deferred_dropped_entries_.size() > kGraveyardLimit) {
-		deferred_dropped_entries_.erase(deferred_dropped_entries_.begin());
-		graveyard_drops_since_last_log_++;
-	}
+	TrimGraveyardLocked();
 }
 
 bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_opaque_data) {
-	// No attach_result_ means we never completed catalog_attach (e.g., the
-	// constructor allows it for in-progress / restored states). With no
-	// attach_opaque_data we can't address the worker, so skip the probe.
+	// Without a completed catalog_attach there is no attach_opaque_data to
+	// address the worker with.
 	if (!attach_result_) {
 		VGI_LOG(context, "catalog.invalidate.skip", {{"reason", "no_attach_result"}});
 		return false;
 	}
-	// Frozen catalogs never change metadata — skip version check entirely
 	if (attach_result_->catalog_version_frozen) {
 		VGI_LOG(context, "catalog.invalidate.skip", {{"reason", "frozen"}});
 		return false;
@@ -611,12 +604,10 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 		}
 	}
 
-	// Query current version from the worker
 	int64_t current_version = vgi::InvokeCatalogVersion(rpc_ctx, context);
 	int64_t last_version = last_known_catalog_version_.load();
 
-	// Version 0 means "unimplemented" or "unknown" — always clear for safety
-	// (preserves existing behavior for workers that don't support catalog_version)
+	// Version 0 means unimplemented/unknown: always clear.
 	if (current_version == 0) {
 		VGI_LOG(context, "catalog.invalidate",
 		        {{"current_version", std::to_string(current_version)},
@@ -626,7 +617,6 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 		return true;
 	}
 
-	// Compare with last known version
 	if (current_version != last_version) {
 		VGI_LOG(context, "catalog.invalidate",
 		        {{"current_version", std::to_string(current_version)},

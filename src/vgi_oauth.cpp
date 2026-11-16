@@ -63,7 +63,6 @@ using namespace duckdb_yyjson; // NOLINT
 namespace duckdb {
 namespace vgi {
 
-// Forward declaration (defined later, used by both device code and PKCE flows)
 static std::string GetResourceDisplayName(const OAuthResourceMetadata &meta);
 
 //===--------------------------------------------------------------------===//
@@ -74,18 +73,13 @@ bool OAuthTokenSet::IsValid() const {
 	if (access_token.empty()) {
 		return false;
 	}
-	// Treat a token inside the skew window as already stale. Letting one expire
-	// in flight is not free: GetToken() then returns "", the request goes out
-	// with no Authorization header, and the 401 costs a re-send of the whole
-	// body including the Arrow IPC payload. Refreshing early trades that for a
-	// single cheap token exchange.
+	// Inside the skew window counts as stale; see TokenStillFresh.
 	return TokenStillFresh(expires_at, std::chrono::steady_clock::now(), kTokenRefreshSkew);
 }
 
 std::string OAuthTokenSet::BearerToken() const {
-	// Prefer access_token per OAuth 2.0 spec. If the resource server needs
-	// id_token (e.g., when access_token is opaque), use_id_token_as_bearer
-	// in the resource metadata controls this.
+	// access_token unless the resource metadata set use_id_token_as_bearer
+	// (e.g. the access_token is opaque to the resource server).
 	if (use_id_token && !id_token.empty()) {
 		return id_token;
 	}
@@ -93,7 +87,7 @@ std::string OAuthTokenSet::BearerToken() const {
 }
 
 bool OAuthServerMetadata::SupportsGrantType(const std::string &grant_type) const {
-	// If the server doesn't advertise grant_types_supported, don't restrict
+	// Not advertised: don't restrict.
 	if (grant_types_supported.empty()) {
 		return true;
 	}
@@ -129,7 +123,7 @@ std::string Base64UrlEncode(const unsigned char *data, size_t len) {
 		}
 	}
 
-	// Convert to base64url: + -> -, / -> _, strip =
+	// base64url: + -> -, / -> _, strip =
 	for (auto &c : result) {
 		if (c == '+') c = '-';
 		else if (c == '/') c = '_';
@@ -177,13 +171,12 @@ std::string Base64UrlDecode(const std::string &input) {
 }
 
 OAuthIdentity ParseIdTokenClaims(const std::string &id_token) {
-	// Not cryptographically verified — id_token arrived over TLS from our own OAuth exchange.
+	// Not signature-verified; see OAuthIdentity.
 	OAuthIdentity identity;
 	if (id_token.empty()) {
 		return identity;
 	}
 
-	// JWT = header.payload.signature — we only need the payload.
 	auto first_dot = id_token.find('.');
 	if (first_dot == std::string::npos) {
 		return identity;
@@ -212,7 +205,6 @@ OAuthIdentity ParseIdTokenClaims(const std::string &id_token) {
 		return identity;
 	}
 
-	// Lift the four universal OIDC claims into dedicated fields for SQL ergonomics.
 	auto sub = yyjson_obj_get(root, "sub");
 	if (sub && yyjson_is_str(sub)) {
 		identity.sub = yyjson_get_str(sub);
@@ -230,9 +222,6 @@ OAuthIdentity ParseIdTokenClaims(const std::string &id_token) {
 		identity.issuer = yyjson_get_str(iss);
 	}
 
-	// Stash the raw decoded payload — caller exposes it as a JSON column so
-	// provider-specific claims (Entra preferred_username/oid/tid, group/role
-	// arrays, custom attributes) are reachable without hardcoding keys here.
 	identity.claims_json = payload_json;
 	identity.present = true;
 	return identity;
@@ -290,7 +279,6 @@ std::string GenerateState() {
 		throw IOException("VGI OAuth: failed to generate random bytes for state");
 	}
 
-	// Hex-encode
 	std::string result;
 	result.reserve(32);
 	static const char hex[] = "0123456789abcdef";
@@ -334,14 +322,7 @@ static std::string DebugSecret(const std::string &secret) {
 
 std::optional<OAuthChallenge> ParseWWWAuthenticate(const std::string &header) {
 	// Bearer resource_metadata="<url>"[, client_id="<id>"][, ...]
-	//
-	// The scheme token is matched case-insensitively (RFC 7235 says schemes are)
-	// and the parameters go through a real auth-param parser. The previous
-	// substring search had a concrete failure: `find("client_id=\"")` also
-	// matches inside `device_code_client_id="`, so a challenge carrying both
-	// reported the device client as the ordinary one — and since the ordinary
-	// client is what a browser (PKCE) flow presents, that is the wrong client
-	// for the flow that would use it.
+	// The scheme is case-insensitive (RFC 7235); params go through ParseAuthParams.
 	static const std::string kScheme = "Bearer";
 	size_t pos = header.find_first_not_of(" \t");
 	if (pos == std::string::npos || header.size() - pos < kScheme.size()) {
@@ -362,8 +343,7 @@ std::optional<OAuthChallenge> ParseWWWAuthenticate(const std::string &header) {
 	const auto params = ParseAuthParams(header.substr(pos));
 	auto rm = params.find("resource_metadata");
 	if (rm == params.end() || rm->second.empty()) {
-		// Without it there is nothing to discover, so this is not a challenge
-		// this client can act on.
+		// Nothing to discover: not a challenge this client can act on.
 		return std::nullopt;
 	}
 
@@ -494,16 +474,13 @@ std::string HttpGet(ClientContext &context, const std::string &url) {
 //===--------------------------------------------------------------------===//
 
 static void EnforceHttpsUrl(const std::string &url, const std::string &context_name) {
-	// Belt-and-suspenders: the upstream caller in vgi_http_client.cpp now
-	// short-circuits on an empty challenge URL with a clean "no credential"
-	// error, so a non-empty URL is expected here. If anything else ever
-	// feeds an empty URL into the OAuth path, surface a readable message
-	// rather than the trailing-whitespace "must use HTTPS: " confusion.
+	// The HTTP 401 handler already rejects an empty challenge URL; this keeps
+	// any other caller from getting a confusing "must use HTTPS: " message.
 	if (url.empty()) {
 		throw IOException(DiscoveryInfo(url), "VGI OAuth: %s URL is empty (no OAuth challenge from server)",
 		                  context_name);
 	}
-	if (url.substr(0, 8) != "https://" && !IsLoopbackHttpUrl(url)) {
+	if (!StringUtil::StartsWith(StringUtil::Lower(url.substr(0, 8)), "https://") && !IsLoopbackHttpUrl(url)) {
 		throw IOException(DiscoveryInfo(url), "VGI OAuth: %s URL must use HTTPS: %s", context_name, url);
 	}
 }
@@ -601,11 +578,7 @@ OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::s
 		meta.use_id_token_as_bearer = yyjson_get_bool(use_id);
 	}
 
-	// token_endpoint (string, optional — non-standard RFC 9728 extension)
-	// When set, this is the VGI server's PKCE token-exchange proxy URL.
-	// Use it instead of the IdP's discovered token_endpoint so the extension
-	// doesn't have to hold the IdP's client_secret. See the comment on
-	// OAuthResourceMetadata::token_endpoint for the security rationale.
+	// token_endpoint (string, optional): see OAuthResourceMetadata::token_endpoint.
 	auto token_ep = yyjson_obj_get(root, "token_endpoint");
 	if (token_ep && yyjson_is_str(token_ep)) {
 		meta.token_endpoint = yyjson_get_str(token_ep);
@@ -620,7 +593,6 @@ OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::s
 
 OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::string &server_url) {
 	EnforceHttpsUrl(server_url, "authorization server");
-	// Append well-known path
 	std::string url = server_url;
 	if (!url.empty() && url.back() == '/') {
 		url.pop_back();
@@ -692,16 +664,8 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 	return meta;
 }
 
-// Resolve the token endpoint to use for token-exchange / refresh requests.
-//
-// When the VGI server's resource metadata advertises its own token_endpoint
-// (a non-standard RFC 9728 extension), prefer it over the IdP's discovered
-// endpoint. The advertised URL points at the server's PKCE token-exchange
-// proxy, which injects the configured server-side client_secret before
-// forwarding to the IdP. This lets the WASM build complete token exchanges
-// without holding the IdP's client_secret locally — which matters for IdPs
-// (notably Google) that reject token-endpoint requests from "Web
-// application" clients without a secret.
+// The token endpoint for code exchange / refresh: the VGI server's proxy when
+// advertised (see OAuthResourceMetadata::token_endpoint), else the IdP's.
 static std::string ResolveTokenEndpoint(const OAuthResourceMetadata &resource_meta,
                                          const OAuthServerMetadata &server_meta) {
 	return resource_meta.token_endpoint.empty() ? server_meta.token_endpoint
@@ -714,15 +678,12 @@ static std::string ResolveTokenEndpoint(const OAuthResourceMetadata &resource_me
 
 void OpenBrowser(const std::string &url) {
 #if defined(__EMSCRIPTEN__)
-	// In WASM, we can't open a browser from a Worker — the URL is printed to stderr for the user
+	// A Worker cannot open a browser: print the URL.
 	fprintf(stderr, "[VGI] Please open this URL in your browser: %s\n", url.c_str());
 #elif defined(__APPLE__)
-	// Double-fork: the intermediate child exits immediately, so the waitpid()
-	// below returns at once (no blocking on the browser launcher), and the
-	// grandchild that execs `open` is reparented to init and auto-reaped —
-	// no zombie left in the DuckDB process.
-	// See ScopedForkSignalBlock: closes the fork()->reset window. The grandchild
-	// fork below is already safe — by then dispositions are SIG_DFL.
+	// Double-fork so waitpid() returns at once and the grandchild running `open`
+	// is reparented to init (no zombie). ScopedForkSignalBlock closes the
+	// fork()->reset window; the grandchild fork already sees SIG_DFL.
 	ScopedForkSignalBlock fork_signal_block;
 	pid_t pid = fork();
 	if (pid == 0) {
@@ -741,15 +702,13 @@ void OpenBrowser(const std::string &url) {
 #elif defined(_WIN32)
 	ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #else
-	// See ScopedForkSignalBlock: closes the fork()->reset window. The grandchild
-	// fork below is already safe — by then dispositions are SIG_DFL.
+	// Double-fork as on macOS.
 	ScopedForkSignalBlock fork_signal_block;
 	pid_t pid = fork();
 	if (pid == 0) {
 		ResetChildSignalDispositions(); // inherited by the grandchild
 		pid_t grandchild = fork();
 		if (grandchild == 0) {
-			// Redirect stderr to /dev/null
 			int devnull = open("/dev/null", O_WRONLY);
 			if (devnull >= 0) {
 				dup2(devnull, STDERR_FILENO);
@@ -771,7 +730,6 @@ void OpenBrowser(const std::string &url) {
 // Token Exchange
 //===--------------------------------------------------------------------===//
 
-// Parse OAuth token response JSON into an OAuthTokenSet
 static OAuthTokenSet ParseTokenResponse(const std::string &json_body, const std::string &error_context) {
 	auto doc = yyjson_read(json_body.c_str(), json_body.size(), 0);
 	if (!doc) {
@@ -816,8 +774,8 @@ static OAuthTokenSet ParseTokenResponse(const std::string &json_body, const std:
 	return tokens;
 }
 
-// POST form-encoded body to a token endpoint, return status code and body without throwing on non-200.
-// Required for device code polling where 400 + "authorization_pending" is expected.
+// POST a form-encoded body to a token endpoint; returns status and body without
+// throwing on non-200 (device-code polling expects 400 authorization_pending).
 struct RawTokenResponse {
 	int status_code;
 	std::string body;
@@ -843,7 +801,6 @@ static RawTokenResponse PostTokenRequestRaw(ClientContext &context,
 	return {static_cast<int>(response->status), resp_body};
 }
 
-// POST form-encoded body to a token endpoint, return parsed tokens
 static std::string PostTokenRequest(ClientContext &context,
                                      const std::string &token_endpoint,
                                      const std::string &body,
@@ -891,11 +848,8 @@ static OAuthTokenSet ExchangeCodeForTokens(ClientContext &context,
 
 	auto resp = PostTokenRequestRaw(context, token_endpoint, body);
 	if (resp.status_code != 200) {
-		// Surface the request shape through the exception so IdP-specific
-		// failures (Microsoft Entra "AADSTS9002313: Invalid request") are
-		// diagnosable from the user-visible error alone. Secrets are
-		// fully redacted (length only) because IOException
-		// messages travel to log manager / telemetry / JDBC clients.
+		// Include the request shape (IdP errors such as Entra's AADSTS9002313
+		// don't name the bad parameter); secrets only as DebugSecret.
 		throw IOException(
 		    OAuthHttpInfo("token_exchange", token_endpoint, resp.status_code, resp.body),
 		    "VGI OAuth: token exchange failed (HTTP %d): %s\n"
@@ -959,10 +913,8 @@ bool IsHeadlessEnvironment() {
 	return false;
 }
 
-// Surface an auth-flow message on stderr when running in Colab. The flow already
-// logs via DUCKDB_LOG_WARNING, but the Python client never displays those; Colab
-// captures C-level stderr into the cell, so this is what the user actually sees.
-// fflush is required — Colab's fd capture won't reliably show buffered output.
+// Auth-flow prompt on stderr under Colab (see IsColabEnvironment). fflush is
+// required: Colab's fd capture won't reliably show buffered output.
 static void PrintPromptIfColab(const std::string &msg) {
 	if (IsColabEnvironment()) {
 		fprintf(stderr, "[VGI] %s\n", msg.c_str());
@@ -1003,7 +955,6 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 	VGI_STDERR_DEBUG("[VGI] oauth.device_code_flow resource_metadata=%s\n",
 	                 challenge.resource_metadata_url.c_str());
 
-	// Prefer device_code_client_id (e.g. Google requires a separate TV-type client).
 	auto device_client = SelectDeviceCodeClient(resource_meta.device_code_client_id,
 	                                            resource_meta.device_code_client_secret,
 	                                            resource_meta.client_id, resource_meta.client_secret,
@@ -1014,24 +965,19 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 		throw IOException("VGI OAuth: no client_id found in WWW-Authenticate header or resource metadata");
 	}
 
-	// Record the client THIS flow used, overriding the caller's provisional
-	// choice. RFC 6749 §6 requires the refresh request to be authenticated as
-	// the client the grant was issued to; presenting the ordinary client id
-	// against a device-issued refresh token makes Google answer invalid_grant,
-	// which then clears the refresh token and silently forces a full
-	// interactive login on every expiry.
+	// Record the client this flow used (see OAuthClientCredentials): refreshing
+	// a device-issued token as the ordinary client gets invalid_grant from
+	// Google, forcing a full login on every expiry.
 	if (refresh_ctx_out) {
 		refresh_ctx_out->client_id = client_id;
-		// When the token-endpoint proxy is in use the server injects the secret
-		// upstream, so carrying one locally is both unnecessary and wrong.
+		// With the token-endpoint proxy the server injects the secret.
 		refresh_ctx_out->client_secret =
 		    resource_meta.token_endpoint.empty() ? client_secret : std::string();
 	}
 
-	// Build scope string
 	std::string scope_str = BuildScopeString(resource_meta);
 
-	// Step 1: POST to device_authorization_endpoint
+	// 1. Device authorization request.
 	EnforceHttpsUrl(server_meta.device_authorization_endpoint, "device authorization endpoint");
 	std::string device_body = "client_id=" + UrlEncode(client_id) +
 	                          "&scope=" + UrlEncode(scope_str);
@@ -1044,7 +990,6 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 		                  device_resp.status_code, SafeBodyForMessage(device_resp.body));
 	}
 
-	// Parse device authorization response
 	auto doc = yyjson_read(device_resp.body.c_str(), device_resp.body.size(), 0);
 	if (!doc) {
 		throw IOException("VGI OAuth: failed to parse device authorization response JSON");
@@ -1097,7 +1042,7 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 		interval = yyjson_get_int(iv_val);
 	}
 
-	// Step 2: Print user instructions via DuckDB warning log
+	// 2. User instructions (DuckDB warning log; also the only channel in WASM).
 	std::string auth_msg = "Authentication required for " + GetResourceDisplayName(resource_meta) + ".\n"
 	    "Visit: " + verification_uri + "\n"
 	    "Enter code: " + user_code;
@@ -1106,11 +1051,8 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 	}
 	DUCKDB_LOG_WARNING(context, auth_msg);
 	PrintPromptIfColab(auth_msg);
-	// Note: in WASM, EM_ASM can't be used from side modules (extensions).
-	// The auth message is logged via DUCKDB_LOG_WARNING. The terminal UI
-	// should display DuckDB warning-level logs to show the user code.
 
-	// Step 3: Poll token endpoint
+	// 3. Poll the token endpoint.
 	EnforceHttpsUrl(server_meta.token_endpoint, "token endpoint");
 	auto effective_timeout = std::min(timeout_seconds, expires_in);
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(effective_timeout);
@@ -1126,15 +1068,12 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 	}
 
 #ifndef __EMSCRIPTEN__
-	// Use condition_variable for interruptible sleep (not available in WASM)
 	std::mutex poll_mutex;
 	std::condition_variable poll_cv;
 #endif
 
 	while (true) {
-		// Sleep between poll attempts.
-		// In WASM Workers, duckdb-wasm overrides _emscripten_yield with Atomics.wait,
-		// so standard sleep functions block properly instead of busy-spinning.
+		// In WASM Workers duckdb-wasm makes usleep block (Atomics.wait), not spin.
 #ifndef __EMSCRIPTEN__
 		{
 			std::unique_lock<std::mutex> lock(poll_mutex);
@@ -1144,14 +1083,12 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 		usleep(static_cast<useconds_t>(interval * 1000000));
 #endif
 
-		// Check timeout
 		if (std::chrono::steady_clock::now() >= deadline) {
 			throw IOException(OAuthInfo(error_subtype::kOAuthTimeout, "device_poll", server_meta.token_endpoint),
 			                  "VGI OAuth: device code authentication timed out after %lld seconds",
 			                  effective_timeout);
 		}
 
-		// Periodic "still waiting" message
 		auto now = std::chrono::steady_clock::now();
 		auto since_last = std::chrono::duration_cast<std::chrono::seconds>(now - last_status_print).count();
 		if (since_last >= 30) {
@@ -1160,12 +1097,11 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			last_status_print = now;
 		}
 
-		// Poll token endpoint
 		RawTokenResponse resp;
 		try {
 			resp = PostTokenRequestRaw(context, server_meta.token_endpoint, poll_body);
 		} catch (const std::exception &e) {
-			// Network error — retry up to 3 times
+			// Network error: retry up to max_network_retries times.
 			network_retries++;
 			if (network_retries > max_network_retries) {
 				throw IOException(OAuthInfo(error_subtype::kTransportFailure, "device_poll", server_meta.token_endpoint)
@@ -1199,14 +1135,12 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			continue;
 		}
 
-		// Healthy round-trip (non-5xx, non-200: e.g. authorization_pending,
-		// slow_down). Reset the consecutive network/server error counter here —
-		// NOT before the 5xx branch, or a steady stream of 500s would reset to
-		// zero every loop and the max_network_retries cap would never trip.
+		// Healthy round-trip (e.g. authorization_pending): reset the error
+		// counter here, after the 5xx branch, or repeated 500s never trip the cap.
 		network_retries = 0;
 
-		// Parse error JSON BEFORE checking status code — servers may use non-standard
-		// status codes (e.g., 403 with slow_down, 428 with authorization_pending)
+		// Parse the error JSON before the status: servers use non-standard codes
+		// (e.g. 403 slow_down, 428 authorization_pending).
 		std::string error_code;
 		std::string error_desc;
 		auto err_doc = yyjson_read(resp.body.c_str(), resp.body.size(), 0);
@@ -1241,14 +1175,12 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			                  "VGI OAuth: device code authentication failed: %s - %s", error_code, error_desc);
 		}
 
-		// Unexpected status code with no parseable error
 		throw IOException(OAuthHttpInfo("device_poll", server_meta.token_endpoint, resp.status_code, resp.body),
 		                  "VGI OAuth: unexpected response during device code polling (HTTP %d): %s",
 		                  resp.status_code, SafeBodyForMessage(resp.body));
 	}
 }
 
-// Forward declarations for platform-specific flow implementations
 static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
                                           const OAuthResourceMetadata &resource_meta,
                                           const OAuthServerMetadata &server_meta,
@@ -1261,14 +1193,12 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
                                ClientContext &context,
                                OAuthRefreshContext &refresh_ctx_out) {
-	// Read flow setting
 	std::string flow = defaults::OAUTH_FLOW;
 	Value flow_val;
 	if (context.TryGetCurrentSetting("vgi_oauth_flow", flow_val)) {
 		flow = flow_val.GetValue<std::string>();
 	}
 
-	// Validate setting
 	if (flow != "auto" && flow != "device_code" && flow != "pkce") {
 		throw InvalidInputException(
 		    ErrorInfo().Set(error_key::kSetting, "vgi_oauth_flow").Set(error_key::kActual, flow),
@@ -1278,7 +1208,6 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 	VGI_STDERR_DEBUG("[VGI] oauth.auth_flow flow=%s resource_metadata=%s\n",
 	                 flow.c_str(), challenge.resource_metadata_url.c_str());
 
-	// Fetch metadata once (shared by both flows)
 	auto resource_meta = FetchResourceMetadata(context, challenge.resource_metadata_url);
 
 	std::string client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
@@ -1288,11 +1217,9 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 
 	auto server_meta = FetchAuthServerMetadata(context, resource_meta.authorization_servers[0]);
 
-	// Populate refresh context for future token refresh
 	refresh_ctx_out.token_endpoint = ResolveTokenEndpoint(resource_meta, server_meta);
 	refresh_ctx_out.client_id = client_id;
-	// When the proxy is in use the server injects client_secret upstream, so
-	// we don't need to store one locally. Only carry it when no proxy is set.
+	// With the token-endpoint proxy the server injects client_secret upstream.
 	refresh_ctx_out.client_secret = resource_meta.token_endpoint.empty() ? resource_meta.client_secret : std::string();
 	refresh_ctx_out.use_id_token = resource_meta.use_id_token_as_bearer;
 	refresh_ctx_out.resource_metadata_url = challenge.resource_metadata_url;
@@ -1305,9 +1232,7 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 	bool has_auth_ep = !server_meta.authorization_endpoint.empty();
 
 #ifdef __EMSCRIPTEN__
-	// WASM: prefer PKCE (popup-based) if server supports it, fall back to device code.
-	// PKCE in WASM uses a popup window opened by the main thread, with the auth code
-	// flowing back via SharedArrayBuffer.
+	// WASM: prefer PKCE (main-thread popup), else device code.
 	if (has_auth_ep) {
 		return PerformPKCEFlowImpl(challenge, resource_meta, server_meta, context);
 	}
@@ -1328,26 +1253,20 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 		return PerformPKCEFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 
-	// Auto mode
-	// Server only has device endpoint
+	// Auto mode.
 	if (!has_auth_ep && has_device_ep) {
 		VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=no_authorization_endpoint\n");
 		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context, &refresh_ctx_out);
 	}
 
-	// Headless / notebook environment. Colab is checked explicitly: it doesn't
-	// always trip the generic headless heuristics, and routing it to the
-	// server-side PKCE/localhost path would open an invisible browser and hang.
+	// Colab is checked explicitly: it may not look headless, and the localhost
+	// PKCE path there opens an invisible browser and hangs.
 	if (has_device_ep && (IsHeadlessEnvironment() || IsColabEnvironment())) {
 		VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=headless_environment\n");
 		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context, &refresh_ctx_out);
 	}
 
-	// Try PKCE, falling back to device code when the loopback callback server
-	// cannot bind. The fallback keys on a dedicated exception type rather than a
-	// substring of the message: control flow that depends on the wording of an
-	// error string breaks silently the moment anyone rewords it, and would also
-	// fire on an unrelated failure whose text happened to contain the phrase.
+	// PKCE, falling back to device code when the callback server cannot bind.
 	if (has_auth_ep) {
 		try {
 			return PerformPKCEFlowImpl(challenge, resource_meta, server_meta, context);
@@ -1360,7 +1279,6 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 		}
 	}
 
-	// No usable flow
 	throw IOException("VGI OAuth: server has no supported authorization endpoints");
 }
 
@@ -1368,7 +1286,7 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 // OAuth Callback Page HTML
 //===--------------------------------------------------------------------===//
 
-// Simple HTML entity escaping for user-provided strings in HTML content
+// HTML entity escaping for user-provided strings.
 static std::string HtmlEscape(const std::string &s) {
 	std::string out;
 	out.reserve(s.size());
@@ -1504,16 +1422,11 @@ static const char *OAUTH_PAGE_STYLE = R"(
 )";
 
 // Logo column shared by the success and failure pages. The artwork is embedded
-// (see vgi_oauth_assets.hpp) rather than fetched: the callback server is torn
-// down the moment the code is captured, so an external — or even a
-// self-hosted — image request would be a race, and the previously-linked
-// remote images had already drifted out from under us.
+// (vgi_oauth_assets.hpp): the callback server stops as soon as the code is
+// captured, so fetching images would race it.
 static std::string OAuthPageLogos() {
-	// <picture> rather than two CSS-toggled <img>s: the browser resolves exactly
-	// one source, so the unused cut is never decoded, and the <img> fallback is
-	// what a browser reporting no color-scheme preference lands on.
-	// The HTML( ) delimiter is required, not stylistic: the media query below
-	// ends in `dark)"`, which would close a plain R"( )" literal early.
+	// <picture>: only one cut is decoded; the <img> is the no-preference fallback.
+	// The HTML( ) delimiter is required: `dark)"` below would end a plain R"( )".
 	return std::string(R"HTML(  <div class="logos">
     <a href="https://query.farm/vgi"><picture>
       <source media="(prefers-color-scheme: dark)" srcset=")HTML") +
@@ -1582,13 +1495,12 @@ static std::string OAuthErrorPage(const std::string &message, const std::string 
 </body></html>)";
 }
 
-// Extract a display name for the resource: prefer resource_name, fall back to hostname from resource URL
+// resource_name, else the resource URL's host.
 static std::string GetResourceDisplayName(const OAuthResourceMetadata &meta) {
 	if (!meta.resource_name.empty()) {
 		return meta.resource_name;
 	}
 	if (!meta.resource.empty()) {
-		// Extract hostname from URL
 		auto scheme_end = meta.resource.find("://");
 		if (scheme_end != std::string::npos) {
 			auto host_start = scheme_end + 3;
@@ -1611,22 +1523,17 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
                                                 const OAuthResourceMetadata &resource_meta,
                                                 const OAuthServerMetadata &server_meta,
                                                 ClientContext &context) {
-	// WASM PKCE: all crypto and URL construction happens here in C++.
-	// The only JS interaction is duckdb_wasm_open_auth_url() which opens a popup
-	// on the main thread and blocks until the auth code comes back via SharedArrayBuffer.
-	// No EM_ASM needed — all JS stubs are in duckdb-wasm's js-stubs.js.
+	// All crypto and URL construction is here; duckdb_wasm_open_auth_url() opens
+	// the popup on the main thread and blocks until the code comes back.
 
 	std::string client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
 	if (client_id.empty()) {
 		throw IOException("VGI OAuth: no client_id found in WWW-Authenticate header or resource metadata");
 	}
-	// When the resource advertises its own token_endpoint (the server's PKCE
-	// proxy), the proxy injects the configured client_secret upstream — we
-	// must not also pass our local copy, since echoing it back over CORS
-	// would defeat the purpose. Only carry the secret when no proxy is set.
+	// With the token-endpoint proxy, never send a local secret (the proxy
+	// injects it; echoing one over CORS would defeat the purpose).
 	std::string client_secret = resource_meta.token_endpoint.empty() ? resource_meta.client_secret : std::string();
 
-	// Generate PKCE parameters (uses duckdb_wasm_crypto_random + duckdb_wasm_sha256)
 	auto code_verifier = GenerateCodeVerifier();
 	auto code_challenge = ComputeCodeChallenge(code_verifier);
 	auto state = GenerateState();
@@ -1640,7 +1547,6 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	std::string redirect_uri = std::string(origin_ptr) + "/oauth-callback.html";
 	free(origin_ptr);
 
-	// Build authorization URL
 	std::string auth_url = server_meta.authorization_endpoint +
 	    "?response_type=code"
 	    "&client_id=" + UrlEncode(client_id) +
@@ -1649,7 +1555,6 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	    "&code_challenge_method=S256"
 	    "&state=" + UrlEncode(state);
 
-	// Add scopes
 	auth_url += "&scope=" + UrlEncode(BuildScopeString(resource_meta));
 
 	DUCKDB_LOG_WARNING(context, "Authentication required for " + GetResourceDisplayName(resource_meta) +
@@ -1657,10 +1562,8 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 
 	const int64_t timeout_seconds = GetOAuthTimeoutSeconds(context);
 
-	// Open popup and block until auth code comes back (or timeout)
 	char *code_ptr = duckdb_wasm_open_auth_url(auth_url.c_str(), static_cast<int>(timeout_seconds * 1000));
 	if (!code_ptr) {
-		// Auth failed or cancelled — get error message
 		char *err_ptr = duckdb_wasm_get_auth_error(0);
 		std::string err_msg = err_ptr ? std::string(err_ptr) : "authentication failed or cancelled";
 		if (err_ptr) free(err_ptr);
@@ -1673,9 +1576,6 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 
 	VGI_STDERR_DEBUG("[VGI] oauth.pkce_wasm code_received\n");
 
-	// Exchange code for tokens (uses duckdb-wasm's HTTP layer).
-	// Use the server's token-proxy URL when advertised so the WASM build
-	// doesn't need to hold the IdP's client_secret to satisfy Google.
 	auto tokens = ExchangeCodeForTokens(context, ResolveTokenEndpoint(resource_meta, server_meta),
 	                                     code, redirect_uri, code_verifier, client_id, client_secret);
 	tokens.use_id_token = resource_meta.use_id_token_as_bearer;
@@ -1693,21 +1593,18 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	VGI_STDERR_DEBUG("[VGI] oauth.pkce_flow resource_metadata=%s\n",
 	                 challenge.resource_metadata_url.c_str());
 
-	// Use client_id from resource metadata if available, otherwise from challenge
 	std::string client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
 	if (client_id.empty()) {
 		throw IOException("VGI OAuth: no client_id found in WWW-Authenticate header or resource metadata");
 	}
-	// When the proxy is in use, don't echo our local client_secret upstream —
-	// the proxy injects the configured one server-side.
+	// With the token-endpoint proxy, never send a local secret.
 	std::string client_secret = resource_meta.token_endpoint.empty() ? resource_meta.client_secret : std::string();
 
-	// Step 3: Generate PKCE parameters
 	auto code_verifier = GenerateCodeVerifier();
 	auto code_challenge = ComputeCodeChallenge(code_verifier);
 	auto state = GenerateState();
 
-	// Step 4: Start local callback server
+	// Local callback server.
 	CPPHTTPLIB_NAMESPACE::Server svr;
 
 	std::promise<std::string> code_promise;
@@ -1766,20 +1663,15 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 		throw PkceCallbackBindFailure();
 	}
 
-	// Use "localhost" instead of "127.0.0.1" in the redirect URI. Azure AD
-	// treats http://localhost specially — matching any port — but does NOT
-	// extend that treatment to http://127.0.0.1.
+	// "localhost", not "127.0.0.1": Azure AD matches any port only for localhost.
 	std::string redirect_uri = "http://localhost:" + std::to_string(port) + "/oauth-callback.html";
 
-	// Start server in background thread
 	std::thread server_thread([&svr]() {
 		svr.listen_after_bind();
 	});
 
-	// Wait for server to be ready
 	svr.wait_until_ready();
 
-	// Step 5: Build authorization URL and open browser
 	std::string auth_url = server_meta.authorization_endpoint +
 	    "?response_type=code"
 	    "&client_id=" + UrlEncode(client_id) +
@@ -1788,18 +1680,12 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	    "&code_challenge_method=S256"
 	    "&state=" + UrlEncode(state);
 
-	// Add scopes (default to "openid" if resource metadata doesn't specify any)
 	auth_url += "&scope=" + UrlEncode(BuildScopeString(resource_meta));
 
-	// NOTE: Do NOT add a &resource= parameter here. The resource parameter is
-	// an OAuth 1.0/v1.0 concept (used by Azure AD v1.0 endpoints) and conflicts
-	// with the v2.0 scope-based model. Azure AD v2.0 returns AADSTS9010010
-	// ("resource parameter doesn't match requested scopes") when both are present.
-	// Google and other standard OAuth 2.0 providers don't use it either.
+	// No &resource= parameter: Azure AD v2.0 rejects it alongside scopes
+	// (AADSTS9010010).
 
-	// Add prompt parameter if configured (controls account picker / re-auth behavior).
-	// Valid values: none (default, omit parameter), login, select_account, consent.
-	// See: https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
+	// OIDC `prompt` (vgi_oauth_prompt); "none" omits the parameter.
 	{
 		std::string prompt = defaults::OAUTH_PROMPT;
 		Value prompt_val;
@@ -1816,7 +1702,7 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 		}
 	}
 
-	// Always print the URL so user can manually navigate if browser fails
+	// Always print the URL in case the browser does not open.
 	std::string pkce_msg = "Authentication required for " + GetResourceDisplayName(resource_meta) +
 	    ". Opening browser...\nIf the browser doesn't open, visit this URL:\n" + auth_url;
 	DUCKDB_LOG_WARNING(context, pkce_msg);
@@ -1824,7 +1710,6 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 
 	OpenBrowser(auth_url);
 
-	// Step 6: Wait for callback with timeout
 	OAuthTokenSet tokens;
 	try {
 		auto wait_status = code_future.wait_for(std::chrono::seconds(timeout_seconds));
@@ -1838,13 +1723,11 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 
 		auto code = code_future.get(); // may throw if error was set
 
-		// Stop callback server
 		svr.stop();
 		server_thread.join();
 
 		VGI_STDERR_DEBUG("[VGI] oauth.code_received\n");
 
-		// Step 7: Exchange code for tokens (via proxy if advertised)
 		tokens = ExchangeCodeForTokens(context, ResolveTokenEndpoint(resource_meta, server_meta),
 		                                code, redirect_uri, code_verifier, client_id, client_secret);
 	} catch (...) {
@@ -1902,9 +1785,8 @@ struct OAuthSessionRegistryEntry {
 };
 
 std::map<std::string, OAuthSessionRegistryEntry> &OAuthSessionRegistry() {
-	// Intentionally strong references: Excel creates and destroys short-lived
-	// DuckDB connections, but a successful login must remain reusable by later
-	// connections in the same host process.
+	// Strong references: hosts (e.g. Excel) create and destroy short-lived
+	// connections, and a login must stay reusable for the process lifetime.
 	static std::map<std::string, OAuthSessionRegistryEntry> sessions;
 	return sessions;
 }
@@ -1984,13 +1866,7 @@ void OAuthCatalogAuth::SeedRefreshToken(const std::string &refresh_token) {
 }
 
 bool OAuthCatalogAuth::IsExplicitlyConfigured() const {
-	// OAuth is "configured" only when the user supplied a refresh token at
-	// ATTACH time (oauth_refresh_token option) OR has already completed an
-	// auth flow. A freshly-constructed default OAuthCatalogAuth — the
-	// fallback path when neither bearer_token nor oauth_refresh_token was
-	// set — returns false so the 401-handler in vgi_http_client.cpp can
-	// surface a clean "no credential" diagnostic instead of launching an
-	// OAuth discovery flow against an empty challenge URL.
+	// See CatalogAuth::IsExplicitlyConfigured.
 	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
 	std::lock_guard<std::mutex> lock(state_->mutex);
 	if (!state_->token.refresh_token.empty()) {
@@ -2009,7 +1885,6 @@ bool OAuthCatalogAuth::WasInteractive() const {
 }
 
 std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) {
-	// Check if OAuth is enabled
 	Value oauth_enabled_val;
 	if (context.TryGetCurrentSetting("vgi_oauth_enabled", oauth_enabled_val)) {
 		if (!oauth_enabled_val.GetValue<bool>()) {
@@ -2041,12 +1916,14 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 	if (state->refresh_ctx.token_endpoint.empty() && !discovered_ctx.token_endpoint.empty()) {
 		state->refresh_ctx = discovered_ctx;
 	}
+	if (!canonical_key.empty()) {
+		state->store_key = canonical_key;
+	}
 
 	uint64_t auth_epoch = state->epoch;
 
-	// Helper: store successful auth result in state (must hold lock).
-	// Helpers below assume `lock` is HELD when called. They publish the
-	// new state, clear the IN_PROGRESS owner, and notify all waiters.
+	// These helpers require `lock` held; they publish the outcome, clear the
+	// IN_PROGRESS owner and notify all waiters.
 	auto StoreSuccess = [&](OAuthTokenSet tokens, const OAuthRefreshContext &rctx) -> std::string {
 		if (state->epoch != auth_epoch) {
 			state->status = AuthState::Status::IDLE;
@@ -2065,7 +1942,6 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		return state->token.BearerToken();
 	};
 
-	// Helper: store failure in state (must hold lock).
 	auto StoreFailed = [&](const std::string &error_msg) {
 		state->status = AuthState::Status::FAILED;
 		state->error_message = error_msg;
@@ -2081,8 +1957,8 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		return true;
 	};
 
-	// Helper: attempt refresh, then fall back to full auth flow.
-	// Called with lock released. Re-acquires lock on success/failure.
+	// Refresh if possible, else the interactive flow. Called with `lock`
+	// released; re-acquires it to publish.
 	auto RefreshOrFullAuth = [&](std::string refresh_token, OAuthRefreshContext refresh_ctx) -> std::string {
 		std::unique_ptr<OAuthCredentialLease> persistent_lease;
 		if (!canonical_key.empty()) {
@@ -2091,18 +1967,17 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		if (persistent_lease && !canonical_key.empty()) {
 			std::string persisted_token;
 			const auto &binding = discovered_ctx.token_endpoint.empty() ? refresh_ctx : discovered_ctx;
-			if (LoadOAuthRefreshToken(canonical_key, binding, cache_mode_, persisted_token)) {
+			OAuthRefreshContext issued_ctx;
+			if (LoadOAuthRefreshToken(canonical_key, binding, cache_mode_, persisted_token, &issued_ctx)) {
 				refresh_token = std::move(persisted_token);
-				refresh_ctx = binding;
+				refresh_ctx = std::move(issued_ctx);
 			}
 		}
 		// Set when the IdP refused the refresh token and the browser build goes
 		// on to interactive sign-in instead of failing (see below).
 		std::string rejected_refresh_error;
-		// Attempt token refresh if we have a refresh_token
 		if (!refresh_token.empty()) {
-			// Discover metadata if we have a token but no refresh context
-			// (e.g., seeded via ATTACH oauth_refresh_token option)
+			// No refresh context yet (e.g. seeded via oauth_refresh_token).
 			if (refresh_ctx.token_endpoint.empty()) {
 				try {
 					refresh_ctx = DiscoverRefreshContext(challenge, context);
@@ -2118,27 +1993,20 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 				try {
 					VGI_STDERR_DEBUG("[VGI] oauth.attempting_refresh\n");
 					auto tokens = AttemptTokenRefresh(refresh_ctx, refresh_token, context);
-					// Preserve old refresh_token if response omits new one (Google behavior)
+					// Keep the old refresh_token when the response omits one (Google).
 					if (tokens.refresh_token.empty()) {
 						tokens.refresh_token = refresh_token;
 					}
 					if (!lock.owns_lock()) lock.lock();
 					return StoreSuccess(std::move(tokens), refresh_ctx);
 				} catch (const std::exception &e) {
-					// Natively, do NOT fall through to PerformAuthFlow: rethrow so
-					// the caller sees the actual refresh failure, and a batch run
-					// never blocks on a browser sign-in it cannot see. In the
-					// browser the host shows a sign-in popup, so a refresh token the
-					// IdP no longer honours (Entra's 24-hour cap on SPA refresh
-					// tokens, a revoked session) goes straight to interactive
-					// sign-in rather than failing this query and leaving the next
-					// one to start it.
+					// Natively, rethrow rather than start an interactive flow: the
+					// caller sees the real failure and a batch run never blocks on an
+					// invisible sign-in. In the browser an invalid_grant (e.g. Entra's
+					// 24-hour SPA refresh cap) goes straight to the sign-in popup.
 					std::string refresh_err = RawMessageOf(e);
-					// AttemptTokenRefresh tags an IdP rejection with the parsed
-					// RFC 6749 `oauth_error`; branch on that. The substring check
-					// is only a fallback for failures that don't carry the field
-					// (e.g. a non-JSON body that still names the error), since the
-					// cost of a miss is a refresh token that keeps failing.
+					// Branch on the `oauth_error` AttemptTokenRefresh attaches; the
+					// substring check covers bodies that don't carry it.
 					const auto refresh_info = ExtraInfoOf(e);
 					const auto oauth_error_it = refresh_info.find(error_key::kOAuthError);
 					const bool invalid_grant = oauth_error_it != refresh_info.end()
@@ -2151,13 +2019,12 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 #endif
 					if (!lock.owns_lock()) lock.lock();
 					if (WasCleared()) throw;
-					// Clear stale refresh token on invalid_grant
 					if (invalid_grant) {
 						state->token.refresh_token.clear();
 					}
 					if (!sign_in_instead) {
-						// Finish the state transition before deletion, which can itself
-						// fail. Otherwise other connections remain stuck IN_PROGRESS.
+						// Publish before deletion, which can throw and would leave
+						// waiters stuck IN_PROGRESS.
 						StoreFailed(refresh_err);
 						if (invalid_grant && !canonical_key.empty()) {
 							VGI_STDERR_DEBUG("[VGI] oauth.clearing_stale_refresh_token\n");
@@ -2180,10 +2047,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					DUCKDB_LOG_WARNING(context,
 					    "VGI OAuth: refresh token rejected, starting interactive sign-in: " + refresh_err);
 				} catch (...) {
-					// Non-std::exception throw (rare, but possible from
-					// nested code). Without this catch the IN_PROGRESS
-					// state would never be cleared and cv.notify_all
-					// never fires — every waiter hangs forever.
+					// Must still leave IN_PROGRESS, or every waiter hangs.
 					if (!lock.owns_lock()) lock.lock();
 					if (WasCleared()) throw;
 					StoreFailed("unknown error during token refresh");
@@ -2198,9 +2062,6 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			OAuthRefreshContext new_refresh_ctx;
 			auto tokens = PerformAuthFlow(challenge, context, new_refresh_ctx);
 			if (!lock.owns_lock()) lock.lock();
-			// Reaching here means an interactive flow (device-code / browser)
-			// completed — the refresh branch above never falls through. Record
-			// it for telemetry (sticky for the auth object's lifetime).
 			state->interactive = true;
 			return StoreSuccess(std::move(tokens), new_refresh_ctx);
 		} catch (const std::exception &e) {
@@ -2216,7 +2077,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			throw IOException(ErrorInfo(error_subtype::kAuthFailed), "%s\n(started because token refresh failed: %s)",
 			                  RawMessageOf(e), rejected_refresh_error);
 		} catch (...) {
-			// Same hang-prevention as the refresh catch above.
+			// Must still leave IN_PROGRESS, or every waiter hangs.
 			if (!lock.owns_lock()) lock.lock();
 			if (WasCleared()) throw;
 			StoreFailed("unknown error during interactive auth flow");
@@ -2240,11 +2101,8 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 	}
 
 	case AuthState::Status::IN_PROGRESS: {
-		// Same-thread re-entry: the auth flow itself produced a 401 that
-		// landed back in *this* HandleUnauthorized (e.g., the discovery
-		// endpoint requires auth from this same auth object, or the token
-		// endpoint host returns 401 mid-refresh). Waiting on cv would
-		// deadlock against ourselves. Throw cleanly instead.
+		// Same-thread re-entry from a 401 inside our own flow: waiting would
+		// self-deadlock (see AuthState::owner).
 		if (state->owner == this_thread) {
 			throw IOException(
 			    "VGI OAuth: nested 401 inside the auth flow on the same thread; aborting "
@@ -2252,13 +2110,8 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			    "discovery endpoint also returned 401.");
 		}
 
-		// Another thread is already doing the auth flow — wait for it.
-		//
-		// Bounded, because the leader may be sitting in a device-code poll
-		// waiting for a human to type a code: an unbounded wait turns that into
-		// every other thread hanging for the full flow timeout with nothing to
-		// show for it. The bound is generous enough to cover a completed login
-		// and still report rather than hang.
+		// Wait for the thread doing the flow, bounded (flow timeout + 30s): the
+		// leader may be waiting on a human, and waiters must report, not hang.
 		VGI_STDERR_DEBUG("[VGI] oauth.waiting_for_auth\n");
 		const auto wait_budget = std::chrono::seconds(GetOAuthTimeoutSeconds(context)) +
 		                         std::chrono::seconds(30);
@@ -2284,7 +2137,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 	}
 
 	case AuthState::Status::COMPLETE: {
-		// Token exists but server returned 401 — token may be stale.
+		// A 401 despite a token: it may be stale.
 		state->status = AuthState::Status::IN_PROGRESS;
 		auth_epoch = state->epoch;
 		state->owner = this_thread;
@@ -2306,7 +2159,9 @@ void OAuthCatalogAuth::ClearTokens() {
 	{
 		std::lock_guard<std::mutex> lock(state_->mutex);
 		logout_epoch = ++state_->epoch;
-		if (!state_->refresh_ctx.issuer.empty()) {
+		if (!state_->store_key.empty()) {
+			key = state_->store_key;
+		} else if (!state_->refresh_ctx.issuer.empty()) {
 			key = OAuthSessionKey(profile_, state_->refresh_ctx);
 		}
 		state_->token = OAuthTokenSet();
@@ -2325,6 +2180,7 @@ void OAuthCatalogAuth::ClearTokens() {
 		std::lock_guard<std::mutex> lock(state_->mutex);
 		if (state_->epoch == logout_epoch && state_->status == AuthState::Status::IDLE) {
 			state_->refresh_ctx = OAuthRefreshContext();
+			state_->store_key.clear();
 		}
 	}
 }
@@ -2360,7 +2216,6 @@ bool OAuthCatalogAuth::GetTokenSetCopy(OAuthTokenSet &out) {
 
 
 std::string ExtractOrigin(const std::string &url) {
-	// Extract scheme://host:port from a URL
 	auto scheme_end = url.find("://");
 	if (scheme_end == std::string::npos) {
 		return url;
@@ -2387,14 +2242,20 @@ OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, Clie
 	OAuthRefreshContext ctx;
 	ctx.token_endpoint = ResolveTokenEndpoint(resource_meta, server_meta);
 	ctx.client_id = client_id;
-	// See refresh_ctx_out comment in PerformAuthFlow: skip the local secret
-	// when the server's token-proxy is in use.
+	// No local secret with the token-endpoint proxy.
 	ctx.client_secret = resource_meta.token_endpoint.empty() ? resource_meta.client_secret : std::string();
 	ctx.use_id_token = resource_meta.use_id_token_as_bearer;
 	ctx.resource_metadata_url = challenge.resource_metadata_url;
 	ctx.scope = BuildScopeString(resource_meta);
 	ctx.issuer = server_meta.issuer;
 	ctx.resource = resource_meta.resource;
+	if (!resource_meta.device_code_client_id.empty()) {
+		auto device_client = SelectDeviceCodeClient(resource_meta.device_code_client_id,
+		                                            resource_meta.device_code_client_secret, resource_meta.client_id,
+		                                            resource_meta.client_secret, challenge.client_id);
+		ctx.device_client_id = device_client.client_id;
+		ctx.device_client_secret = resource_meta.token_endpoint.empty() ? device_client.client_secret : std::string();
+	}
 	return ctx;
 }
 
@@ -2419,12 +2280,8 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 
 	auto resp = PostTokenRequestRaw(context, ctx.token_endpoint, body);
 	if (resp.status_code != 200) {
-		// Surface the request shape through the exception. The IdP's
-		// "invalid_grant" / "AADSTS9002313" body doesn't tell you which
-		// parameter is wrong; the request shape does. Refresh tokens are
-		// fully redacted (length only) — IOException text
-		// travels to log manager / telemetry / JDBC clients, so a leaked
-		// refresh_token is a credential leak.
+		// Include the request shape (the IdP body rarely names the bad
+		// parameter); secrets only as DebugSecret.
 		throw IOException(
 		    OAuthHttpInfo("refresh", ctx.token_endpoint, resp.status_code, resp.body),
 		    "VGI OAuth: token refresh failed (HTTP %d): %s\n"
@@ -2458,15 +2315,11 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 }
 
 std::string ComputeCatalogIdentityFingerprint(const std::shared_ptr<CatalogAuth> &auth) {
-	// No auth, or an OAuth object the user never opted into → anonymous scope.
 	if (!auth || !auth->IsExplicitlyConfigured()) {
 		return "anon";
 	}
-	// OAuth: scope by the exact credential presented to the resource server, not
-	// by decoded id_token claims. Those claims are intentionally exposed only as
-	// unverified display hints; using them here would turn attacker-controlled JWT
-	// payload bytes into a cache-isolation boundary. A refresh changes the cache
-	// identity by design. Reads only resolved state and never launches a flow.
+	// Scope by the exact credential sent, never by id_token claims: those are
+	// unverified, and would make attacker-controlled bytes an isolation boundary.
 	OAuthTokenSet ts;
 	if (auth->GetTokenSetCopy(ts)) {
 		if (!ts.IsValid()) {
@@ -2474,15 +2327,11 @@ std::string ComputeCatalogIdentityFingerprint(const std::shared_ptr<CatalogAuth>
 		}
 		return ComputeCredentialCacheFingerprint("oauth", ts.BearerToken());
 	}
-	// Static bearer token: safe to read without triggering a flow. Salted +
-	// hashed so the raw token never enters the cache key or the on-disk digest.
 	if (auto *bearer = dynamic_cast<BearerTokenCatalogAuth *>(auth.get())) {
 		std::string tok = bearer->GetToken();
 		return ComputeCredentialCacheFingerprint("bearer", tok);
 	}
-	// Explicitly configured (opted-in) but no resolvable identity/token yet
-	// (e.g. an OAuth catalog not authenticated at bind time). Fail closed: the
-	// caller must refuse to cache rather than collapse distinct principals.
+	// Configured but unresolvable: fail closed.
 	return "";
 }
 

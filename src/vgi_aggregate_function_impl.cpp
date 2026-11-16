@@ -82,12 +82,8 @@ std::vector<ArrowArray> ExportBatchColumns(const vgi::VgiBatch &batch) {
 	return columns;
 }
 
-// Every aggregate request carries the owning catalog schema alongside the
-// function name: a name is unique only within a schema, so without it the
-// worker re-resolves each unary call by bare name and can land on another
-// schema's implementation after a bind that resolved correctly. Empty string
-// serialises as null, which is the legitimate
-// "caller names no schema" wire form — the field stays nullable.
+// Every aggregate request carries schema_name; see
+// VgiAggregateFunctionInfo::schema_name.
 vgi::VgiBatchPtr BuildAggregateBindRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &attach_opaque_data,
@@ -99,26 +95,25 @@ vgi::VgiBatchPtr BuildAggregateBindRequest(
 
 	auto schema_bytes = vgi::SerializeSchemaToIpcBytes(input_schema);
 
-	// Serialize arguments (const values) as IPC bytes
+	// Const arguments.
 	std::vector<uint8_t> arguments_bytes;
 	if (arrow_arguments) {
 		// Already the one-row {args: struct} batch.
 		arguments_bytes = vgi::SerializeToIpcBytes(arrow_arguments.batch);
 	} else {
-		// A zero-row {args: struct<>} batch.
-		auto args_batch =
-		    vgi::VgiBatch::MakeEmpty(vgi::MakeSchema({vgi::type::Struct({}).Named("args")}));
-		arguments_bytes = vgi::SerializeToIpcBytes(args_batch);
+		// One valid empty row: Python's Arguments.deserialize_from_bytes reads row 0.
+		vgi::VgiBatchBuilder builder(vgi::MakeSchema({vgi::type::Struct({}).Named("args")}));
+		vgi::append::FinishElement(builder.column(0));
+		builder.FinishRow();
+		arguments_bytes = vgi::SerializeToIpcBytes(builder.Finish());
 	}
 
-	// Serialize settings
 	std::vector<uint8_t> settings_bytes;
 	if (!settings.empty()) {
 		auto settings_batch = vgi::BuildSettingsBatch(context, settings);
 		settings_bytes = vgi::SerializeToIpcBytes(settings_batch);
 	}
 
-	// Serialize secrets
 	auto secrets = vgi::ExtractVgiSecrets(context, required_secrets);
 	auto secrets_ipc_bytes = vgi::BuildSecretsBatch(context, secrets);
 
@@ -225,17 +220,13 @@ void ThrowMissingAggregateResult(const VgiAggregateBindData &bind_data, const st
 	                  method_name, bind_data.function_name, AggregateWorkerPath(bind_data));
 }
 
-// ============================================================================
-// Shared RPC envelope + invoker
-// ============================================================================
-// Moved out of the anonymous namespace so aggregate_window_impl.cpp can share
-// the same connection-pool / subprocess / HTTP transport plumbing.
+// Shared RPC invoker (also used by vgi_aggregate_window_impl.cpp).
 
 AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
                                       const std::string &method_name,
                                       const vgi::VgiBatchPtr &params,
                                       bool enable_logging) {
-	// Validate the outgoing request batch before dispatch (catches encoder drift).
+	// Catches encoder drift.
 	ValidateRequestSchema(params, method_name, bind_data.attach_params->worker_path());
 
 	UnaryRpcOptions opts {context,
@@ -249,10 +240,9 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	                      bind_data.attach_params->cookie_jar(),
 	                      enable_logging};
 	opts.iroh = bind_data.attach_params->iroh();
-	// The same HTTP plumbing the catalog RPCs get. Without it every aggregate
-	// RPC -- one per output row for a windowed aggregate on engines without the
-	// batched window callback -- rebuilt its HTTP params through the secret
-	// manager and probed HEAD /health for capabilities before the POST.
+	// The catalog RPCs' HTTP plumbing; otherwise each aggregate RPC (one per row
+	// for a windowed aggregate without the batched callback) re-resolves HTTP
+	// params via the secret manager and re-probes capabilities.
 	const auto &agg_worker_path = bind_data.attach_params->worker_path();
 	if (IsHttpTransport(agg_worker_path) || IsHttpiTransport(agg_worker_path)) {
 		if (IsHttpTransport(agg_worker_path)) {
@@ -261,7 +251,6 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 		opts.http_client_pool = bind_data.attach_params->GetOrInitHttpClientPool();
 		opts.server_caps = bind_data.attach_params->server_caps();
 	}
-	// Forward launcher overrides for `launch:` LOCATIONs (no-op for other transports).
 	if (bind_data.attach_params->launcher_idle_timeout_seconds().has_value()) {
 		opts.launcher_idle_timeout =
 		    std::chrono::seconds(*bind_data.attach_params->launcher_idle_timeout_seconds());
@@ -271,9 +260,7 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	}
 	auto response = InvokePooledUnaryRpc(opts, method_name, params);
 
-	// Outer envelope unwrap + schema validation against the registry.
-	// The registered schema for aggregate_* methods follows vgi-python's
-	// Aggregate*Response dataclasses.
+	// Unwrap the envelope and validate against the method's registered schema.
 	VgiBatchPtr inner;
 	const auto &worker_path = bind_data.attach_params->worker_path();
 	if (response.batch && response.batch->num_rows() > 0) {
@@ -284,9 +271,7 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	return {response.batch, inner};
 }
 
-// ============================================================================
 // VgiAggregateBindData
-// ============================================================================
 
 unique_ptr<FunctionData> VgiAggregateBindData::Copy() const {
 	auto copy = make_uniq<VgiAggregateBindData>();
@@ -301,25 +286,20 @@ unique_ptr<FunctionData> VgiAggregateBindData::Copy() const {
 	copy->catalog = catalog;
 	copy->context = context;
 	copy->const_values = const_values;
-	copy->exec_state = exec_state;  // Share execution state across copies
+	copy->exec_state = exec_state;  // shared, not copied
 	return copy;
 }
 
 bool VgiAggregateBindData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<VgiAggregateBindData>();
-	// schema_name participates: the same aggregate name can be declared in two
-	// schemas of one catalog and they are different implementations, so bind
-	// data from one must never satisfy an Equals() check for the other.
+	// schema_name participates: same-named aggregates in two schemas are
+	// different implementations.
 	if (function_name != other.function_name || schema_name != other.schema_name ||
 	    attach_opaque_data != other.attach_opaque_data || settings != other.settings) {
 		return false;
 	}
-	// Null-safe const-argument comparison: Value::operator== throws
-	// "Comparison on NULL values" when either side is NULL (e.g. a NULL const
-	// argument like vgi_percentile(x, NULL)). NotDistinctFrom treats NULL==NULL
-	// as equal and NULL vs non-null as unequal, without throwing — so the NULL
-	// const flows through to the worker, which returns its own clean validation
-	// error instead of an INTERNAL error.
+	// NotDistinctFrom, not operator==, which throws on a NULL const argument
+	// (e.g. vgi_percentile(x, NULL)) instead of letting the worker reject it.
 	if (const_values.size() != other.const_values.size()) {
 		return false;
 	}
@@ -331,14 +311,11 @@ bool VgiAggregateBindData::Equals(const FunctionData &other_p) const {
 	return true;
 }
 
-// ============================================================================
 // Aggregate callbacks
-// ============================================================================
 
 idx_t VgiAggregateStateSize(AggregateStateInput &input) {
-	// The same buffer serves both the standard aggregate path and the
-	// windowed aggregate path — size it for the larger of the two. The
-	// tag field at offset 0 (shared layout) discriminates at teardown time.
+	// One buffer serves both the aggregate and window paths (see
+	// VgiAggregateStateTag): size it for the larger.
 	idx_t agg_size = sizeof(VgiAggregateState);
 	idx_t win_size = sizeof(VgiAggregateWindowLocalState);
 	return agg_size > win_size ? agg_size : win_size;
@@ -348,11 +325,9 @@ void VgiAggregateInitialize(AggregateStateInput &input, data_ptr_t *states, idx_
 	for (idx_t i = 0; i < count; i++) {
 		new (states[i]) VgiAggregateState();
 	}
-	// tag stays UNSET, group_id stays -1. The first-use site (update/combine/
-	// finalize for the aggregate path, or VgiAggregateWindowInit for the
-	// window path) is responsible for setting the tag. Initialize doesn't
-	// receive AggregateInputData, so we can't access the per-query ExecState
-	// counters here anyway.
+	// Tag UNSET, group_id -1: the first use (update/combine/finalize, or
+	// VgiAggregateWindowInit) sets them. Initialize has no AggregateInputData,
+	// so the ExecState counters are not reachable here.
 }
 
 void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &state_vector,
@@ -364,7 +339,7 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 	}
 	auto &context = *context_lock;
 
-	// Get state pointers and assign group_ids to uninitialized states
+	// Assign group_ids to uninitialized states.
 	UnifiedVectorFormat sdata;
 	state_vector.ToUnifiedFormat(count, sdata);
 	auto states = UnifiedVectorFormat::GetData<VgiAggregateState *>(sdata);
@@ -378,11 +353,10 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 		agg_state.tag = VgiAggregateStateTag::AGGREGATE;
 	}
 
-	// Build group_id column
 	auto gid_batch = BuildGroupIdBatch(UpdateGroupIdSchema(), sdata, states, count);
 
-	// Build actual input schema from runtime types (may differ from bind-time
-	// schema when varargs are present — bind schema has fixed params only)
+	// Input schema from runtime types: with varargs it differs from the bind
+	// schema, which has fixed params only.
 	vector<LogicalType> actual_input_types;
 	vector<string> actual_input_names;
 	for (idx_t i = 0; i < input_count; i++) {
@@ -395,7 +369,6 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 	}
 	auto actual_schema = BuildArrowSchemaFromDuckDB(context, actual_input_types, actual_input_names);
 
-	// Convert input vectors to Arrow
 	vgi::VgiBatchPtr input_batch;
 	if (input_count > 0) {
 		DataChunk input_chunk;
@@ -407,7 +380,7 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 		input_batch = DataChunkToArrow(context, input_chunk, actual_schema);
 	}
 
-	// Build full batch: __vgi_group_id + input columns
+	// Group-id column first, then the inputs.
 	auto full_schema = actual_schema->AddField(0, gid_batch->schema()->field(0));
 
 	auto columns = ExportBatchColumns(*gid_batch);
@@ -418,7 +391,6 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 	}
 	auto full_batch = vgi::VgiBatch::FromColumns(full_schema, static_cast<int64_t>(count), std::move(columns));
 
-	// Build RPC request: aggregate_update(function_name, execution_id, input_batch)
 	auto request = BuildAggregateUpdateRequest(bind_data.function_name, bind_data.schema_name,
 	                                            bind_data.exec_state->execution_id,
 	                                            bind_data.attach_opaque_data, full_batch);
@@ -438,7 +410,7 @@ void VgiAggregateCombine(Vector &source, Vector &combined, AggregateInputData &a
 	source.ToUnifiedFormat(count, sdata);
 	combined.ToUnifiedFormat(count, cdata);
 
-	// Assign group_ids to any uninitialized states (states that were never updated)
+	// Assign group_ids to states that were never updated.
 	auto src_states = UnifiedVectorFormat::GetData<VgiAggregateState *>(sdata);
 	auto tgt_states = UnifiedVectorFormat::GetData<VgiAggregateState *>(cdata);
 	for (idx_t i = 0; i < count; i++) {
@@ -454,7 +426,6 @@ void VgiAggregateCombine(Vector &source, Vector &combined, AggregateInputData &a
 		tgt_states[tgt_idx]->tag = VgiAggregateStateTag::AGGREGATE;
 	}
 
-	// Build merge batch: (source_group_id, target_group_id)
 	static const auto merge_schema = vgi::MakeSchema({
 	    vgi::type::Int64().Named("source_group_id"),
 	    vgi::type::Int64().Named("target_group_id"),
@@ -488,7 +459,7 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateFinalizeInputData &aggr
 	}
 	auto &context = *context_lock;
 
-	// Build group_ids batch, assigning ids to any uninitialized states
+	// Assign group_ids to states that were never updated.
 	UnifiedVectorFormat sdata;
 	state_vector.ToUnifiedFormat(count, sdata);
 	auto states = UnifiedVectorFormat::GetData<VgiAggregateState *>(sdata);
@@ -502,7 +473,6 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateFinalizeInputData &aggr
 
 	auto gid_batch = BuildGroupIdBatch(GroupIdSchema(), sdata, states, count);
 
-	// Call aggregate_finalize RPC
 	auto request = BuildAggregateFinalizeRequest(bind_data.function_name, bind_data.schema_name,
 	                                              bind_data.exec_state->execution_id,
 	                                              bind_data.attach_opaque_data, gid_batch,
@@ -525,17 +495,15 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateFinalizeInputData &aggr
 		                  result_batch->num_rows(), count, bind_data.function_name);
 	}
 
-	// Convert Arrow result to DuckDB Vector
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> output_types;
 	vector<string> output_names;
 	ArrowSchemaToDuckDBTypes(context, result_batch->schema(), c_schema, arrow_table, output_types, output_names);
 
-	// Type-confusion guard: the worker's finalize result is converted (via a type
-	// map built from its own schema) into a result Vector of the declared return
-	// type, so a result whose type disagrees with what the worker declared at
-	// bind is a misread. No projection on this path. See vgi_batch_validation.hpp.
+	// Type-confusion guard: the result is converted with a type map from its own
+	// schema into a Vector of the declared return type, so a schema that differs
+	// from the bind-time one would be misread. See vgi_batch_validation.hpp.
 	ValidateProjectedWireBatch(&context, *result_batch, bind_data.resolved_output_schema, {},
 	                           bind_data.attach_params->worker_path(), bind_data.function_name);
 
@@ -551,8 +519,7 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateFinalizeInputData &aggr
 	VectorOperations::Copy(temp_output.data[0], result, count, 0, offset);
 }
 
-// Forward-declared here so VgiAggregateDestroy can dispatch to the window
-// destructor path. Defined in vgi_aggregate_window_impl.cpp.
+// Defined in vgi_aggregate_window_impl.cpp.
 void SendAggregateWindowDestructorRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
                                        int64_t partition_id);
 
@@ -564,17 +531,13 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 		UnifiedVectorFormat sdata;
 		state_vector.ToUnifiedFormat(count, sdata);
 
-		// The l_state buffer is shared between the aggregate path (VgiAggregateState)
-		// and the window path (VgiAggregateWindowLocalState). The tag field at
-		// offset 0 is part of both struct layouts; inspect it through a
-		// VgiAggregateState* view (safe because layout compatibility is
-		// guaranteed for the tag field).
+		// Read the tag through a VgiAggregateState* view; it is the first field of
+		// both state structs (see VgiAggregateStateTag).
 		auto raw_states = UnifiedVectorFormat::GetData<VgiAggregateState *>(sdata);
 
 		int64_t aggregate_initialized = 0;
-		// Window states — dispatch destructor RPC per partition_id. Only the
-		// GLOBAL state of a window aggregator carries a real partition_id;
-		// per-thread LOCAL states stay at partition_id == -1 and are skipped.
+		// One window destructor RPC per partition_id; states with partition_id -1
+		// are skipped.
 		std::vector<int64_t> window_partition_ids;
 
 		for (idx_t i = 0; i < count; i++) {
@@ -590,14 +553,11 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 					window_partition_ids.push_back(win->partition_id);
 				}
 			}
-			// UNSET: state was never touched — nothing to clean up.
+			// UNSET: never used, nothing to clean up.
 		}
 
-		// Lock the weak_ptr<ClientContext>. If the originating session has
-		// gone away (destructor firing on a task-scheduler thread during
-		// shutdown after the session tore down), we have no context to
-		// dispatch RPCs on — surrender silently. Worker-side state will
-		// be reclaimed by execution_id timeout / pool eviction.
+		// The session may be gone (destructor on a scheduler thread at shutdown):
+		// then there is no context to dispatch on and worker state is not freed.
 		auto context_lock = bind_data.context.lock();
 		if (!context_lock) {
 			return;
@@ -609,19 +569,20 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 			try {
 				SendAggregateWindowDestructorRpc(context, bind_data, pid);
 			} catch (...) {
-				// Swallow — best-effort; the safety sweep in aggregate_destructor
-				// will clear any residual partitions for this execution_id.
+				// Best-effort. The Python SDK's aggregate_destructor also clears an
+				// execution's window partitions, when one is sent.
 			}
 		}
 
-		// --- Aggregate destructor path (unchanged semantics) ---
+		// Aggregate destructor: one RPC, from the batch that destroys the last
+		// created group.
 		if (aggregate_initialized == 0) {
 			return;
 		}
 		auto prev = bind_data.exec_state->destroy_counter.fetch_add(aggregate_initialized);
 		auto total_created = bind_data.exec_state->group_id_counter.load();
 		if (prev + aggregate_initialized < total_created) {
-			return; // Not the last batch — skip RPC
+			return;
 		}
 
 		vgi::VgiBatchBuilder gid_builder(GroupIdSchema());
@@ -632,18 +593,29 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 		auto request = BuildAggregateDestructorRequest(bind_data.function_name, bind_data.schema_name,
 		                                                bind_data.exec_state->execution_id,
 		                                                bind_data.attach_opaque_data, gid_batch);
-		// enable_logging=false: this path runs on task-scheduler threads during
-		// pipeline teardown. VGI_LOG / DrainToLog are unsafe there (crash #A in
-		// the shutdown stacks). Worker stderr stays buffered on the drainer.
+		// enable_logging=false: runs on scheduler threads during pipeline teardown.
 		InvokeAggregateRpc(context, bind_data, "aggregate_destructor", request, /*enable_logging=*/false);
 	} catch (...) {
-		// Swallow all exceptions — destructor must not throw
+		// Destructors must not throw.
 	}
 }
 
-// ============================================================================
 // Bind
-// ============================================================================
+
+// Same reason as the scalar callbacks: const params are erased from the bound
+// arguments, so a deserialized plan looks the overload up by the erased types
+// and fails. NotImplemented makes plan copies (CTE inlining, partitioned
+// execution, verify_serializer) fall back instead of failing the query.
+static void VgiAggregateFunctionSerialize(Serializer &, const optional_ptr<FunctionData>,
+                                          const BoundAggregateFunction &function) {
+	throw NotImplementedException("VGI aggregate function '%s' with constant parameters cannot be serialized",
+	                              function.GetName().GetIdentifierName());
+}
+
+static unique_ptr<FunctionData> VgiAggregateFunctionDeserialize(Deserializer &, BoundAggregateFunction &function) {
+	throw NotImplementedException("VGI aggregate function '%s' with constant parameters cannot be deserialized",
+	                              function.GetName().GetIdentifierName());
+}
 
 unique_ptr<FunctionData> VgiAggregateFunctionBind(BindAggregateFunctionInput &input) {
 	auto &context = input.GetClientContext();
@@ -651,10 +623,8 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(BindAggregateFunctionInput &in
 	auto &arguments = input.GetArguments();
 	auto &registered_info = function.GetExtraFunctionInfo().Cast<VgiAggregateFunctionInfo>();
 
-	// A function published into system.main outlives DETACH (DuckDB has no way
-	// to unregister one), so its connection state is resolved from the live
-	// catalog here rather than trusted from registration time: a re-ATTACH
-	// refreshes it transparently, and a DETACHed catalog throws a clear error.
+	// A system.main function outlives DETACH, so resolve its connection state
+	// from the live catalog: re-ATTACH refreshes it, DETACH gives a clear error.
 	shared_ptr<VgiAggregateFunctionInfo> live_info;
 	if (registered_info.global) {
 		auto binding = ResolveVgiGlobalBinding(context, registered_info.catalog_name, function.GetName().GetIdentifierName());
@@ -668,14 +638,12 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(BindAggregateFunctionInput &in
 
 	auto settings = ExtractVgiSettings(context, func_info.setting_names);
 
-	// ========================================================================
-	// Phase 1: Detect and extract const values (same pattern as scalar bind)
-	// ========================================================================
+	// Extract const arguments (same pattern as scalar bind).
 	vector<Value> const_values;
 	vector<idx_t> const_indices;
 
-	// Re-bind guard: if arguments already match post-erase count, const args
-	// were already extracted (plan caching / deserialization).
+	// Re-bind guard: an argument count equal to the non-const count means the
+	// const args were already erased (plan caching / deserialization).
 	idx_t expected_non_const = 0;
 	for (idx_t i = 0; i < func_info.positional_is_const.size(); i++) {
 		if (!func_info.positional_is_const[i]) {
@@ -716,19 +684,21 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(BindAggregateFunctionInput &in
 				const_indices.push_back(i);
 			}
 		}
-		// Erase const arguments in reverse order to preserve indices
+		// Reverse order preserves indices.
 		for (auto it = const_indices.rbegin(); it != const_indices.rend(); ++it) {
 			auto index = *it;
 			arguments.erase(arguments.begin() + index);
 			function.GetArguments().erase(function.GetArguments().begin() + index);
 		}
+		if (!const_indices.empty()) {
+			function.SetSerializeCallback(VgiAggregateFunctionSerialize);
+			function.SetDeserializeCallback(VgiAggregateFunctionDeserialize);
+		}
 	}
 
 	// DuckDB 2 resolves variadic arguments before this callback.
 
-	// ========================================================================
-	// Phase 2: Build input schema from remaining (non-const) arguments
-	// ========================================================================
+	// Input schema from the remaining (non-const) arguments.
 	vector<LogicalType> input_types;
 	vector<string> input_names;
 	for (idx_t i = 0; i < arguments.size(); i++) {
@@ -737,16 +707,12 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(BindAggregateFunctionInput &in
 	}
 	auto input_schema = BuildArrowSchemaFromDuckDB(context, input_types, input_names);
 
-	// ========================================================================
-	// Phase 3: Build ArrowArguments from const values
-	// ========================================================================
 	vector<Value> positional_args;
 	for (auto &val : const_values) {
 		positional_args.push_back(val);
 	}
 	ArrowArguments arrow_arguments = BuildArgumentsFromValues(context, positional_args, {});
 
-	// Call aggregate_bind RPC
 	auto request = BuildAggregateBindRequest(func_info.function_name, func_info.schema_name,
 	                                          func_info.attach_opaque_data, input_schema,
 	                                          context, settings, func_info.required_secrets,
@@ -762,11 +728,10 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(BindAggregateFunctionInput &in
 	bind_data->resolved_output_schema = func_info.output_schema;
 	bind_data->input_schema = input_schema;
 	bind_data->catalog = func_info.catalog;
-	// shared_from_this on ClientContext is safe — DuckDB owns it via shared_ptr.
+	// ClientContext is always owned by a shared_ptr.
 	bind_data->context = context.shared_from_this();
 	bind_data->const_values = const_values;
 
-	// Call aggregate_bind to get execution_id
 	auto rpc_result = InvokeAggregateRpc(context, *bind_data, "aggregate_bind", request);
 
 	auto bind_result = DecodeAggregateResult<generated::AggregateBindResult>(rpc_result, *bind_data, "aggregate_bind");
@@ -788,7 +753,7 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(BindAggregateFunctionInput &in
 		}
 	}
 
-	// Verify execution_id was extracted — without it, all queries share FunctionStorage state
+	// Without an execution_id all queries would share worker storage state.
 	if (bind_data->exec_state->execution_id.empty()) {
 		throw IOException(AggregateViolation(*bind_data, "aggregate_bind").Set(error_key::kField, "execution_id"),
 		                  "VGI aggregate_bind did not return execution_id for '%s'", bind_data->function_name);

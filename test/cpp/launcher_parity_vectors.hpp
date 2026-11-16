@@ -114,6 +114,62 @@ inline const std::vector<ParityVector> &PythonParityVectors() {
 	        /*env=*/{{"VGI_RPC_TOKEN", "secret"}, {"VGI_RPC_REGION", "us-west-2"}, {"VGI_RPC_BUCKET", "my-bucket"}},
 	        /*expected_hash=*/"8abb635d646af180",
 	    },
+	    {
+	        /*name=*/"argv_latin1_bmp",
+	        /*argv=*/{"python", "/opt/caf\303\251/w\303\266rker.py"},
+	        /*cwd=*/"/tmp",
+	        /*env=*/{},
+	        /*expected_hash=*/"79e46dc35c27cc16",
+	    },
+	    {
+	        /*name=*/"argv_cjk",
+	        /*argv=*/{"python", "\346\225\260\346\215\256.py"},
+	        /*cwd=*/"/tmp",
+	        /*env=*/{},
+	        /*expected_hash=*/"aec6dc40c6763148",
+	    },
+	    {
+	        /*name=*/"argv_non_bmp",
+	        /*argv=*/{"python", "emoji-\360\237\230\200-\360\220\215\210"},
+	        /*cwd=*/"/tmp",
+	        /*env=*/{},
+	        /*expected_hash=*/"6ebd0055d87da561",
+	    },
+	    {
+	        /*name=*/"argv_del_and_controls",
+	        /*argv=*/{"echo", "a\177b\001c\342\200\250d"},
+	        /*cwd=*/"/tmp",
+	        /*env=*/{},
+	        /*expected_hash=*/"3eee9bd8280cb97e",
+	    },
+	    {
+	        /*name=*/"cwd_non_ascii",
+	        /*argv=*/{"python"},
+	        /*cwd=*/"/home/jos\303\251/\320\277\321\200\320\276\320\265\320\272\321\202",
+	        /*env=*/{},
+	        /*expected_hash=*/"13015d0b82242fd5",
+	    },
+	    {
+	        /*name=*/"env_non_ascii_value",
+	        /*argv=*/{"python"},
+	        /*cwd=*/"/tmp",
+	        /*env=*/{{"VGI_RPC_NAME", "Zo\303\253"}},
+	        /*expected_hash=*/"690467d78e790053",
+	    },
+	    {
+	        /*name=*/"argv_invalid_utf8",
+	        /*argv=*/{"python", "bad\377\344\270A\355\240\200\300\257\364\220\200\200"},
+	        /*cwd=*/"/tmp/\200dir",
+	        /*env=*/{},
+	        /*expected_hash=*/"08788ff3cdb6804b",
+	    },
+	    {
+	        /*name=*/"env_keys_code_point_order",
+	        /*argv=*/{"python"},
+	        /*cwd=*/"/tmp",
+	        /*env=*/{{"VGI_RPC_\200", "raw"}, {"VGI_RPC_\303\251", "accented"}},
+	        /*expected_hash=*/"5a360a6072cea2a7",
+	    },
 	};
 	return kVectors;
 }

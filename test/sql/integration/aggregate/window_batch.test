@@ -1,0 +1,69 @@
+# name: test/sql/integration/aggregate/window_batch.test
+# description: Windowed VGI aggregates use the batched aggregate_window_batch callback (one RPC per Evaluate chunk)
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# 5000 rows in one partition spans several Evaluate chunks, so later batches
+# start at row_idx > 0 and must land at result offset 0 of their own chunk.
+query I
+SELECT count(*) FILTER (WHERE v IS DISTINCT FROM s)
+FROM (
+  SELECT
+    example.main.vgi_window_sum(x) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING) AS v,
+    sum(x) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING) AS s
+  FROM range(5000) t(x)
+);
+----
+0
+
+# Every output row went through the batch callback, and in more than one call.
+query II
+SELECT sum(regexp_extract(message, 'rows=(\d+)', 1)::BIGINT), count(*) > 1
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%aggregate.window_batch%';
+----
+5000	true
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%aggregate.window_batch%'
+  AND regexp_extract(message, 'row_idx=(\d+)', 1)::BIGINT > 0;
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Partitions and multi-subframe (EXCLUDE) frames through the batch path.
+query I
+SELECT count(*) FILTER (WHERE v IS DISTINCT FROM s)
+FROM (
+  SELECT
+    example.main.vgi_window_sum(x) OVER (PARTITION BY x % 3 ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW) AS v,
+    sum(x) OVER (PARTITION BY x % 3 ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW) AS s
+  FROM range(3000) t(x)
+);
+----
+0
+
+query I
+SELECT sum(regexp_extract(message, 'rows=(\d+)', 1)::BIGINT)
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%aggregate.window_batch%';
+----
+3000

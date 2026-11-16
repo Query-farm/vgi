@@ -1,0 +1,63 @@
+# name: test/sql/oauth/oauth_logout.test
+# description: vgi_oauth_logout() logs out all attached VGI catalogs or one by catalog := alias
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+SET vgi_oauth_cache = 'memory';
+
+query IIIIII
+DESCRIBE SELECT * FROM vgi_oauth_logout() LIMIT 0;
+----
+catalog_name	VARCHAR	YES	NULL	NULL	NULL
+status	VARCHAR	YES	NULL	NULL	NULL
+
+# Nothing attached: nothing to log out.
+query I
+SELECT count(*) FROM vgi_oauth_logout();
+----
+0
+
+statement ok
+ATTACH 'example' AS vgi_logout_a (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+ATTACH 'example' AS vgi_logout_b (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query II
+SELECT catalog_name, status FROM vgi_oauth_logout() ORDER BY catalog_name;
+----
+vgi_logout_a	logged_out
+vgi_logout_b	logged_out
+
+# catalog := restricts the logout to that attach alias.
+query II
+SELECT catalog_name, status FROM vgi_oauth_logout(catalog := 'vgi_logout_b');
+----
+vgi_logout_b	logged_out
+
+# An alias that names no attached VGI catalog is an error, not a silent no-op.
+statement error
+SELECT * FROM vgi_oauth_logout(catalog := 'no_such_catalog');
+----
+no attached VGI catalog named 'no_such_catalog'
+
+statement error
+SELECT * FROM vgi_oauth_logout(catalog := NULL);
+----
+catalog must not be NULL
+
+# The old origin-varargs form is gone: positional arguments are rejected.
+statement error
+SELECT * FROM vgi_oauth_logout('https://auth.example.com');
+----
+No function matches the given name and argument types 'vgi_oauth_logout(STRING_LITERAL)'
+
+statement ok
+DETACH vgi_logout_a;
+
+statement ok
+DETACH vgi_logout_b;

@@ -11,9 +11,7 @@ namespace vgi {
 
 namespace {
 
-// Run `fn`, turning any failure into a std::runtime_error so a mid-serve failure
-// surfaces as an exception the operator boundary catches (same message shape as
-// before: "vgi memo arena: <what>: <detail>").
+// Run `fn`, rethrowing any failure as std::runtime_error("vgi memo arena: <what>: ...").
 template <typename F>
 auto Guard(const char *what, F &&fn) -> decltype(fn()) {
 	try {
@@ -23,9 +21,8 @@ auto Guard(const char *what, F &&fn) -> decltype(fn()) {
 	}
 }
 
-// Take `idx` rows from `src` (in idx order); indices are arena offsets, valid by
-// construction. TakeRows produces a compact copy (the result owns only the gathered
-// rows), so the footprint of a materialized batch is its own rows, never the source's.
+// TakeRows copies, so a materialized batch's footprint is its own rows, never the
+// source arena's.
 VgiBatchPtr TakeArenaRows(const VgiBatchPtr &src, const std::vector<int64_t> &idx) {
 	return Guard("take", [&] { return TakeRows(src, idx); });
 }
@@ -34,10 +31,8 @@ VgiBatchPtr ConcatArenaBatches(const std::vector<VgiBatchPtr> &parts) {
 	return Guard("concat", [&] { return ConcatBatches(parts); });
 }
 
-// Serialize one batch as a self-contained Arrow IPC stream (schema + batch). The
-// columnar arena is the memory optimization; the DISK representation is per-slot IPC
-// (the same bytes the pre-arena per-value entries used), which the backend stores.
-// No message custom_metadata is written (an empty metadata overrides the batch's own).
+// One slot as a self-contained Arrow IPC stream (schema + batch) for the disk tier.
+// The empty metadata suppresses the batch's own custom_metadata.
 std::string SerializeBatchToIpc(const VgiBatchPtr &batch) {
 	return Guard("ipc write", [&] {
 		const VgiMetadata no_metadata;
@@ -51,16 +46,13 @@ int64_t NowUnix() {
 }
 
 VgiBatchPtr DeserializeBatchFromIpc(const std::string &ipc) {
-	// Zero-copy over a buffer that owns a copy of the bytes. Schema included; may be a
-	// 0-row batch (a negative memo).
+	// May be a 0-row batch (a negative memo).
 	return Guard("ipc read", [&] { return DeserializeBatch(VgiBuffer::FromString(ipc)); });
 }
 
 } // namespace
 
-// ============================================================================
 // VgiMemoArena
-// ============================================================================
 
 int32_t VgiMemoArena::ResolveValidator(const ArenaValidator &v) {
 	if (v.scope.empty() && v.etag.empty() && v.last_modified.empty() && !v.revalidatable) {
@@ -141,11 +133,8 @@ ArenaProbeResult VgiMemoArena::Probe(const std::vector<std::string> &keys,
 	std::vector<int64_t> logical;
 	std::vector<int32_t> parent;
 
-	// SHARED lock: read-only. Concurrent probes of the same (hot) arena run their gathers
-	// in parallel. NO mutation here — a stale slot is treated as a MISS and left in place;
-	// the exclusive Store path reclaims stale slots + their rows (either by overwriting the
-	// key on a re-store, or by dropping it on the next compaction). This is what removes the
-	// Step-5 warm-serve contention (Probe used to hold an exclusive lock during the Take).
+	// Shared lock: no mutation here. A stale slot is a miss left in place; Store
+	// replaces it on a re-store and compaction drops it.
 	std::shared_lock<std::shared_mutex> lg(mu_);
 	bool first_hit = true;
 	for (size_t k = 0; k < keys.size(); k++) {
@@ -155,12 +144,12 @@ ArenaProbeResult VgiMemoArena::Probe(const std::vector<std::string> &keys,
 		}
 		const VgiMemoSlot &s = it->second;
 		if (!s.never_expires && now >= s.expires_at) {
-			continue; // stale → MISS (reclaimed by Store, never mutated under the shared lock)
+			continue; // stale → miss
 		}
 		r.hit[k] = 1;
 		r.validator_ref[k] = s.validator_ref;
 		r.num_hits++;
-		// Aggregate for the M2 cc-latch (B1/B2).
+		// Cache-control latch aggregates (see ArenaProbeResult).
 		if (!s.never_expires) {
 			r.latch_all_never_expires = false;
 			int64_t rem = std::chrono::duration_cast<std::chrono::seconds>(s.expires_at - now).count();
@@ -197,9 +186,8 @@ int64_t VgiMemoArena::Store(const VgiBatchPtr &batch,
 	const int64_t before = footprint_;
 	const auto now = std::chrono::steady_clock::now();
 
-	// Append the whole batch to the tail (coalesced into one contiguous batch). Rows
-	// land at [base_rows_ + old_tail_rows, ...). Specs whose key already has a FRESH
-	// slot are skipped (first-writer-wins); their rows in `batch` become dead.
+	// Append the whole batch to the (single, coalesced) tail; rows land at
+	// [base_rows_ + old_tail_rows, ...).
 	const int64_t appended = batch ? batch->num_rows() : 0;
 	if (appended > 0) {
 		if (!tail_) {
@@ -213,12 +201,10 @@ int64_t VgiMemoArena::Store(const VgiBatchPtr &batch,
 	const int64_t batch_base = base_rows_ + (tail_rows_ - appended);
 	int64_t off = 0;
 	int64_t new_dead = 0;
-	// Structural bound on a single arena (the registry's byte-budget eviction cannot evict
-	// the arena currently being appended to, so a single pathological high-cardinality key
-	// must not grow without limit). Over the cap, new values are simply not memoized.
+	// Per-arena slot cap: a high-cardinality function must not grow one arena without
+	// limit. Over the cap, new values are not memoized.
 	const int64_t kMaxSlots = 1 << 20;
-	// Track newly-published slots (with their offset WITHIN `batch`) so they can be
-	// persisted to the disk backend after the loop (before compaction rebases offsets).
+	// New slots with their offset within `batch`, persisted before compaction rebases.
 	std::vector<std::pair<std::string, VgiMemoSlot>> new_slots;
 	for (const auto &sp : specs) {
 		const int64_t start = batch_base + off;
@@ -227,9 +213,7 @@ int64_t VgiMemoArena::Store(const VgiBatchPtr &batch,
 		auto it = slots_.find(*sp.key);
 		if (it != slots_.end()) {
 			if (!it->second.never_expires && now >= it->second.expires_at) {
-				// Existing slot is STALE — reclaim it so this value can be re-memoized
-				// (Probe treated it as a miss). Its old rows become dead; fall through to
-				// insert the fresh slot below.
+				// Stale: reclaim it (its rows become dead) and re-memoize below.
 				dead_rows_ += it->second.length;
 				slots_.erase(it);
 			} else {
@@ -310,7 +294,7 @@ int64_t VgiMemoArena::LoadFromBackend(int64_t now_unix) {
 	if (!backend_->Hydrate(static_fp_, now_unix, schema_ipc, slots) || slots.empty()) {
 		return 0;
 	}
-	// No lock: called pre-publication (the registry holds this arena's only reference).
+	// No lock: the arena is not yet published.
 	const auto steady_now = std::chrono::steady_clock::now();
 	std::vector<VgiBatchPtr> batches;
 	int64_t cursor = 0;
@@ -325,7 +309,7 @@ int64_t VgiMemoArena::LoadFromBackend(int64_t now_unix) {
 		s.never_expires = (p.expires_unix < 0);
 		s.expires_at = s.never_expires ? steady_now
 		                               : steady_now + std::chrono::seconds(p.expires_unix - now_unix);
-		// Deduplicate the validator (no lock; single-threaded during hydrate).
+		// Deduplicate the validator.
 		ArenaValidator v {p.scope, p.etag, p.last_modified, p.revalidatable};
 		s.validator_ref = -1;
 		if (!(v.scope.empty() && v.etag.empty() && v.last_modified.empty() && !v.revalidatable)) {
@@ -360,10 +344,8 @@ bool VgiMemoArena::ShouldCompactLocked() const {
 }
 
 void VgiMemoArena::CompactLocked(std::chrono::steady_clock::time_point now) {
-	// Rebuild base_ from ONLY the live+FRESH slots (dropping dead rows AND stale slots)
-	// in slot-iteration order, rebasing each slot's row_start. Reads the OLD
-	// base_/tail_/base_rows_ via MaterializeLocked, so publish the new state only after
-	// materializing. This is where stale slots left behind by Probe are reclaimed.
+	// MaterializeLocked reads the old base_/tail_/base_rows_, so publish the new state
+	// only after materializing.
 	std::vector<int64_t> logical;
 	logical.reserve(static_cast<size_t>(base_rows_ + tail_rows_ - dead_rows_));
 	std::vector<std::string> stale_keys;
@@ -371,7 +353,7 @@ void VgiMemoArena::CompactLocked(std::chrono::steady_clock::time_point now) {
 	for (auto &kv : slots_) {
 		VgiMemoSlot &s = kv.second;
 		if (!s.never_expires && now >= s.expires_at) {
-			stale_keys.push_back(kv.first); // drop (and its rows) — do not carry into the new base
+			stale_keys.push_back(kv.first);
 			continue;
 		}
 		for (int32_t o = 0; o < s.length; o++) {
@@ -404,11 +386,8 @@ int64_t VgiMemoArena::RecomputeFootprintLocked() {
 	if (tail_) {
 		f += tail_->TotalBufferSize();
 	}
-	// Slot-map + key-blob overhead. Per slot: the unordered_map node (~48), the
-	// VgiMemoSlot (~48), the std::string key control block (~32) + slack, plus the key
-	// bytes. Calibrated against a measured ~240 B/value at 1M BIGINT values (of which
-	// ~8 B is the payload, counted above): 160 + key bytes tracks real RSS within ~1.35x
-	// so the byte budget genuinely bounds memory rather than under-counting it.
+	// Per-slot overhead (map node, VgiMemoSlot, key string) estimated at 160 bytes plus
+	// the key, calibrated against measured RSS so the byte budget bounds real memory.
 	for (auto &kv : slots_) {
 		f += static_cast<int64_t>(kv.first.size()) + 160;
 	}
@@ -432,14 +411,7 @@ VgiMemoArena::Stats VgiMemoArena::GetStats() {
 	return st;
 }
 
-// ============================================================================
 // VgiMemoArenaRegistry
-// ============================================================================
-
-VgiMemoArenaRegistry &VgiMemoArenaRegistry::Instance() {
-	static VgiMemoArenaRegistry *inst = new VgiMemoArenaRegistry(); // leaked, like the cache singleton
-	return *inst;
-}
 
 std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::GetOrCreate(const std::string &static_fp,
                                                                 const VgiSchemaPtr &schema) {
@@ -447,7 +419,7 @@ std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::GetOrCreate(const std::strin
 	++tick_;
 	auto it = arenas_.find(static_fp);
 	if (it != arenas_.end()) {
-		// Schema mismatch → refuse (never serve the wrong shape). Caller skips memo.
+		// Never serve the wrong shape; the caller skips memoization.
 		if (schema && it->second.arena->schema() && !it->second.arena->schema()->Equals(*schema)) {
 			return nullptr;
 		}
@@ -458,7 +430,7 @@ std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::GetOrCreate(const std::strin
 	int64_t fp_bytes = 0;
 	if (backend_) {
 		arena->SetPersistence(backend_, static_fp);
-		fp_bytes = arena->LoadFromBackend(NowUnix()); // hydrate prior-process / peer slots
+		fp_bytes = arena->LoadFromBackend(NowUnix());
 	}
 	Entry e;
 	e.arena = arena;
@@ -479,9 +451,8 @@ std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::Get(const std::string &stati
 		it->second.last_used = ++tick_;
 		return it->second.arena;
 	}
-	// Cold: hydrate from the backend so a warm memo survives a restart and is shared
-	// across same-host processes. Only materialise the arena if the backend actually has
-	// slots for this key (otherwise a probe of an unmemoized function would create empties).
+	// Cold: hydrate, but only keep the arena if the backend has slots, so probing an
+	// unmemoized function does not create empty arenas.
 	if (backend_) {
 		auto arena = std::make_shared<VgiMemoArena>(nullptr);
 		arena->SetPersistence(backend_, static_fp);
@@ -598,8 +569,8 @@ void VgiMemoArenaRegistry::ReleaseBackend() {
 		b = std::move(backend_); // registry drops its ref
 		backend_dir_.clear();    // so the next EnsureSqliteBackend re-opens
 	}
-	// `b`'s destructor (sqlite3_close) runs here, outside the lock — releasing the OS file
-	// handle so the cache directory can be removed on Windows.
+	// Dropping `b` outside the lock closes the SQLite file unless an active arena
+	// still holds the backend.
 }
 
 std::vector<VgiMemoArenaRegistry::ArenaRow> VgiMemoArenaRegistry::Snapshot() {

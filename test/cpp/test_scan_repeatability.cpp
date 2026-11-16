@@ -107,6 +107,27 @@ TEST_CASE("Stable bind snapshots survive direct copies and disable statement reu
 	CHECK(copy.bind_result.opaque_data[0] == 1);
 }
 
+// A clone that drops these sends COPY FROM without its file context, or skips
+// the split-token TTL floor.
+TEST_CASE("Bind data copies keep the COPY FROM context and split-token TTL", "[repeatability]") {
+	vgi::VgiTableFunctionBindData data;
+	data.split_token_ttl_seconds = 7;
+	data.copy_from = vgi::CopyFromBindContext {"fmt", "/data/in.fmt", {1, 2, 3}};
+	auto copied = data.Copy();
+	auto &copy = copied->Cast<vgi::VgiTableFunctionBindData>();
+	REQUIRE(copy.split_token_ttl_seconds.has_value());
+	CHECK(*copy.split_token_ttl_seconds == 7);
+	REQUIRE(copy.copy_from.has_value());
+	CHECK(copy.copy_from->format == "fmt");
+	CHECK(copy.copy_from->file_path == "/data/in.fmt");
+	CHECK(copy.copy_from->expected_schema_bytes == std::vector<uint8_t> {1, 2, 3});
+
+	vgi::VgiTableFunctionBindData unset;
+	auto unset_copy = unset.Copy();
+	CHECK_FALSE(unset_copy->Cast<vgi::VgiTableFunctionBindData>().split_token_ttl_seconds.has_value());
+	CHECK_FALSE(unset_copy->Cast<vgi::VgiTableFunctionBindData>().copy_from.has_value());
+}
+
 TEST_CASE("Stable table plan copies preserve the snapshot and reject changed rebind state", "[repeatability-native]") {
 	auto worker = std::getenv("VGI_REPEATABILITY_WORKER");
 	REQUIRE(worker);

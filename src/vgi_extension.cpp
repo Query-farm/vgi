@@ -130,7 +130,6 @@
 
 namespace duckdb {
 
-// Forward declarations — functions defined below after VgiStorageExtension class
 static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecretInput &input);
 static unique_ptr<BaseSecret> IrohCreateSecret(ClientContext &context, CreateSecretInput &input);
 static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
@@ -139,17 +138,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
                                                                   AttachedDatabase &db, Catalog &catalog);
 
-// ============================================================================
-// VgiStreamingWindowOptimizer — rewrite eligible LogicalWindow → streaming op
-// ============================================================================
-// Walks the plan post-optimize. For each LogicalWindow whose every window
-// expression is a VGI aggregate with streaming_partitioned=true and a
-// cumulative frame (UNBOUNDED PRECEDING -> CURRENT ROW), replace with our
-// custom LogicalVgiStreamingWindow. Otherwise leave the LogicalWindow alone
-// (it falls through to PhysicalWindow as today).
-//
-// All-or-nothing in v1: if any expression is ineligible, the whole node
-// stays a regular LogicalWindow. Mixed-eligibility splitting is a v2 task.
+// Post-optimize: replace a LogicalWindow with LogicalVgiStreamingWindow when
+// EVERY expression is a streaming_partitioned VGI aggregate over a cumulative
+// frame (UNBOUNDED PRECEDING -> CURRENT ROW) with identical PARTITION BY /
+// ORDER BY keys; otherwise leave it for PhysicalWindow. Mixed nodes are not split.
 
 class VgiStreamingWindowOptimizer : public OptimizerExtension {
 public:
@@ -188,10 +180,8 @@ private:
 		if (!vgi_info || !vgi_info->streaming_partitioned) {
 			return false;
 		}
-		// Streaming-open currently ships an empty Arguments envelope; any
-		// const positional would be silently dropped on the wire. Punt
-		// these to PhysicalWindow until the const-arg pass-through is
-		// wired (see comment in BuildStreamingOpenRequest).
+		// Streaming-open ships an empty Arguments envelope, so a const positional
+		// would be silently dropped (see BuildStreamingOpenRequest).
 		for (bool is_const : vgi_info->positional_is_const) {
 			if (is_const) {
 				return false;
@@ -200,20 +190,38 @@ private:
 		if (!IsCumulativeFrame(wexpr)) {
 			return false;
 		}
-		// EXCLUDE clauses produce multiple subframes per row — punt for v1.
+		// EXCLUDE produces multiple subframes per row.
 		if (wexpr.WindowExclude() != WindowExcludeMode::NO_OTHER) {
 			return false;
 		}
-		// DISTINCT, FILTER, ORDER BY in args — punt for v1, fall through to
-		// PhysicalWindow which handles them.
+		// DISTINCT, FILTER and argument ORDER BY are left to PhysicalWindow.
 		if (wexpr.Distinct() || wexpr.Filter() || !wexpr.ArgOrders().empty()) {
 			return false;
 		}
 		return true;
 	}
 
+	// The operator is fed in expression 0's sort order and projects each
+	// expression's own keys, so every expression must use the same keys in the
+	// same positions; otherwise other expressions see out-of-order rows.
+	static bool HasSameWindowKeys(const BoundWindowExpression &lhs, const BoundWindowExpression &rhs) {
+		if (lhs.Partitions().size() != rhs.Partitions().size() || lhs.OrderBy().size() != rhs.OrderBy().size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < lhs.Partitions().size(); i++) {
+			if (!lhs.Partitions()[i]->Equals(*rhs.Partitions()[i])) {
+				return false;
+			}
+		}
+		for (idx_t i = 0; i < lhs.OrderBy().size(); i++) {
+			if (!lhs.OrderBy()[i].Equals(rhs.OrderBy()[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	static void Rewrite(unique_ptr<LogicalOperator> &op) {
-		// Recurse first so children are rewritten before we look at this node.
 		for (auto &child : op->children) {
 			Rewrite(child);
 		}
@@ -229,30 +237,27 @@ private:
 				return; // leave the LogicalWindow alone
 			}
 		}
+		auto &first = window.expressions[0]->Cast<BoundWindowExpression>();
+		for (idx_t i = 1; i < window.expressions.size(); i++) {
+			if (!HasSameWindowKeys(first, window.expressions[i]->Cast<BoundWindowExpression>())) {
+				return; // mixed keys: PhysicalWindow sorts per key set
+			}
+		}
 
-		// All expressions eligible — swap in the streaming operator.
 		auto streaming_op = make_uniq<vgi::LogicalVgiStreamingWindow>(window.window_index);
 		streaming_op->expressions = std::move(window.expressions);
 		streaming_op->children = std::move(window.children);
 
-		// Restore the sort PhysicalWindow would have done internally.  Unlike
-		// PhysicalWindow, the VGI streaming operator has no internal sort: it
-		// ships chunks to the worker in arrival order and the worker computes the
-		// running aggregate over rows in exactly that order.  Without an explicit
-		// LogicalOrder on (PARTITION BY, ORDER BY), an OVER (... ORDER BY y) over
-		// an unsorted input silently produces wrong cumulative values.  Insert a
-		// binding-transparent LogicalOrder (empty projection_map passes the
-		// child's bindings/types through unchanged, so streaming_op's bound
-		// expressions keep resolving and the plan survives VerifyPlan).  All
-		// expressions in one node share equivalent partitions/orders (enforced by
-		// eligibility + the streaming operator's OpenSessions asserts), so
-		// expressions[0] is representative.
+		// The streaming operator does not sort (the worker aggregates in arrival
+		// order), so add the sort PhysicalWindow would have done, or ORDER BY
+		// windows over unsorted input give wrong running values. An empty
+		// projection_map keeps the child's bindings, so streaming_op's bound
+		// expressions still resolve. The key check above makes [0] representative.
 		auto &wexpr = streaming_op->expressions[0]->Cast<BoundWindowExpression>();
 		if (!wexpr.Partitions().empty() || !wexpr.OrderBy().empty()) {
 			vector<BoundOrderByNode> sort_orders;
-			// Group partitions first (any total order over the key suffices to make
-			// each partition contiguous); then the within-partition window order,
-			// copied verbatim so ASC/DESC + NULLS placement match the frame.
+			// Partition keys first (any order makes partitions contiguous), then
+			// the window ORDER BY verbatim so ASC/DESC and NULLS match the frame.
 			for (auto &p : wexpr.Partitions()) {
 				sort_orders.emplace_back(OrderType::ASCENDING, OrderByNullType::ORDER_DEFAULT, p->Copy());
 			}
@@ -285,15 +290,9 @@ private:
 	}
 };
 
-// ============================================================================
-// VgiTableBufferingRewriter — rewrite LogicalGet → LogicalVgiTableBufferingFunction
-// ============================================================================
-// Walks the plan post-built-in-optimizers. For each LogicalGet whose bind_data
-// is a VgiTableInOutBindData with table_buffering=true, replaces it with a
-// LogicalVgiTableBufferingFunction carrying the same return types/names and
-// the bind_data ownership. The LATERAL decorrelation pass has already run by
-// this point, so any correlated subqueries are already DELIM_JOINs and our
-// LogicalGet appears as a plain (non-projected_input) node.
+// Post-optimize: replace each LogicalGet whose bind_data is a table_buffering
+// VgiTableInOutBindData with a LogicalVgiTableBufferingFunction that takes over
+// its bind_data. Decorrelation has already run, so the get is a plain node.
 
 class VgiTableBufferingRewriter : public OptimizerExtension {
 public:
@@ -311,7 +310,6 @@ private:
 	}
 
 	static void Rewrite(unique_ptr<LogicalOperator> &op, ClientContext &context) {
-		// Recurse first so leaf-level rewrites finish before we look at this node.
 		for (auto &child : op->children) {
 			Rewrite(child, context);
 		}
@@ -322,17 +320,12 @@ private:
 		if (!IsBufferedTableInOutGet(get)) {
 			return;
 		}
-		// The LogicalGet's child carries the table-input subquery for an
-		// in-out function. Move it into our new extension op.
+		// The child, if any, is the table-input subquery; it moves to the new op.
 		D_ASSERT(get.children.size() <= 1);
 
-		// LogicalGet::ResolveTypes() (duckdb/src/planner/operator/logical_get.cpp:162-177)
-		// has already narrowed `get.types` to match column_ids/projection_ids
-		// under projection pushdown. Pass the narrowed types as our op's
-		// return_types so upstream LogicalProjection/LogicalFilter bindings
-		// resolve correctly. The full worker schema lives separately in
-		// all_column_types/all_column_names for filter serialization and
-		// for telling the worker what the projected output_schema should be.
+		// LogicalGet::ResolveTypes() already narrowed `get.types` to the
+		// projection; use them as return_types so parent bindings resolve. The
+		// full worker schema goes in all_column_types/all_column_names.
 		auto post_proj_types = get.types;
 		auto post_proj_names = vector<string>();
 		const auto &all_col_ids = get.GetColumnIds();
@@ -359,30 +352,24 @@ private:
 		    std::move(get.bind_data));
 		rewritten->children = std::move(get.children);
 
-		// Capture pushdown state. The streaming pure-table path captures the
-		// same data at InitGlobal time via TableFunctionInitInput; the buffered
-		// path goes through a custom PhysicalOperator with no InitInput, so the
-		// rewriter is the analogous capture point.
+		// Capture pushdown state here: the buffered path's custom operator gets
+		// no TableFunctionInitInput (the pure-table path captures it at InitGlobal).
 		rewritten->all_column_types = get.returned_types;
 		rewritten->all_column_names = IdentifiersToStrings(get.names);
 
-		// Read pushdown capabilities from bind_data (echoed from Meta at
-		// catalog-load time). The catalog set's HasTableInput branch already
-		// gated `table_func.projection_pushdown=true` on this same flag, so
-		// `column_ids` only contains real column indices (rather than a
-		// virtual GetAnyColumn placeholder) when this is true.
+		// The catalog set enabled table_func.projection_pushdown on this same
+		// flag, so column_ids holds real column indices only when it is true.
 		const auto *bd_for_caps =
 		    static_cast<const vgi::VgiTableInOutBindData *>(rewritten->bind_data.get());
 		const bool worker_supports_projection =
 		    bd_for_caps && bd_for_caps->projection_pushdown;
 
 		// projection_ids: worker-schema indices of the columns the parent op
-		// actually wants. Match the streaming pure-table convention
-		// (vgi_table_function_impl.cpp:1023-1042): when the function declares
-		// projection_pushdown=true, use ``get.GetColumnIds()`` as the
-		// projection (NOT ``get.projection_ids`` — that's a secondary
-		// projection on top of column_ids; rare in practice). The streaming
-		// path also handles get.projection_ids for completeness.
+		// actually wants. Match the pure-table convention
+		// (``VgiTableFunctionInitGlobal``): when the function declares
+		// projection_pushdown=true, project ``get.GetColumnIds()``. When
+		// ``get.projection_ids`` is non-empty (a secondary projection on top
+		// of column_ids; rare in practice), apply it on top below.
 		if (worker_supports_projection && !all_col_ids.empty()) {
 			rewritten->projection_pushdown = true;
 			if (get.projection_ids.empty()) {
@@ -411,8 +398,8 @@ private:
 			    idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID : idx.GetPrimaryIndex()));
 		}
 
-		// Serialize filters via the shared utility. FilterPushdown has already
-		// delegated required predicates to this scan, so failures must abort.
+		// FilterPushdown already delegated these predicates to the scan, so a
+		// serialization failure must abort rather than drop them.
 		if (get.table_filters.HasFilters()) {
 			auto bd_typed = static_cast<vgi::VgiTableInOutBindData *>(rewritten->bind_data.get());
 			auto worker_path = bd_typed && bd_typed->attach_params
@@ -429,10 +416,9 @@ private:
 			rewritten->join_keys_buffers = std::move(serialized.join_keys_buffers);
 		}
 
-		// Pre-build the EXPLAIN summary while we still have the raw
-		// TableFilter objects in scope (the wire-serialized form is opaque
-		// to the C++ side). Reused later by PhysicalVgiTableBufferingFunction
-		// ::ParamsToString.
+		// Build the EXPLAIN summary (PhysicalVgiTableBufferingFunction::
+		// ParamsToString) while the TableFilters are in scope; the serialized
+		// form is opaque.
 		if (rewritten->projection_pushdown || get.table_filters.HasFilters()) {
 			std::string summary;
 			if (rewritten->projection_pushdown) {
@@ -489,11 +475,9 @@ private:
 	}
 
 	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-		// Gated on a session setting so an emergency-rollback path exists if
-		// the rewriter regresses against a real workload. When disabled, the
-		// loud-failure asserts in VgiTableInOutFunction/VgiTableInOutFinalize
-		// will catch any table_buffering function call so users see a clear
-		// error rather than the pre-fix UNION-ALL corruption.
+		// Emergency off switch. When disabled, the guards in
+		// VgiTableInOutFunction/VgiTableInOutFinalize turn any table_buffering
+		// call into a clear error instead of wrong results.
 		Value enabled_val;
 		if (!input.context.TryGetCurrentSetting("vgi_table_buffering", enabled_val) ||
 		    enabled_val.IsNull() || !enabled_val.GetValue<bool>()) {
@@ -503,23 +487,12 @@ private:
 	}
 };
 
-// ============================================================================
-// VgiRequiredFiltersOptimizer — enforce Table.required_filters
-// ============================================================================
-// Walks the plan post-FilterPushdown. For each LogicalGet whose underlying
-// table is a VgiTableEntry with a non-empty `required_filters`,
-// collects the raw component paths of column references touched by any filter expression
-// in scope (the LogicalGet's table_filters plus any parent LogicalFilter
-// expressions referencing this LogicalGet's table_index). Throws
-// BinderException listing any required path that is not satisfied (prefix-
-// inclusive: a present `bbox` satisfies all of `bbox.xmin` / `.xmax` / etc.).
-//
-// Phase: optimize_function (post-optimize), so DuckDB's FilterPushdown has
-// already settled filters into LogicalGet::table_filters.
-//
-// Cost: O(plan_size) for tables that have no requirements (empty list →
-// fast return after the cast); a small TableFilter tree walk + expression
-// walk per LogicalGet that does have requirements.
+// Enforce Table.required_filters post-optimize (FilterPushdown has settled
+// LogicalGet::table_filters). For each LogicalGet over a VgiTableEntry with
+// requirements, collect the column paths referenced by its table_filters and by
+// enclosing LogicalFilter expressions on its table_index, and throw
+// BinderException for any unsatisfied group. Prefix-inclusive: a filter on
+// `bbox` satisfies `bbox.xmin`. Also rewrites native-delegation markers.
 class VgiRequiredFiltersOptimizer : public OptimizerExtension {
 public:
 	VgiRequiredFiltersOptimizer() {
@@ -583,10 +556,8 @@ private:
 		});
 	}
 
-	// Resolve a BoundColumnRefExpression's binding.column_index (which is
-	// post-projection — an index into LogicalGet::column_ids) to the original
-	// column index in LogicalGet::names. Returns -1 for virtual columns or
-	// out-of-range bindings.
+	// Map a post-projection binding index (into column_ids) to an index into
+	// LogicalGet::names; -1 for virtual or out-of-range columns.
 	static int64_t ResolveOrigIndex(idx_t binding_col_idx,
 	                                const vector<ColumnIndex> &col_ids,
 	                                idx_t names_size) {
@@ -686,7 +657,6 @@ private:
 		return group.size() == 1 ? out : "one of (" + out + ")";
 	}
 
-	// Join rendered groups with ", " for the required / missing lists.
 	static std::string JoinGroups(const RequiredGroups &groups) {
 		std::string out;
 		for (size_t i = 0; i < groups.size(); ++i) {
@@ -698,11 +668,8 @@ private:
 		return out;
 	}
 
-	// Resolve "what VgiTableEntry owns this LogicalGet, if any". Two paths:
-	//   (1) VGI-side scans (vgi_table_scan): GetTable() returns the entry.
-	//   (2) Native delegation (marker bind_data): GetTable() returns nullptr,
-	//       but bind_data is a VgiNativeDelegationMarkerBindData carrying the
-	//       entry. The rewriter below will replace the marker after the check.
+	// The VgiTableEntry behind this LogicalGet: GetTable() for VGI-side scans,
+	// or the entry carried by a VgiNativeDelegationMarkerBindData.
 	static optional_ptr<VgiTableEntry> ResolveEntry(const LogicalGet &get) {
 		if (auto tbl = get.GetTable()) {
 			if (auto *vgi = dynamic_cast<VgiTableEntry *>(tbl.get())) {
@@ -718,9 +685,6 @@ private:
 		return nullptr;
 	}
 
-	// Run the requirement check against the LogicalGet's filters + parent
-	// LogicalFilter expressions. Throws BinderException with the formatted
-	// message on miss; returns silently on satisfy.
 	static void EnforceRequirements(
 	    const LogicalGet &get, VgiTableEntry &vgi,
 	    const std::vector<unique_ptr<Expression>> &parent_exprs) {
@@ -751,19 +715,11 @@ private:
 			WalkFilterExpression(*filter.expr, roots, present);
 		}
 
-		// Source 2: dynamic_filters (Top-N / runtime). The public API doesn't
-		// expose per-column iteration, so we can't introspect *which* columns
-		// have dynamic filters from here. Acceptable for v1: the typical
-		// Overture bbox case is satisfied by static table_filters or by parent
-		// LogicalFilter walks; if a worker has a real need to count dynamic
-		// presence per-column, that's a follow-up. We do conservatively note
-		// that filters exist by emitting nothing — leaving the strict check.
+		// Dynamic (Top-N / runtime) filters never count; neither do the
+		// optional runtime subtrees skipped by WalkFilterExpression.
 
-		// Source 3: parent LogicalFilter expressions in scope that reference
-		// this LogicalGet's table_index. Catches range-join LogicalFilters
-		// above the scan and other non-pushed-down predicates. Walk() has
-		// already rewritten these through any intervening LogicalProjection,
-		// so their column refs bind to this get's table_index.
+		// Enclosing LogicalFilter expressions (non-pushed-down predicates such as
+		// range joins), already rewritten by Walk() through any projections.
 		for (auto &expr_ptr : parent_exprs) {
 			WalkExpression(*expr_ptr, get.table_index, col_ids, get.names, present);
 		}
@@ -796,19 +752,15 @@ private:
 		    JoinGroups(required), JoinGroups(missing));
 	}
 
-	// If the LogicalGet wraps a VgiNativeDelegationMarkerBindData, transfer
-	// the pre-bound native TableFunction / bind_data / return shape stashed by
-	// GetScanFunctionImpl into the LogicalGet in place. The LogicalGet was
-	// constructed with the catalog's declared Table.columns; we now replace
-	// returned_types/names with the native function's actual bind output so
-	// downstream passes (physical planner, executor) see the true scan shape.
+	// Replace a VgiNativeDelegationMarkerBindData with the native function,
+	// bind_data and return shape GetScanFunctionImpl pre-bound, so later passes
+	// see the native scan's real shape instead of the declared Table.columns.
 	static void RewriteMarkerToNative(ClientContext &context, LogicalGet &get) {
 		auto *mark = dynamic_cast<VgiNativeDelegationMarkerBindData *>(get.bind_data.get());
 		if (!mark) {
 			return;
 		}
-		// Move out of the marker. The marker bind_data is replaced by the
-		// native bind_data below, so this is the marker's last access.
+		// Last access to the marker: get.bind_data is replaced below.
 		auto native_tf = std::move(mark->native_tf);
 		auto native_bind = std::move(mark->native_bind);
 		auto native_return_types = std::move(mark->native_return_types);
@@ -827,11 +779,9 @@ private:
 		        {{"table", table_name_log}, {"function", function_name_log}});
 	}
 
-	// Substitute every column ref that binds to `proj`'s output with a copy of
-	// the projection's defining expression, so a filter accumulated *above* the
-	// projection ends up referencing whatever the projection reads (ultimately
-	// the LogicalGet). Mirrors DuckDB's own ReplaceProjectionBindings
-	// (duckdb/src/optimizer/pushdown/pushdown_projection.cpp).
+	// Replace refs to `proj`'s outputs with the defining expressions, so a filter
+	// above the projection references what it reads. Mirrors DuckDB's
+	// ReplaceProjectionBindings (pushdown_projection.cpp).
 	static void RewriteThroughProjection(unique_ptr<Expression> &expr,
 	                                     const LogicalProjection &proj) {
 		ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
@@ -845,8 +795,7 @@ private:
 
 	static void Walk(ClientContext &context, LogicalOperator &op,
 	                 std::vector<unique_ptr<Expression>> &parent_exprs) {
-		// LogicalFilter: accumulate owned copies of its expressions before
-		// descending — so any LogicalGet beneath us sees them. Pop on exit.
+		// Accumulate copies of filter expressions for the gets below; pop on exit.
 		if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
 			auto &lf = op.Cast<LogicalFilter>();
 			size_t pushed = 0;
@@ -863,12 +812,9 @@ private:
 			return;
 		}
 
-		// LogicalProjection: rewrite the accumulated filter expressions through
-		// the projection so their bindings reference the projection's input
-		// (the get, or a deeper projection). Restore the originals on exit so
-		// sibling subtrees are unaffected. Without this, a filter sitting above
-		// an interposed projection (the common shape DuckDB pushdown produces)
-		// binds to the projection's table_index and never matches the get.
+		// Rewrite accumulated expressions through the projection (a common
+		// shape after pushdown), or they would never bind to the get. Restore
+		// the originals for sibling subtrees.
 		if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			auto &proj = op.Cast<LogicalProjection>();
 			std::vector<unique_ptr<Expression>> saved = std::move(parent_exprs);
@@ -888,11 +834,8 @@ private:
 		if (op.type == LogicalOperatorType::LOGICAL_GET) {
 			auto &get = op.Cast<LogicalGet>();
 			if (auto vgi = ResolveEntry(get)) {
-				// Run the requirement check FIRST — if it fails, we throw,
-				// the plan is discarded, and the user sees a clean
-				// BinderException without ever binding read_parquet.
+				// Check before rewriting so a failure never binds the native scan.
 				EnforceRequirements(get, *vgi, parent_exprs);
-				// Then rewrite if this was a marker; no-op for VGI-side scans.
 				RewriteMarkerToNative(context, get);
 			}
 		}
@@ -943,8 +886,6 @@ public:
 		return &static_cast<VgiStorageExtension &>(*ext).location_policy_;
 	}
 
-	// Convenience: locate the VGI extension on a DatabaseInstance and
-	// return its dispatcher. nullptr if the extension isn't registered.
 	static vgi::VgiCancelDispatcher *FindCancelDispatcher(DatabaseInstance &db) {
 		auto &config = DBConfig::GetConfig(db);
 		auto ext = StorageExtension::Find(config, "vgi");
@@ -954,8 +895,7 @@ public:
 		return &static_cast<VgiStorageExtension &>(*ext).dispatcher_;
 	}
 
-	// Thread-safe registry of redact keys per secret type name.
-	// Populated during ATTACH after successful secret type registration.
+	// Redact keys per secret type name, recorded at ATTACH.
 	void SetRedactKeys(const std::string &secret_type_name, case_insensitive_set_t keys) {
 		std::lock_guard<std::mutex> lock(redact_mutex_);
 		redact_keys_[secret_type_name] = std::move(keys);
@@ -970,7 +910,6 @@ public:
 		return {};
 	}
 
-	// Locate the VGI storage extension on a DatabaseInstance. nullptr if absent.
 	static VgiStorageExtension *Find(DatabaseInstance &db) {
 		auto &config = DBConfig::GetConfig(db);
 		auto ext = StorageExtension::Find(config, "vgi");
@@ -980,10 +919,9 @@ public:
 		return static_cast<VgiStorageExtension *>(ext.get());
 	}
 
-	// Registry of Orchard remote secret providers, keyed by attached catalog
-	// name. The SecretManager owns each VgiRemoteSecretStorage (no unload API);
-	// these are non-owning pointers kept for diagnostics and best-effort detach.
-	// Valid for the DB's lifetime (the storage objects never go away).
+	// Orchard remote secret providers by catalog name. Non-owning: the
+	// SecretManager owns each VgiRemoteSecretStorage for the DB's lifetime (no
+	// unload API).
 	void RegisterSecretProvider(const std::string &catalog_name, vgi::VgiRemoteSecretStorage *storage) {
 		std::lock_guard<std::mutex> lock(secret_mutex_);
 		secret_providers_[catalog_name] = storage;
@@ -1005,9 +943,8 @@ public:
 		return out;
 	}
 
-	// Auto-allocate a unique tie_break_offset for each secret provider, starting
-	// at 100 (built-ins occupy 10/20, so a remote catch-all loses to local
-	// secrets). Step 10 leaves room and never collides within a DB.
+	// Unique tie_break_offset per provider: 100, 110, ... Built-in storages use
+	// 0-20, so local secrets win over a remote catch-all.
 	int64_t NextSecretTieBreakOffset() {
 		std::lock_guard<std::mutex> lock(secret_mutex_);
 		int64_t off = next_secret_offset_;
@@ -1015,15 +952,10 @@ public:
 		return off;
 	}
 
-	// ---- COPY ... FROM format registry --------------------------------------
-	// Tracks the VGI-registered COPY formats per DB so vgi_copy_formats() can
-	// enumerate them and so ATTACH can detect collisions. The system-catalog
-	// CopyFunction entry persists past DETACH, so entries here also persist
-	// (matching the documented "DETACH can't unregister" limitation).
-	//
-	// Concurrency: callers performing the registry-check + system-catalog
-	// create + record sequence hold CopyFormatMutex() across all three steps to
-	// close the TOCTOU between concurrent ATTACHes (see VgiCatalogAttach).
+	// ---- COPY format registry ----
+	// For vgi_copy_formats() and ATTACH collision checks. Entries outlive
+	// DETACH, as the system-catalog CopyFunction does. Hold CopyFormatMutex()
+	// across check + create + record to close the TOCTOU between ATTACHes.
 	struct CopyFormatEntry {
 		std::string catalog_name;   // owning catalog attach alias (may later be detached)
 		std::string registered_name; // scoped name registered in the system catalog (what users type)
@@ -1055,17 +987,11 @@ public:
 		return out;
 	}
 
-	// ---- Global (system.main) function registry ------------------------------
-	// Tracks the functions VGI catalogs published into DuckDB's global function
-	// namespace via `CatalogAttachResult.global_functions`, so ATTACH can apply
-	// first-attach-wins and vgi_global_functions() can enumerate them. DuckDB
-	// has no API to unregister a function, so — like COPY formats — an entry
-	// here persists past DETACH (calling it then throws; see
-	// ResolveVgiGlobalBinding).
-	//
-	// Concurrency: the registry-check + system-catalog create + record sequence
-	// is performed under GlobalFunctionMutex() to close the TOCTOU between
-	// concurrent ATTACHes.
+	// ---- Global (system.main) function registry ----
+	// Functions published via CatalogAttachResult.global_functions, for
+	// first-attach-wins and vgi_global_functions(). Entries outlive DETACH (no
+	// unregister API; calls then throw, see ResolveVgiGlobalBinding). Hold
+	// GlobalFunctionMutex() across check + create + record.
 	struct GlobalFunctionEntry {
 		std::string global_name;   // name registered into system.main (lowercased)
 		std::string catalog_name;  // owning attach alias (may later be detached)
@@ -1101,22 +1027,17 @@ public:
 		return out;
 	}
 
-	// --- Companion catalog registry (lakehouse federation) ---------------
-	// Tracks catalogs the VGI layer attached on behalf of a catalog_attach
-	// `attach_catalogs` manifest, so we never clobber a non-companion catalog
-	// and can refcount-share a companion across VGI catalogs.
+	// ---- Companion catalog registry (lakehouse federation) ----
+	// Catalogs attached for a catalog_attach `attach_catalogs` manifest, so a
+	// non-companion catalog is never clobbered and companions are refcount-shared.
 	enum class CompanionOutcome { ATTACHED, SHARED, CONFLICT };
 
-	// Resolve + (if needed) attach one companion, serialized against other
-	// companion ops. Returns:
-	//   SHARED   — an existing companion with the same target; refcount bumped,
-	//              no attach performed.
-	//   ATTACHED — freshly attached (attach_fn ran and did not throw).
-	//   CONFLICT — the alias is held by a different-target companion or by a
-	//              non-companion catalog; `conflict_target_out` describes the
-	//              holder. Nothing is attached; never clobbers.
-	// attach_fn performs the real DatabaseManager::AttachDatabase and throws on
-	// failure (registry stays unchanged in that case — it propagates out).
+	// Attach one companion if needed, serialized against other companion ops.
+	//   SHARED   — same-target companion still attached; refcount bumped.
+	//   ATTACHED — attach_fn ran (it throws on failure, leaving the registry
+	//              unchanged).
+	//   CONFLICT — alias held by another target or a non-companion catalog;
+	//              `conflict_target_out` describes the holder; nothing attached.
 	CompanionOutcome AcquireCompanion(const std::string &alias, const std::string &target,
 	                                  const std::string &db_type, bool hidden, DatabaseManager &db_manager,
 	                                  const std::function<void()> &attach_fn, std::string &conflict_target_out) {
@@ -1124,10 +1045,8 @@ public:
 		auto it = companion_catalogs_.find(alias);
 		if (it != companion_catalogs_.end()) {
 			if (it->second.target == target) {
-				// Share — but only if the companion is still actually attached.
-				// If a user detached it out-of-band, the registry is stale; drop
-				// the stale record and fall through to a fresh attach so branches
-				// can still resolve it.
+				// Share only if still attached; if it was detached out-of-band,
+				// drop the stale record and re-attach.
 				if (db_manager.GetDatabase(Identifier(alias))) {
 					it->second.refcount++;
 					return CompanionOutcome::SHARED;
@@ -1233,18 +1152,14 @@ private:
 
 namespace vgi {
 
-// Resolve a companion's secret_ref into ATTACH options for metadata connections
-// that need credentials at attach time (e.g. a postgres DSN). Data-file creds
-// (S3/GCS/HTTP) don't need this — they resolve through the Orchard catch-all
-// secret storage at query time.
+// Copy a companion's secret_ref into its ATTACH options, for metadata
+// connections that need credentials at attach time (e.g. a postgres DSN).
+// Data-file creds resolve through the Orchard catch-all at query time instead.
 //
-// SECURITY: secret_ref is a WORKER-CHOSEN local secret name, and the companion
-// target host is also worker-chosen — so blindly injecting the secret would let
-// a malicious worker exfiltrate a user's credentials to an arbitrary host. This
-// is therefore FAIL-CLOSED: injection happens only when the user explicitly
-// opts in per-ATTACH (`attach_companion_secrets true`). Without opt-in a
-// non-empty secret_ref is skipped (logged); the companion falls back to the
-// Orchard catch-all / ambient credentials, or fails on its own — never exfil.
+// SECURITY: the worker chooses both the secret name and the target host, so
+// injecting blindly would let a malicious worker exfiltrate credentials.
+// Fail-closed: only with `attach_companion_secrets true`; otherwise the ref is
+// skipped (logged) and the companion uses ambient credentials or fails.
 static void InjectCompanionSecret(ClientContext &context, const std::string &secret_ref, bool allowed,
                                   AttachOptions &options) {
 	if (secret_ref.empty()) {
@@ -1274,14 +1189,11 @@ static void InjectCompanionSecret(ClientContext &context, const std::string &sec
 	}
 }
 
-// ============================================================================
-// Global (system.main) function publishing
-// ============================================================================
+// ---- Global (system.main) function publishing ----
 
-// True when *anything* already owns `name` in the system catalog's function
-// namespace. DuckDB keeps scalar / aggregate / table functions and macros in
-// ONE per-schema CatalogSet, so a lookup under any of those types surfaces the
-// others — possibly as a type-mismatch error, which is equally "taken".
+// True when anything owns `name` in system.main's function namespace. Functions
+// and macros share one per-schema CatalogSet, so a lookup can surface another
+// type as a type-mismatch error, which also means "taken".
 static bool SystemFunctionNameTaken(ClientContext &context, Catalog &system_catalog, const std::string &name) {
 	static const CatalogType kFunctionTypes[] = {CatalogType::SCALAR_FUNCTION_ENTRY,
 	                                             CatalogType::AGGREGATE_FUNCTION_ENTRY,
@@ -1301,9 +1213,7 @@ static bool SystemFunctionNameTaken(ClientContext &context, Catalog &system_cata
 	return false;
 }
 
-// Which of DuckDB's function namespaces a worker function type registers into.
-// Streaming Table and buffered TableBuffering share the table-function
-// namespace (the distinction is a bind-time dispatch detail).
+// Function kind for conflict checks; Table and TableBuffering are both "table".
 static std::string GlobalFunctionKindName(vgi::VgiFunctionType type) {
 	switch (type) {
 	case vgi::VgiFunctionType::Scalar:
@@ -1336,9 +1246,8 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 		setting_names.push_back(setting.name);
 	}
 
-	// The globally-published functions are NOT registered under a schema of the
-	// VGI catalog, so the target carries no Catalog& — the entry outlives DETACH
-	// and re-resolves the live catalog from `catalog_name` at every bind.
+	// No Catalog&: the entry outlives DETACH and re-resolves the catalog by
+	// `catalog_name` at every bind.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = nullptr;
 	target.catalog_name = catalog_alias;
@@ -1348,8 +1257,8 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 	// Empty: each function dispatches on the schema the worker declared it in.
 	target.schema_name = std::string();
 
-	// Group overloads by the name users will type. std::map for a stable
-	// registration order (overload order is user-visible in dispatch).
+	// Group overloads by global name; std::map keeps registration order stable
+	// (overload order is user-visible in dispatch).
 	struct GlobalGroup {
 		vgi::VgiFunctionType kind = vgi::VgiFunctionType::Scalar;
 		std::vector<vgi::VgiFunctionInfo> overloads;
@@ -1370,8 +1279,7 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 			groups.emplace(global_name, std::move(group));
 			continue;
 		}
-		// DuckDB keeps one function namespace per schema, so a name can't be
-		// both (say) a scalar and a table function. Keep the first kind seen.
+		// One namespace per schema: keep the first kind seen.
 		if (GlobalFunctionKindName(it->second.kind) != GlobalFunctionKindName(func_info.function_type)) {
 			VGI_LOG(context, "global_function.register",
 			        {{"catalog", catalog_alias},
@@ -1390,9 +1298,8 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 
 		std::lock_guard<std::mutex> lock(vgi_ext->GlobalFunctionMutex());
 		if (auto *existing = vgi_ext->FindGlobalFunctionLocked(global_name)) {
-			// Same alias → a re-ATTACH: reuse the registration (its binds
-			// resolve the live catalog, so the connection state is already
-			// fresh). Different alias → first attach wins.
+			// Same alias (re-ATTACH): reuse it; binds resolve the live catalog.
+			// Different alias: first attach wins.
 			const bool same_owner = StringUtil::CIEquals(existing->catalog_name, catalog_alias);
 			VGI_LOG(context, "global_function.register",
 			        {{"catalog", catalog_alias},
@@ -1461,8 +1368,7 @@ static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string
 			         {"kind", kind},
 			         {"outcome", "registered"}});
 		} catch (const std::exception &e) {
-			// Publishing is advisory — never fail the ATTACH over it. The
-			// function stays reachable at its schema-qualified name.
+			// Advisory: never fail the ATTACH; the schema-qualified name works.
 			VGI_LOG(context, "global_function.register",
 			        {{"catalog", catalog_alias},
 			         {"global_name", global_name},
@@ -1483,9 +1389,8 @@ void ReleaseCompanionCatalogs(ClientContext &context, const std::vector<std::str
 	auto to_detach = vgi_ext->ReleaseCompanions(aliases);
 	auto &db_manager = DatabaseManager::Get(context);
 	for (const auto &alias : to_detach) {
-		// Best-effort: DetachDatabase throws on the default-DB guard
-		// (`USE companion; DETACH vgi_catalog`) — a rare edge case that must not
-		// abort the parent detach or leak the exception out of OnDetach.
+		// Best-effort: DetachDatabase throws when the companion is the default
+		// DB (`USE companion; DETACH vgi_catalog`); must not escape OnDetach.
 		try {
 			db_manager.DetachDatabase(context, Identifier(alias), OnEntryNotFound::RETURN_NULL);
 			VGI_LOG(context, "vgi.companion_detach", {{"alias", alias}});
@@ -1497,13 +1402,12 @@ void ReleaseCompanionCatalogs(ClientContext &context, const std::vector<std::str
 
 } // namespace vgi
 
-// Create function for VGI secrets — builds a KeyValueSecret from config options.
-// All named parameters from CREATE SECRET are copied into the secret's key-value map.
+// KeyValueSecret from every CREATE SECRET option, with the redact keys recorded
+// for this secret type at ATTACH.
 static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecretInput &input) {
 	auto scope = input.scope;
 	auto secret = make_uniq<KeyValueSecret>(scope, input.type, input.provider, input.name);
 
-	// Look up redact keys from VgiStorageExtension (per-DatabaseInstance, not global)
 	auto &config = DBConfig::GetConfig(context);
 	auto vgi_ext = StorageExtension::Find(config, "vgi");
 	if (vgi_ext) {
@@ -1513,7 +1417,6 @@ static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecr
 		}
 	}
 
-	// Copy all user-provided options into the secret map
 	for (const auto &entry : input.options) {
 		secret->secret_map[Identifier(entry.first)] = entry.second;
 	}
@@ -1574,9 +1477,8 @@ static std::vector<string> CollectScalarOrList(const Value &v, char delim) {
 	return out;
 }
 
-// Parse a struct-valued LOCATION into its address (image) + container options.
-// The address comes from an `image` (or `location`/`path`) key; remaining keys
-// are runtime / transport / volumes / env / extra_args. Throws on unknown keys
+// Parse a struct-valued LOCATION: address from `image` (or `location`/`path`),
+// plus runtime / connection / volumes / env / extra_args. Throws on unknown keys
 // or a missing address.
 static ParsedContainerOptions ParseContainerLocationStruct(const Value &loc) {
 	ParsedContainerOptions out;
@@ -1624,7 +1526,6 @@ static ParsedContainerOptions ParseContainerLocationStruct(const Value &loc) {
 
 } // namespace
 
-// ATTACH handler for VGI catalogs
 static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                             AttachedDatabase &db, const string &name, AttachInfo &info,
                                             AttachOptions &options) {
@@ -1648,45 +1549,29 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	vgi::IrohOptions iroh_options; // iroh_* options (shared parser with vgi_catalogs)
 	string data_version_spec;
 	string implementation_version;
-	// Per-LOCATION launcher overrides — only valid with ``launch:`` LOCATIONs;
-	// rejected at parse time for any other transport.  -1 sentinel for "unset"
-	// on the integer; std::nullopt-equivalent on the string is empty.
+	// ``launch:``-only overrides; -1 / empty = unset.
 	int64_t launcher_idle_timeout_seconds = -1;
 	string launcher_state_dir;
-	// A struct-valued LOCATION carries the worker address plus all transport
-	// options in one parameter (container transport). Captured here, parsed after
-	// the option loops. A plain VARCHAR LOCATION sets worker_path directly.
+	// A struct-valued LOCATION (container transport) is parsed after the option
+	// loops; a VARCHAR LOCATION sets worker_path directly.
 	Value location_struct;
 	bool location_is_struct = false;
-	// Opt out of Orchard's remote secret provider for this catalog. Default on:
-	// an HTTP catalog whose attach response advertises a secret-service URL gets
-	// a VgiRemoteSecretStorage auto-registered (reusing this catalog's identity).
+	// `secrets false` opts out of auto-registering a VgiRemoteSecretStorage when
+	// the attach response advertises a secret-service URL.
 	bool secrets_enabled = true;
-	// Opt out of provisioning companion catalogs advertised via the
-	// catalog_attach `attach_catalogs` manifest (lakehouse federation). Default
-	// on: attach is largely lazy and guarded by a scheme allowlist + a
-	// never-clobber conflict policy. Set `attach_companions false` to disable.
+	// `attach_companions false` opts out of the `attach_catalogs` manifest
+	// (guarded by a scheme allowlist and never-clobber policy when on).
 	bool attach_companions_enabled = true;
-	// Opt IN to injecting a worker-named secret (`secret_ref`) into a companion's
-	// ATTACH options. Default OFF: a worker chooses both the secret name and the
-	// target host, so auto-injecting would let a malicious worker exfiltrate the
-	// user's credentials to an arbitrary host. Data-file creds still resolve via
-	// the Orchard catch-all without this.
+	// Opt-in: see InjectCompanionSecret for why this defaults off.
 	bool attach_companion_secrets = false;
-	// Opt out of publishing this catalog's advertised `global_functions` into
-	// DuckDB's global function namespace (system.main). Default on: publishing
-	// is best-effort (first-attach-wins, never clobbers an existing name) and
-	// the schema-qualified name always keeps working.
+	// `global_functions false` opts out of publishing into system.main.
 	bool global_functions_enabled = true;
-	// Unknown-to-the-extension options are forwarded to the worker as
-	// attach-time options after validation against the catalog's declared
-	// AttachOptionSpec list (fetched via InvokeCatalogs when present).
+	// Options the extension does not know, forwarded to the worker after
+	// validation against the catalog's AttachOptionSpec list.
 	std::map<std::string, Value> attach_options;
-	// Every non-secret ATTACH option (name → string value), folded into the
-	// result-cache key so differing options (which may route to different data /
-	// locations) never share a cache entry. Excludes the secret tokens and
-	// LOCATION (already keyed via worker_path). std::map keeps it canonically
-	// sorted for a stable serialization.
+	// Non-secret ATTACH options for the result-cache key (attaches with
+	// different options never share entries). Excludes secret tokens and
+	// LOCATION; std::map gives a canonical order.
 	std::map<std::string, std::string> key_options;
 	// Cache-key entries for worker-declared options, held back until the spec is
 	// known: a credential (spec `secret`) enters the key only as a salted HMAC,
@@ -1696,13 +1581,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// can be redacted from info.path once the spec says it is one.
 	std::set<std::string> path_query_keys;
 
-	// Per-option handler, shared between the connection-string query (below) and
-	// the explicit (TYPE vgi, ...) options clause so both honour the same names.
+	// Shared by the connection-string query and the (TYPE vgi, ...) clause.
 	auto apply_option = [&](const string &lower_name, const Value &value) {
-		// Record for the cache key — every option except the secret tokens and
-		// LOCATION/PATH (LOCATION is already the key's worker_path; the tokens
-		// must never enter the key or the on-disk digest). Worker-declared
-		// options are deferred until their spec says whether they are secret.
+		// Secret tokens must never enter the cache key or on-disk digest.
+		// Worker-declared options are deferred until their spec says whether
+		// they are secret.
 		const bool keyable = lower_name != "type" && lower_name != "location" && lower_name != "path" &&
 		                     lower_name != "bearer_token" && lower_name != "oauth_refresh_token" &&
 		                     lower_name != "iroh_secret_key" && lower_name != vgi::ATTACH_TICKET_OPTION &&
@@ -1711,9 +1594,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		if (lower_name == "type") {
 			return;
 		} else if (lower_name == "location" || lower_name == "path") {
-			// LOCATION is dynamically typed: a STRUCT bundles the worker address
-			// plus transport options (container transport); a VARCHAR is the plain
-			// address. The struct is parsed after the option loops.
 			if (value.type().id() == LogicalTypeId::STRUCT) {
 				location_struct = value;
 				location_is_struct = true;
@@ -1721,9 +1601,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				worker_path = value.ToString();
 			}
 		} else if (lower_name == "worker_debug") {
-			// DefaultCastAs (not GetValue<bool>) so VARCHAR values from the
-			// connection-string query ("true"/"false") cast semantically rather
-			// than as a raw int8; typed BOOLEAN values from the clause are a no-op.
+			// DefaultCastAs, not GetValue<bool>: query-string values are VARCHAR.
 			worker_debug = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "pool") {
 			use_pool = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
@@ -1764,7 +1642,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "tcp_proxy"), "tcp_proxy, if set, must not be empty");
 			}
 		} else if (vgi::ApplyIrohOption(lower_name, value, iroh_options)) {
-			// iroh_* options: parsed by the shared helper (see vgi_iroh_config.hpp).
 		} else if (lower_name == "data_version_spec") {
 			data_version_spec = value.ToString();
 		} else if (lower_name == "implementation_version") {
@@ -1783,9 +1660,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "launcher_state_dir"), "launcher_state_dir, if set, must not be empty");
 			}
 		} else {
-			// Collect for validation + forwarding to the worker. Assignment, not
-			// emplace: the options clause is applied after the path's '?query'
-			// and must win.
+			// Assignment, not emplace: the options clause is applied after the
+			// path's '?query' and must win.
 			attach_options[lower_name] = value;
 			worker_option = true;
 		}
@@ -1798,13 +1674,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	};
 
-	// Connection-string form (mirrors the airport extension): the worker location
-	// and ATTACH options may be encoded in the ATTACH path as
+	// Connection-string form (as in the airport extension):
 	//   '<catalog>?location=<worker>&<opt>=<val>&...'
-	// so a catalog is reachable without an explicit options clause — e.g. from the
-	// DuckDB/haybarn CLI:  haybarn-cli "vgi:example?location=https://host/vgi/".
-	// The base (before '?') stays the catalog name; the query string supplies
-	// options, applied first so an explicit (TYPE vgi, ...) clause still overrides.
+	// e.g. haybarn-cli "vgi:example?location=https://host/vgi/". Query options are
+	// applied first so an explicit (TYPE vgi, ...) clause overrides them.
 	bool secret_in_path = false;
 	bool had_query = false;
 	{
@@ -1835,21 +1708,18 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				}
 				start = amp + 1;
 			}
-			// A token embedded in the ATTACH path is just as introspection-visible
-			// as one in the options clause — strip the whole query from info.path.
-			// Recommend CREATE SECRET / the options clause for non-ephemeral tokens.
+			// A token in the path is as introspection-visible as one in the
+			// clause: strip the whole query from info.path.
 			if (secret_in_path) {
 				info.path = catalog_name + "?<redacted>";
 			}
 		}
 	}
 
-	// Explicit (TYPE vgi, ...) options clause. Applied after the query string so it
-	// wins on conflicts; tokens are wiped from the parsed AttachInfo so they can't
-	// be echoed by DuckDB introspection (catalog logging, prepared-statement dumps,
-	// telemetry). The CatalogAuth holds the live token from here on.
-	// duckdb_databases().options reads the AttachOptions copy of the clause
-	// (options.options), not info.options, so a credential is redacted in both.
+	// Explicit options clause, applied after the query string. Tokens are
+	// redacted so DuckDB introspection can't echo them; CatalogAuth holds the
+	// live value. Redact both info.options and options.options: the latter is
+	// what duckdb_databases().options reads.
 	auto redact_option = [&](const std::string &lower_target) {
 		for (auto &entry : info.options) {
 			if (StringUtil::Lower(entry.first) == lower_target) {
@@ -1871,23 +1741,19 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		redact_option(token_option);
 	}
 
-	// Resolve a struct-valued LOCATION into the worker address (worker_path) plus
-	// the container options carried alongside it. Done before the bare-form
-	// fallback / empty-LOCATION check below so worker_path is set.
+	// Before the bare-form fallback / empty-LOCATION check, so worker_path is set.
 	ParsedContainerOptions container_opts;
 	if (location_is_struct) {
 		container_opts = ParseContainerLocationStruct(location_struct);
 		worker_path = container_opts.image;
 	}
 
-	// Validate mutual exclusivity of auth options
 	if (!bearer_token.empty() && !oauth_refresh_token.empty()) {
 		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "bearer_token"), "Cannot specify both bearer_token and oauth_refresh_token");
 	}
-	// An attach ticket IS the catalog's options: the worker restores the sealed
-	// options and version specs and refuses anything beside it, so reject that
-	// here, clearly, before any I/O. Extension options (LOCATION, auth, pool,
-	// ...) are not catalog options and remain allowed.
+	// An attach ticket IS the catalog's options (and version specs); the worker
+	// refuses anything beside it, so reject that before any I/O. Extension
+	// options (LOCATION, auth, pool, ...) remain allowed.
 	if (attach_ticket_given) {
 		if (attach_ticket.empty()) {
 			throw BinderException("attach_ticket must not be empty");
@@ -1923,11 +1789,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		                                         oauth_cache_mode));
 	}
 
-	// Bare connection-string form: when no LOCATION was given and the path
-	// carried no '?query' (which would mark the base as a catalog name,
-	// airport-style), the whole ATTACH path IS the worker location — e.g. the
-	// haybarn CLI form `vgi:uvx vgi-easter`, or `ATTACH 'uvx vgi-easter'
-	// (TYPE vgi)`. The remote catalog name is discovered from the worker below.
+	// Bare form: with no LOCATION and no '?query', the whole ATTACH path is the
+	// worker location (`vgi:uvx vgi-easter`, `ATTACH 'uvx vgi-easter' (TYPE vgi)`)
+	// and the catalog name is discovered from the worker below.
 	bool discover_catalog = false;
 	if (worker_path.empty() && !had_query && !catalog_name.empty()) {
 		worker_path = catalog_name;
@@ -1941,9 +1805,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// What the user typed as LOCATION, for vgi_export_session() (worker_path may
 	// be rewritten below, e.g. database:// into an internal artifact token).
 	const std::string user_location = location_is_struct ? location_struct.ToString() : worker_path;
-	// Transport policy gate: before ANY I/O on the location (container runtime
-	// detection / image inspection, database:// resolution, Iroh configuration,
-	// the discovery RPC). Checks the raw user LOCATION, before the rewrites below.
+	// Policy gate on the user's LOCATION, before ANY I/O on it (container
+	// inspection, database:// resolution, Iroh config, discovery RPC) and before
+	// the rewrites below.
 	vgi::CheckLocationPolicy(context, worker_path, vgi::LocationEntryPoint::ATTACH);
 
 	if (!tcp_proxy.empty() && !vgi::IsTcpTransport(worker_path)) {
@@ -1956,10 +1820,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 	auto iroh_config = vgi::BuildIrohClientConfigForLocation(context, worker_path, std::move(iroh_options), "ATTACH");
 
-	// Telemetry capture — the event fires only on the success path, near the
-	// return. Snapshot the raw (pre-rewrite) location + the user's options here,
-	// before the container/HTTP rewrites and the attach RPC. Best-effort; nothing
-	// below may throw on telemetry's account.
+	// Telemetry (emitted only on success): snapshot the pre-rewrite location and
+	// options. Nothing may throw on telemetry's account.
 	vgi::VgiAttachInfo tele;
 	tele.raw_location = worker_path;
 	tele.opt_pool = use_pool;
@@ -1977,11 +1839,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 	const auto tele_start = std::chrono::steady_clock::now();
 
-	// Launcher overrides are only meaningful for ``launch:`` LOCATIONs.
-	// ``unix://`` connects to an externally-managed worker (we don't spawn,
-	// don't manage state); HTTP and bare-subprocess transports don't go
-	// through the launcher at all.  Reject loudly so users catch typos
-	// or wrong-transport mistakes before they hit the worker.
+	// Launcher overrides only mean something for ``launch:`` (``unix://`` is an
+	// externally managed worker); reject them elsewhere.
 	if ((launcher_idle_timeout_seconds >= 0 || !launcher_state_dir.empty()) &&
 	    !vgi::IsLaunchLocation(worker_path)) {
 		throw BinderException(
@@ -1991,9 +1850,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		                       worker_path));
 	}
 
-	// A struct-valued LOCATION carries container options, so it is only meaningful
-	// for a container (oci:// / docker://) address. Catch a struct LOCATION whose
-	// address isn't a container image early.
 	if (location_is_struct && !vgi::IsContainerLocation(worker_path)) {
 		throw BinderException(
 		    "VGI struct LOCATION is only supported for oci:// / docker:// container images "
@@ -2007,10 +1863,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		    "VGI container (oci:// / docker://) LOCATIONs require a child-process transport "
 		    "not available in this build; use http:// instead");
 #else
-		// Validate an explicit `connection` up front — before any docker call
-		// (runtime detect / image inspect) — so a bad value fails fast and
-		// daemon-free. `stdio` ⇒ private per-process; http/tcp ⇒ shared; unix is
-		// rejected (AF_UNIX over docker bind mounts is unreliable).
+		// Validate `connection` before any runtime call. stdio = private
+		// per-process; http/tcp = shared; unix is rejected.
 		string conn = StringUtil::Lower(container_opts.connection);
 		bool shared = false;
 		vgi::ContainerConnMode shared_mode = vgi::ContainerConnMode::HTTP;
@@ -2029,9 +1883,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		spec.image = vgi::StripContainerScheme(worker_path);
 		spec.runtime = vgi::DetectContainerRuntime(container_opts.runtime_override);
 
-		// Auto-mount the volumes the image declares via its OCI label, then layer
-		// user-supplied volume entries on top (user wins on a duplicate mount
-		// point).  Inspection pulls the image first if it isn't present locally.
+		// Image-declared volumes, overridden by user entries on the same mount
+		// point. Inspection may pull the image.
 		spec.volumes = vgi::InspectImageVolumes(spec.runtime, spec.image);
 		auto upsert_volume = [&](const string &host, const string &path) {
 			for (auto &v : spec.volumes) {
@@ -2053,9 +1906,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		spec.env = std::move(container_opts.env);
 		spec.extra_args = std::move(container_opts.extra_args);
 
-		// Auto-select the connection from the image's advertised transports when
-		// none was given (prefer tcp — native protocol + idle self-shutdown — over
-		// http); a label-less image stays private per-process (back-compat).
+		// No `connection`: prefer an advertised tcp (idle self-shutdown) over
+		// http; a label-less image stays private per-process.
 		if (conn.empty()) {
 			auto modes = vgi::InspectImageTransports(spec.runtime, spec.image);
 			bool has_tcp = false, has_http = false;
@@ -2072,16 +1924,14 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			}
 		}
 
-		// Telemetry: container facts (before worker_path is rewritten below).
 		tele.is_container = true;
 		tele.container_runtime = spec.runtime.kind;
 		tele.container_connection = shared ? (shared_mode == vgi::ContainerConnMode::TCP ? "tcp" : "http") : "stdio";
 		tele.container_shared = shared;
 
 		if (shared) {
-			// Transparent shared container: register the resolved spec/mode under an
-			// internal container-shared: token; the dispatch resolves the live
-			// endpoint at connection time via the daemon-introspection coordinator.
+			// Register under an internal container-shared: token; the dispatch
+			// resolves the live endpoint at connection time (EnsureSharedContainer).
 			string shared_loc = "container-shared:" + worker_path + "#" + vgi::ContainerSpecHash(spec);
 			vgi::RegisterSharedContainer(shared_loc, spec, shared_mode);
 			static std::once_flag reap_shared_once;
@@ -2098,9 +1948,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			use_pool = false;
 			worker_path = shared_loc;
 		} else {
-			// Private per-process container (the shipped default for label-less
-			// images / connection:'stdio'). Resolve the run command + a
-			// pool-disambiguation suffix and register it for the spawn sites.
+			// Private per-process container: register the run command under a
+			// pool-disambiguating "#<hash>" suffix for the spawn sites.
 			string command_template = vgi::BuildContainerRunCommandTemplate(spec);
 			string suffixed = worker_path + "#" + vgi::ContainerSpecHash(spec);
 			vgi::RegisterContainerLaunch(suffixed, spec.runtime.binary, command_template);
@@ -2111,9 +1960,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 #endif
 	}
 
-	// database:// is a package resolver, not a wire transport. Snapshot the
-	// committed registry row now; every RPC below runs the resulting immutable
-	// artifact through the ordinary subprocess machinery.
+	// database:// is a package resolver, not a transport: snapshot the registry
+	// row now; RPCs run the immutable artifact as an ordinary subprocess.
 	std::shared_ptr<void> worker_artifact_anchor;
 	if (vgi::IsDatabaseLocation(worker_path)) {
 		auto resolved = vgi::ResolveDatabaseWorker(worker_path, context);
@@ -2121,42 +1969,34 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		worker_artifact_anchor = std::move(resolved.lifetime_anchor);
 	}
 
-	// github-auto:// latest-release LOCATIONs (owner/repo, owner/repo@latest)
-	// resolve to one tag here, so the catalog — every worker it spawns or pools —
-	// runs that release for its whole lifetime, and worker_path (logs,
-	// vgi_global_functions) records what actually ran. vgi_export_session keeps
-	// the user's @latest LOCATION.
+	// Pin a github-auto:// @latest LOCATION to one tag for the catalog's lifetime;
+	// worker_path then records what actually ran. vgi_export_session keeps the
+	// user's @latest LOCATION.
 	worker_path = vgi::PinGithubLatestLocation(worker_path, context);
 
 #ifdef __EMSCRIPTEN__
-	// WASM: HTTP and browser SAB targets are supported. `worker:` names a legacy
-	// worker script; `iroh://` names a remote EndpointId that the page bridge maps
-	// to its one application-owned Iroh adapter Worker.
+	// WASM: HTTP and browser SAB targets only. `worker:` names a legacy worker
+	// script; `iroh://` an EndpointId the page maps to its Iroh adapter Worker.
 	if (!vgi::IsHttpTransport(worker_path) && !vgi::IsWebWorkerTransport(worker_path) &&
 	    !vgi::IsIrohTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
 		throw BinderException("VGI in WASM only supports HTTP ('http[s]://') or "
 		                      "browser SAB ('worker:', 'iroh://', or 'httpi://') transports.");
 	}
 	use_pool = false;
-	// HTTP in WASM goes through duckdb-wasm's XHR layer, not httpfs; worker: pools
-	// via SAB slots, not the subprocess pool.
 #else
-	// HTTP transport: require httpfs for POST support, disable subprocess pooling
 	if (vgi::IsHttpTransport(worker_path)) {
 		try {
 			ExtensionHelper::TryAutoLoadExtension(db.GetDatabase(), "httpfs");
 		} catch (...) {
-			// ignore auto-load errors, check below
 		}
 		if (!db.GetDatabase().ExtensionIsLoaded("httpfs")) {
 			throw BinderException("VGI HTTP transport requires the httpfs extension. "
 			                      "Install it with: INSTALL httpfs; LOAD httpfs;");
 		}
-		use_pool = false; // HTTP is stateless, no subprocess pooling
+		use_pool = false;
 	}
 #endif
 
-	// Create per-catalog auth state
 	std::shared_ptr<vgi::CatalogAuth> auth;
 	if (!bearer_token.empty()) {
 		if (!vgi::IsHttpTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
@@ -2178,8 +2018,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		auth = std::move(oauth_auth);
 	}
 
-	// Telemetry: auth mode. OAuth/bearer only apply to HTTP transport; every other
-	// transport is unauthenticated from the extension's perspective.
 	if (!bearer_token.empty()) {
 		tele.auth_mode = "bearer";
 	} else if (!oauth_refresh_token.empty()) {
@@ -2190,17 +2028,14 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		tele.auth_mode = "none";
 	}
 
-	// HTTP cookie jar — carries proxy-issued Set-Cookie / Cookie headers for
-	// sticky version-aware routing. Subprocess transport doesn't use this.
+	// Carries proxy-issued cookies for sticky version-aware routing.
 	std::shared_ptr<vgi::SessionCookieJar> cookie_jar;
 	if (vgi::IsHttpTransport(worker_path) || vgi::IsHttpiTransport(worker_path)) {
 		cookie_jar = std::make_shared<vgi::SessionCookieJar>();
 	}
 
-	// Lifted from the InvokeCatalogAttach call below — these optionals must
-	// also flow into InvokeCatalogs so the discovery RPC primes the launcher
-	// cache with the user's overrides, not [defaults]. See InvokeCatalogs's
-	// docstring and InvokeCatalogAttach's analogous fix.
+	// Also passed to InvokeCatalogs, so the discovery RPC primes the launcher
+	// cache with the user's overrides rather than defaults.
 	std::optional<int64_t> launcher_idle_for_attach;
 	std::optional<std::string> launcher_state_dir_for_attach;
 	if (launcher_idle_timeout_seconds >= 0) {
@@ -2210,18 +2045,30 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		launcher_state_dir_for_attach = launcher_state_dir;
 	}
 
-	// Fetch the worker's catalog list once when we need it — either to discover
-	// the catalog name for the bare connection-string form, or to validate
-	// attach-time options against the catalog's declared AttachOptionSpec list.
-	// Catalogs without options on the explicit form pay no overhead (no RPC).
+	// Before the first pooled RPC below, so ATTACH's own discovery / attach
+	// workers are already sized by this ATTACH's settings.
+	vgi::PoolSettings pool_settings;
+	if (use_pool) {
+		pool_settings = vgi::PoolSettingsFromSession(context);
+		if (pool_max_override >= 0) {
+			pool_settings.max_pool_size = static_cast<size_t>(pool_max_override);
+		}
+		if (pool_timeout_override >= 0) {
+			pool_settings.idle_timeout_seconds = static_cast<size_t>(pool_timeout_override);
+		}
+	} else {
+		pool_settings.max_pool_size = 0; // disabled
+	}
+	vgi::VgiWorkerPool::Instance().ConfigurePath(worker_path, pool_settings);
+
+	// The catalog list is fetched only to discover the name (bare form) or to
+	// validate attach options against the AttachOptionSpec list.
 	if (discover_catalog || !attach_options.empty()) {
 		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth,
 		                                    launcher_idle_for_attach, launcher_state_dir_for_attach,
 		                                    worker_artifact_anchor, tcp_proxy, iroh_config);
 
-		// Bare form: resolve the (omitted) catalog name from the worker. A
-		// single-catalog worker resolves unambiguously; >1 forces the user to
-		// name one via the '<catalog>?location=<worker>' form.
+		// Bare form: only a single-catalog worker resolves unambiguously.
 		if (discover_catalog) {
 			if (catalogs.empty()) {
 				throw BinderException("VGI worker at '%s' exposes no catalogs", worker_path);
@@ -2243,23 +2090,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			}
 			catalog_name = catalogs[0].name;
 
-			// When DuckDB derived the database alias from the path (the CLI
-			// default-DB open `vgi:uvx vgi-easter`, or `ATTACH 'uvx vgi-easter'
-			// (TYPE vgi)` with no AS clause), the alias is the ugly path
-			// basename. Replace it with the discovered catalog name so the DB
-			// surfaces as `easter`, not `uvx vgi-easter`. Registration reads
-			// GetName() *after* attach (DatabaseManager::FinalizeAttach), and
-			// derives the default-database pointer from it too, so SetName here
-			// is honored consistently. A user-chosen `AS alias` (name differs
-			// from the path basename) is left untouched.
+			// An alias DuckDB derived from the path (no AS clause) is the path
+			// basename; rename it to the discovered catalog (`easter`, not
+			// `uvx vgi-easter`). DatabaseManager::FinalizeAttach reads GetName()
+			// after attach, so SetName here sticks. A user AS alias is kept.
 			auto &fs = FileSystem::GetFileSystem(context);
 			if (name == AttachedDatabase::ExtractDatabaseName(info.path, fs)) {
 				db.SetName(Identifier(catalog_name));
 			}
 		}
 
-		// Validate attach-time options against the resolved catalog's declared
-		// AttachOptionSpec list (skipped on the bare form when no options given).
 		if (!attach_options.empty()) {
 			const vgi::VgiCatalogInfo *matching_info = nullptr;
 			for (const auto &info_entry : catalogs) {
@@ -2369,8 +2209,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
-	// Retained for vgi_export_session(): the catalog options as validated above
-	// (secret ones included, in memory only) and the version specs as typed.
+	// For vgi_export_session(): validated options (secrets included, memory
+	// only) and the version specs as typed.
 	auto retained_attach = std::make_shared<vgi::VgiRetainedAttach>();
 	retained_attach->location = user_location;
 	retained_attach->catalog_name = catalog_name;
@@ -2379,9 +2219,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	retained_attach->implementation_version = implementation_version;
 
 	if (attach_ticket_given) {
-		// Only a worker hosting vgi.attach_tickets.v1 redeems the reserved
-		// option; anything else would reject it as an unknown option or, worse,
-		// hand it to catalog code. Ask reflection first (spec §5.1).
+		// Only a worker hosting vgi.attach_tickets.v1 may receive the ticket;
+		// any other would reject it or hand it to catalog code. Ask reflection.
 		vgi::VgiAttachParametersConfig probe_cfg;
 		probe_cfg.worker_path = worker_path;
 		probe_cfg.worker_debug = worker_debug;
@@ -2403,8 +2242,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		attach_options.emplace(vgi::ATTACH_TICKET_WIRE_OPTION, Value(attach_ticket));
 		retained_attach->options.clear();
 		retained_attach->via_ticket = true;
-		// Two attaches with different tickets may restore different options:
-		// key the result cache on the ticket, as a salted hash only.
+		// Different tickets may restore different options: key the result cache
+		// on the ticket, as a salted hash only.
 		std::string cache_dir;
 #ifndef __EMSCRIPTEN__
 		Value dir_value;
@@ -2416,11 +2255,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		    vgi::AttachOptionKeySalt(cache_dir), vgi::ATTACH_TICKET_OPTION, attach_ticket);
 	}
 
-	// Call catalog_attach via RPC. The worker validates data_version_spec and
-	// implementation_version and throws with a human-readable message on
-	// unsatisfiable requests; that surfaces as the ATTACH failure. The
-	// launcher_*_for_attach optionals were already built above (alongside the
-	// InvokeCatalogs path) so the override flows into both RPCs identically.
+	// The worker validates the version specs; its error is the ATTACH failure.
 	vgi::ServerCapabilities attach_capabilities;
 	auto invoke_attach = [&]() {
 		return vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
@@ -2432,8 +2267,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	if (!attach_ticket_given) {
 		attach_result = invoke_attach();
 	} else {
-		// A refused ticket is reported by its error kind, the same for every SDK,
-		// without the worker's own wording (spec §4: never the ticket text).
+		// Report a refused ticket by error kind only (same for every SDK), never
+		// with the worker's wording, which could quote the ticket.
 		try {
 			attach_result = invoke_attach();
 		} catch (const vgi::VgiRpcException &e) {
@@ -2452,13 +2287,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
-	// Register extension options for settings exposed by this catalog
-	// Check for type conflicts with existing settings
+	// Register the catalog's settings; an existing one must have the same type.
 	auto &config = DBConfig::GetConfig(db.GetDatabase());
 
 	for (const auto &setting : attach_result.settings) {
 		if (config.HasExtensionOption(Identifier(setting.name))) {
-			// Setting already exists - verify types match
 			ExtensionOption existing_option;
 			if (!config.TryGetExtensionOption(Identifier(setting.name), existing_option)) {
 				throw BinderException("Failed to retrieve existing VGI setting '%s'", setting.name);
@@ -2473,14 +2306,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				        "VGI setting '%s' already exists with type %s, but catalog '%s' requires type %s",
 				        setting.name, existing_option.type.ToString(), catalog_name, setting.type.ToString()));
 			}
-			// Types match - setting is already registered, no need to add again
 		} else {
-			// New setting - register it
 			config.AddExtensionOption(Identifier(setting.name), setting.description, setting.type, setting.default_value);
 		}
 	}
 
-	// Register secret types exposed by this catalog
 	auto &secret_manager = SecretManager::Get(context);
 	auto vgi_ext = StorageExtension::Find(config, "vgi");
 	for (const auto &st : attach_result.secret_types) {
@@ -2491,7 +2321,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			        {{"catalog", catalog_name}, {"secret_type", st.name}, {"reason", "reserved by the vgi extension"}});
 			continue;
 		}
-		// Build redact keys set from parameter metadata
 		case_insensitive_set_t redact_set;
 		for (const auto &param : st.parameters) {
 			if (param.redact) {
@@ -2499,7 +2328,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			}
 		}
 
-		// Register the secret type with DuckDB
 		SecretType secret_type;
 		secret_type.name = Identifier(st.name);
 		secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
@@ -2508,19 +2336,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		try {
 			secret_manager.RegisterSecretType(secret_type);
 		} catch (const InternalException &) {
-			// Already registered by another VGI catalog — skip
-			// Don't overwrite redact keys from the first (winning) registration
+			// Registered by another catalog: keep the first registration's keys.
 			redact_set = {};
 			VGI_LOG(context, "attach.secret_type_exists",
 			        {{"catalog", catalog_name}, {"secret_type", st.name}, {"outcome", "kept first registration"}});
 		}
 
-		// Store redact keys on VgiStorageExtension (only for newly registered types)
 		if (vgi_ext && !redact_set.empty()) {
 			static_cast<VgiStorageExtension &>(*vgi_ext).SetRedactKeys(st.name, std::move(redact_set));
 		}
 
-		// Register "config" provider create function with named parameters
 		CreateSecretFunction create_func;
 		create_func.secret_type = st.name;
 		create_func.provider = "config";
@@ -2531,31 +2356,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		secret_manager.RegisterSecretFunction(create_func, OnCreateConflict::IGNORE_ON_CONFLICT);
 	}
 
-	// Build per-path pool config and register with pool
-	vgi::PoolSettings pool_settings;
-	if (use_pool) {
-		// Default per-path limit from vgi_worker_pool_max setting
-		Value max_val;
-		if (context.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
-			pool_settings.max_pool_size = static_cast<size_t>(max_val.GetValue<int64_t>());
-		}
-		Value idle_val;
-		if (context.TryGetCurrentSetting("vgi_worker_pool_idle_limit_seconds", idle_val)) {
-			pool_settings.idle_timeout_seconds = static_cast<size_t>(idle_val.GetValue<int64_t>());
-		}
-		// ATTACH options override the defaults
-		if (pool_max_override >= 0) {
-			pool_settings.max_pool_size = static_cast<size_t>(pool_max_override);
-		}
-		if (pool_timeout_override >= 0) {
-			pool_settings.idle_timeout_seconds = static_cast<size_t>(pool_timeout_override);
-		}
-	} else {
-		pool_settings.max_pool_size = 0; // disabled
-	}
-	vgi::VgiWorkerPool::Instance().ConfigurePath(worker_path, pool_settings);
-
-	// Set database-level comment and tags from worker metadata
 	if (!attach_result.comment.empty()) {
 		db.comment = Value(attach_result.comment);
 	}
@@ -2563,9 +2363,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		db.tags[key] = val;
 	}
 
-	// Surface resolved versions via duckdb_databases().tags so users can verify
-	// what the worker actually picked. Namespaced with vgi_ to avoid clashing
-	// with any worker-declared tags.
+	// Resolved versions in duckdb_databases().tags (vgi_ prefix avoids clashing
+	// with worker tags).
 	if (!attach_result.resolved_data_version.empty()) {
 		db.tags["vgi_resolved_data_version"] = attach_result.resolved_data_version;
 	}
@@ -2573,10 +2372,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		db.tags["vgi_resolved_implementation_version"] = attach_result.resolved_implementation_version;
 	}
 
-	// Create attach parameters. Resolved versions are what the worker picked;
-	// they're used by the pool key so catalogs attached at different versions
-	// never share a subprocess worker.  Launcher overrides flow through to
-	// the cache layer where they're pinned to the worker's lifetime.
+	// The resolved versions go into the pool key, so catalogs at different
+	// versions never share a worker.
 	vgi::VgiAttachParametersConfig attach_cfg;
 	attach_cfg.worker_path = worker_path;
 	attach_cfg.catalog_name = catalog_name;
@@ -2596,31 +2393,21 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	if (!launcher_state_dir.empty()) {
 		attach_cfg.launcher_state_dir = launcher_state_dir;
 	}
-	// Canonical (sorted) serialization of the non-secret ATTACH options for the
-	// result-cache key. std::map iteration is already sorted.
 	attach_cfg.attach_options_canonical = vgi::CanonicalAttachOptions(key_options);
 	attach_cfg.retained_attach = std::move(retained_attach);
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(std::move(attach_cfg));
-	// The attach RPC already negotiated HTTP capabilities on its temporary
-	// parameters. Keep that snapshot so the first catalog RPC needs no probe.
+	// Reuse the capabilities the attach RPC negotiated, so no probe is needed.
 	attach_params->StoreServerCapabilities(attach_capabilities);
 
-	// Prime the HTTPParams cache while we're outside any VGI catalog
-	// transaction. HTTPFSUtil::InitializeParameters pulls settings/secrets
-	// through KeyValueSecretReader, which takes the MetaTransaction mutex —
-	// doing it lazily from inside VgiTransaction::Start would self-deadlock
-	// (the surrounding MetaTransaction::GetTransaction call already holds that
-	// mutex). Doing it here, during ATTACH handling and before any VGI
-	// transaction exists, avoids the reentrancy. TODO(#22258): remove once
-	// https://github.com/duckdb/duckdb/issues/22258 is fixed.
+	// Prime the HTTPParams cache outside any VGI transaction: see
+	// VgiAttachParameters::GetOrInitHttpParams (duckdb#22258).
 	if (vgi::IsHttpTransport(worker_path)) {
 		attach_params->GetOrInitHttpParams(context, worker_path);
 	}
 
 	auto attach_result_ptr = std::make_shared<vgi::CatalogAttachResult>(std::move(attach_result));
 
-	// Snapshot eager-load thresholds at attach time. The runtime form is a
-	// fixed struct of int64s; we never re-parse the map on the hot path.
+	// Snapshot eager-load thresholds once; the hot path never re-parses the map.
 	VgiObjectCounts eager_thresholds;
 	{
 		Value threshold_val;
@@ -2635,27 +2422,20 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				threshold_map[kv_struct[0].GetValue<std::string>()] = kv_struct[1].GetValue<int64_t>();
 			}
 		}
-		// Default for missing keys is 1000 (per setting docs); ObjectCountsFromMap fills in.
 		eager_thresholds = ObjectCountsFromMap(threshold_map, vgi::defaults::EAGER_LOAD_THRESHOLD);
 	}
 
-	// Auto-register Orchard's remote secret provider when the catalog advertises
-	// a secret-service URL via tags (and the user didn't opt out with
-	// `secrets false`). Reuses THIS catalog's auth (OAuth/bearer) so a single
-	// login authorizes both worker RPCs and secret fetches. HTTP-only — there's
-	// no secret endpoint to call on subprocess/launch/unix transports.
+	// Auto-register Orchard's remote secret provider when the catalog's tags
+	// advertise vgi_secret_service_url (HTTP only). It reuses this catalog's
+	// auth, so one login covers worker RPCs and secret fetches.
 	if (secrets_enabled && vgi::IsHttpTransport(worker_path)) {
 		auto turl = attach_result_ptr->tags.find("vgi_secret_service_url");
 		if (turl != attach_result_ptr->tags.end() && !turl->second.empty()) {
 			const std::string secret_endpoint = turl->second;
-			// A remote credential broker must be reached over TLS. Require https://
-			// — allow cleartext http only for loopback (local testing).
+			// A credential broker must use TLS; cleartext http only for loopback.
 			auto lower_secret_url = StringUtil::Lower(secret_endpoint);
 			const bool is_https = StringUtil::StartsWith(lower_secret_url, "https://");
-			const bool is_loopback_http =
-			    StringUtil::StartsWith(lower_secret_url, "http://127.0.0.1") ||
-			    StringUtil::StartsWith(lower_secret_url, "http://localhost") ||
-			    StringUtil::StartsWith(lower_secret_url, "http://[::1]");
+			const bool is_loopback_http = vgi::IsLoopbackHttpUrl(secret_endpoint);
 			if (!is_https && !is_loopback_http) {
 				throw BinderException(
 				    "vgi_secret_service_url advertised by catalog '%s' must be an https:// URL — a remote "
@@ -2663,7 +2443,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				    "for testing). Got: %s",
 				    catalog_name, secret_endpoint);
 			}
-			// Default cache TTL frozen per-provider at attach time.
 			int64_t default_ttl = vgi::defaults::SECRET_DEFAULT_TTL_SECONDS;
 			Value ttl_val;
 			if (context.TryGetCurrentSetting("vgi_secret_default_ttl_seconds", ttl_val) && !ttl_val.IsNull()) {
@@ -2676,9 +2455,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			auto *vgi_ext = VgiStorageExtension::Find(*context.db);
 			if (vgi_ext) {
 				const int64_t offset = vgi_ext->NextSecretTieBreakOffset();
-				// Unique storage name per registration (offset suffix) so a
-				// re-ATTACH after detach doesn't collide with the inert prior
-				// storage still owned by the SecretManager.
+				// Offset suffix: a re-ATTACH must not collide with the inert prior
+				// storage the SecretManager still owns.
 				const std::string storage_name =
 				    "vgi_secret_" + catalog_name + "_" + std::to_string(offset);
 				auto storage = make_uniq<vgi::VgiRemoteSecretStorage>(
@@ -2701,15 +2479,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
-	// Auto-register custom COPY ... FROM formats advertised by this catalog.
-	// Each format becomes a DuckDB CopyFunction in the system catalog. DuckDB's
-	// COPY format namespace is global and keyed by the exact string the user
-	// types, so we SCOPE the registered name by the attach alias (`name`, which
-	// is unique per DB): `<alias>.<format>`. That makes collisions between
-	// attaches impossible by construction — two attaches of the same worker get
-	// distinct format names — so no opt-out flag is needed. Users write
-	// `COPY t FROM 'p' (FORMAT '<alias>.<format>')`. Old workers that don't
-	// implement the discovery RPC degrade to "no formats". See docs/copy_from.md.
+	// Register the catalog's COPY ... FROM formats as system-catalog
+	// CopyFunctions. The format namespace is global, so names are scoped by the
+	// (per-DB unique) attach alias: `<alias>.<format>`, which makes collisions
+	// between attaches impossible. Workers without the RPC have no formats.
+	// See docs/copy_from.md.
 	{
 		std::vector<vgi::VgiCopyFromFormatInfo> formats;
 		try {
@@ -2719,7 +2493,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			if (e.GetErrorKind() != vgi::error_kind::kMethodNotImplemented) {
 				throw;
 			}
-			// Old worker: advertises no COPY formats. Continue the ATTACH.
 		}
 
 		if (!formats.empty()) {
@@ -2728,8 +2501,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			auto sys_txn = CatalogTransaction::GetSystemTransaction(*context.db);
 			const std::string alias_lower = StringUtil::Lower(name);
 
-			// Collect setting names registered by this catalog so COPY binds can
-			// forward catalog-scoped settings to the worker handler.
+			// COPY binds forward these catalog-scoped settings to the worker.
 			std::vector<std::string> setting_names;
 			setting_names.reserve(attach_result_ptr->settings.size());
 			for (const auto &setting : attach_result_ptr->settings) {
@@ -2737,20 +2509,17 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			}
 
 			for (auto &fmt : formats) {
-				// Scoped, collision-free registered name (lowercased to match the
-				// binder's case-insensitive format lookup).
+				// Lowercased to match the binder's case-insensitive lookup.
 				const std::string registered_name = alias_lower + "." + StringUtil::Lower(fmt.format_name);
 
-				// Registry-first under the registry lock. With alias scoping a hit
-				// means a re-ATTACH of the same alias (the prior system-catalog
-				// entry persists past DETACH) — idempotent, skip re-registering.
+				// A registry hit is a re-ATTACH of the same alias (the system-catalog
+				// entry outlives DETACH): skip.
 				std::lock_guard<std::mutex> lock(vgi_ext->CopyFormatMutex());
 				if (vgi_ext->FindCopyFormatLocked(registered_name)) {
 					continue;
 				}
 
-				// Defensive: refuse if something already owns the scoped name in
-				// the system catalog (shouldn't happen for alias-scoped names).
+				// Defensive: should not happen for alias-scoped names.
 				CatalogEntryRetriever retriever {context};
 				auto clash = system_catalog.GetEntry(retriever, DEFAULT_SCHEMA,
 				                                     {CatalogType::COPY_FUNCTION_ENTRY, QualifiedName(Identifier(registered_name))},
@@ -2762,18 +2531,15 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					    registered_name, name);
 				}
 
-				// Build the CopyFunction, wiring each direction the worker
-				// advertises. A format may be "from", "to", or "both"; the FROM
-				// and TO sides are independent (copy_from_function.function_info
-				// vs cf.function_info), so one CopyFunction can carry both.
+				// "from", "to" or "both": the two sides use independent info slots
+				// (copy_from_function.function_info vs cf.function_info).
 				const std::string dir = StringUtil::Lower(fmt.direction);
 				const bool wants_from = (dir != "to"); // "from", "both", or unset → reader
 				const bool wants_to = (dir == "to" || dir == "both");
 
 				CopyFunction cf {Identifier(registered_name)};
 				if (wants_from) {
-					// Per-format reader context rides on the copy_from_function's
-					// TableFunctionInfo carrier (self-contained, outlives DETACH).
+					// Self-contained reader context; outlives DETACH.
 					cf.copy_from_bind = vgi::VgiCopyFromBind;
 					cf.copy_from_function = vgi::MakeVgiCopyFromTableFunction();
 					cf.copy_from_function.function_info = make_shared_ptr<vgi::VgiCopyFromFunctionInfo>(
@@ -2781,8 +2547,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					    fmt.options_schema, setting_names);
 				}
 				if (wants_to) {
-					// Per-format writer context rides on cf.function_info, which
-					// copy_to_bind receives directly (no table-function indirection).
+					// copy_to_bind receives cf.function_info directly.
 					cf.function_info = make_shared_ptr<vgi::VgiCopyToFunctionInfo>(
 					    name, attach_params, attach_result_ptr->attach_opaque_data, fmt.format_name, fmt.handler,
 					    fmt.options_schema, setting_names);
@@ -2806,33 +2571,20 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
-	// Publish the functions this catalog asked us to put into DuckDB's global
-	// function namespace (system.main), so they are callable unqualified. See
-	// docs/global_functions.md.
-	//
-	// Registration is best-effort and advisory — it must never fail the ATTACH:
-	//   * FIRST ATTACH WINS. A global name already owned by a different catalog
-	//     (or by any other extension / built-in) is skipped and logged; the
-	//     function stays reachable at its schema-qualified path.
-	//   * Re-ATTACH of the same alias is idempotent — the existing registration
-	//     is reused, and its connection state refreshes because the bind
-	//     re-resolves the live catalog (ResolveVgiGlobalBinding).
-	//   * `global_functions false` opts the catalog out entirely.
+	// Publish global functions into system.main (best-effort; see
+	// RegisterVgiGlobalFunctions and docs/global_functions.md).
 	if (global_functions_enabled && attach_result_ptr && !attach_result_ptr->global_functions.empty()) {
 		RegisterVgiGlobalFunctions(context, name, attach_params, *attach_result_ptr);
 	}
 
-	// Capture the companion manifest before attach_result_ptr is moved into the
-	// catalog below.
+	// attach_result_ptr is moved into the catalog below.
 	std::vector<vgi::VgiAttachCatalogInfo> companion_manifest;
 	if (attach_companions_enabled && attach_result_ptr) {
 		companion_manifest = attach_result_ptr->attach_catalogs;
 	}
 
-	// Telemetry: catalog facts from the attach result, captured before the result
-	// is moved into the catalog below. companion_count reflects what the worker
-	// advertised (independent of the attach_companions opt-out); db_types only —
-	// never companion targets/DSNs.
+	// Telemetry: companion_count is what the worker advertised (ignores the
+	// opt-out); db_types only, never targets/DSNs.
 	tele.catalog_name = catalog_name;
 	tele.has_catalog_version = true;
 	tele.catalog_version = attach_result_ptr->catalog_version;
@@ -2852,17 +2604,12 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto vgi_catalog = make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params),
 	                                          std::move(attach_result_ptr), eager_thresholds);
 
-	// Provision companion catalogs advertised via the catalog_attach
-	// `attach_catalogs` manifest (lakehouse federation). Done eagerly here,
-	// inside the storage attach callback: reentrancy-safe because DuckDB's
-	// databases_lock is NOT held across CreateAttachedDatabase (which invoked
-	// us) — a companion registers before this parent (FinalizeAttach).
-	//
-	// Trust: opt-out (`attach_companions false`) + a scheme allowlist +
-	// AcquireCompanion's never-clobber conflict policy (it will not replace a
-	// catalog the VGI layer did not itself create). The secret provider was
-	// registered above, so a companion's credential lookups resolve through the
-	// Orchard catch-all automatically (see docs/companion_catalogs.md).
+	// Provision the `attach_catalogs` companions here. Reentrant attach is safe:
+	// DuckDB does not hold databases_lock across CreateAttachedDatabase (our
+	// caller), so a companion registers before this parent's FinalizeAttach.
+	// Guards: scheme allowlist + AcquireCompanion's never-clobber policy. The
+	// secret provider registered above serves companion credential lookups.
+	// See docs/companion_catalogs.md.
 	if (attach_companions_enabled && !companion_manifest.empty()) {
 		auto *vgi_ext = VgiStorageExtension::Find(*context.db);
 		if (vgi_ext) {
@@ -2871,16 +2618,12 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			auto &db_manager = DatabaseManager::Get(context);
 			auto &cfg = DBConfig::GetConfig(context);
 			std::vector<std::string> referenced;
-			// Partial-failure safety: a mid-loop throw (scheme reject, required
-			// conflict/failure) must not leak the companions already attached in
-			// this ATTACH — release them (registry refcount + detach) before the
-			// exception unwinds out of VgiCatalogAttach (whose catalog is never
-			// returned, so OnDetach would never run).
+			// A mid-loop throw must release the companions already attached: the
+			// catalog is never returned, so OnDetach would never run.
 			try {
 			for (const auto &c : companion_manifest) {
-				// Scheme allowlist (defense-in-depth): the scheme is the explicit
-				// db_type or the target's prefix. Reject bare local-file paths
-				// and unknown schemes.
+				// Scheme = db_type or the target's prefix; bare paths and unknown
+				// schemes are rejected.
 				std::string scheme = StringUtil::Lower(c.db_type);
 				if (scheme.empty()) {
 					auto colon = c.target.find(':');
@@ -2943,24 +2686,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 						    if (coptions.db_type.empty()) {
 							    DBPathAndType::ExtractExtensionPrefix(cinfo.path, coptions.db_type);
 						    }
-						    // Companions attach at their natural (config/worker-specified)
-						    // access mode — writable federation (postgres, a writable
-						    // DuckLake, a local duckdb/sqlite file) is supported. Note
-						    // the tradeoff: a bare `sqlite`/`duckdb` target that doesn't
-						    // exist is CREATED, so a malicious worker can make the client
-						    // create empty db files at writable paths (low impact — no
-						    // data write on attach, existing non-db files error). Only
-						    // attach workers you trust; the scheme allowlist +
-						    // never-clobber policy remain the primary guards.
+						    // Natural access mode (writable federation is supported).
+						    // Known tradeoff: a missing `sqlite`/`duckdb` target is
+						    // CREATED, so a malicious worker can create empty db files
+						    // at writable paths.
 						    if (c.hidden) {
 							    coptions.visibility = AttachVisibility::HIDDEN;
 						    }
 						    for (const auto &kv : c.options) {
 							    coptions.options[kv.first] = Value(kv.second);
 						    }
-						    // Orchard: pre-resolve secret_ref into ATTACH options for
-						    // metadata connections that need creds at attach time.
-						    // Fail-closed — only when the user opted in (see the flag).
 						    vgi::InjectCompanionSecret(context, c.secret_ref, attach_companion_secrets, coptions);
 						    db_manager.AttachDatabase(context, cinfo, coptions);
 					    },
@@ -2987,8 +2722,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
-	// Success path only — fire the attach telemetry event (async, fire-and-forget,
-	// honors QUERY_FARM_TELEMETRY_OPT_OUT; never throws).
+	// Success path only. Async, honours QUERY_FARM_TELEMETRY_OPT_OUT, never throws.
 	tele.extension_version = VGI_EXTENSION_VERSION;
 	if (auth) {
 		tele.auth_interactive = auth->WasInteractive();
@@ -3004,7 +2738,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	return vgi_catalog;
 }
 
-// Create transaction manager for VGI catalog
 static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
                                                                   AttachedDatabase &db, Catalog &catalog) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
@@ -3032,11 +2765,13 @@ struct OAuthLogoutState : public GlobalTableFunctionState {
 static unique_ptr<FunctionData> OAuthLogoutBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<OAuthLogoutBindData>();
-	if (input.inputs.size() > 1) {
-		throw BinderException("vgi_oauth_logout expects 0 or 1 arguments (catalog name), got %d", input.inputs.size());
-	}
-	if (!input.inputs.empty()) {
-		bind_data->target_catalog = input.inputs[0].GetValue<string>();
+	auto it = input.named_parameters.find("catalog");
+	if (it != input.named_parameters.end()) {
+		// A NULL from a variable must not silently widen to "log out everything".
+		if (it->second.IsNull()) {
+			throw BinderException("vgi_oauth_logout: catalog must not be NULL; omit it to log out every catalog");
+		}
+		bind_data->target_catalog = it->second.ToString();
 	} else {
 		bind_data->logout_all = true;
 	}
@@ -3051,6 +2786,7 @@ static unique_ptr<GlobalTableFunctionState> OAuthLogoutInit(ClientContext &conte
 	auto state = make_uniq<OAuthLogoutState>();
 	auto &bind_data = input.bind_data->Cast<OAuthLogoutBindData>();
 
+	bool matched = false;
 	auto databases = DatabaseManager::Get(context).GetDatabases(context);
 	for (auto &db : databases) {
 		auto &catalog = db->GetCatalog();
@@ -3061,6 +2797,7 @@ static unique_ptr<GlobalTableFunctionState> OAuthLogoutInit(ClientContext &conte
 		if (!bind_data.logout_all && catalog_name != bind_data.target_catalog) {
 			continue;
 		}
+		matched = true;
 
 		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 		const auto &params = vgi_catalog.attach_parameters();
@@ -3068,6 +2805,9 @@ static unique_ptr<GlobalTableFunctionState> OAuthLogoutInit(ClientContext &conte
 			params->auth()->ClearTokens();
 			state->rows.push_back({catalog_name, "logged_out"});
 		}
+	}
+	if (!bind_data.logout_all && !matched) {
+		throw InvalidInputException("vgi_oauth_logout: no attached VGI catalog named '%s'", bind_data.target_catalog);
 	}
 
 	return std::move(state);
@@ -3198,12 +2938,9 @@ static void OAuthTokensFunction(ClientContext &context, TableFunctionInput &inpu
 }
 
 //===--------------------------------------------------------------------===//
-// vgi_oauth_identity() table function
+// vgi_oauth_identity(): one row per attached VGI catalog with the OIDC identity
+// from its id_token; authenticated=false and NULL fields without OAuth state.
 //===--------------------------------------------------------------------===//
-//
-// Emits one row per attached VGI catalog showing the OIDC identity parsed
-// from the OAuth id_token (if any). Catalogs without OAuth state appear
-// with authenticated=false and NULL identity fields.
 
 struct OAuthIdentityState : public GlobalTableFunctionState {
 	struct IdentityRow {
@@ -3237,8 +2974,7 @@ static unique_ptr<FunctionData> OAuthIdentityBind(ClientContext &context, TableF
 	names.push_back("name");
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("issuer");
-	// Raw decoded JWT payload — provider-specific claims (Entra preferred_username/oid/tid,
-	// group/role arrays, custom attributes) reachable via JSON path expressions.
+	// Raw decoded JWT payload, for provider-specific claims via JSON paths.
 	return_types.push_back(LogicalType::JSON());
 	names.push_back("claims");
 	return nullptr;
@@ -3263,7 +2999,6 @@ static unique_ptr<GlobalTableFunctionState> OAuthIdentityInit(ClientContext &con
 		row.catalog_name = catalog.GetName().GetIdentifierName();
 		row.origin = vgi::ExtractOrigin(params->worker_path());
 
-		// Get identity from per-catalog auth state
 		auto &auth = params->auth();
 		if (auth) {
 			vgi::OAuthTokenSet token_copy;
@@ -3298,8 +3033,7 @@ static void OAuthIdentityFunction(ClientContext &context, TableFunctionInput &in
 		output.SetValue(4, count, row.has_identity && !row.email.empty() ? Value(row.email) : Value());
 		output.SetValue(5, count, row.has_identity && !row.name.empty() ? Value(row.name) : Value());
 		output.SetValue(6, count, row.has_identity && !row.issuer.empty() ? Value(row.issuer) : Value());
-		// The claims column is typed JSON — DuckDB stores JSON as VARCHAR with an alias,
-		// so a plain Value(string) lands correctly and returns as JSON on read.
+		// JSON is a VARCHAR alias, so a plain string Value is correct.
 		output.SetValue(7, count,
 		                row.has_identity && !row.claims_json.empty() ? Value(row.claims_json) : Value());
 		state.offset++;
@@ -3308,9 +3042,9 @@ static void OAuthIdentityFunction(ClientContext &context, TableFunctionInput &in
 	output.SetCardinality(count);
 }
 
-// ── Orchard remote secret provider diagnostics ──────────────────────────────
-// These live here (not a separate .cpp) because the per-DB provider registry is
-// a member of the file-local VgiStorageExtension.
+// ---- Orchard remote secret provider diagnostics ----
+// Here, not in their own .cpp, because they read the file-local
+// VgiStorageExtension.
 
 struct VgiSecretProvidersData : public TableFunctionData {
 	bool finished = false;
@@ -3351,9 +3085,8 @@ static void VgiSecretProvidersScan(ClientContext &context, TableFunctionInput &d
 	output.SetCardinality(row);
 }
 
-// vgi_companion_catalogs(): one row per companion catalog attached by the VGI layer
-// (lakehouse federation). Surfaces hidden companions that are invisible to
-// duckdb_databases().
+// vgi_companion_catalogs(): one row per companion catalog, including hidden
+// ones duckdb_databases() does not show.
 struct VgiCompanionsData : public TableFunctionData {
 	bool finished = false;
 };
@@ -3429,11 +3162,8 @@ static void VgiSecretFlushScan(ClientContext &context, TableFunctionInput &data_
 	output.SetCardinality(1);
 }
 
-// ============================================================================
-// vgi_copy_formats() — diagnostic: one row per (catalog, format, direction,
-// option) for every VGI-registered COPY ... FROM format. Modeled on
-// vgi_function_arguments(); reads the per-DB registry on VgiStorageExtension.
-// ============================================================================
+// vgi_copy_formats(): one row per (catalog, format, direction, option) of every
+// VGI-registered COPY format.
 
 struct VgiCopyFormatRow {
 	string catalog_name;
@@ -3559,13 +3289,8 @@ static void VgiCopyFormatsScan(ClientContext &context, TableFunctionInput &data_
 	output.SetCardinality(count);
 }
 
-// ============================================================================
-// vgi_global_functions() — diagnostic: one row per function an attached VGI
-// catalog published into DuckDB's global function namespace (system.main).
-// `live` reports whether the owning catalog is still attached — a registration
-// persists past DETACH (DuckDB cannot unregister a function), and calling a
-// dead one throws telling the user to re-ATTACH.
-// ============================================================================
+// vgi_global_functions(): one row per function published into system.main.
+// `live` = the owning catalog is still attached (registrations outlive DETACH).
 
 struct VgiGlobalFunctionRow {
 	string global_name;
@@ -3630,22 +3355,13 @@ static void VgiGlobalFunctionsScan(ClientContext &context, TableFunctionInput &d
 static void LoadInternal(ExtensionLoader &loader) {
 	vgi::CheckArrowRuntime();
 #if defined(__EMSCRIPTEN__) && VGI_ASYNC_INIT_ENABLED
-	// Pre-spawn a bounded pool of background workers at extension load. Required
-	// under MAIN_MODULE=1 + pthreads: pthread_create after side-modules are
-	// dlopen'd is unreliable (emsdk #19425/#19199/#13303), so we spawn once at
-	// load time and keep the workers parked in cv_.wait() until tasks arrive.
-	// Pool size must fit within PTHREAD_POOL_SIZE alongside DuckDB's worker
-	// threads — see duckdb-wasm/lib/CMakeLists.txt.
-	//
-	// Only spawned when VGI_ASYNC_INIT_ENABLED == 1 (off by default on WASM).
-	// With async init disabled, the pool would sit idle forever — skip it.
+	// Spawn the async-init pool at load: pthread_create after side-module
+	// dlopen is unreliable (see VGI_ASYNC_INIT_ENABLED). Its size must fit in
+	// PTHREAD_POOL_SIZE alongside DuckDB's threads (duckdb-wasm/lib/CMakeLists.txt).
 	duckdb::vgi::VgiWasmAsyncPool::Instance().EnsureStarted(3);
 #endif
 #if VGI_POSIX_TRANSPORT
-	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()
-	// This prevents the process from being killed when a worker dies unexpectedly.
-	// Windows has no SIGPIPE; the (future) Win32 subprocess backend maps
-	// ERROR_BROKEN_PIPE to the same EPIPE-equivalent status instead.
+	// A dead worker must surface as EPIPE from write(), not kill the process.
 	struct sigaction sa;
 	sa.sa_handler = SIG_IGN;
 	sigemptyset(&sa.sa_mask);
@@ -3655,28 +3371,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 	}
 #endif // VGI_POSIX_TRANSPORT
 
-	// Register profiling atexit handler if VGI_PROFILE is enabled
 	vgi::VgiProfileRegisterAtExit();
 
-	// Register VGI log type
 	auto &log_manager = loader.GetDatabaseInstance().GetLogManager();
 	log_manager.RegisterLogType(make_uniq<VgiLogType>());
 
 	QueryFarmSendTelemetry(loader, "vgi", VGI_EXTENSION_VERSION);
 
-	// Register VGI storage extension
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	auto vgi_storage = make_shared_ptr<VgiStorageExtension>(loader.GetDatabaseInstance());
 	StorageExtension::Register(config, "vgi", vgi_storage);
 	ExtensionCallback::Register(config, make_shared_ptr<VgiConnectionLifecycle>(vgi_storage));
 #ifdef __EMSCRIPTEN__
-	// Start the cancel dispatcher's thread now, on the main runtime thread
-	// (haybarn-wasm runs LOAD single-threaded). Creating it lazily, from the
-	// destructor of an interrupted scan running on a pthread, deadlocked the
-	// engine; see VgiCancelDispatcher::EnsureWorkerStarted. It waits for
-	// requests, waking every 100ms, and takes one slot of the PTHREAD_POOL_SIZE
-	// pool. If it can't be created, LOAD still succeeds: cancels are dropped
-	// and server-side streams expire by TTL.
+	// Start the cancel dispatcher thread now, on the main runtime thread: lazy
+	// creation from an interrupted scan's destructor on a pthread deadlocks
+	// (see VgiCancelDispatcher::EnsureWorkerStarted). It uses one
+	// PTHREAD_POOL_SIZE slot. On failure LOAD still succeeds; cancels are
+	// dropped and server-side streams expire by TTL.
 	try {
 		vgi_storage->GetCancelDispatcher().StartWorker();
 	} catch (const std::exception &e) {
@@ -3687,8 +3398,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// that owns its state, and before anything can ATTACH.
 	vgi::RegisterLocationPolicySetting(config, vgi_storage->GetLocationPolicy());
 
-	// Register the transport-owned Iroh identity secret independently of any
-	// worker-advertised secret types so it is available immediately after LOAD.
+	// The extension-owned Iroh identity secret type, available right after LOAD.
 	SecretType iroh_secret_type;
 	iroh_secret_type.name = "iroh";
 	iroh_secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
@@ -3702,17 +3412,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	iroh_secret_function.named_parameters["secret_key"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(std::move(iroh_secret_function));
 
-	// -------------------------------------------------------------------------
-	// Register native GeoArrow Arrow extension types
-	// -------------------------------------------------------------------------
-	// Enable round-tripping GEOMETRY through Arrow IPC as native struct/list
-	// layouts instead of opaque WKB blobs.  Each entry maps a GeoArrow
-	// extension name to a DuckDB struct type and a GeometryStorageType used
-	// by the spatial extension's Geometry::ToVectorizedFormat /
-	// FromVectorizedFormat for conversion.
-	//
-	// ArrowToDuck (worker → client): struct vector → GEOMETRY via cast
-	// DuckToArrow (client → worker): GEOMETRY → struct vector via ToVectorizedFormat
+	// Native GeoArrow extension types: GEOMETRY crosses Arrow IPC as struct/list
+	// layouts instead of WKB. Worker → client casts the struct to GEOMETRY;
+	// client → worker uses Geometry::ToVectorizedFormat with each entry's
+	// GeometryStorageType.
 	{
 		auto xy = LogicalType::STRUCT({{"x", LogicalType::DOUBLE}, {"y", LogicalType::DOUBLE}});
 
@@ -3726,8 +3429,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 			}
 		};
 
-		// DuckToArrow closures per geometry storage type
-		// Each lambda captures the storage type for ToVectorizedFormat
 #define VGI_GEOARROW_DUCK_TO_ARROW(STORAGE_TYPE)                                                                       \
 	[](ClientContext &, const Vector &source, Vector &result, idx_t count) {                                                 \
 		Geometry::ToVectorizedFormat(source, result, count, STORAGE_TYPE);                                              \
@@ -3763,7 +3464,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 				     make_shared_ptr<ArrowTypeExtensionData>(LogicalType::GEOMETRY(), entry.arrow_type,
 				                                             NativeGeoArrow::ArrowToDuck, entry.duck_to_arrow)});
 			} catch (...) {
-				// Extension may already be registered (e.g., by spatial extension in a future version)
+				// Already registered (e.g. by another extension).
 			}
 		}
 	}
@@ -3778,24 +3479,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	OptimizerExtension::Register(config, VgiRequiredFiltersOptimizer());
 	vgi::RegisterVgiSpatialExtentOptimizer(config);
 
-	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
 	RegisterVgiProtocolsFunction(loader);
 	RegisterVgiEngineFeaturesFunction(loader);
 	vgi::RegisterVgiQueryFunction(loader);
 	vgi::RegisterVgiExportSessionFunction(loader);
 
-	// Register the synthetic catalog-scan function under its name. VgiTableEntry
-	// builds an unnamed-in-catalog "vgi_table_scan" TableFunction per scan, but
-	// DuckDB's LogicalOperator::Copy() round-trips a LogicalGet through
-	// serialize/deserialize (e.g. the WindowSelfJoin optimizer duplicating a
-	// `COUNT(*) OVER (PARTITION BY ...)` scan), and FunctionSerializer resolves
-	// the function *by name* from the catalog on the way back. Without a
-	// registered entry that lookup throws "Table Function with name
-	// vgi_table_scan does not exist!". This entry exists solely to carry the
-	// deserialize callback; it has no bind, so a direct call still fails at bind
-	// time. VgiTableScanDeserialize reassigns `function` to a fully-configured
-	// scan, so the flags/callbacks set here are only placeholders.
+	// Catalog entry for the synthetic "vgi_table_scan": LogicalOperator::Copy()
+	// (e.g. WindowSelfJoin) round-trips a LogicalGet through serialization, and
+	// FunctionSerializer resolves the function by name. The entry only carries
+	// the deserialize callback (no bind, so direct calls fail);
+	// VgiTableScanDeserialize swaps in a fully configured scan.
 	{
 		TableFunction scan_func("vgi_table_scan", {}, vgi::VgiTableFunctionScan, nullptr,
 		                        vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
@@ -3814,21 +3508,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(std::move(scan_info));
 	}
 
-	// Register the native-delegation marker function under its name. Same
-	// motivation as vgi_table_scan above: built-in optimizer passes that run
-	// BEFORE VgiRequiredFiltersOptimizer (e.g. WindowSelfJoin,
-	// CommonSubplanOptimizer) may call LogicalOperator::Copy() on a LogicalGet
-	// while it still wraps the marker. FunctionSerializer::DeserializeBase
-	// resolves table functions by name from the system catalog on the way
-	// back, so without a registered entry that lookup throws "Table Function
-	// with name vgi_native_delegation_marker does not exist!" — opaque error.
-	//
-	// We give the registered entry a `deserialize` that throws a CLEAR
-	// SerializationException. Today's built-in callers (WindowSelfJoin,
-	// CommonSubplanOptimizer) wrap their Copy() in try/catch and bail
-	// gracefully (perf regression, not wrong result). Any future caller that
-	// doesn't try/catch gets a message pointing directly at the real bug:
-	// VgiRequiredFiltersOptimizer didn't fire when it should have.
+	// Same for the native-delegation marker: passes before
+	// VgiRequiredFiltersOptimizer (WindowSelfJoin, CommonSubplanOptimizer) may
+	// Copy() a LogicalGet still wrapping it. Its deserialize throws a clear
+	// error; those callers catch it and skip their rewrite.
 	{
 		TableFunction marker_func = MakeNativeDelegationMarkerFunction();
 		marker_func.deserialize = [](Deserializer &, BoundTableFunction &) -> unique_ptr<FunctionData> {
@@ -3844,7 +3527,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(marker_func);
 	}
 
-	// Register worker pool diagnostic functions
 	vgi::RegisterVgiWorkerPoolFunction(loader);
 	vgi::RegisterVgiWorkerPoolStatsFunction(loader);
 	vgi::RegisterVgiWorkerPoolFlushFunction(loader);
@@ -3855,20 +3537,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	vgi::RegisterVgiWorkerPackageMacro(loader);
 	vgi::RegisterVgiWorkerCacheFunctions(loader);
 
-	// Register table statistics diagnostic function
 	vgi::RegisterVgiTableStatisticsFunction(loader);
 
-	// Register cache management function
 	vgi::RegisterVgiClearCacheFunction(loader);
 	vgi::RegisterVgiCatalogContentsFunction(loader);
 
-	// Register result-cache diagnostics
 	vgi::RegisterVgiResultCacheFunction(loader);
 	vgi::RegisterVgiResultCacheFlushFunction(loader);
 	vgi::RegisterVgiResultCacheReapFunction(loader);
 	vgi::RegisterVgiResultCacheStatsFunction(loader);
 
-	// Register Orchard remote secret provider diagnostics
+	// Registry diagnostics: COPY formats, global functions, secret providers,
+	// companions.
 	{
 		TableFunction copy_formats_func("vgi_copy_formats", {}, VgiCopyFormatsScan, VgiCopyFormatsBind);
 		CreateTableFunctionInfo copy_formats_info(copy_formats_func);
@@ -3922,27 +3602,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(std::move(flush_info));
 	}
 
-	// Register multi-branch diagnostic function — one row per branch per
-	// VGI table, across every attached VGI catalog. See vgi_table_branches_function.cpp.
 	vgi::RegisterVgiTableBranchesFunction(loader);
 
-	// Register per-argument diagnostic function — one row per (catalog, schema,
-	// function, argument) with named/positional/const/varargs/type + vgi_doc.
 	vgi::RegisterVgiFunctionArgumentsFunction(loader);
 	vgi::RegisterVgiSecretTypesFunction(loader);
 
-	// Register OAuth diagnostic/management functions
 	{
-		// vgi_oauth_logout([origin])
+		// Per catalog, not per origin: each attached catalog owns its CatalogAuth.
 		TableFunction logout_func("vgi_oauth_logout", {}, OAuthLogoutFunction, OAuthLogoutBind, OAuthLogoutInit);
-		logout_func.GetSignature().AddArgs("origins", LogicalType::VARCHAR);
+		vgi::AddVgiFunctionOption(logout_func, "catalog", LogicalType::VARCHAR);
 		CreateTableFunctionInfo logout_info(logout_func);
 		logout_info.descriptions.push_back(vgi::MakeFunctionDescription(
-		    "Forget cached OAuth tokens. With no arguments, clears every stored token; pass one or more OAuth "
-		    "origins to clear only those. Returns one row per cleared origin.",
-		    {"origin"}, {LogicalType::VARCHAR},
+		    "Forget the OAuth tokens of attached VGI catalogs, including any refresh token saved in the "
+		    "persistent credential store. With no arguments, logs out every attached VGI catalog; pass "
+		    "catalog := 'alias' to log out only that one (an unknown alias is an error). Returns one row "
+		    "(catalog_name, status) per catalog logged out.",
+		    {"catalog"}, {LogicalType::VARCHAR},
 		    {"SELECT * FROM vgi_oauth_logout();",
-		     "SELECT * FROM vgi_oauth_logout('https://auth.example.com');"}));
+		     "SELECT * FROM vgi_oauth_logout(catalog := 'mycatalog');"}));
 		loader.RegisterFunction(std::move(logout_info));
 
 		// vgi_oauth_tokens()
@@ -3955,7 +3632,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    {}, {}, {"SELECT * FROM vgi_oauth_tokens();"}));
 		loader.RegisterFunction(std::move(tokens_info));
 
-		// vgi_oauth_identity() — surfaces OIDC identity claims per attached VGI catalog
 		TableFunction identity_func("vgi_oauth_identity", {}, OAuthIdentityFunction, OAuthIdentityBind,
 		                            OAuthIdentityInit);
 		CreateTableFunctionInfo identity_info(identity_func);

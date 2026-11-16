@@ -37,53 +37,11 @@ namespace duckdb {
 namespace vgi {
 
 // Largest byte count handed to a single read()/write()/ReadFile()/_write().
-//
-// A batch whose serialized body exceeds 2 GiB used to fail on macOS with
-// "Read error: Invalid argument": Darwin's read(2)/write(2) reject a count
-// above INT_MAX with EINVAL rather than transferring a prefix. Linux instead
-// caps silently at 0x7ffff000 and returns a short count, which is why the
-// ceiling only ever showed up on macOS. Windows' _write takes an unsigned
-// int, so a count at or above 4 GiB truncates -- at exactly 4 GiB it
-// truncates to zero and the loop spins forever.
-//
-// Every one of these loops already handles a short transfer, so clamping is
-// purely a portability guard: it changes how many syscalls a large payload
-// costs, never how many bytes move. 1 GiB is far below every platform limit
-// and keeps the extra syscalls negligible (one per GiB).
+// Darwin's read(2)/write(2) reject a count above INT_MAX with EINVAL, and
+// Windows' _write takes an unsigned int (a 4 GiB count truncates to zero and the
+// loop never advances). The loops already handle short transfers, so the clamp
+// changes only the syscall count, never the bytes moved.
 static constexpr int64_t kMaxIoChunkBytes = 1LL << 30; // 1 GiB
-
-// ============================================================================
-// Protocol State Metadata
-// ============================================================================
-
-VgiMetadataPtr CreateProtocolStateMetadata(const char *state) {
-	return VgiMetadata::Make({{PROTOCOL_STATE_KEY, state}});
-}
-
-std::string GetProtocolState(const VgiMetadataPtr &metadata) {
-	if (!metadata) {
-		return "";
-	}
-	auto result = metadata->Get(PROTOCOL_STATE_KEY);
-	return result ? *result : std::string();
-}
-
-void ValidateProtocolState(const VgiMetadataPtr &metadata, const char *expected_state, const std::string &context,
-                           const std::string &worker_path, pid_t worker_pid) {
-	auto actual_state = GetProtocolState(metadata);
-	if (actual_state.empty()) {
-		ThrowVgiIOException("Protocol state missing in %s response (expected '%s')", worker_path, worker_pid, "",
-		                    context, expected_state);
-	}
-	if (actual_state != expected_state) {
-		ThrowVgiIOException("Protocol state mismatch in %s: expected '%s', got '%s'", worker_path, worker_pid, "",
-		                    context, expected_state, actual_state);
-	}
-}
-
-// ============================================================================
-// Serialization Functions
-// ============================================================================
 
 std::string ResolveDiskCompressionCodec(const std::string &requested) {
 	std::string c;
@@ -133,14 +91,10 @@ VgiBufferPtr SerializeRecordBatch(const VgiBatch &batch, const VgiMetadata *cust
 	return SerializeBatch(batch, custom_metadata ? custom_metadata : &none, options);
 }
 
-// Fd-based stream I/O is the subprocess/AF_UNIX data path
-// (raw read/write on a pipe or socket fd). Compiled on POSIX and Windows; the
-// per-syscall split is `#if VGI_POSIX_TRANSPORT … #else (Windows _read/_write)`.
-// HTTP and catalog paths use the buffer-based serialization helpers above, which
-// stay compiled everywhere. See vgi_platform.hpp.
+// Fd-based stream I/O: the subprocess/AF_UNIX data path. Compiled wherever
+// VGI_SUBPROCESS_TRANSPORT is set (POSIX and Windows); see vgi_platform.hpp.
 #if VGI_SUBPROCESS_TRANSPORT
 
-// FdInputStream implementation
 FdInputStream::FdInputStream(int fd, ClientContext *context, bool require_complete_reads)
     : fd_(fd), position_(0), is_open_(true), context_(context), require_complete_reads_(require_complete_reads)
 #if defined(_WIN32)
@@ -172,8 +126,7 @@ int64_t FdInputStream::Read(int64_t nbytes, void *out) {
 		throw IOException("Stream is closed");
 	}
 
-	// Loop until we have all requested bytes or hit EOF.
-	// Pipes may return partial reads, so we must loop.
+	// Pipes may return partial reads: loop until nbytes or EOF.
 	uint8_t *buffer = static_cast<uint8_t *>(out);
 	int64_t total_bytes_read = 0;
 
@@ -183,11 +136,10 @@ int64_t FdInputStream::Read(int64_t nbytes, void *out) {
 #if VGI_POSIX_TRANSPORT
 		ssize_t bytes_read = read(fd_, buffer + total_bytes_read, static_cast<size_t>(chunk));
 #else
-		// Windows: overlapped ReadFile so the engine thread blocks at 0% CPU and
-		// wakes the instant bytes arrive (poll()-equivalent), instead of
+		// Windows: overlapped ReadFile so the engine thread blocks instead of
 		// busy-spinning and stealing a core from the worker. A non-overlapped
-		// handle (e.g. a socket) completes synchronously and we use that result.
-		// Cancellation: re-check context->IsInterrupted() every 250ms.
+		// handle (e.g. a socket) completes synchronously. Cancellation is
+		// re-checked (RpcInterrupted) every 250ms.
 		int bytes_read;
 		{
 			DWORD want = static_cast<DWORD>(chunk);
@@ -203,12 +155,9 @@ int64_t FdInputStream::Read(int64_t nbytes, void *out) {
 			} else {
 				DWORD e = ::GetLastError();
 				if (e == ERROR_IO_PENDING) {
-					// Cheap spin (no syscall — polls the OVERLAPPED completion flag)
-					// to catch the common case where the next batch is already
-					// in-flight and completes within nanoseconds, keeping the inline
-					// RPC hot path fast. If it doesn't land quickly, fall through to a
-					// blocking wait at 0% CPU so a slow worker (e.g. the shm-write
-					// path) gets the core instead of our busy-spinning.
+					// Brief syscall-free spin on the OVERLAPPED flag for the common
+					// already-in-flight case, then a blocking wait so a slow worker
+					// gets the core.
 					bool completed = false;
 					for (int spin = 0; spin < 8192; ++spin) {
 						if (HasOverlappedIoCompleted(&ov)) {
@@ -262,10 +211,8 @@ int64_t FdInputStream::Read(int64_t nbytes, void *out) {
 			throw IOException(std::string("Read error: ") + strerror(errno));
 		}
 		if (bytes_read == 0) {
-			// EOF reached partway through. Return the bytes we did read —
-			// returning 0 here would discard them and surface as "stream
-			// ended" to Arrow's IPC reader, after which any subsequent
-			// reads start mid-frame and produce corrupt batches.
+			// EOF partway through: return the bytes read. Returning 0 would
+			// discard them and later reads would start mid-frame.
 			break;
 		}
 		total_bytes_read += bytes_read;
@@ -279,7 +226,6 @@ int64_t FdInputStream::Read(int64_t nbytes, void *out) {
 	return total_bytes_read;
 }
 
-// FdOutputStream implementation
 FdOutputStream::FdOutputStream(int fd) : fd_(fd), position_(0), is_open_(true) {
 }
 
@@ -300,20 +246,15 @@ void FdOutputStream::Write(const void *data, int64_t nbytes) {
 	int64_t total_written = 0;
 
 #if VGI_POSIX_TRANSPORT
-	// Bound: an unresponsive worker that fills its kernel pipe buffer
-	// would otherwise block write() forever. 60s is well above any
-	// realistic RPC payload write time on a healthy worker. Mirrors the
-	// fd-readiness wait (WaitForReadableUntilCancel) on the read side.
+	// An unresponsive worker that fills its pipe buffer would otherwise block
+	// write() forever; 60s is well above any healthy write time.
 	constexpr int kWriteTimeoutSeconds = 60;
 	const auto deadline =
 	    std::chrono::steady_clock::now() + std::chrono::seconds(kWriteTimeoutSeconds);
 
 	while (total_written < nbytes) {
-		// Wait for the fd to become writable before each write call so
-		// we never block indefinitely on a kernel-pipe-buffer-full
-		// scenario where the worker is hung. If the deadline has passed
-		// before select() returns writable, surface a clean IOError
-		// instead of hanging the calling query forever.
+		// Wait for writability before each write so a hung worker yields a
+		// clean IOException at the deadline.
 		fd_set write_fds;
 		FD_ZERO(&write_fds);
 		FD_SET(fd_, &write_fds);
@@ -360,9 +301,7 @@ void FdOutputStream::Write(const void *data, int64_t nbytes) {
       // blocking _write loop suffices for the lockstep RPC. (A hung-worker write
       // timeout would need overlapped I/O — deferred; the read side is bounded.)
 	while (total_written < nbytes) {
-		// Clamped per-syscall count; see kMaxIoChunkBytes. Without this a
-		// count at or above 4 GiB truncates to zero in the unsigned int
-		// conversion and this loop never advances.
+		// Clamped per-syscall count; see kMaxIoChunkBytes.
 		const int64_t chunk = std::min<int64_t>(nbytes - total_written, kMaxIoChunkBytes);
 		int written = _write(fd_, bytes + total_written, static_cast<unsigned int>(chunk));
 		if (written < 0) {
@@ -383,9 +322,6 @@ void FdOutputStream::Write(const void *data, int64_t nbytes) {
 
 #endif // VGI_SUBPROCESS_TRANSPORT
 
-// Extract string values from a result batch column.
-// Returns empty vector if batch is null (protocol error) or has no rows (empty result).
-// Callers should distinguish these cases if needed by checking the batch before calling.
 std::vector<std::string> ExtractStringColumn(const VgiBatchPtr &batch, const std::string &column_name) {
 	std::vector<std::string> values;
 	if (!batch || batch->num_rows() == 0) {

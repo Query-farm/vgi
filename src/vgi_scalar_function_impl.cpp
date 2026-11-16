@@ -31,25 +31,19 @@ namespace duckdb {
 
 using vgi::ExtractVgiSettings;
 
-// ============================================================================
-// Local State Constructor/Destructor
-// ============================================================================
-
 VgiScalarFunctionLocalState::VgiScalarFunctionLocalState() = default;
 
 VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
-	// Clean up connection - try to return to pool if possible
+	// End the stream and return the worker to the pool when possible.
 	if (connection && initialized) {
 		VGI_STDERR_DEBUG("[VGI] scalar.destructor is_finished=%s pid=%d\n",
 		                 connection->IsFinished() ? "true" : "false", connection->GetSubprocessPid().value_or(-1));
 
 		if (!connection->IsFinished()) {
 			try {
-				// Close input stream to signal worker we're done
 				connection->CloseInputWriter();
 				VGI_STDERR_DEBUG("[VGI] scalar.destructor closed_input_writer pid=%d\n", connection->GetSubprocessPid().value_or(-1));
-				// Read the output EOS to complete the IPC stream protocol
-				// Worker sends EOS immediately after seeing input close
+				// The worker answers input EOS with output EOS.
 				auto batch = connection->ReadDataBatch();
 				VGI_STDERR_DEBUG("[VGI] scalar.destructor read_eos batch=%s is_finished=%s pid=%d\n",
 				                 batch ? "non-null" : "null", connection->IsFinished() ? "true" : "false",
@@ -77,14 +71,9 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 			}
 		}
 	}
-	// Otherwise connection destructor handles cleanup
 }
 
 namespace vgi {
-
-// ============================================================================
-// Initialize Local State
-// ============================================================================
 
 unique_ptr<FunctionLocalState> VgiScalarFunctionInitLocalState(ExpressionState &state,
                                                                 const BoundFunctionExpression &expr,
@@ -92,24 +81,32 @@ unique_ptr<FunctionLocalState> VgiScalarFunctionInitLocalState(ExpressionState &
 	return make_uniq<VgiScalarFunctionLocalState>();
 }
 
-// ============================================================================
-// Scalar Function Bind (for dynamic return types)
-// ============================================================================
+// A call with const params has them erased from its arguments, so a
+// deserialized plan looks the overload up by the erased types and fails
+// ("Failed to find function"). Refusing with NotImplemented makes plan copies
+// (CTE inlining, partitioned execution, verify_serializer) fall back instead.
+static void VgiScalarFunctionSerialize(Serializer &, const optional_ptr<FunctionData>,
+                                       const BoundScalarFunction &function) {
+	throw NotImplementedException("VGI scalar function '%s' with constant parameters cannot be serialized",
+	                              function.GetName().GetIdentifierName());
+}
+
+static unique_ptr<FunctionData> VgiScalarFunctionDeserialize(Deserializer &, BoundScalarFunction &function) {
+	throw NotImplementedException("VGI scalar function '%s' with constant parameters cannot be deserialized",
+	                              function.GetName().GetIdentifierName());
+}
 
 unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 	auto &context = input.GetClientContext();
 	auto &bound_function = input.GetBoundFunction();
 	auto &arguments = input.GetArguments();
-	// Get the function info attached to the function
 	if (!bound_function.HasExtraFunctionInfo()) {
 		throw InternalException("VgiScalarFunctionBind: missing VgiScalarFunctionInfo");
 	}
 	auto &registered_info = bound_function.GetExtraFunctionInfo().Cast<VgiScalarFunctionInfo>();
 
-	// A function published into system.main outlives DETACH (DuckDB has no way
-	// to unregister one), so its connection state is resolved from the live
-	// catalog here rather than trusted from registration time: a re-ATTACH
-	// refreshes it transparently, and a DETACHed catalog throws a clear error.
+	// A system.main function outlives DETACH, so resolve its connection state
+	// from the live catalog: re-ATTACH refreshes it, a DETACHed catalog throws.
 	shared_ptr<VgiScalarFunctionInfo> live_info;
 	if (registered_info.global) {
 		auto binding = ResolveVgiGlobalBinding(context, registered_info.catalog_name, bound_function.GetName().GetIdentifierName());
@@ -121,9 +118,8 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 	}
 	const auto &func_info = live_info ? *live_info : registered_info;
 
-	// Preserve DuckDB's resolved argument names, including named calls. Metadata
-	// supplies names only when the binder has none (e.g. unnamed varargs).
-	// Capture this before ConstParam expressions are erased below.
+	// DuckDB's resolved argument names first, metadata names otherwise. Must run
+	// before const params are erased.
 	std::vector<std::optional<std::string>> resolved_argument_names;
 	resolved_argument_names.reserve(arguments.size());
 	for (idx_t i = 0; i < arguments.size(); i++) {
@@ -137,31 +133,26 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 		}
 	}
 
-	// Extract settings from context using setting_names registered during catalog load
 	auto settings = ExtractVgiSettings(context, func_info.setting_names);
 
-	// ========================================================================
-	// Phase 1: Extract const values and collect indices to erase
-	// ========================================================================
-	// Note: Bind may be called multiple times (e.g., during deserialization).
-	// If arguments.size() < positional_is_const.size(), const args were already erased.
 	vector<Value> const_values;
 	vector<idx_t> const_indices;
 
-	// Count how many const params we have
 	idx_t num_const_params = 0;
 	for (bool is_const : func_info.positional_is_const) {
 		if (is_const) num_const_params++;
 	}
 	idx_t expected_args_after_erase = func_info.positional_is_const.size() - num_const_params;
 
-	// Only extract/erase if arguments haven't been modified yet.
-	// Re-bind detection: if we have const params and argument count matches post-erase count,
-	// const args were already extracted in a previous bind call (e.g., deserialization).
-	// When num_const_params == 0, there's nothing to erase, so never skip.
-	bool const_args_already_erased = (num_const_params > 0 && arguments.size() == expected_args_after_erase);
-
-	if (!const_args_already_erased) {
+	// Only a re-bind of an already-erased call has this count (scalar params
+	// have no defaults), and it has lost the const values: refuse rather than
+	// execute without them. The serialize callbacks below keep plan copies
+	// from re-binding.
+	if (num_const_params > 0 && arguments.size() == expected_args_after_erase) {
+		throw InternalException("VGI scalar function '%s' re-bound after its constant arguments were erased",
+		                        func_info.function_name);
+	}
+	{
 		for (idx_t i = 0; i < arguments.size() && i < func_info.positional_is_const.size(); i++) {
 			if (func_info.positional_is_const[i]) {
 				auto &expr = arguments[i];
@@ -172,16 +163,10 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 					throw BinderException("Parameter '%s' of function '%s' must be a constant value",
 					                      param_name, func_info.function_name);
 				}
-				// Evaluate the foldable expression to get the constant value
 				Value val = ExpressionExecutor::EvaluateScalar(context, *expr);
-				// DuckDB's binder may not insert an implicit cast on the
-				// foldable arg expression (e.g. hash_seed('5') still has a
-				// VARCHAR literal node even though the signature is
-				// hash_seed(BIGINT)). Without an explicit cast here we ship
-				// the raw VARCHAR value and the worker crashes with a
-				// type-mismatch deep inside compute(). Cast to the function's
-				// declared positional type when concrete; ANY/INVALID stays
-				// polymorphic and we let the worker resolve it.
+				// The binder may leave the literal uncast (hash_seed('5') against
+				// BIGINT stays VARCHAR); cast to a concrete declared type so the
+				// worker gets what it declared. ANY/INVALID stays as-is.
 				if (i < bound_function.GetArguments().size()) {
 					const auto &declared = bound_function.GetArguments()[i];
 					if (declared.id() != LogicalTypeId::ANY && declared.id() != LogicalTypeId::INVALID &&
@@ -205,26 +190,20 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 			}
 		}
 
-		// ========================================================================
-		// Phase 2: Erase const arguments in reverse order (to preserve indices)
-		// ========================================================================
+		// Erase in reverse to keep indices valid.
 		for (auto it = const_indices.rbegin(); it != const_indices.rend(); ++it) {
 			auto index = *it;
 			arguments.erase(arguments.begin() + index);
 			bound_function.GetArguments().erase(bound_function.GetArguments().begin() + index);
 		}
+		if (num_const_params > 0) {
+			bound_function.SetSerializeCallback(VgiScalarFunctionSerialize);
+			bound_function.SetDeserializeCallback(VgiScalarFunctionDeserialize);
+		}
 	}
 
-	// ========================================================================
-	// Phase 3: Build input schema from the function's DECLARED arg types
-	// where concrete, falling back to the caller-site expression type where
-	// the function accepts ANY (polymorphic). DuckDB's binder may leave a
-	// narrower caller type in place (e.g. DECIMAL(3,2) literals against a
-	// DOUBLE-declared param) without inserting an explicit Cast because it
-	// treats decimal→float as lossless promotion. The worker still needs to
-	// receive the declared type — otherwise its function metadata and the
-	// wire disagree. We cast the DataChunk back up to these types at execute
-	// time (see VgiScalarFunctionExecute).
+	// Input schema from the declared argument types (the caller's type for ANY);
+	// see VgiScalarFunctionBindData::input_duckdb_types.
 	vector<LogicalType> input_types;
 	vector<string> input_names;
 	for (idx_t i = 0; i < arguments.size(); i++) {
@@ -238,33 +217,19 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 	}
 	auto input_schema = BuildArrowSchemaFromDuckDB(context, input_types, input_names);
 
-	// ========================================================================
-	// Phase 4: Build invocation arguments
-	// ========================================================================
+	// Only const values are invocation arguments; the rest arrive as input columns.
 	vector<Value> positional_args;
-
-	// Pass only the extracted const values — non-const params come from input batch columns
 	for (auto &val : const_values) {
 		positional_args.push_back(val);
 	}
 
 	ArrowArguments arrow_arguments = BuildArgumentsFromValues(context, positional_args, {});
 
-	// ========================================================================
-	// Phase 5: Connect to worker and perform bind to get output schema
-	// ========================================================================
+	// Bind against the worker for the output schema.
 	VgiSchemaPtr output_schema;
 	bool secret_dependent = !func_info.required_secrets.empty();
 
-	// Skip the worker call on re-bind when const values were already extracted
-	bool skip_worker_call = const_args_already_erased;
-
-	if (skip_worker_call) {
-		// Re-bind during deserialization for function with const params
-		// Use existing output schema from function info
-		output_schema = func_info.output_schema;
-	} else {
-		// Initial bind - call worker to get output schema
+	{
 		auto bind_catalog = func_info.catalog;
 		auto transaction_opaque_data = bind_catalog
 		    ? VgiTransaction::Get(context, *bind_catalog).GetTransactionOpaqueData()
@@ -290,20 +255,16 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 			    func_info.required_secrets, func_info.attach_params);
 		}
 
-		// Set input schema and perform bind to get actual output schema
 		connection->SetInputSchema(input_schema);
 		connection->SetSchemaName(func_info.schema_name);
 		connection->SetArgumentNames(resolved_argument_names);
 		auto bind_result = connection->PerformBindRpc();
 		secret_dependent = secret_dependent || bind_result.secret_dependent;
 
-		// Get the output schema from bind result
 		output_schema = bind_result.output_schema;
 
-		// Release the bind worker back to the pool. The worker finished a
-		// unary RPC and is idle in its accept-loop; execute will pool-hit
-		// and pay one cheap bind RPC instead of holding this worker hostage
-		// from other concurrent planner/catalog RPCs.
+		// Return the idle bind worker to the pool rather than hold it until
+		// execute, which re-acquires one and re-binds.
 		if (func_info.use_pool()) {
 			auto bind_worker_pid = connection->GetSubprocessPid().value_or(-1);
 			auto bind_conn_id = connection->GetConnIdHex();
@@ -325,14 +286,12 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 		                  func_info.function_name);
 	}
 
-	// Convert Arrow output type to DuckDB type
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> output_types;
 	vector<string> output_names;
 	ArrowSchemaToDuckDBTypes(context, output_schema, c_schema, arrow_table, output_types, output_names);
 
-	// Set the actual return type on the bound function
 	bound_function.SetReturnType(output_types[0]);
 
 	VGI_LOG(context, "scalar.bind",
@@ -341,9 +300,6 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 	         {"const_values", std::to_string(const_values.size())},
 	         {"return_type", output_types[0].ToString()}});
 
-	// ========================================================================
-	// Phase 6: Create bind data with resolved information
-	// ========================================================================
 	auto bind_data = make_uniq<VgiScalarFunctionBindData>();
 	bind_data->attach_params = func_info.attach_params;
 	bind_data->attach_opaque_data = func_info.attach_opaque_data;
@@ -361,39 +317,24 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(BindScalarFunctionInput &input) {
 	return bind_data;
 }
 
-// ============================================================================
-// Scalar Function Execution
-// ============================================================================
-
 void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	// Get the function info from the expression
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	if (!func_expr.Function().HasExtraFunctionInfo()) {
 		throw InternalException("VgiScalarFunctionExecute: missing VgiScalarFunctionInfo");
 	}
 	auto &func_info = func_expr.Function().GetExtraFunctionInfo().Cast<VgiScalarFunctionInfo>();
 
-	// Get the local state
 	auto &local_state = ExecuteFunctionState::GetFunctionState(state)->Cast<VgiScalarFunctionLocalState>();
 	auto &context = state.GetContext();
 
-	// Get bind data if available (present when function has const params or dynamic return type)
 	VgiScalarFunctionBindData *bind_data = nullptr;
 	if (func_expr.BindInfo()) {
 		bind_data = &func_expr.BindInfo()->Cast<VgiScalarFunctionBindData>();
 	}
 
-	// Initialize connection on first call
 	if (!local_state.initialized) {
-		// Reuse the bind-time input schema when available. Previously we
-		// re-derived the schema from `args.data[i].GetType()` here and then
-		// swapped it back onto the IPC writer mid-stream — that created wire
-		// drift whenever DuckDB's physical planner elided a Cast the binder
-		// had inserted (e.g. DECIMAL(3,2)→DOUBLE on numeric literals), because
-		// args.data can arrive narrower than what the worker was told to
-		// expect at bind. Casting the DataChunk back up before serialization
-		// (see castChunkToBindTypes below) keeps the wire in sync with the
-		// worker's bind contract.
+		// The bind-time input schema, never one derived from args.data (see
+		// VgiScalarFunctionBindData::input_duckdb_types).
 		if (bind_data && bind_data->input_schema) {
 			local_state.input_schema = bind_data->input_schema;
 		} else {
@@ -406,7 +347,6 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			local_state.input_schema = BuildArrowSchemaFromDuckDB(context, input_types, input_names);
 		}
 
-		// Build invocation arguments: pass const values (const params were erased at bind time)
 		vector<Value> positional_args;
 		if (bind_data) {
 			for (auto &val : bind_data->const_values) {
@@ -415,9 +355,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		ArrowArguments arguments = BuildArgumentsFromValues(context, positional_args, {});
 
-		// Acquire connection from the pool (or spawn fresh) and do a fresh
-		// bind. The bind worker was released to the pool at bind time, so
-		// this typically pool-hits and pays only the cheap bind RPC.
+		// Pooled (or fresh) connection and a fresh bind.
 		std::unique_ptr<IFunctionConnection> connection;
 		bool use_pool = bind_data ? bind_data->use_pool() : func_info.use_pool();
 		const auto &worker_path = bind_data ? bind_data->worker_path() : func_info.worker_path();
@@ -425,7 +363,6 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		const auto &function_name = bind_data ? bind_data->function_name : func_info.function_name;
 		const auto &schema_name = bind_data ? bind_data->schema_name : func_info.schema_name;
 		bool worker_debug = bind_data ? bind_data->worker_debug() : func_info.worker_debug();
-		// Extract settings: from bind_data if available, otherwise extract fresh from context
 		auto settings = bind_data ? bind_data->settings : ExtractVgiSettings(context, func_info.setting_names);
 		const auto &required_secrets = bind_data ? bind_data->required_secrets : func_info.required_secrets;
 		const auto &attach_params = bind_data ? bind_data->attach_params : func_info.attach_params;
@@ -459,22 +396,14 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			                 worker_path.c_str(), connection->GetSubprocessPid().value_or(-1));
 		}
 
-		// Bind and open the IPC writer with a single schema — the bind-time
-		// one. Previously we'd swap to an execute-time schema derived from
-		// args.data, which could narrower than the bind-promised types;
-		// casting the DataChunk (below, in the per-batch path) keeps the
-		// wire in sync with what the worker is expecting.
 		connection->SetInputSchema(local_state.input_schema);
 		connection->SetSchemaName(schema_name);
 		if (bind_data) {
 			connection->SetArgumentNames(bind_data->argument_names);
 		}
 		auto bind_result = connection->PerformBindRpc();
-		// Execute opens a fresh worker connection and therefore performs bind a
-		// second time. Preserve its sanitized provenance too: this is both a
-		// fail-closed guard for deserialized const-argument binds (where the
-		// planner intentionally skips the first RPC) and protection against a
-		// worker whose bind-time secret request is input-dependent.
+		// Keep this bind's secret provenance too: a deserialized const-argument
+		// bind skipped the planner RPC, and a worker's secret use may vary.
 		local_state.secret_dependent =
 		    (bind_data && bind_data->secret_dependent) || bind_result.secret_dependent;
 		// This bind's secrets are the ones the worker computes with on this
@@ -486,7 +415,6 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		local_state.connection = std::move(connection);
 		local_state.initialized = true;
 
-		// Capture pool max size for use in destructor (where ClientContext may not be accessible)
 		local_state.use_pool = use_pool;
 
 		VGI_LOG(context, "scalar.init",
@@ -497,21 +425,14 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		         {"const_values", std::to_string(positional_args.size())}});
 	}
 
-	// Handle empty input
 	if (args.size() == 0) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 		ConstantVector::SetNull(result, true);
 		return;
 	}
 
-	// Cast args to bind-time DuckDB types, then convert to Arrow. DuckDB's
-	// binder may resolve a DOUBLE-declared param against a DECIMAL literal
-	// without inserting an explicit Cast (it treats the promotion as
-	// lossless). Re-applying it here guarantees the wire matches
-	// bind_data->input_schema — which is what the worker was told to expect
-	// at bind. When types already match (fast path) DefaultCast is a
-	// near-zero-cost identity clone. ANY-declared params keep the raw
-	// caller type and are skipped.
+	// Cast args to the bind-time types (see input_duckdb_types); ANY params
+	// keep the caller's type.
 	DataChunk casted_chunk;
 	DataChunk *to_serialize = &args;
 	if (bind_data && !bind_data->input_duckdb_types.empty() &&
@@ -542,10 +463,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 	}
 
-	// [dedup] A VGI scalar is a pure 1:1 map, so ship only the DISTINCT input tuples to
-	// the worker and scatter the results back positionally. For a low-cardinality input
-	// (country_code, enum, …) this turns 2048 worker evals into the distinct count. The
-	// per-row-purity that makes this sound is the same contract the cache opt-in asserts.
+	// [dedup] A scalar is a 1:1 map: ship only distinct input tuples and scatter the
+	// results back. Sound only for per-row-pure functions.
 	bool dedup_enabled = true;
 	{
 		Value dv;
@@ -553,10 +472,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			dedup_enabled = dv.GetValue<bool>();
 		}
 	}
-	// NEVER dedup a VOLATILE scalar — its output legitimately differs per call for the
-	// same input (RNG, etc.), so collapsing duplicate inputs would serve one row's value
-	// for all of them. The worker declares stability (FunctionStability) and it is set on
-	// the ScalarFunction at registration; CONSISTENT / CONSISTENT_WITHIN_QUERY are safe.
+	// Never dedup a VOLATILE scalar (worker-declared FunctionStability): its output
+	// may differ per call for the same input.
 	const bool is_volatile = func_expr.Function().GetStability() == FunctionStability::VOLATILE;
 	InputDedup dedup;
 	DataChunk deduped_chunk;
@@ -581,13 +498,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	}
 	const bool deduped = (ship != to_serialize);
 
-	// [per-value] Build the static cache key once (identity + worker + fn + const args +
-	// settings + versions), then memoize the scalar output per DISTINCT input tuple: a
-	// fully-warm distinct set serves without the worker (cross-chunk / cross-query /
-	// cross-restart value reuse). Gated by the dedup master switch (per-value needs the
-	// distinct set), the master cache switch + per-catalog opt-out (via the key builder),
-	// the worker's vgi.cache.* opt-in (checked on store), and non-volatility. `ship` is the
-	// distinct set (dd.k rows) whenever dedup ran.
+	// [per-value] Memoize output per distinct input tuple; a fully-cached chunk skips the
+	// worker. Needs dedup (the distinct set `ship`), cache eligibility (key builder:
+	// master switch, per-catalog opt-out), the worker's opt-in, and non-volatility.
 	if (!local_state.cache_key_built && bind_data) {
 		local_state.cache_key_built = true;
 		std::string canon_args; // canonical const-arg serialization (stable per bind)
@@ -597,10 +510,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		const char *reason = nullptr;
 		int64_t cver = 0;
-		// operator_kind carries a fingerprint of the worker OUTPUT schema (the scalar's
-		// return type) so a worker that changes its output shape WITHOUT bumping a version
-		// gets a DIFFERENT key — old-shaped cached bytes can never be served into the new
-		// shape (critical once results persist across a restart). See shape_key.
+		// The return type in operator_kind keys the shape, so cached bytes never meet a
+		// changed output schema (VgiResultCacheKey::shape_key).
 		const std::string op_kind = "scalar\x1f" + result.GetType().ToString();
 		if (BuildExchangeCacheKeyStaticFields(context, bind_data->attach_params, bind_data->function_name,
 		                                      bind_data->schema_name, canon_args, bind_data->settings, {},
@@ -625,21 +536,18 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			pv_setting = pvv.GetValue<bool>();
 		}
 	}
-	// Per-value memoization requires the worker's `vgi.cache.per_value` opt-in, which rides
-	// an output batch and so is only visible after an exchange. Seed from the process-wide
-	// advertisement registry (an earlier exchange against this function) and latch from this
-	// state's own exchanges. This gates the PROBE only; the STORE below keys off the live
-	// cache-control, so a function's first exchange still memoizes. `vgi_result_cache_per_value`
-	// is a CEILING over the advertisement, never an enabler. See VGI_CACHE_PER_VALUE_KEY.
+	// The `vgi.cache.per_value` opt-in arrives on an output batch, so the probe is armed
+	// from the process-wide registry or this state's earlier exchanges; the store keys
+	// off the live cache-control, so the first exchange still memoizes. The
+	// vgi_result_cache_per_value setting can only disable, never enable.
 	if (!local_state.cache_pv_opt_in && local_state.cache_eligible) {
 		local_state.cache_pv_opt_in =
 		    GetResultCache(context).HasPerValueOptIn(local_state.cache_static_key);
 	}
 	const bool pv_enabled = pv_setting && local_state.cache_pv_opt_in && dedup_enabled && !is_volatile &&
 	                        local_state.cache_eligible;
-	// Per-value memo probe against the columnar arena. `pv_blobs` is the raw sort-key blob
-	// per distinct tuple (the arena's slot key). Probe returns the hit rows in ascending
-	// distinct order + a per-tuple hit mask; a miss (or no arena yet) leaves pv_hit=0.
+	// Arena probe keyed by each distinct tuple's sort-key blob: hit rows in ascending
+	// distinct order plus a per-tuple hit mask.
 	std::vector<std::string> pv_blobs;
 	std::vector<char> pv_hit;                      // parallel to ship (1 = served from arena)
 	VgiBatchPtr pv_cached; // hit rows, ascending-distinct order
@@ -662,12 +570,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	const bool full_pv_hit =
 	    pv_enabled && ship->size() > 0 && pv_hit_count == static_cast<int64_t>(ship->size());
 
-	// Build input-side conversion cache on the first batch. The cached
-	// types/names/extension_types/client_props are stable for the lifetime
-	// of this scalar's bind — input column count and types do not change
-	// per batch. Subsequent batches use DataChunkToArrowCached, which skips
-	// the per-batch vector push-backs + ClientProperties copy +
-	// GetExtensionTypes() lookup.
+	// Input conversion state, stable for the bind.
 	if (!local_state.input_convert_cached) {
 		local_state.input_arrow_types.clear();
 		local_state.input_arrow_names.clear();
@@ -677,7 +580,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			local_state.input_arrow_types.push_back(to_serialize->data[i].GetType());
 			local_state.input_arrow_names.push_back(local_state.input_schema->field_name(static_cast<int>(i)));
 		}
-		local_state.input_client_props = context.GetClientProperties();
+		local_state.input_client_props = VgiWireClientProperties(context);
 		local_state.input_extension_types =
 		    ArrowTypeExtensionData::GetExtensionTypes(context, local_state.input_arrow_types);
 		local_state.input_convert_cached = true;
@@ -687,17 +590,14 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	VgiBatchPtr output_batch;
 
 	if (full_pv_hit) {
-		// Every distinct tuple is memoized → the arena already returned all K rows in
-		// ascending-distinct order; serve WITHOUT the worker.
+		// Every distinct tuple is memoized: serve without the worker.
 		output_batch = pv_cached;
 		VGI_LOG(context, "result_cache.hit",
 		        {{"function", func_info.function_name},
 		         {"key_hash", local_state.cache_static_fp},
 		         {"tier", "per_value"}});
 	} else {
-		// Ship the tuples with no cached row; splice the arena's cached rows back into
-		// distinct order below. Full-miss is the empty-cached-prefix case (every distinct
-		// tuple is a miss); full_pv_hit already handled all-cached.
+		// Ship only the misses; cached rows are spliced back into distinct order below.
 		std::vector<idx_t> miss_indices;
 		for (idx_t d = 0; d < ship->size(); d++) {
 			if (!pv_hit[d]) {
@@ -890,19 +790,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	         {"function_name", func_info.function_name},
 	         {"output_rows", std::to_string(output_batch->num_rows())}});
 
-	// Convert Arrow result to DuckDB Vector using DuckDB's built-in ArrowToDuckDB.
-	// The output schema of a scalar function is fixed at bind time — the worker
-	// returns the same schema for every batch. So parse it ONCE on the first
-	// batch and reuse the cached result thereafter. Saves an ExportSchema +
-	// PopulateArrowTableSchema + GetDuckDBTypesFromArrowTable per batch
-	// (~1 µs each at 2K rows, ~3-5% of total per-batch cost for cheap-compute
-	// scalars like multiply).
-	// Type-confusion guard: the worker's output batch must carry the type it
-	// declared at bind. ArrowToDuckDB below reads the batch's buffers into a
-	// result Vector of the declared return type (and caches the Arrow type map
-	// from the first batch), so a batch whose type disagrees is a misread, not a
-	// cast. Gated by vgi_validate_worker_batches (NONE opts out, like the
-	// producer path). See vgi_batch_validation.hpp.
+	// Type-confusion guard: ArrowToDuckDB reads the buffers as the declared return
+	// type (and the type map cached from the first batch), so a batch of another type
+	// would be misread, not cast. vgi_validate_worker_batches=NONE opts out.
 	if (bind_data && bind_data->resolved_output_schema &&
 	    GetWorkerBatchValidation(&context) != WorkerBatchValidation::NONE) {
 		const auto &declared = *bind_data->resolved_output_schema;
@@ -945,7 +835,6 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		                                  temp_output, false);
 
 		if (deduped) {
-			// Scatter the K distinct worker outputs back to the N original rows:
 			// result[n] = worker_out[orig_to_distinct[n]].
 			SelectionVector sel(args.size());
 			for (idx_t n = 0; n < args.size(); n++) {
@@ -964,7 +853,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		convert_out();
 	}
 
-	// For single-row results (constant folding), set vector type to CONSTANT_VECTOR
+	// A single-row result (constant folding) is a CONSTANT_VECTOR.
 	if (args.size() == 1) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}

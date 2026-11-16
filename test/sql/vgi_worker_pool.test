@@ -426,3 +426,65 @@ SELECT COUNT(*) FROM vgi_worker_pool();
 
 statement ok
 DETACH vgi_pf_pm;
+
+# ============================================================================
+# vgi_worker_pool_max applies to paths no ATTACH has configured
+# ============================================================================
+# The `env NAME=1` prefixes give LOCATIONs that run the same worker but are
+# pool paths nothing else in this process has configured.
+
+statement ok
+SET vgi_worker_pool_max = 0;
+
+query I
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
+----
+true
+
+# vgi_catalogs() discovery sizes the pool from the session setting.
+query I
+SELECT count(*) >= 1 FROM vgi_catalogs('env VGI_POOL_DISCOVERY_TEST=1 ${VGI_TEST_WORKER}');
+----
+true
+
+query I
+SELECT COUNT(*) FROM vgi_worker_pool() WHERE worker_path LIKE 'env VGI_POOL_DISCOVERY_TEST=1 %';
+----
+0
+
+# A later discovery call picks up a changed setting.
+statement ok
+SET vgi_worker_pool_max = 4;
+
+query I
+SELECT count(*) >= 1 FROM vgi_catalogs('env VGI_POOL_DISCOVERY_TEST=1 ${VGI_TEST_WORKER}');
+----
+true
+
+query I
+SELECT COUNT(*) FROM vgi_worker_pool() WHERE worker_path LIKE 'env VGI_POOL_DISCOVERY_TEST=1 %';
+----
+1
+
+# ATTACH's own catalog RPCs are already sized by the ATTACH's settings.
+statement ok
+SET vgi_worker_pool_max = 0;
+
+statement ok
+ATTACH 'example' AS vgi_pool_first_attach (TYPE vgi, LOCATION 'env VGI_POOL_ATTACH_TEST=1 ${VGI_TEST_WORKER}');
+
+query I
+SELECT COUNT(*) FROM vgi_worker_pool() WHERE worker_path LIKE 'env VGI_POOL_ATTACH_TEST=1 %';
+----
+0
+
+statement ok
+DETACH vgi_pool_first_attach;
+
+statement ok
+RESET vgi_worker_pool_max;
+
+query I
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
+----
+true

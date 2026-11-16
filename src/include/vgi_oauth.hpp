@@ -32,14 +32,10 @@ struct OAuthResourceMetadata {
 	std::string resource;
 	std::string resource_name;
 	bool use_id_token_as_bearer = false; // If true, send id_token as Bearer instead of access_token
-	// Non-standard RFC 9728 extension: when set, this URL points at the VGI
-	// server's PKCE token-exchange proxy. The proxy injects the configured
-	// server-side client_secret before forwarding to the IdP, which is
-	// required for IdPs (notably Google) that reject token-endpoint
-	// requests from "Web application" clients without a secret. When
-	// present, prefer this over the IdP's discovered token_endpoint so the
-	// extension can complete token exchanges without holding the secret
-	// locally — this is what makes secret-less PKCE work in the WASM build.
+	// Non-standard RFC 9728 extension: the VGI server's PKCE token-exchange
+	// proxy, which injects the server-side client_secret (IdPs such as Google
+	// require one). Preferred over the IdP's token_endpoint when set, so PKCE
+	// works without a local secret (e.g. in WASM).
 	std::string token_endpoint;
 };
 
@@ -53,16 +49,9 @@ struct OAuthServerMetadata {
 	bool SupportsGrantType(const std::string &grant_type) const;
 };
 
-// Parsed OIDC id_token claims. Populated from the JWT payload at token
-// ingestion. Not cryptographically verified — the id_token arrived over TLS
-// from our own OAuth exchange, so we trust it as an identity hint, not a
-// security boundary.
-//
-// Only the universal OIDC claims (sub, iss, email, name) are lifted into
-// dedicated fields. Everything else — provider-specific claims like Entra's
-// preferred_username/oid/tid, Google's custom attributes, group/role arrays —
-// stays in claims_json verbatim so downstream SQL can reach it via JSON path
-// expressions without the extension needing to know each provider's quirks.
+// Parsed OIDC id_token claims. Not signature-verified: an identity hint for
+// display, never a security boundary. sub/iss/email/name get fields; all other
+// (provider-specific) claims stay verbatim in claims_json for SQL JSON paths.
 struct OAuthIdentity {
 	bool present = false;     // true iff parse succeeded and payload was valid JSON
 	std::string sub;          // "sub" claim — subject / user id
@@ -82,7 +71,6 @@ struct OAuthTokenSet {
 	OAuthIdentity identity;    // Parsed claims from id_token (present=false if unavailable)
 
 	bool IsValid() const;
-	// Returns access_token by default; id_token if use_id_token is set
 	std::string BearerToken() const;
 };
 
@@ -95,6 +83,11 @@ struct OAuthRefreshContext {
 	std::string resource;
 	bool use_id_token = false;
 	std::string resource_metadata_url;
+	// Resource metadata's separate device-code client, when advertised. A
+	// device-issued refresh token is persisted under this client and must be
+	// redeemed with it, so a reload has to recognize it as the same session.
+	std::string device_client_id;
+	std::string device_client_secret;
 };
 
 struct AuthState {
@@ -104,43 +97,33 @@ struct AuthState {
 	OAuthRefreshContext refresh_ctx;
 	std::string error_message;
 	std::condition_variable cv;
-	// Thread that owns the IN_PROGRESS state. If a 401 from the auth flow
-	// itself (e.g., the discovery endpoint or token endpoint requires
-	// auth that 401s back into this same auth object) re-enters
-	// HandleUnauthorized on the same thread, we'd self-wait on cv
-	// forever. This lets us throw cleanly instead.
+	// Thread owning IN_PROGRESS: a 401 from the auth flow itself re-entering
+	// HandleUnauthorized on that thread throws instead of self-waiting on cv.
 	std::thread::id owner;
-	// True once an interactive auth flow (device-code / browser PKCE) actually
-	// ran for this catalog — i.e. PerformAuthFlow was invoked, as opposed to a
-	// silent refresh or an already-cached token. Sticky for the auth object's
-	// lifetime; read by telemetry to distinguish human-in-the-loop attaches.
+	// Sticky: set once PerformAuthFlow (device-code / browser PKCE) ran, as
+	// opposed to a silent refresh or cached token. Read by telemetry.
 	bool interactive = false;
 	uint64_t epoch = 0; // incremented by logout; in-flight auth may not publish across it
+	// Persistent-store key of this session. Not derivable from refresh_ctx after
+	// a device-code login, whose client_id is the device client.
+	std::string store_key;
 	mutable std::mutex mutex;
 };
 
-// ============================================================================
-// Per-Catalog Authentication
-// ============================================================================
-
-// Abstract base class for catalog authentication.
-// Each attached VGI catalog owns its own CatalogAuth instance, ensuring
-// independent auth state even when multiple catalogs point to the same origin.
+// Per-catalog authentication: each attached VGI catalog owns its own instance,
+// even when several catalogs point at the same origin.
 class CatalogAuth {
 public:
 	virtual ~CatalogAuth() = default;
 
-	// Get current bearer token (empty string if none available)
+	// Current bearer token ("" if none).
 	virtual std::string GetToken() = 0;
 
-	// Handle a 401 response — attempt to obtain a valid token.
-	// Returns the new bearer token. Throws if auth fails irrecoverably.
+	// Handle a 401: obtain and return a new bearer token, or throw.
 	virtual std::string HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) = 0;
 
-	// Clear any cached tokens (resets to unauthenticated state)
 	virtual void ClearTokens() = 0;
 
-	// Diagnostics
 	struct TokenInfo {
 		bool has_refresh_token = false;
 		int64_t expires_in_seconds = 0;
@@ -149,24 +132,18 @@ public:
 	virtual bool GetTokenInfo(TokenInfo &info) { return false; }
 	virtual bool GetTokenSetCopy(OAuthTokenSet &out) { return false; }
 
-	// True iff an interactive auth flow (device-code / browser) actually ran for
-	// this catalog. Distinct from IsExplicitlyConfigured() (which reflects an
-	// ATTACH-time opt-in, not whether a human completed a flow). Bearer / silent
-	// refresh / cached-token paths never set it. Used by attach telemetry.
+	// True iff an interactive flow (device-code / browser) ran; see AuthState::interactive.
 	virtual bool WasInteractive() const { return false; }
 
-	// True iff the user explicitly opted into this auth flow at ATTACH time.
-	// Bearer auth: always true once the bearer_token option was supplied.
-	// OAuth: true only when oauth_refresh_token was seeded — a default
-	// OAuthCatalogAuth (no user opt-in) returns false so HttpPostArrowIpc
-	// can produce a "no credential" diagnostic rather than launching an
-	// OAuth discovery flow on an empty challenge.
+	// Whether a credential is configured. Bearer: always. OAuth: when a refresh
+	// token is held (e.g. oauth_refresh_token) or a flow completed. A default
+	// OAuthCatalogAuth returns false, so the HTTP 401 handler reports "no
+	// credential" instead of starting discovery on an empty challenge.
 	virtual bool IsExplicitlyConfigured() const = 0;
 };
 
-// Static bearer token auth (API keys, service account tokens, pre-obtained JWTs).
-// GetToken() returns the static token. HandleUnauthorized() throws — a rejected
-// static token has no recovery mechanism.
+// Static bearer token (API keys, service account tokens, pre-obtained JWTs).
+// HandleUnauthorized() throws: a rejected static token cannot be recovered.
 class BearerTokenCatalogAuth : public CatalogAuth {
 public:
 	explicit BearerTokenCatalogAuth(std::string token);
@@ -181,9 +158,7 @@ private:
 	std::string token_;
 };
 
-// Full OAuth flow auth (PKCE, device code, token refresh).
-// Per-catalog version of the former VgiTokenManager singleton — same flow logic,
-// same thread synchronization, but operating on a single AuthState.
+// OAuth (PKCE, device code, token refresh) over one AuthState.
 class OAuthCatalogAuth : public CatalogAuth {
 public:
 	explicit OAuthCatalogAuth(std::string profile = "default", std::string cache_mode = "auto");
@@ -192,8 +167,7 @@ public:
 	std::string HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) override;
 	void ClearTokens() override;
 
-	// Seed a refresh token (e.g., from ATTACH oauth_refresh_token option).
-	// Only sets the token if auth state is IDLE (not already authenticated).
+	// Seed a refresh token (ATTACH oauth_refresh_token); only while IDLE.
 	void SeedRefreshToken(const std::string &refresh_token);
 
 	bool GetTokenInfo(TokenInfo &info) override;
@@ -209,9 +183,7 @@ private:
 	std::string cache_mode_;
 };
 
-// ============================================================================
-// Free-function auth flow helpers (stateless — used by OAuthCatalogAuth)
-// ============================================================================
+// Stateless auth flow helpers used by OAuthCatalogAuth.
 
 OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, ClientContext &context);
 
@@ -222,29 +194,16 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge, ClientContext &co
                                OAuthRefreshContext &refresh_ctx_out);
 
 
-// Environment detection
 bool IsHeadlessEnvironment();
 
-// True when running inside a Google Colab kernel. Colab captures the kernel's
-// C-level stderr into the notebook cell, so the device-code prompt (URL + user
-// code) is written to stderr there — otherwise it only reaches DUCKDB_LOG_WARNING,
-// which the Python client never surfaces, and login appears to hang.
 // Parse the auth-params of a `WWW-Authenticate` challenge into name -> value.
-//
-// A real RFC 9110 parser rather than a substring search, because searching is
-// wrong in a way that bites: `find("client_id=\"")` also matches *inside*
-// `device_code_client_id="`, so a challenge advertising both would report the
-// device client as the ordinary one. Handles quoted values (which may contain
-// commas and equals signs), backslash escapes, unquoted values, and
-// case-insensitive parameter names.
+// A real RFC 9110 parser (quoted values with commas/escapes, unquoted values,
+// case-insensitive names), not a substring search: `client_id="` also occurs
+// inside `device_code_client_id="`.
 std::map<std::string, std::string> ParseAuthParams(const std::string &params);
 
-// The loopback callback server could not bind a port.
-//
-// A dedicated type rather than a plain IOException so the auto-mode fallback to
-// the device-code flow can key on the failure *kind*. Keying on the message text
-// — as this once did — means any rewording silently disables the fallback, and a
-// headless or port-restricted user gets a hard failure instead of a device code.
+// The loopback callback server could not bind a port. A dedicated type so the
+// auto-mode fallback to the device-code flow keys on the kind, not message text.
 class PkceCallbackBindFailure : public IOException {
 public:
 	PkceCallbackBindFailure()
@@ -252,33 +211,34 @@ public:
 	}
 };
 
-// The client credentials a flow presents. OAuth 2.0 (RFC 6749 §6) requires a
-// refresh request to be authenticated as the *same* client the grant was issued
-// to, so whichever flow ran must hand its choice to the refresh context —
-// selecting again later can pick a different client and the refresh is refused.
+// The client credentials a flow presents. A refresh must authenticate as the
+// same client the grant was issued to (RFC 6749 §6), so the flow hands its
+// choice to the refresh context rather than selecting again.
 struct OAuthClientCredentials {
 	std::string client_id;
 	std::string client_secret;
 };
 
-// Which client the device-code flow presents.
-//
-// Providers such as Google register a separate "TV/device" client, advertised as
-// `device_code_client_id`. When present it wins; otherwise fall back to the
-// ordinary client, preferring resource metadata over the challenge header.
+// Which client the device-code flow presents: `device_code_client_id` (e.g.
+// Google's TV/device client) when present, else the ordinary client, resource
+// metadata before the challenge header.
 OAuthClientCredentials SelectDeviceCodeClient(const std::string &device_client_id,
                                               const std::string &device_client_secret,
                                               const std::string &client_id,
                                               const std::string &client_secret,
                                               const std::string &challenge_client_id);
 
-// Whether an access token is still usable `skew` ahead of now.
-//
-// The margin matters because an expired token is not merely refreshed: the
-// request goes out with no Authorization header at all, so the server answers
-// 401 and the entire body — Arrow IPC payload included — is re-sent. Refreshing
-// slightly early trades that for one cheap token exchange. A zero-valued
-// `expires_at` means the token never expires.
+// Persisted refresh-token record: the token plus the issuer/resource/client/scope
+// it is bound to. Decode succeeds only for a record of `expected`'s session,
+// issued to either its ordinary or its device-code client; `issued` receives the
+// refresh context the token must be redeemed with (RFC 6749 §6).
+std::string EncodeOAuthRefreshRecord(const OAuthRefreshContext &binding, const std::string &refresh_token);
+bool DecodeOAuthRefreshRecord(const std::string &data, const OAuthRefreshContext &expected,
+                              std::string &refresh_token, OAuthRefreshContext &issued);
+
+// Whether an access token is still usable `skew` ahead of now (a zero
+// `expires_at` never expires). Refreshing early avoids a request going out
+// without a token, drawing a 401 and re-sending the whole body.
 bool TokenStillFresh(std::chrono::steady_clock::time_point expires_at,
                      std::chrono::steady_clock::time_point now,
                      std::chrono::seconds skew);
@@ -286,60 +246,49 @@ bool TokenStillFresh(std::chrono::steady_clock::time_point expires_at,
 // How far ahead of expiry a token is treated as already stale.
 static constexpr std::chrono::seconds kTokenRefreshSkew {45};
 
+// True inside a Google Colab kernel, which shows C-level stderr in the cell: the
+// device-code prompt goes to stderr there (DUCKDB_LOG_WARNING is not surfaced by
+// the Python client, so login would appear to hang).
 bool IsColabEnvironment();
 
-// True iff url is a plain-http loopback URL (127.0.0.1 / localhost / [::1]) with a
-// proper host boundary after the host (':' port, '/' path, or end-of-string). Used
-// to allow http only for genuine loopback while rejecting look-alikes such as
-// http://127.0.0.1.evil.com that a prefix match would wrongly accept.
+// True iff url is http:// whose authority is exactly 127.0.0.1 / localhost / [::1]
+// (host case-insensitive), with an optional numeric port and no userinfo, so
+// http://127.0.0.1.evil.com and http://localhost@evil.com are rejected.
 bool IsLoopbackHttpUrl(const std::string &url);
 
-// Utility functions
 std::optional<OAuthChallenge> ParseWWWAuthenticate(const std::string &header);
 std::string GenerateCodeVerifier();
 std::string ComputeCodeChallenge(const std::string &verifier);
 std::string GenerateState();
 std::string Base64UrlEncode(const unsigned char *data, size_t len);
-// Decodes a base64url-encoded string (RFC 4648 §5) — accepts missing padding.
-// Returns empty string on malformed input.
+// Base64url (RFC 4648 §5) decode; padding optional; "" on malformed input.
 std::string Base64UrlDecode(const std::string &input);
-// Parse an OIDC id_token JWT and extract identity claims. No signature
-// verification — see OAuthIdentity doc.
+// Identity claims of an OIDC id_token JWT (unverified; see OAuthIdentity).
 OAuthIdentity ParseIdTokenClaims(const std::string &id_token);
 std::string UrlEncode(const std::string &str);
 void OpenBrowser(const std::string &url);
 
-// HTTP helper for metadata fetches
 std::string HttpGet(ClientContext &context, const std::string &url);
 
-// Metadata discovery
 OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::string &url);
 OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::string &server_url);
 
-// Extract scheme://host:port from a URL
+// scheme://host:port of a URL.
 std::string ExtractOrigin(const std::string &url);
 
-// Stable, NON-SECRET fingerprint of the calling identity, for scoping the
-// result cache so one principal's cached rows are never served to another
-// (security-critical — see the result-cache identity_scope). Returns:
-//   - "anon"            : no auth / not explicitly configured (subprocess,
-//                         anonymous HTTP, direct path).
-//   - "oauth:<sha256>"  : OAuth with a valid resolved token — hashes the exact
-//                         bearer credential sent to the resource server. Token
-//                         refresh deliberately creates a new cache identity.
-//   - "bearer:<sha256>" : static bearer token — salted SHA-256 of the token
-//                         (the raw token never enters the key or disk).
-//   - ""  (empty)       : configured but UNRESOLVABLE (e.g. OAuth opted-in but
-//                         not yet authenticated) — the caller MUST fail closed
-//                         and refuse to cache rather than collapse identities.
-// Never triggers an auth flow (reads only already-resolved state / the static
-// bearer token).
+// Non-secret fingerprint of the calling identity for scoping the result cache,
+// so one principal's cached rows are never served to another (security-critical).
+//   - "anon"            : no auth, or not explicitly configured.
+//   - "oauth:<sha256>"  : salted hash of the exact bearer credential sent; a
+//                         refresh deliberately changes the identity.
+//   - "bearer:<sha256>" : salted hash of the static token.
+//   - ""                : configured but unresolvable (e.g. OAuth not yet
+//                         authenticated): the caller MUST fail closed (not cache).
+// Never triggers an auth flow.
 std::string ComputeCatalogIdentityFingerprint(const std::shared_ptr<CatalogAuth> &auth);
 
-// The full cache identity scope for a catalog-attached table: catalog name +
-// the auth-principal fingerprint (US-separated). Returns "" when the identity is
-// configured-but-unresolvable (caller must fail closed / skip). Used by both the
-// cache-key builder and the per-identity disk-flush path so they agree exactly.
+// Catalog name + US + ComputeCatalogIdentityFingerprint, or "" (fail closed).
+// The single builder for both the cache key and the per-identity disk-flush path.
 std::string BuildCatalogIdentityScope(const std::string &catalog_name,
                                       const std::shared_ptr<CatalogAuth> &auth);
 

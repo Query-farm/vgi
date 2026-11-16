@@ -1,0 +1,65 @@
+# name: test/sql/integration/scalar/const_args_identity.test
+# description: Constant args are erased from a bound scalar call, so calls that differ only in
+#   them must stay distinct expressions (CSE), and plan copies (CTE inlining) must not lose them.
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# multiply(value, factor) — factor is a constant parameter.
+
+# Same column, different constant: CSE must not merge the two calls.
+query III
+SELECT x, example.multiply(x, 2) AS a, example.multiply(x, 3) AS b FROM range(3) t(x) ORDER BY x;
+----
+0	0	0
+1	2	3
+2	4	6
+
+query I
+SELECT example.multiply(x, 2) + example.multiply(x, 3) FROM range(3) t(x) ORDER BY 1;
+----
+0
+5
+10
+
+query II
+SELECT example.multiply(x, 2) AS a, example.multiply(x, 3) AS b FROM range(3) t(x) GROUP BY ALL ORDER BY a;
+----
+0	0
+2	3
+4	6
+
+# Same constant twice is still a common subexpression.
+query II
+SELECT example.multiply(x, 4), example.multiply(x, 4) FROM range(3) t(x) ORDER BY 1;
+----
+0	0
+4	4
+8	8
+
+# A CTE referenced twice under a LIMIT, or NOT MATERIALIZED, is inlined by copying the plan.
+# That copy used to fail with "Failed to find function ... multiply(BIGINT)".
+query III
+WITH c AS (SELECT x, example.multiply(x, 5) AS v FROM range(3) t(x))
+SELECT c1.x, c1.v, c2.v FROM c c1 JOIN c c2 USING (x) ORDER BY 1 LIMIT 2;
+----
+0	0	0
+1	5	5
+
+query III
+WITH c AS NOT MATERIALIZED (SELECT x, example.multiply(x, 5) AS v FROM range(3) t(x))
+SELECT c1.x, c1.v, c2.v FROM c c1 JOIN c c2 USING (x) ORDER BY 1;
+----
+0	0	0
+1	5	5
+2	10	10
+
+statement ok
+DETACH example;

@@ -31,6 +31,8 @@ using duckdb::vgi::WebWorkerFunctionConnection;
 extern "C" void vgi_rust_serve_table_sab_slot(int slot);
 extern "C" bool vgi_rust_table_protocol_matches(const char *name, size_t name_len,
                                                 const char *version, size_t version_len);
+// Native ring backend (test/support): the c2w_closed lane of a slot.
+extern "C" int vgi_sab_native_c2w_closed(int region_offset, int slot);
 
 namespace {
 void RequireMatchingRustProtocol() {
@@ -182,24 +184,11 @@ TEST_CASE("WebWorkerFunctionConnection surfaces a worker produce error", "[sab-c
 // which hang or mis-frame rather than failing cleanly, and neither of which a
 // browser is a pleasant place to debug.
 //
-// BOTH ARE TAGGED [.] — hidden from a default run, runnable with [sab-split].
-// The CLIENT half is implemented (ResetForNextSplit mirrors PerformFinalizeInit,
-// which is the tested precedent for re-initializing a live SAB connection). What
-// is missing is on the other side of the ring, and these tests pin it precisely:
-// a second PerformInit fails with "Stream header EOF", because the worker's
-// connection has already ended.
-//
-// Traced as far as: the ring itself is NOT closed (vgi_sab_native_ring only
-// EOFs on close_ring, and only w2c is closed, at the very end of serve). The
-// worker exits because vgi-rpc's _serve_one gets None from read_request — it
-// reads an end-of-stream where it expects the next request frame. The client
-// writes that EOS when it terminates its TICK stream, which on a pipe is just
-// framing the next request follows, and on the ring is being read as the end of
-// the conversation.
-//
-// So finishing SAB splits means settling that framing question between the
-// client's tick-stream teardown and the worker's request loop — not more work in
-// ResetForNextSplit. Turning these on is the acceptance test for that change.
+// Both also carry [sab-split] so they can be run on their own.
+// ResetForNextSplit mirrors PerformFinalizeInit. Ending the tick/input stream
+// must end only that Arrow stream, never the ring: a ring EOS makes the
+// worker's request loop read end-of-conversation, and the next PerformInit then
+// fails with "Stream header EOF" (see CloseInputWriter).
 
 TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained split",
           "[sab-conn][sab-split]") {
@@ -291,4 +280,55 @@ TEST_CASE("WebWorkerFunctionConnection re-inits after a split whose output was n
 	worker.join();
 
 	CHECK(got == std::vector<int64_t>({0, 1, 2, 3, 4}));
+}
+
+// CloseInputWriter ends the input STREAM, not the ring: a closed c2w ring ends
+// the worker's serve loop, yet FINALIZE, table_buffering_* RPCs and later splits
+// still use the same slot (the subprocess analog keeps stdin open).
+TEST_CASE("WebWorkerFunctionConnection CloseInputWriter keeps the slot serving", "[sab-conn]") {
+	RequireMatchingRustProtocol();
+	DuckDB db(nullptr);
+	Connection con(db);
+	ClientContext &context = *con.context;
+
+	ArrowArguments args = BuildArgumentsFromValues(context, {Value::BIGINT(5)});
+	std::unique_ptr<WebWorkerFunctionConnection> conn_owned(
+	    new WebWorkerFunctionConnection("worker:test", "count_to", args, {}, {}, context, "TABLE"));
+	auto &conn = *conn_owned;
+	conn.EnsureWorkerSpawned();
+	conn.SetSchemaName("main"); // see the first case
+	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
+
+	auto drain = [&conn]() {
+		std::vector<int64_t> out;
+		while (auto batch = conn.ReadDataBatch()) {
+			auto col = batch->column(0);
+			for (int64_t i = 0; i < col.length(); i++) {
+				out.push_back(col.GetInt(i));
+			}
+		}
+		return out;
+	};
+
+	BindResult bind_result = conn.PerformBindRpc();
+	// The init's first tick is already written; closing now ends the tick
+	// stream after that one tick (lockstep: one output batch, then EOS).
+	conn.PerformInit(bind_result);
+	conn.CloseInputWriter();
+	const int c2w_closed_after_close = vgi_sab_native_c2w_closed(0, 0);
+	auto first = drain();
+
+	// A second request on the same slot: fails with "Stream header EOF" if
+	// CloseInputWriter closed the ring.
+	conn.ResetForNextSplit();
+	conn.PerformInit(bind_result);
+	auto second = drain();
+
+	conn_owned.reset();
+	worker.join();
+
+	CHECK(c2w_closed_after_close == 0);
+	const std::vector<int64_t> want {0, 1, 2, 3, 4};
+	CHECK(first == want);
+	CHECK(second == want);
 }

@@ -36,10 +36,8 @@
 #include <mutex>
 
 #if VGI_POSIX_TRANSPORT
-// Launcher / AF_UNIX transport — POSIX only (Windows brings launch:/unix:// via
-// named pipes in a later phase). On Windows/Emscripten the dispatch path below
-// short-circuits with InvalidInputException and these headers (whose classes are
-// VGI_POSIX_TRANSPORT-guarded) are not included.
+// Launcher / AF_UNIX transport. On Emscripten the dispatch below throws
+// InvalidInputException instead.
 #include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
@@ -54,8 +52,8 @@ namespace duckdb {
 namespace vgi {
 
 namespace {
-// `function_kind` token for a connection's function_type_ ("TABLE",
-// "SCALAR_FUNCTION", "TABLE_BUFFERING", ...).
+// ErrorInfo `function_kind` token for a function_type_: strips a "_FUNCTION"
+// suffix and reports TABLE_BUFFERING as TABLE_IN_OUT.
 std::string FunctionKindToken(const std::string &function_type) {
 	std::string kind = function_type;
 	const std::string suffix = "_FUNCTION";
@@ -75,8 +73,7 @@ ErrorInfo FunctionInfo(const std::string &function_name, const std::string &func
 	return info;
 }
 
-// ThrowVgiIOException plus the caller's extra_info (function context,
-// subtype). The message is built exactly as ThrowVgiIOException builds it.
+// ThrowVgiIOException with the caller's extra_info (function context, subtype).
 template <typename... ARGS>
 [[noreturn]] void ThrowFunctionIOException(ErrorInfo info, const std::string &msg, const std::string &worker_path,
                                            pid_t worker_pid, const std::string &execution_id_hex, ARGS... params) {
@@ -84,8 +81,6 @@ template <typename... ARGS>
 	throw IOException(info, BuildMessageWithContext(msg, worker_path), params...);
 }
 
-// The message of an exception thrown by the IPC / stream layer, for embedding
-// in a wrapping error.
 std::string StreamErrorText(const std::exception &e) {
 	return ErrorData(e).RawMessage();
 }
@@ -97,16 +92,14 @@ const VgiMetadata &NoMetadata() {
 	return kNone;
 }
 
-// The batch that just came off a worker stream plus its message custom_metadata
-// (null when the message carried none).
+// A batch read off a worker stream plus its custom_metadata (null when empty).
 struct WireBatch {
 	VgiBatchPtr batch;
 	VgiMetadataPtr custom_metadata;
 };
 
-// The producer-mode tick: a zero-row batch of the empty schema. Shared and
-// immutable, so a tick costs no allocation; tick_schema_ is its schema, so the
-// writer's schema check is a pointer compare.
+// The shared, immutable producer-mode tick (zero rows, empty schema).
+// tick_schema_ is its schema, so the writer's schema check is a pointer compare.
 const VgiBatchPtr &EmptyTick() {
 	static const VgiBatchPtr kTick = VgiBatch::MakeEmpty(VgiSchema::Empty());
 	return kTick;
@@ -124,10 +117,6 @@ WireBatch ToWireBatch(VgiBatchPtr batch) {
 }
 } // namespace
 
-// ============================================================================
-// FunctionConnectionParams Accessors (out-of-line, needs VgiAttachParameters)
-// ============================================================================
-
 const std::string &FunctionConnectionParams::worker_path() const {
 	return attach_params->worker_path();
 }
@@ -144,17 +133,12 @@ const std::string &FunctionConnectionParams::implementation_version() const {
 	return attach_params->implementation_version();
 }
 
-// ============================================================================
-// Connection Acquisition with Retry
-// ============================================================================
-
 namespace {
 
 #if VGI_SHM_TRANSPORT
-// Recursively true if any field in the type tree is dictionary-encoded (DuckDB
-// ENUMs). Dict inputs are kept inline: the worker resolves inbound params with a
-// null DictionaryProvider, so a dict batch couldn't be decoded — matching the
-// worker's outbound emit policy, which also skips dicts.
+// True if any field in the type tree is dictionary-encoded (DuckDB ENUMs). Such
+// batches stay inline: the worker resolves inbound shm batches without a
+// dictionary provider, so it could not decode them.
 bool TypeHasDictionary(const ArrowSchema &type) {
 	if (type.dictionary) {
 		return true;
@@ -176,8 +160,7 @@ bool SchemaHasDictionary(const VgiSchema &schema) {
 	return false;
 }
 
-// Writes into a fixed region of the shm segment (a reserved slot) and refuses
-// to run past it: an overflow throws, and the caller falls back to inline.
+// Writes into a reserved shm slot; overflow throws (caller falls back to inline).
 class ShmSlotOutputStream final : public VgiOutputStream {
 public:
 	ShmSlotOutputStream(uint8_t *data, int64_t capacity) : data_(data), capacity_(capacity) {
@@ -199,8 +182,7 @@ private:
 	int64_t position_ = 0;
 };
 
-// Node and buffer counts of an array tree (children and dictionaries), for the
-// IPC message-header size bound below.
+// Node and buffer counts of an array tree, for the IPC header size bound.
 void CountArrayParts(const ArrowArray &array, int64_t &nodes, int64_t &buffers) {
 	nodes++;
 	buffers += array.n_buffers;
@@ -212,14 +194,10 @@ void CountArrayParts(const ArrowArray &array, int64_t &nodes, int64_t &buffers) 
 	}
 }
 
-// Minimum batch size (bytes) worth shipping through shm. Below this, the pipe
-// wins: shm's fixed per-batch cost (slot allocation + a pointer-batch round trip
-// + the peer's resolve/free) outweighs the copy it saves on a small payload.
-// Measured crossover is platform-specific — POSIX shm_open/mmap overtakes the
-// pipe around 64–256KB, while Windows' page-file mapping plus the fast
-// overlapped-pipe read push it to ~0.5–1MB. Overridable with
-// VGI_RPC_SHM_MIN_BATCH_BYTES. Computed
-// once. Mirrors the same gate in the Python/Go/Rust/Java SDK output paths.
+// Minimum batch size worth shipping through shm: below it, shm's fixed per-batch
+// cost (slot allocation, pointer round trip, resolve/free) exceeds the copy it
+// saves. The crossover is higher on Windows (page-file mapping, fast overlapped
+// pipe reads). Overridable once per process with VGI_RPC_SHM_MIN_BATCH_BYTES.
 static int64_t ShmMinBatchBytes() {
 	static const int64_t kThreshold = []() -> int64_t {
 		if (const char *e = std::getenv("VGI_RPC_SHM_MIN_BATCH_BYTES")) {
@@ -240,20 +218,15 @@ static int64_t ShmMinBatchBytes() {
 
 // Client→worker shm offload. If a segment is attached and `batch` is eligible
 // (non-empty, non-dict, at least ShmMinBatchBytes()) and fits, write its IPC
-// bytes into the segment and return a 0-row pointer batch plus
-// {shm_offset, shm_length} metadata to send in its place. Otherwise returns
-// {nullptr, nullptr} → caller sends `batch` inline.
+// stream into the segment and return a 0-row pointer batch plus
+// {shm_offset, shm_length} metadata to send instead; else {nullptr, nullptr}
+// (send inline). The worker frees the slot after resolving it (cf. vgi_rpc
+// shm.py maybe_write_to_shm).
 //
-// `wire_schema` is the schema the worker expects on the wire — for the streaming
-// input path it's the bind-time input schema the inline writer was opened with,
-// which can differ from batch->schema() (e.g. TIMESTAMP_TZ tz normalization).
-// We serialize the batch's buffers under wire_schema exactly as the inline
-// input_writer_ does (a lenient write), so the worker reads back the schema it
-// declared and doesn't try (and fail) to cast the resolved batch.
-//
-// Mirrors vgi_rpc/shm.py maybe_write_to_shm and the Java worker's
-// ShmResolver.maybeWriteToShm; the worker frees the slot once it resolves the
-// pointer (client allocates → worker frees).
+// `wire_schema` is the schema the worker expects (for streaming input, the one
+// input_writer_ was opened with), which can differ from batch->schema() (e.g.
+// TIMESTAMP_TZ normalization). Writing the buffers under it, as input_writer_
+// does, spares the worker a failing cast of the resolved batch.
 std::pair<VgiBatchPtr, VgiMetadataPtr> MaybeWriteBatchToShm(VgiShmSegment *shm, const VgiBatchPtr &batch,
                                                             const VgiSchemaPtr &wire_schema) {
 	if (!shm || !batch || !wire_schema || batch->num_rows() == 0 || SchemaHasDictionary(*wire_schema)) {
@@ -262,15 +235,11 @@ std::pair<VgiBatchPtr, VgiMetadataPtr> MaybeWriteBatchToShm(VgiShmSegment *shm, 
 	if (batch->num_columns() != wire_schema->num_fields()) {
 		return {nullptr, nullptr};
 	}
-	// Small batches are cheaper over the pipe than through shm — skip the slot
-	// allocation + pointer round trip below the measured crossover.
 	const int64_t body_bytes = batch->TotalBufferSize();
 	if (body_bytes < ShmMinBatchBytes()) {
 		return {nullptr, nullptr};
 	}
-	// Build the 0-row pointer batch first (before allocating) so a failure here
-	// can't leak a segment allocation. The batch's buffers are written under
-	// wire_schema (same physical layout; names / nullability / tz may differ).
+	// Build these before allocating so a failure cannot leak a slot.
 	VgiBatchPtr pointer;
 	VgiBatchPtr to_write;
 	try {
@@ -280,14 +249,10 @@ std::pair<VgiBatchPtr, VgiMetadataPtr> MaybeWriteBatchToShm(VgiShmSegment *shm, 
 		return {nullptr, nullptr};
 	}
 
-	// Serialize the batch under wire_schema as a full IPC stream (schema +
-	// batch + EOS) *directly into the segment*: the IPC writer's sink is the
-	// reserved slot itself, so no intermediate heap buffer is filled and then
-	// copied in. The exact stream size is only known once written, so reserve a
-	// safe upper bound — the schema message, the record-batch header (bounded
-	// by its node/buffer count), the body (every buffer padded to 64 bytes) and
-	// the 8-byte EOS — and advertise the bytes actually written. A write that
-	// would run past the reservation is refused (inline fallback).
+	// Write the full IPC stream (schema + batch + EOS) straight into the slot.
+	// The size is known only after writing, so reserve an upper bound (schema
+	// message, header bounded by node/buffer count, body with 64-byte padding,
+	// 8-byte EOS) and advertise the bytes actually written.
 	int64_t nodes = 0;
 	int64_t buffers = 0;
 	CountArrayParts(to_write->c_array(), nodes, buffers);
@@ -325,23 +290,16 @@ std::pair<VgiBatchPtr, VgiMetadataPtr> MaybeWriteBatchToShm(VgiShmSegment *shm, 
 	return {pointer, metadata};
 }
 
-// __transport_options__ capability handshake. Process-wide cache of each
-// worker's shm capability, keyed by worker identity (the launch:/binary path —
-// capability depends on the worker binary + its runtime, not on version dims).
-// Negotiated once per worker; reused across pooled / launcher-reused connections
-// so there is no per-query round trip. Stale entries are benign (the same path
-// always launches the same binary); a respawn of an idle-killed launcher worker
-// re-uses the cached value, which is unchanged.
+// Process-wide cache of each worker path's shm capability (from
+// __transport_options__). Capability depends on the worker binary, not on version
+// dimensions, and the same path launches the same binary, so it is negotiated
+// once and never invalidated.
 std::map<std::string, bool> g_shm_capability_cache;
 std::mutex g_shm_capability_mutex;
 
-// Ask the worker whether it supports the shared-memory side-channel, via the
-// framework-level __transport_options__ method, before any shm is used. The
-// client always advertises shm support (it both writes and resolves pointer
-// batches); shm is enabled only if the worker also reports it. ANY failure
-// (an old worker that 404s the method, an untagged unknown-method error, a
-// transport error) is treated as "no shm" → inline fallback. Result cached
-// per worker path. Runs in lockstep on the same pipe, before the init request.
+// Ask the worker via __transport_options__ (in lockstep, before the init
+// request) whether it supports shm; the client always advertises it. Any failure
+// (unknown method, transport error) means no shm.
 bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &worker_path, ClientContext &context,
                                   pid_t pid) {
 	{
@@ -353,8 +311,7 @@ bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &work
 	}
 	bool capable = false;
 	try {
-		// Zero-field, 1-row params batch (the worker decodes empty kwargs); the
-		// client's capabilities ride as metadata under vgi_rpc.transport.*.
+		// Zero-field, 1-row params batch (empty kwargs); capabilities ride as metadata.
 		auto empty_params = VgiBatch::FromColumns(VgiSchema::Empty(), 1, {});
 		auto client_caps = VgiMetadata::Make({{TRANSPORT_CAP_SHM_KEY, "true"}});
 		WriteRpcRequest(in_fd, TRANSPORT_OPTIONS_METHOD, empty_params, client_caps);
@@ -379,9 +336,8 @@ bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &work
 	}
 	return capable;
 }
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SHM_TRANSPORT
 
-// Internal: build a fresh FunctionConnection using the HTTP/subprocess factory.
 std::unique_ptr<IFunctionConnection> CreateFreshConnection(ClientContext &context,
                                                             const FunctionConnectionParams &params) {
 	return CreateFunctionConnection(params.worker_path(), params.function_name, params.arguments,
@@ -390,15 +346,9 @@ std::unique_ptr<IFunctionConnection> CreateFreshConnection(ClientContext &contex
 	                                params.settings, params.required_secrets, params.attach_params);
 }
 
-// Internal: pool-or-spawn a connection. Sets `from_pool` to true when the
-// connection came from VgiWorkerPool (subprocess only). HTTP transport never
-// pools, so HTTP callers always see from_pool == false. When `force_fresh` is
-// true the pool fast-path is skipped and we always spawn — used by the
-// stale-retry path so a sick pool doesn't hand back another dead worker.
-//
-// Logs `worker_pool.acquire` with the result tag so the existing observability
-// surface stays identical for both AcquireAndBindConnection and
-// AcquireConnectionForInit.
+// Pool-or-create a connection, logging `worker_pool.acquire`. HTTP never pools.
+// `force_fresh` skips the pool (stale retry, so it can't hand back another dead
+// worker).
 std::unique_ptr<IFunctionConnection> AcquireConnection(ClientContext &context, const FunctionConnectionParams &params,
                                                        bool &from_pool, bool force_fresh = false) {
 	std::unique_ptr<IFunctionConnection> conn;
@@ -442,7 +392,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	auto conn = AcquireConnection(context, params, from_pool);
 	BindResult bind_result;
 
-	// Lambda to attempt bind, returns true on success, false if retry needed
+	// False means a pooled worker was stale and a fresh retry is needed.
 	auto try_bind = [&](bool is_retry) -> bool {
 		try {
 			if (params.input_schema) {
@@ -457,23 +407,20 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 				conn->SetCopyToContext(*params.copy_to);
 			}
 			bind_result = conn->PerformBindRpc();
-			return true; // Success
+			return true;
 		} catch (const IOException &e) {
 			if (!is_retry && from_pool) {
-				// Pooled worker was stale, signal retry needed
 				auto fields = BuildConnLogFields(*conn);
 				fields.emplace_back("error", e.what());
 				fields.emplace_back("phase", params.phase);
 				VGI_LOG(context, "worker_pool.stale", fields);
-				return false; // Trigger retry
+				return false;
 			}
-			throw; // Fresh connection or retry failed, propagate
+			throw;
 		}
 	};
 
-	// Attempt bind with single retry for stale pool connections
 	if (!try_bind(false)) {
-		// Pooled worker was stale, retry with fresh
 		NoteWorkerConnectionReestablished(params.worker_path());
 		conn = CreateFreshConnection(context, params);
 		from_pool = false;
@@ -482,7 +429,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		fields.emplace_back("result", "retry_after_stale");
 		fields.emplace_back("phase", params.phase);
 		VGI_LOG(context, "worker_pool.acquire", fields);
-		try_bind(true); // Throws if fails, no more retries
+		try_bind(true);
 	}
 
 	return AcquireAndBindResult {std::move(conn), std::move(bind_result)};
@@ -493,45 +440,24 @@ AcquireForInitResult AcquireConnectionForInit(ClientContext &context, const Func
 	bool from_pool = false;
 	auto conn = AcquireConnection(context, params, from_pool, force_fresh);
 
-	// PerformBindRpc has historically been the lazy-spawn hook for subprocess
-	// transport — fresh-constructed connections defer spawning their worker
-	// until the first wire RPC. We're skipping that bind, so the spawn must
-	// happen explicitly here; otherwise PerformInit fails its proc_ guard.
-	// HTTP transport implements this as a no-op.
+	// No bind RPC to spawn the worker, so spawn it here, or PerformInit's
+	// TransportReady guard throws. No-op for HTTP.
 	conn->EnsureWorkerSpawned();
 
-	// The caller already holds a BindResult and will call PerformInit directly.
-	// SetInputSchema must still be wired up here for table-in-out / scalar
-	// functions whose first RPC consumes a typed input stream — input_schema_
-	// has to be set before the connection sees any data. PerformBindRpc would
-	// have done this; in the no-bind path we replicate it.
+	// Replicate what AcquireAndBindConnection sets before bind.
 	if (params.input_schema) {
 		conn->SetInputSchema(params.input_schema);
 	}
-	// Same reason: PerformBindRpc's caller (AcquireAndBindConnection) sets the
-	// owning schema on the connection, and the no-bind path has to replicate
-	// it. Without this the connection's schema_name_ stays empty and every
-	// subsequent unary RPC built off it (table_buffering_process / _combine /
-	// _destructor) reaches the worker with a null schema — which re-resolves
-	// the function by bare name and can run a *different* schema's
-	// implementation than the bind picked. Empty stays legal (null on the
-	// wire) for callers that genuinely name no schema.
+	// Without the schema, table_buffering_* RPCs reach the worker with a null
+	// schema and it resolves the function by bare name, possibly to another
+	// schema's implementation than the bind picked.
 	conn->SetSchemaName(params.schema_name);
 
 	return AcquireForInitResult {std::move(conn), from_pool};
 }
 
-// ============================================================================
-// FunctionConnection - vgi_rpc Protocol Implementation
-// ============================================================================
-
-// The FunctionConnection implementation is the subprocess/AF_UNIX transport
-// (fork/exec or AF_UNIX socket on POSIX, CreateProcess on Windows), driven via
-// fd-based RPC. Compiled on POSIX and Windows; on Emscripten (HTTP-only) the
-// class is never instantiated — the factory functions below throw before
-// constructing it — so the member definitions are excluded. HTTP uses
-// HttpFunctionConnection, an independent IFunctionConnection sibling. The
-// shared-memory side-channel within is POSIX-only (guarded separately). See
+// FunctionConnection exists only with a child-process transport (POSIX and
+// Windows); on Emscripten the factories below never construct it. See
 // vgi_platform.hpp.
 #if VGI_SUBPROCESS_TRANSPORT
 
@@ -566,9 +492,8 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
       attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data),
       global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
       required_secrets_(required_secrets), proc_(pooled_worker->Release()) {
-	// Adopt the drainer that was kept running while the worker was idle
-	// in the pool. Falling back to a fresh drainer is unexpected (pool
-	// invariant: workers always carry a drainer), but cheap if needed.
+	// Adopt the drainer that ran while the worker idled in the pool; pooled
+	// workers should always carry one, but create one if not.
 	stderr_drainer_ = pooled_worker->ReleaseDrainer();
 	if (!stderr_drainer_ && proc_ && proc_->GetStderrFd() >= 0) {
 		stderr_drainer_ = std::make_unique<StderrDrainer>(proc_->ReleaseStderrFd());
@@ -588,9 +513,7 @@ FunctionConnection::FunctionConnection(std::unique_ptr<SubProcess> proc, const s
       attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data),
       global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
       required_secrets_(required_secrets), proc_(std::move(proc)) {
-	// AF_UNIX-backed workers (UnixSocketWorker) report stderr_fd_ == -1, so
-	// the drainer attach below is a no-op.  Subprocess-backed adopters do
-	// get a drainer.
+	// Socket-backed workers have no stderr fd, so this is usually a no-op.
 	if (proc_ && proc_->GetStderrFd() >= 0) {
 		stderr_drainer_ = std::make_unique<StderrDrainer>(proc_->ReleaseStderrFd());
 	}
@@ -676,11 +599,7 @@ StreamHeaderResult FunctionConnection::ReadTransportHeader() {
 }
 
 void FunctionConnection::EnsureWorkerSpawned() {
-	// Lazy-spawn for subprocess transport. Pool-acquired connections arrive
-	// with proc_ already set; fresh constructions defer the spawn until the
-	// first RPC needs it. PerformBindRpc has historically been that hook;
-	// callers that skip the on-wire bind (cached BindResult → straight to
-	// PerformInit) call this directly so proc_ exists before the init write.
+	// Called by PerformBindRpc, and directly by callers that skip bind.
 	if (TransportReady()) {
 		return;
 	}
@@ -701,7 +620,6 @@ void FunctionConnection::EnsureWorkerSpawned() {
 }
 
 BindResult FunctionConnection::PerformBindRpc() {
-	// Spawn the worker process (unless we already have one from the pool).
 	EnsureWorkerSpawned();
 
 	int64_t num_args = arguments_batch_ ? arguments_batch_->num_rows() : 0;
@@ -713,7 +631,6 @@ BindResult FunctionConnection::PerformBindRpc() {
 		VGI_LOG(context_, "function_connection.bind", fields);
 	}
 
-	// Transport: send bind via subprocess stdin/stdout
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> VgiBatchPtr {
 		auto rpc_params = generated::BuildBindParams(request_bytes);
 		ValidateRequestSchema(rpc_params, "bind", worker_path_);
@@ -781,17 +698,16 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 	// A new stream: its worker has applied no dynamic-filter delta yet.
 	tick_filter_cursor_.Reset();
 
-	// Convert projection_ids to int64_t
 	std::vector<int64_t> projection_ids_64;
 	projection_ids_64.reserve(projection_ids.size());
 	for (auto id : projection_ids) {
 		projection_ids_64.push_back(static_cast<int64_t>(id));
 	}
 
-	// Determine execution_id: use global_execution_id_ for secondary workers
+	// global_execution_id_: set for secondary workers and FINALIZE.
 	auto &execution_id = global_execution_id_;
 
-	// Extract order hint fields (empty strings / -1 when no hint)
+	// Empty strings / -1 when no hint.
 	std::string ob_col, ob_dir, ob_null;
 	int64_t ob_limit = -1;
 	if (order_by.has_value()) {
@@ -801,7 +717,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		ob_limit = order_by->row_limit;
 	}
 
-	// Extract table sample hint fields (-1.0 / -1 when no hint)
+	// -1.0 / -1 when no hint.
 	double ts_percentage = -1.0;
 	int64_t ts_seed = -1;
 	if (table_sample.has_value()) {
@@ -809,27 +725,21 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		ts_seed = table_sample->seed;
 	}
 
-	// Build InitRequest — pass the buffers directly to avoid copying
 	auto init_request = BuildInitRequest(bind_result.bind_request_bytes, bind_result.output_schema_bytes,
 	                                     bind_result.opaque_data, projection_ids_64, pushdown_filters, join_keys, phase,
 	                                     execution_id, init_opaque_data, ob_col, ob_dir, ob_null, ob_limit,
 	                                     ts_percentage, ts_seed, finalize_state_id, substream_id_, split_tokens);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 
-	// Build RPC params and send request. If shm transport is enabled,
-	// lazily create a segment on first init (per-connection) and advertise
-	// it on every init request via custom_metadata; the worker (Python)
-	// reads SHM_SEGMENT_NAME_KEY / SHM_SEGMENT_SIZE_KEY in
-	// _maybe_attach_shm and writes batches into it. Reset the allocator
-	// before each request so the worker starts fresh.
+	// With shm requested (VGI_RPC_SHM_SIZE_BYTES) and negotiated, create the
+	// per-connection segment on first init and advertise it on every init
+	// request (SHM_SEGMENT_NAME_KEY / SHM_SEGMENT_SIZE_KEY).
 	auto rpc_params = generated::BuildInitParams(init_request_bytes);
 	ValidateRequestSchema(rpc_params, "init", worker_path_);
 	VgiMetadataPtr shm_metadata;
-#if VGI_SHM_TRANSPORT // shared-memory side-channel (shm_open/mmap) is POSIX-only
-	// Only create + advertise the segment if shm is requested AND the worker
-	// confirmed (once, cached) it can do shm via __transport_options__. A worker
-	// that can't (Java 21 / non-POSIX / old worker) → segment stays null → all
-	// shm use sites no-op → inline (pipe) transport, no silent data loss.
+#if VGI_SHM_TRANSPORT
+	// A worker that can't do shm leaves shm_segment_ null, so every shm use site
+	// falls back to inline.
 	if (const char *env = std::getenv("VGI_RPC_SHM_SIZE_BYTES");
 	    proc_ && env && *env &&
 	    NegotiateWorkerShmCapability(proc_->GetStdinFd(), proc_->GetStdoutFd(), worker_path_, context_,
@@ -850,10 +760,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 				}
 				shm_segment_->RetainOnly(leased);
 			}
-			// Python's multiprocessing.shared_memory prepends '/' itself
-			// (controlled by _prepend_leading_slash), so we advertise the
-			// posix-shm name WITHOUT the leading slash. shm_open is fine
-			// with the slash on the C++ side.
+			// Advertise the name without its leading '/': Python's
+			// multiprocessing.shared_memory prepends one itself.
 			std::string py_name = shm_segment_->name();
 			if (!py_name.empty() && py_name[0] == '/') {
 				py_name.erase(0, 1);
@@ -861,15 +769,14 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 			shm_metadata = VgiMetadata::Make(
 			    {{SHM_SEGMENT_NAME_KEY, py_name}, {SHM_SEGMENT_SIZE_KEY, std::to_string(shm_segment_->size())}});
 		} catch (const std::exception &e) {
-			// Best-effort: fall back to inline transport if shm setup fails.
-			// (Dropping our leases does not unmap under a retained batch: each
-			// lease co-owns the segment.)
+			// Fall back to inline. Dropping our leases does not unmap under a
+			// retained batch: each lease co-owns the segment.
 			shm_leases_.clear();
 			shm_segment_.reset();
 			shm_metadata.reset();
 		}
 	}
-#endif // VGI_POSIX_TRANSPORT (shm)
+#endif // VGI_SHM_TRANSPORT
 	try {
 #if VGI_SHM_TRANSPORT
 		// Set before writing: a lost reply does not undo the peer's attachment.
@@ -886,7 +793,6 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		throw;
 	}
 
-	// Read stream header (GlobalInitResponse)
 	StreamHeaderResult header;
 	try {
 		header = ReadTransportHeader();
@@ -901,39 +807,21 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 	auto init_response = ParseGlobalInitResponse(header.header_batch, worker_path_);
 	execution_id_ = init_response.execution_id;
 
-	// Open data exchange streams based on mode.
+	// A worker's output IPC schema is written only with its first output batch,
+	// i.e. after it has consumed its first input. Opening data_reader_ (which
+	// reads the schema) any earlier would deadlock, so: producer mode sends the
+	// first tick before opening it; exchange mode opens it in the first
+	// ReadDataBatch, after the caller has written input.
 	//
-	// IMPORTANT: pyarrow's ipc.new_stream() does NOT write the IPC schema to the
-	// output stream immediately — it defers the schema write until the first
-	// write_batch() call. This means:
-	//   - C++ MakeStreamWriter writes the input schema to stdin immediately (via write() syscall)
-	//   - The Python server reads the input schema and opens its output writer
-	//   - But the output writer's schema is NOT written to stdout yet
-	//   - The output schema only appears when the server processes the first input batch
-	//     and calls write_batch(), which flushes schema + data together
-	//
-	// Therefore:
-	//   - Producer mode: we must send the first tick batch before opening data_reader_,
-	//     so the server can process it and flush the output schema to stdout.
-	//   - Exchange mode: we defer opening data_reader_ to the first ReadDataBatch() call,
-	//     which happens after the caller has written at least one input batch via
-	//     WriteInputBatch(), giving the server data to process and flush.
-	//
-	// Phase override: FINALIZE and TABLE_BUFFERING_FINALIZE phases are
-	// always producer-mode regardless of bind_call.input_schema, because
-	// they reuse the bind context but emit only output (no input). The
-	// streaming-shape FINALIZE phase historically went through
-	// PerformFinalizeInit which clears input_schema_; the buffered
-	// TABLE_BUFFERING_FINALIZE phase calls PerformInit directly with a
-	// fresh worker, so we honor the phase here.
+	// FINALIZE / TABLE_BUFFERING_FINALIZE emit output only, so they are producer
+	// mode even with an input schema (TABLE_BUFFERING_FINALIZE reaches here
+	// directly, not via PerformFinalizeInit).
 	bool producer_phase_override = (phase == "FINALIZE" || phase == "TABLE_BUFFERING_FINALIZE");
 	if (!input_schema_ || producer_phase_override) {
-		// Regular table function: producer mode (tick-based)
 		is_producer_mode_ = true;
 		tick_schema_ = EmptyTick()->schema();
 
-		// Create the tick writer on stdin. Like Arrow's stream writer it writes
-		// the (empty) schema with the first batch, i.e. the tick just below.
+		// The writer emits the (empty) schema with the first tick, just below.
 		auto sink = TransportOutput();
 		try {
 			input_writer_ = VgiIpcWriter::Open(sink, tick_schema_);
@@ -943,14 +831,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		}
 		input_writer_opened_ = true;
 
-		// Send the first tick batch immediately. The server needs to receive and
-		// process a tick before it calls write_batch() on the output, which is
-		// what actually flushes the output IPC schema to stdout.
-		//
-		// Conditional-revalidation validators (M6) ride the FIRST tick's
-		// custom_metadata (where the worker's process() reads them, mirroring
-		// vgi_pushdown_filters) so the worker can answer 304-style with a 0-row
-		// vgi.cache.not_modified batch instead of re-streaming the payload.
+		// Conditional-revalidation validators ride the first tick's metadata, so
+		// the worker can answer with a 0-row vgi.cache.not_modified batch.
 		const auto &tick_batch = EmptyTick();
 		VgiMetadata first_tick_metadata;
 		if (!cond_if_none_match_.empty()) {
@@ -966,8 +848,6 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 			                    GetExecutionIdHex(), StreamErrorText(e));
 		}
 
-		// Now open data reader on stdout — the server has processed the tick and
-		// flushed the output schema + first data batch to stdout
 		data_stream_ = TransportInput();
 		try {
 			data_reader_ = VgiIpcReader::Open(data_stream_);
@@ -980,11 +860,9 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 			throw IOException("vgi_query output stream schema differs from the prepared schema");
 		}
 	} else {
-		// Scalar or table-in-out function: exchange mode
 		is_producer_mode_ = false;
 
-		// Create input writer on stdin (the schema goes out with the first input
-		// batch, or at CloseInputWriter when there is none)
+		// The schema goes out with the first input batch, or at CloseInputWriter.
 		auto sink = TransportOutput();
 		try {
 			input_writer_ = VgiIpcWriter::Open(sink, input_schema_);
@@ -994,10 +872,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		}
 		input_writer_opened_ = true;
 
-		// Do NOT open data_reader_ here. The server's output schema is only flushed
-		// to stdout when it processes the first input batch and calls write_batch().
-		// data_reader_ will be opened lazily in ReadDataBatch() after the caller
-		// has written at least one input batch via WriteInputBatch().
+		// data_reader_ opens in ReadDataBatch (see above).
 	}
 
 	init_done_ = true;
@@ -1029,7 +904,6 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 		VGI_LOG(context_, "function_connection.finalize_init", fields);
 	}
 
-	// Close current data exchange streams
 	if (input_writer_ && !input_writer_closed_) {
 		try {
 			input_writer_->Close();
@@ -1042,11 +916,9 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	input_writer_opened_ = false;
 	input_writer_closed_ = false;
 
-	// If data_reader_ was never opened (e.g., DuckDB skipped calling the in-out
-	// function because 0 input rows were produced), the worker's output data stream
-	// from the INPUT phase still sits unconsumed on stdout. We must open and drain
-	// it before sending the FINALIZE init request, otherwise ReadStreamHeader will
-	// read the leftover INPUT-phase output instead of the FINALIZE response header.
+	// If data_reader_ never opened (e.g. no input rows reached the function), the
+	// INPUT-phase output stream is still unread; drain it, or the FINALIZE
+	// ReadStreamHeader would read it instead of the FINALIZE response.
 	if (!data_reader_ && TransportReady()) {
 		data_stream_ = TransportInput();
 		try {
@@ -1055,8 +927,7 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 			throw; // cancellation (raw Iroh streams) always interrupts
 		} catch (const std::exception &e) {
 			if (iroh_config_) {
-				// The next bytes cannot be assumed to begin FINALIZE when the
-				// preceding stateful stream failed before even yielding its schema.
+				// The stream boundary is unknown, so FINALIZE cannot follow.
 				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to open Iroh output stream before finalize: %s", worker_path_,
 				                    TransportPid(), GetExecutionIdHex(), StreamErrorText(e));
 			}
@@ -1064,7 +935,6 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 		}
 	}
 
-	// Drain remaining output from current stream
 	while (data_reader_) {
 		VgiBatchPtr drained;
 		try {
@@ -1072,9 +942,8 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 		} catch (const InterruptException &) {
 			throw;
 		} catch (const std::exception &e) {
-			// A raw Iroh stream is a persistent stateful byte transport. Any
-			// failure before the IPC stream's explicit EOS marker leaves the next
-			// RPC boundary unknowable, so it cannot be treated as an empty drain.
+			// On a persistent Iroh stream, failing before EOS leaves the next RPC
+			// boundary unknown, so it is not an empty drain.
 			if (iroh_config_) {
 				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed while draining Iroh output before finalize: %s", worker_path_,
 				                    TransportPid(), GetExecutionIdHex(), StreamErrorText(e));
@@ -1088,18 +957,15 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	data_reader_.reset();
 	data_stream_.reset();
 
-	// Reset init state so PerformInit can be called again
 	init_done_ = false;
 	data_finished_ = false;
 
-	// Clear input_schema_ so PerformInit enters producer mode (tick-based).
-	// The server's FINALIZE phase uses producer mode (no input schema), not exchange mode.
+	// FINALIZE is producer mode under this init's execution id; restore both after.
 	auto saved_input_schema = input_schema_;
 	auto saved_global_exec_id = global_execution_id_;
 	input_schema_.reset();
-	global_execution_id_ = execution_id_;  // Use the execution_id from our init
+	global_execution_id_ = execution_id_;
 
-	// RAII scope guard to restore state even if PerformInit throws
 	struct RestoreGuard {
 		VgiSchemaPtr &input_schema;
 		std::vector<uint8_t> &global_exec_id;
@@ -1111,7 +977,6 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 		}
 	} guard{input_schema_, global_execution_id_, std::move(saved_input_schema), std::move(saved_global_exec_id)};
 
-	// Call PerformInit with phase=FINALIZE and the stored execution_id
 	PerformInit(bind_result, {}, nullptr, {}, "FINALIZE");
 }
 
@@ -1125,18 +990,13 @@ void FunctionConnection::ResetForNextSplit() {
 		                    TransportPid(), GetExecutionIdHex());
 	}
 
-	// FIRST: close the input writer. This writes the IPC end-of-stream on stdin so
-	// the worker's tick reader terminates and returns to its RPC dispatch loop.
-	// Doing this after (or not at all) means PerformInit installs a NEW stream
-	// writer over the same fd while the old stream is still open, and the next
-	// init request's bytes land inside an unterminated tick stream. Same ordering
-	// as PerformFinalizeInit, for the same reason.
+	// First close the input writer: its EOS returns the worker to its RPC loop.
+	// Otherwise the next init request lands inside an unterminated tick stream.
 	if (input_writer_ && !input_writer_closed_) {
 		try {
 			input_writer_->Close();
 		} catch (const std::exception &e) {
-			// Poison: the stream is in an unknown state, so the connection must not
-			// go back to the pool looking idle.
+			// Unknown stream state: must not be pooled (see split_reset_failed_).
 			split_reset_failed_ = true;
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Failed to close input writer between splits: %s", worker_path_,
 			                    TransportPid(), GetExecutionIdHex(), StreamErrorText(e));
@@ -1146,8 +1006,7 @@ void FunctionConnection::ResetForNextSplit() {
 	input_writer_opened_ = false;
 	input_writer_closed_ = false;
 
-	// Drain any unread output from this split before the next init request goes
-	// out, or ReadStreamHeader would read the leftover data as the new response.
+	// Drain unread output, or the next ReadStreamHeader would read it.
 	while (data_reader_) {
 		VgiBatchPtr drained;
 		try {
@@ -1170,8 +1029,7 @@ void FunctionConnection::ResetForNextSplit() {
 	data_reader_.reset();
 	data_stream_.reset();
 
-	// Per-init stream state. Everything below is scoped to ONE split's stream and
-	// would otherwise leak into the next one.
+	// Per-stream state that must not leak into the next split.
 	init_done_ = false;
 	data_finished_ = false;
 	last_batch_index_ = DConstants::INVALID_INDEX;
@@ -1182,14 +1040,10 @@ void FunctionConnection::ResetForNextSplit() {
 	cond_if_none_match_.clear();
 	cond_if_modified_since_.clear();
 
-	// Shared memory: nothing to clear here. shm_leases_ deliberately survives the
-	// split boundary — PerformInit's negotiated-shm branch resets the allocator
-	// around whichever of them are still referenced.
-
-	// NOT cleared, deliberately: proc_ and its pipes (the transport), tick_filter_state_
-	// (a shared gstate object PerformInit never touches, so dynamic join-key pushdown
-	// survives into the next split), and substream_id_ (one reader keeps one identity
-	// across the splits it claims).
+	// Deliberately kept: the transport; shm_leases_ (PerformInit resets the
+	// allocator around live ones); tick_filter_state_ (shared gstate, so dynamic
+	// join-key pushdown carries over); substream_id_ (one reader keeps one
+	// identity across its splits).
 }
 
 VgiBatchPtr FunctionConnection::ReadDataBatch() {
@@ -1201,7 +1055,7 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 		return nullptr;
 	}
 
-	// Lazily open data reader if not yet opened (exchange mode defers this)
+	// Exchange mode opens the reader here (see PerformInit).
 	if (!data_reader_) {
 		if (!TransportReady()) {
 			ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "FunctionConnection::ReadDataBatch transport is not connected", worker_path_, -1,
@@ -1216,33 +1070,18 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 		}
 	}
 
-	// For producer mode (table functions): each call sends the NEXT tick and
-	// returns the batch produced by the PREVIOUS tick — a one-ahead pipeline.
-	// The first tick was already sent during PerformInit to bootstrap the
-	// stream, so we DON'T send a tick before reading here; we send it only
-	// after we've finished with the current batch (read + shm-free + resolve),
-	// just before returning it to the consumer (see end of this function).
-	//
-	// Why after, not before: with the shared-memory transport the worker's
-	// allocator and our FreeAllocation both mutate the segment's lock-free
-	// header. Sending the next tick wakes the worker's allocator; if we did
-	// that before FreeAllocation (as the old code did), the worker would be
-	// mid-allocate in its process while we mutate the same header here —
-	// a cross-process data race that corrupts num_allocs / the entry table
-	// (torn header => duplicated/lost batches). Deferring the tick until after
-	// the free restores the true lockstep the shm header assumes ("only one
-	// side active at a time"): once we've read the current pointer batch the
-	// worker is blocked waiting for the next tick, so the free is race-free.
-	// The tick still goes out before we return the batch, so DuckDB consuming
-	// the current batch overlaps with the worker producing the next one —
-	// the one-ahead latency hiding is preserved.
+	// Producer mode is one tick ahead: PerformInit sent the first tick, and each
+	// call sends the next one just before returning its batch, so the worker
+	// produces while DuckDB consumes. The tick must go out only AFTER the shm
+	// slot sweep/resolve below: it wakes the worker's allocator, and both sides
+	// mutating the unlocked shm allocator header at once corrupts it (lost or
+	// duplicated batches). The header relies on strict lockstep.
 	auto send_next_tick = [this]() {
 		if (!(is_producer_mode_ && input_writer_ && !input_writer_closed_)) {
 			return;
 		}
 		const auto &tick_batch = *EmptyTick();
 
-		// Attach dynamic filter metadata as IPC custom metadata if available
 		VgiMetadata tick_metadata;
 		if (tick_filter_state_) {
 			// Only a delta this stream has not been sent yet; an unchanged filter
@@ -1256,28 +1095,23 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 		try {
 			input_writer_->Write(tick_batch, &tick_metadata);
 		} catch (const std::exception &) {
-			// Tick write can fail with EPIPE/broken pipe if the server has already
-			// finished (e.g., finalize with no output). This is not an error — just
-			// mark the writer closed; the next read will return EOS.
+			// EPIPE when the worker already finished (e.g. finalize with no
+			// output): not an error; the next read returns EOS.
 			input_writer_closed_ = true;
 		}
 	};
 
-	// Loop to skip log batches (replaces recursive ReadDataBatch call)
+	// Loops past log batches.
 	while (true) {
-		// Drain any buffered stderr to logging
 		DrainStderrLog();
 
-		// Gate each read on cancellation. Without this, a worker that opens the
-		// data stream then stalls mid-production wedges the scan with Ctrl-C
-		// ignored — ReadNext() bottoms out in a bare blocking read(). proc_ is
-		// always non-null here (the lazy open above throws otherwise; HTTP uses a
-		// separate connection class), so polling its stdout fd is safe.
+		// Gate each read on cancellation, or a worker stalled mid-production
+		// wedges the scan in a blocking read() with Ctrl-C ignored. proc_ is null
+		// only for Iroh, whose stream reads handle interruption themselves.
 		if (proc_) {
 			WaitForReadableUntilCancel(proc_->GetStdoutFd(), &context_);
 		}
 
-		// Read from the data stream reader
 		VgiBatchPtr read_batch;
 		try {
 			read_batch = data_reader_->ReadNext();
@@ -1285,27 +1119,17 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 			throw; // cancellation (raw Iroh streams) always interrupts
 		} catch (const std::exception &e) {
 			const std::string error_text = StreamErrorText(e);
-			// QUIC FIN is only transport EOF. Raw Arrow-mux still requires the
-			// IPC EOS marker; accepting a truncated stream here would silently
-			// return a truncated result and leave this stateful connection
-			// desynchronized.
+			// QUIC FIN is only transport EOF; without the IPC EOS marker the result
+			// is truncated and the stateful connection desynchronized.
 			if (iroh_config_) {
 				ThrowFunctionIOException(FunctionInfo(function_name_, function_type_, nullptr), "Iroh data stream ended before the Arrow EOS marker: %s", worker_path_,
 				                    TransportPid(), GetExecutionIdHex(), error_text);
 			}
-			// The IPC stream uses an explicit EOS marker (0xFFFFFFFF +
-			// 0-length); a clean stream-end surfaces *below* as a null
-			// batch. A truncated / invalid stream here means the bytes
-			// were cut short — almost always because the worker died or
-			// closed stdout *before* writing the EOS marker.
-			//
-			// We can't entirely abandon the tolerant behaviour: some HTTP
-			// paths (proc_ null) and some workers historically end their
-			// stream by closing stdout without an EOS marker after a
-			// clean exit. So: if we can prove the worker died unexpectedly
-			// (killed by signal, or exited non-zero), surface a real
-			// error. Otherwise fall through to the legacy tolerant path
-			// so we don't regress healthy producers.
+			// A clean EOS surfaces below as a null batch; an invalid stream here
+			// means the bytes were cut short, usually because the worker died
+			// before writing EOS. Some workers end by closing stdout without EOS
+			// after a clean exit, so this is an error only when the worker is
+			// known to have been signalled or to have exited non-zero.
 			if (IsIpcStreamInvalid(e)) {
 				int exit_status = 0;
 				if (proc_ && proc_->TryWait(&exit_status)) {
@@ -1319,10 +1143,8 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), exit_status,
 						    error_text);
 					}
-					// exit_status == 0: worker exited cleanly without EOS.
 				}
-				// HTTP transport (no proc_) or worker still running: keep
-				// legacy tolerant behaviour.
+				// Clean exit or still running: treat as EOS.
 				data_finished_ = true;
 				return nullptr;
 			}
@@ -1331,17 +1153,10 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 		}
 		auto result = ToWireBatch(std::move(read_batch));
 
-		// Null batch means end of stream (EOS). Apply the same liveness
-		// probe as the truncation branch above: EOF at a message boundary
-		// is a silent EOS, so a SIGKILL'd worker's truncated stream can
-		// surface here too.
-		//
-		// Limitation: if the user's LOCATION wraps the worker behind a
-		// shell or launcher (e.g., ``uv run ...``), proc_ is the wrapper,
-		// not the worker. The wrapper may stay alive briefly after the
-		// worker dies, so TryWait returns false and we fall through. For
-		// LOCATION pointing directly at the worker binary we surface
-		// signal/non-zero exits cleanly.
+		// EOS. Apply the same liveness probe as above: EOF at a message boundary
+		// can also look like EOS. Limitation: when LOCATION wraps the worker
+		// (e.g. `uv run ...`), proc_ is the wrapper, which may still be alive
+		// after the worker dies, so the death goes undetected.
 		if (!result.batch) {
 			int exit_status = 0;
 			if (proc_ && proc_->TryWait(&exit_status)) {
@@ -1358,24 +1173,16 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 			return nullptr;
 		}
 
-		// Check for log/error batches via HandleBatchLogMessage
 		const auto log_error_context = FunctionInfo(function_name_, function_type_);
 		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, TransportPid(),
 		                          GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
 		                          &log_error_context)) {
-			continue;  // Skip log batch, read next
+			continue;
 		}
 
-		// External-location pointer batches: a 0-row batch carrying
-		// `vgi_rpc.location`. The worker externalized this batch (e.g. a large
-		// payload written to a shared blob store / pre-signed URL) instead of
-		// streaming it inline. Fetch + splice the real IPC data in place, then
-		// fall through to the metadata parsing below (batch_index /
-		// partition_values / cache-control ride the RESOLVED batch's metadata).
-		// Transport-independent: ResolveExternalLocation uses DuckDB's HTTPUtil,
-		// so subprocess workers get externalization just like HTTP ones. (A batch
-		// is either an external-location pointer OR a shm pointer OR inline — the
-		// shm block below is skipped for a resolved external batch.)
+		// External-location pointer: a 0-row batch carrying `vgi_rpc.location`.
+		// Fetch the real batch (over DuckDB's HTTPUtil, on any transport); the
+		// metadata parsed below comes from the RESOLVED batch.
 		bool resolved_external = false;
 		if (result.custom_metadata &&
 		    ClassifyBatch(result.batch, result.custom_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
@@ -1389,15 +1196,10 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 			result.custom_metadata = resolved.metadata;
 		}
 
-		// shm pointer batches: 0-row batches with shm_offset/shm_length in
-		// custom_metadata. Resolve to the actual batch from the segment.
-		// Hand back the slots nobody references any more first. The lockstep
-		// RPC protocol makes this a safe point to edit the allocator table;
-		// it does NOT mean the previous batch is finished with — a consumer may
-		// have retained it (result-cache capture, memo arena), and such a slot
-		// stays leased until that holder lets go. Without the sweep the
-		// allocator fills monotonically and the worker falls back to inline.
-		// (POSIX-only: shm_segment_ is never non-null on Windows.)
+		// shm pointer batch: 0-row with shm_offset/shm_length metadata. First
+		// sweep unreferenced slots (a lockstep point; a retained earlier batch
+		// keeps its slot leased), or the allocator fills and the worker falls
+		// back to inline.
 #if VGI_SHM_TRANSPORT
 		if (shm_segment_) {
 			ReleaseUnreferencedShmSlots();
@@ -1410,20 +1212,16 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 					fprintf(stderr, "[shm] resolved batch off=%lld len=%lld\n", (long long)resolved_offset,
 					        (long long)resolved->num_rows());
 				}
-				// Swap in the resolved batch but DON'T return here — fall through
-				// to the vgi_partition_values#b64 / vgi_batch_index parsing below.
-				// Those keys ride on result.custom_metadata (the worker merges them
-				// onto the pointer batch's metadata in maybe_write_to_shm), so an
-				// early return would silently drop partition values / batch index
-				// for every shm-resolved batch. result.custom_metadata is left
-				// intact precisely because the parsers read from it.
+				// Keep result.custom_metadata: the worker puts batch_index /
+				// partition values etc. on the pointer batch, and the parsers
+				// below read them from there.
 				result.batch = resolved;
 			}
 			if (std::getenv("VGI_RPC_SHM_DEBUG") && result.batch && result.batch->num_rows() > 0) {
 				fprintf(stderr, "[shm] inline fallback (rows=%lld)\n", (long long)result.batch->num_rows());
 			}
 		}
-#endif // VGI_POSIX_TRANSPORT (shm)
+#endif // VGI_SHM_TRANSPORT
 
 		// Validate the batch DuckDB will read (inline or shm-resolved). An
 		// externalized batch was validated by the reader that fetched it.
@@ -1431,9 +1229,7 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 			ValidateWorkerBatch(&context_, result.batch.get(), worker_path_);
 		}
 
-		// Parse vgi_partition_values#b64 off the wire metadata. Base64-
-		// decode here; IPC decode + validation happen in InstallBatch on
-		// the consumer thread (uniform error reporting across transports).
+		// Base64-decode only; InstallBatch does IPC decode and validation.
 		last_partition_values_bytes_.clear();
 		if (result.custom_metadata) {
 			auto pv_idx = result.custom_metadata->FindKey("vgi_partition_values#b64");
@@ -1457,10 +1253,7 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 			}
 		}
 
-		// Parse vgi_rpc.parent_row#b64 off the wire metadata (per-output-row parent
-		// input-row index for the batched-lateral operator). Raw little-endian
-		// int32 array (length == batch rows); the operator decodes + validates it.
-		// Empty = no provenance on this batch (identity mapping assumed).
+		// The batched-lateral operator validates it; empty = identity mapping.
 		last_parent_row_bytes_.clear();
 		if (result.custom_metadata) {
 			auto pr_idx = result.custom_metadata->FindKey("vgi_rpc.parent_row#b64");
@@ -1484,11 +1277,7 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 			}
 		}
 
-		// Parse vgi_batch_index off the wire metadata, if present. Validation
-		// (missing-tag / cap / monotonicity) happens in VgiTableFunctionImpl's
-		// InstallBatch on the consumer thread — here we just stash the raw
-		// uint64. INVALID_INDEX means "no key on this batch" — InstallBatch
-		// converts that into a typed IOException when the function opted in.
+		// Parse only; InstallBatch validates (missing key, cap, monotonicity).
 		last_batch_index_ = DConstants::INVALID_INDEX;
 		if (result.custom_metadata) {
 			auto bi_idx = result.custom_metadata->FindKey("vgi_batch_index");
@@ -1528,25 +1317,15 @@ VgiBatchPtr FunctionConnection::ReadDataBatch() {
 			}
 		}
 
-		// Parse vgi.cache.* cache-control off the wire metadata. A worker
-		// advertises only on the first data batch; the result-cache capture
-		// layer reads this via GetLastCacheControl() on that first batch (same
-		// lockstep timing as last_batch_index_). Cheap: a few FindKeys, only on
-		// the data-batch path; present=false when no vgi.cache.* key is set.
+		// Workers advertise vgi.cache.* on the first data batch only.
 		last_cache_control_ = ParseVgiCacheControl(result.custom_metadata);
 		last_more_output_ = HasMoreOutputStatus(result.custom_metadata);
 
-		// We're committed to returning this data batch. NOW send the next tick —
-		// after FreeAllocation + shm resolve above — so the worker's allocator
-		// never runs concurrently with our header mutation (see the long comment
-		// on send_next_tick near the top of this function). The tick goes out
-		// before we return, so the worker produces the next batch while DuckDB
-		// consumes this one.
+		// Only now, after the shm sweep/resolve (see send_next_tick).
 		send_next_tick();
 
-		// In the vgi_rpc protocol, EOS is signaled by the IPC stream closing (null
-		// batch from ReadNext above), not by 0-row batches. 0-row batches are valid
-		// responses in exchange mode (e.g., function buffered input without output).
+		// 0-row batches are valid (e.g. exchange input buffered without output);
+		// only the IPC EOS ends the stream.
 		return result.batch;
 	}
 }
@@ -1573,18 +1352,12 @@ std::string FunctionConnection::GetTransactionOpaqueDataDigest() const {
 }
 
 void FunctionConnection::SetInputSchema(const VgiSchemaPtr &input_schema) {
-	// No guard: pooled connections start with proc_ already set from
-	// construction, so a "post-spawn" check would falsely reject every
-	// pool-acquired bind. The schema is committed to the wire by the next
-	// PerformBindRpc; calling SetInputSchema after that desyncs caller and
-	// server, but it's a programmer error not protected against here.
+	// No proc_ guard: pooled connections already have one. Calling this after
+	// PerformBindRpc desyncs client and worker; that is unchecked.
 	input_schema_ = input_schema;
 }
 
 void FunctionConnection::UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) {
-	// Allow updating input schema after bind but before OpenInputWriter.
-	// Used when reusing a bind connection and the actual DataChunk types
-	// differ from the bind-time expression types (e.g., DECIMAL vs DOUBLE).
 	if (input_writer_opened_) {
 		ThrowVgiIOException("FunctionConnection::UpdateInputSchemaForExecution called after OpenInputWriter",
 		                    worker_path_, proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
@@ -1597,17 +1370,15 @@ void FunctionConnection::OpenInputWriter() {
 		ThrowVgiIOException("FunctionConnection::OpenInputWriter called before PerformInit", worker_path_,
 		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
 	}
-	// Input writer is now opened during PerformInit to avoid deadlock
-	// (server waits for input stream schema before writing output stream)
+	// PerformInit opens the writer, so this is normally a no-op.
 	if (input_writer_opened_) {
-		return; // Already opened during init
+		return;
 	}
 	if (!input_schema_) {
 		ThrowVgiIOException("FunctionConnection::OpenInputWriter called on non-table-in-out function", worker_path_,
 		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
 	}
 
-	// Create an IPC stream writer for stdin
 	auto sink = TransportOutput();
 	try {
 		input_writer_ = VgiIpcWriter::Open(sink, input_schema_);
@@ -1656,41 +1427,25 @@ void FunctionConnection::WriteInputBatch(const VgiBatchPtr &batch) {
 		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
 	}
 
-	// Reconcile the batch's schema to the writer's declared (worker-facing)
-	// schema. DuckDB's ArrowConverter::ToArrowSchema can't preserve every
-	// Arrow attribute on its types (notably nullability flags and
-	// TIMESTAMP_TZ unit/tz), so a batch produced by DataChunkToArrow may not
-	// match the schema the IPC stream was opened with even when the data
-	// would round-trip cleanly. ReconcileBatchToSchema handles the metadata
-	// reshape (no copy) and any genuine type cast
-	// recursively into nested types. Fast-path returns the batch unchanged
-	// when schemas already match.
+	// DuckDB's Arrow export loses some attributes (nullability, TIMESTAMP_TZ
+	// unit/tz), so reconcile the batch to the schema the writer declared.
 	auto reconciled = batch;
 	if (input_schema_) {
 		reconciled = ReconcileBatchToSchema(batch, input_schema_);
 	}
 
-	// Offload large non-dict inputs to the shared-memory segment: write the
-	// batch's IPC bytes into the segment and send a 0-row pointer batch
-	// (carrying shm_offset/shm_length) in its place. The worker resolves it and
-	// frees the slot. Falls back to writing the batch inline.
 	auto to_write = reconciled;
 	VgiMetadataPtr write_meta;
 #if VGI_SHM_TRANSPORT
-	// Serialize under input_schema_ — the schema input_writer_ declares on the
-	// wire — so the worker reads back exactly what it expects (no cast).
 	if (auto [pointer, shm_meta] = MaybeWriteBatchToShm(shm_segment_.get(), reconciled, input_schema_); pointer) {
 		to_write = pointer;
 		write_meta = shm_meta;
 	}
 #endif
 
-	// Conditional-revalidation validators (exchange-mode result cache): ride the
-	// exchange input batch's custom_metadata (the worker's exchange process() reads
-	// them, mirroring the producer's first tick) so the worker can answer 304-style
-	// with a 0-row vgi.cache.not_modified batch. The caller (an exchange operator)
-	// sets them per input unit via SetConditionalRequest and clears them after, so
-	// they never leak to the next unit. Merged with any shm pointer metadata.
+	// Exchange-mode result-cache validators (as on the producer's first tick).
+	// The exchange operator sets them per input unit via SetConditionalRequest
+	// and clears them after.
 	if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
 		std::vector<std::pair<std::string, std::string>> pairs;
 		if (write_meta) {
@@ -1719,41 +1474,31 @@ void FunctionConnection::WriteInputBatch(const VgiBatchPtr &batch) {
 		VGI_LOG(context_, "function_connection.input_batch_written", fields);
 	}
 
-	// Drain any buffered stderr
 	DrainStderrLog();
 }
 
 void FunctionConnection::CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) {
 	(void)state_token;
-	(void)live_context; // raw transports cancel without context-bound logging/HTTP
-	// The Iroh cancellation handle owns only the native stream. Never route the
-	// off-thread dispatcher through Arrow's writer: its output wrapper retains
-	// the originating query context for in-flight write cancellation, and that
-	// context may already have been destroyed by the time this method runs.
+	(void)live_context;
+	// Iroh: use the native stream's cancel handle, never the IPC writer — this
+	// runs off-thread, and the writer's output stream may hold a query context
+	// that is already destroyed.
 	if (transport_cancel_) {
 		transport_cancel_();
 		return;
 	}
-	// Best-effort: if the writer isn't open or is already closed, the
-	// worker has already learned the stream is done via EOS or pipe
-	// close; no cancel is needed.
+	// No open writer: the worker already saw EOS or pipe close.
 	if (!input_writer_opened_ || input_writer_closed_ || !input_writer_) {
 		return;
 	}
-	// Cancel is only supported for producer mode (table function). In
-	// producer mode tick_schema_ is an empty schema and a zero-row
-	// batch with no arrays is well-formed. In exchange mode
-	// (scalar / table-in-out input phase), input_schema_ has fields —
-	// a zero-array batch would mismatch the writer's opened schema and
-	// trip Arrow DCHECKs. For those callers the worker already learns
-	// about teardown via pipe close on the next batch boundary.
+	// Producer mode only: the empty tick would not match an exchange-mode
+	// writer's schema. Exchange workers learn of teardown via pipe close.
 	if (!tick_schema_) {
 		return;
 	}
 	const auto &cancel_batch = EmptyTick();
 	const VgiMetadata metadata {{std::string(generated::VGI_RPC_CANCEL_KEY), "1"}};
-	// Best-effort — dispatcher catches any throw; here we just swallow a
-	// failed write (the worker learns of teardown via pipe close anyway).
+	// Best-effort; the worker learns of teardown via pipe close anyway.
 	try {
 		input_writer_->Write(*cancel_batch, &metadata);
 	} catch (const std::exception &) {
@@ -1766,11 +1511,9 @@ void FunctionConnection::CloseInputWriter() {
 		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
 	}
 	if (input_writer_closed_) {
-		// Already closed, no-op
 		return;
 	}
 
-	// Close the IPC stream writer (sends end-of-stream marker)
 	try {
 		input_writer_->Close();
 	} catch (const std::exception &e) {
@@ -1786,30 +1529,16 @@ void FunctionConnection::CloseInputWriter() {
 		VGI_LOG(context_, "function_connection.input_writer_closed", fields);
 	}
 
-	// Drain any buffered stderr
 	DrainStderrLog();
 }
 
-// ============================================================================
-// Buffered Table Function RPCs (Sink+Source path)
-// ============================================================================
-//
-// Each RPC is a unary request/response sent on the connection's stdin/stdout
-// using the same WriteRpcRequest/ReadUnaryResponse framing PerformBindRpc
-// uses. Bind+init must have run on this connection first (with phase
-// "TABLE_BUFFERING"), establishing execution_id on the worker side. The
-// caller threads gstate.execution_id through every subsequent RPC.
+// Buffered table function (sink+source) RPCs: unary request/response on the
+// transport. The caller passes the execution_id from a TABLE_BUFFERING init.
 
 #if VGI_SHM_TRANSPORT
-// Resolve a shm pointer batch returned by a *unary* RPC response in place.
-// The worker offloads large non-dict responses to the shared-memory segment
-// exactly as it does for streaming scan output; the only difference is the
-// read path. Same ownership rule as ReadDataBatch: the slot is leased to the
-// resolved batch and handed back at a later sweep, once nothing references it.
-// (This used to free at once and rely on "the bytes survive until the worker's
-// next write" — true only while no caller keeps the decoded batch past the next
-// request.) We are just past a response, the worker is blocked on our next
-// request, so this is a lockstep point and sweeping here is safe.
+// Resolve a unary response's shm pointer batch in place. As in ReadDataBatch,
+// the slot stays leased until nothing references the resolved batch. Just past
+// a response is a lockstep point, so sweeping here is safe.
 void FunctionConnection::ResolveUnaryShm(UnaryResponseResult &response) {
 	if (!shm_segment_ || !response.batch) {
 		return;
@@ -1831,11 +1560,9 @@ void FunctionConnection::ReleaseUnreferencedShmSlots() {
 	if (!shm_segment_) {
 		return;
 	}
-	// use_count() == 1 means ours is the only reference. That is stable, not
-	// merely a snapshot: the other holders are the slot's buffers, and once the
-	// last of them is gone nothing can mint a new one (only we hold the lease).
-	// A count above 1 may be about to drop on another thread — then the slot
-	// simply waits for the next sweep.
+	// use_count() == 1 is stable: the other holders are the slot's buffers, and
+	// only our lease could mint new ones. A higher count may drop concurrently;
+	// that slot waits for the next sweep.
 	auto unreferenced = [this](const std::shared_ptr<VgiShmSlotLease> &lease) {
 		if (lease.use_count() != 1) {
 			return false;
@@ -1845,28 +1572,18 @@ void FunctionConnection::ReleaseUnreferencedShmSlots() {
 	};
 	shm_leases_.erase(std::remove_if(shm_leases_.begin(), shm_leases_.end(), unreferenced), shm_leases_.end());
 }
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SHM_TRANSPORT
 
 namespace {
 
-// Inner-request builders live in vgi_table_buffering_builders.cpp and are
-// shared with the HTTP transport. We reach them through ::duckdb::vgi::.
-
-// Decode the outer-envelope response into the registered result schema.
-// The 'result' column of the outer envelope is a binary blob containing
-// the IPC-serialized inner RecordBatch (matches what the worker emits).
+// Unwrap the {result: binary} envelope into the inner record batch.
 VgiBatchPtr DecodeOuterResponse(const UnaryResponseResult &response, const std::string &method_name,
                                 const std::string &worker_path) {
-	// Empty-schema responses (e.g. table_buffering_destructor) emit a null result;
-	// return null so the caller can skip column lookup.
+	// table_buffering_destructor returns a null result.
 	return UnwrapResultEnvelope(response.batch, method_name, ErrorInfo().Worker(worker_path), /*null_result_ok=*/true);
 }
 
 } // namespace
-
-// ===========================================================================
-// Table sink+source RPC family (new buffered API)
-// ===========================================================================
 
 std::vector<uint8_t>
 FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, const std::vector<uint8_t> &execution_id,
@@ -1876,15 +1593,12 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, c
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id, batch_bytes,
 	                                                       attach_opaque_data_, batch_index);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_process", worker_path_);
-	// The params batch embeds the (potentially large) input batch bytes; offload
-	// it to shm when a segment is attached. The 0-row pointer goes inline and
-	// WriteRpcRequest still stamps the method/version metadata onto it, so the
-	// worker reads method + shm_offset off the pointer and resolves the params.
+	// The params embed the input batch, so offload them to shm when possible;
+	// WriteRpcRequest still stamps method/version metadata onto the pointer.
 	auto process_params = rpc_params;
 	VgiMetadataPtr process_meta;
 #if VGI_SHM_TRANSPORT
-	// WriteRpcRequest opens the request stream with the params batch's own
-	// schema, so that's the wire schema here.
+	// The request stream is opened with the params batch's own schema.
 	if (auto [pointer, shm_meta] = MaybeWriteBatchToShm(shm_segment_.get(), rpc_params, rpc_params->schema());
 	    pointer) {
 		process_params = pointer;
@@ -1945,26 +1659,19 @@ int FunctionConnection::Wait() {
 }
 
 std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
-	// The worker can be handed back to the pool only if it's parked at its
-	// RPC accept-loop and the process is still alive. A streaming data
-	// phase is in-flight iff init was sent and we haven't seen EOS. Every
-	// other state — never-bound, post-bind pre-init, or post-EOS — means
-	// the worker has looped back and is ready to accept another RPC.
+	// Poolable only if alive and parked at its RPC loop: a data stream is in
+	// flight iff init was sent and EOS not yet seen.
 	if (!proc_ || proc_->TryWait()) {
-		return nullptr; // process missing or exited
+		return nullptr;
 	}
 	if (!proc_->IsPoolable()) {
-		// AF_UNIX-backed workers are shared via the launcher's socket, not
-		// via DuckDB's per-process worker pool.  The connection just
-		// closes its socket on destruction; the worker keeps running for
-		// the next caller.
+		// Socket-backed workers are shared at the OS level; closing our end
+		// leaves the worker running.
 		return nullptr;
 	}
 #if VGI_SHM_TRANSPORT
 	if (shm_session_advertised_) {
-		// The pool also lends processes to catalog/bind readers that have no
-		// SHM resolver. Keep this private process with its session owner;
-		// destruction closes it while retained batches keep their own leases.
+		// See shm_session_advertised_. Retained batches keep their own leases.
 		return nullptr;
 	}
 #endif
@@ -1972,19 +1679,14 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	if (streaming_in_flight) {
 		return nullptr;
 	}
-	// A failed split reset/init clears the flags above, so the check would pass;
-	// refuse explicitly instead of handing back a connection with an unanswered
-	// request in flight. See split_reset_failed_'s declaration.
+	// See split_reset_failed_.
 	if (split_reset_failed_) {
 		return nullptr;
 	}
 
-	// Properly close the data exchange streams before releasing to the pool.
-	// The input writer must be closed (writes EOS to stdin) so the server
-	// exits its data loop. The data reader must be drained to EOS so the
-	// stdout pipe is clean for the next operation.
+	// Close the input writer (EOS ends the worker's data loop) and drain the
+	// reader so the pipe is clean for the next checkout. Errors are ignored.
 	if (input_writer_ && !input_writer_closed_) {
-		// Ignore close errors during cleanup (worker might have died)
 		try {
 			input_writer_->Close();
 		} catch (const std::exception &) {
@@ -1992,7 +1694,6 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 		input_writer_closed_ = true;
 	}
 	if (data_reader_) {
-		// Drain remaining output to EOS (any read error ends the drain)
 		while (true) {
 			VgiBatchPtr drained;
 			try {
@@ -2009,16 +1710,12 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	data_reader_.reset();
 	data_stream_.reset();
 
-	// Hand the (still-running) drainer off to the pool so it keeps consuming
-	// stderr while the worker is idle. This prevents the Python worker from
-	// blocking on a full stderr pipe buffer between RPCs.
+	// The drainer keeps running in the pool (see stderr_drainer_).
 	auto drainer = std::move(stderr_drainer_);
 
-	// Create pooled worker with our subprocess and the live drainer.
 	PoolKey pool_key {worker_path_, data_version_spec_, implementation_version_};
 	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), pool_key, std::move(drainer));
 
-	// Clear our state so destructor doesn't try to use proc_
 	proc_.reset();
 
 	return pooled;
@@ -2026,26 +1723,12 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 
 void FunctionConnection::StartStderrReader() {
 	if (stderr_drainer_) {
-		return; // Already running
+		return;
 	}
 	if (!proc_ || proc_->GetStderrFd() < 0) {
 		return; // No stderr pipe (passthrough mode or no process)
 	}
 	stderr_drainer_ = std::make_unique<StderrDrainer>(proc_->ReleaseStderrFd());
-}
-
-int FunctionConnection::ReleaseStderrReaderFd() {
-	if (!stderr_drainer_) {
-		return -1;
-	}
-	int fd = stderr_drainer_->ReleaseFd();
-	stderr_drainer_.reset();
-	return fd;
-}
-
-void FunctionConnection::StopStderrReader() {
-	// Dropping the drainer joins the thread and closes the fd.
-	stderr_drainer_.reset();
 }
 
 void FunctionConnection::DrainStderrLog() {
@@ -2056,10 +1739,6 @@ void FunctionConnection::DrainStderrLog() {
 }
 
 #endif // VGI_SUBPROCESS_TRANSPORT
-
-// ============================================================================
-// Factory Functions
-// ============================================================================
 
 std::unique_ptr<IFunctionConnection>
 CreateFunctionConnection(const std::string &worker_path, const std::string &function_name,
@@ -2091,9 +1770,8 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 #endif
 	}
 #if defined(__EMSCRIPTEN__)
-	// worker:<url> and iroh://<EndpointId> use the same in-browser SAB byte
-	// transport. The page bridge owns either the legacy worker or the shared Iroh
-	// adapter worker; C++ owns only the target region and slot.
+	// worker:<url> and iroh://<EndpointId> share the in-browser SAB byte
+	// transport; the page bridge owns the worker, C++ only the region and slot.
 	if (IsWebWorkerTransport(worker_path) || IsIrohTransport(worker_path)) {
 		return std::make_unique<WebWorkerFunctionConnection>(worker_path, function_name, arguments, attach_opaque_data,
 		                                                     transaction_opaque_data, context, function_type,
@@ -2111,9 +1789,8 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 		    attach_params->data_version_spec(), attach_params->implementation_version(), attach_params->iroh());
 	}
 #endif
-	// Shared container: resolve the live endpoint via the daemon-introspection
-	// coordinator at connection time (self-heals an idle-stopped container), then
-	// build the right connection for the resolved mode.
+	// Shared container: resolve the live endpoint at connect time (restarting an
+	// idle-stopped container), then connect in the resolved mode.
 	if (IsContainerSharedLocation(worker_path)) {
 #if VGI_SUBPROCESS_TRANSPORT
 		ContainerSpec shared_spec;
@@ -2122,10 +1799,9 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 			throw IOException("vgi: no resolved shared-container info for '%s' (was the catalog attached?)",
 			                  worker_path);
 		}
-		// The container is warm by query time (catalog discovery already ran RPCs
-		// against it), so a single defensive stale-retry suffices — mirrors
-		// ResolveAndConnect: on a connect failure, invalidate the cached endpoint
-		// and re-resolve once (re-creating the container if it died mid-session).
+		// The container is warm by query time (catalog discovery used it), so one
+		// retry suffices: on failure invalidate the cached endpoint and re-resolve,
+		// re-creating the container if it died.
 		for (int attempt = 0;; attempt++) {
 			try {
 				auto ep = EnsureSharedContainer(shared_spec, shared_mode);
@@ -2134,8 +1810,7 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 					    ep.url, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 					    function_type, global_execution_id, worker_debug, settings, required_secrets, attach_params);
 				}
-				// tcp (and, later, unix): native vgi-rpc over a connected fd, driven by
-				// the same FunctionConnection machinery as the launch:/unix:// transports.
+				// Otherwise native vgi-rpc over a connected fd.
 				auto worker = ConnectSharedContainer(ep);
 				return std::make_unique<FunctionConnection>(std::move(worker), worker_path, function_name, arguments,
 				                                            attach_opaque_data, transaction_opaque_data, context,
@@ -2155,10 +1830,8 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 	}
 	if (IsTcpTransport(worker_path)) {
 #if VGI_POSIX_TRANSPORT
-		// tcp://host:port — connect-only against an out-of-band worker listening
-		// on a raw-TCP socket (vgi-rpc serve_tcp). Wrap the connected fd in a
-		// UnixSocketWorker (it's just an fd) so the existing FunctionConnection
-		// wire-protocol code drives it, exactly like unix:// and container-shared tcp.
+		// Connect-only to an out-of-band raw-TCP worker (vgi-rpc serve_tcp). A
+		// UnixSocketWorker wraps any connected fd.
 		std::string host;
 		int port;
 		ParseTcpLocation(worker_path, host, port);
@@ -2177,9 +1850,7 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 		                                            attach_opaque_data, transaction_opaque_data, context, function_type,
 		                                            global_execution_id, worker_debug, settings, required_secrets);
 #elif defined(_WIN32)
-		// tcp://host:port on Windows — connect a raw TCP socket (Winsock) and wrap
-		// the connected fd in a NamedPipeWorker (the generic fd worker on Windows),
-		// exactly like UnixSocketWorker over AF_UNIX on POSIX.
+		// NamedPipeWorker is Windows' generic connected-fd worker.
 		std::string host;
 		int port;
 		ParseTcpLocation(worker_path, host, port);
@@ -2203,22 +1874,10 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 	}
 	if (IsLaunchLocation(worker_path) || IsUnixLocation(worker_path)) {
 #if VGI_POSIX_TRANSPORT
-		// AF_UNIX path: resolve the socket via the launcher cache (which
-		// invokes vgi::Launch() on first call per process), open a fresh
-		// AF_UNIX connection, wrap it in a UnixSocketWorker so the
-		// existing FunctionConnection wire-protocol code drives it
-		// without modification.
-		//
-		// ResolveAndConnect handles the cache-staleness retry: if the
-		// cached worker has idle-shut-down between calls, the first
-		// connect fails, the cache is invalidated, the launcher fires
-		// fresh, and we reconnect.  Without this, long-lived DuckDB
-		// sessions would see ECONNREFUSED every time an idle worker times
-		// out (default 300 s).
-		//
-		// Launcher overrides (idle_timeout, state_dir) come from ATTACH
-		// options on attach_params; the cache pins them per-location so
-		// a second ATTACH with conflicting overrides fails fast.
+		// ResolveAndConnect resolves the socket via the launcher cache (launching
+		// on first use) and, if the cached worker idle-exited (default 300 s),
+		// invalidates, relaunches and reconnects. The cache pins launcher
+		// overrides per location, so a conflicting second ATTACH fails fast.
 		LaunchOverrides overrides;
 		if (attach_params && attach_params->launcher_idle_timeout_seconds().has_value()) {
 			overrides.idle_timeout = std::chrono::seconds(*attach_params->launcher_idle_timeout_seconds());
@@ -2232,9 +1891,8 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 		                                            attach_opaque_data, transaction_opaque_data, context, function_type,
 		                                            global_execution_id, worker_debug, settings, required_secrets);
 #elif defined(_WIN32)
-		// Windows: launch:/unix:// rendezvous over a Windows named pipe. unix://
-		// connects to an out-of-band worker; launch: spawns (or reuses) one via
-		// the named-pipe launcher (Launch → \\.\pipe\vgi-rpc-<hash>), then connects.
+		// Named pipes: unix:// connects to an out-of-band worker; launch: spawns
+		// or reuses one via the named-pipe launcher.
 		std::string pipe_name;
 		if (IsUnixLocation(worker_path)) {
 			pipe_name = StripUnixScheme(worker_path);
@@ -2262,13 +1920,9 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 	}
 	if (IsGithubLocation(worker_path) || IsGithubAutoLocation(worker_path)) {
 #if VGI_SUBPROCESS_TRANSPORT
-		// github:// / github-auto:// — run a worker downloaded from a GitHub release
-		// over the subprocess transport (POSIX or Windows). Resolution
-		// (download/extract/verify) is deferred to EnsureWorkerSpawned, which has the
-		// ClientContext and resolves worker_path → the local cached entrypoint.
-		// worker_path stays the github:// LOCATION so the worker pool keys
-		// acquire/release symmetrically. Version-key fields are forwarded so
-		// ReleaseForPooling buckets correctly.
+		// A GitHub-release worker over the subprocess transport. EnsureWorkerSpawned
+		// downloads/resolves it; worker_path stays the github:// LOCATION so pool
+		// keys match on acquire and release.
 		std::string gh_data_version_spec;
 		std::string gh_implementation_version;
 		if (attach_params) {
@@ -2285,15 +1939,13 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 		    worker_path);
 #endif
 	}
-	// Bare-command path → subprocess transport. Available on POSIX (fork/exec)
-	// and Windows (CreateProcess); only Emscripten lacks a child-process transport.
+	// Bare command → subprocess transport.
 #if !VGI_SUBPROCESS_TRANSPORT
 	throw InvalidInputException("vgi: subprocess (bare command) LOCATIONs require a child-process transport "
 	    "not available in this build (worker_path=%s); use http://… instead",
 	    worker_path);
 #else
-	// Forward version-key fields so ReleaseForPooling routes this worker back
-	// to the same pool bucket on next release.
+	// Version-key fields select the pool bucket.
 	std::string data_version_spec;
 	std::string implementation_version;
 	if (attach_params) {
@@ -2313,8 +1965,7 @@ CreateFunctionConnectionFromPool(std::unique_ptr<PooledWorker> pooled_worker, co
                                  const std::string &function_type, const std::vector<uint8_t> &global_execution_id,
                                  bool worker_debug, const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets) {
-	// Only subprocess connections use the pool. The pool is empty on builds
-	// without a child-process transport (Emscripten), so this is never reached there.
+	// Unreachable without a child-process transport: the pool stays empty.
 #if VGI_SUBPROCESS_TRANSPORT
 	return std::make_unique<FunctionConnection>(std::move(pooled_worker), function_name, arguments, attach_opaque_data,
 	                                            transaction_opaque_data, context, function_type, global_execution_id,

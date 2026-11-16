@@ -59,40 +59,27 @@ namespace vgi {
 
 namespace {
 
-// Adapt CatalogRpcContext::transaction_opaque_data (`std::vector<uint8_t>`, empty == none)
-// to the std::optional<std::vector<uint8_t>> shape the generated request builders
-// expect. The empty-as-absent convention predates the generators; rather than
-// thread std::optional through every storage-layer ctx construction, we wrap
-// here at the catalog-API boundary.
+// CatalogRpcContext uses empty-as-absent; the generated builders take optionals.
 inline std::optional<std::vector<uint8_t>> OptTxn(const CatalogRpcContext &ctx) {
 	return ctx.transaction_opaque_data.empty()
 	           ? std::nullopt
 	           : std::optional<std::vector<uint8_t>>(ctx.transaction_opaque_data);
 }
 
-// Adapt empty-string-as-absent strings (e.g. at_unit/at_value time-travel args)
-// to std::optional<std::string>. Mirrors the legacy BuildNullableStringScalar
-// behaviour the hand-coded builders relied on.
+// Empty-string-as-absent (e.g. at_unit/at_value) to optional.
 inline std::optional<std::string> OptStrIfNonEmpty(const std::string &s) {
 	return s.empty() ? std::nullopt : std::optional<std::string>(s);
 }
 
-// Adapt explicit (value, is_null) pairs from the existing Invoke* signatures
-// to std::optional<std::string>. Used for COMMENT ON ... and similar where the
-// caller carries an out-of-band null flag.
+// (value, is_null) pairs, e.g. COMMENT ON ... IS NULL, to optional.
 inline std::optional<std::string> OptStrNullable(const std::string &s, bool is_null) {
 	return is_null ? std::nullopt : std::optional<std::string>(s);
 }
 
-// Wraps every catalog RPC dispatch with an `outcome=ok|error` `catalog.rpc`
-// log carrying duration_ms + the entity context callers have populated on
-// CatalogRpcContext. Replaces the older start-side `rpc.invoke` log so each
-// dispatch produces exactly one event with the answer to "did it succeed and
-// how long did it take", which is what timeline analysis actually wants.
-//
-// The caller calls MarkOk() on the success path; the destructor distinguishes
-// normal-return vs. exception-unwind and logs accordingly. Also doubles as a
-// ScopedTimer so VGI_PROFILE=1 runs aggregate per-method totals at exit.
+// Exactly one `catalog.rpc` event per dispatch, with outcome=ok|error,
+// duration_ms and the CatalogRpcContext entity context. Callers MarkOk() on
+// success; otherwise the destructor logs an error. Also a ScopedTimer for
+// VGI_PROFILE=1.
 class CatalogRpcInstrumentation {
 public:
 	CatalogRpcInstrumentation(ClientContext &context, const CatalogRpcContext &ctx,
@@ -108,9 +95,8 @@ public:
 		ok_ = true;
 	}
 
-	// Stash the exception type/message we caught so the destructor can include
-	// them. Used by the explicit catch-then-rethrow path; std::current_exception
-	// is unreliable to inspect during stack unwind without a catch.
+	// Called from a catch-then-rethrow: the destructor runs during unwind,
+	// where the in-flight exception cannot be inspected without a catch.
 	void NoteException(const std::string &kind, const std::string &what) {
 		err_kind_ = kind;
 		err_what_ = what;
@@ -166,30 +152,19 @@ private:
 
 }  // namespace
 
-// ============================================================================
-// VgiAttachParameters — HTTPParams cache accessor
-// ============================================================================
-
-// See the comment on GetOrInitHttpParams in vgi_catalog_api.hpp for the
-// rationale. Initialization happens once per catalog; subsequent RPCs reuse
-// the same HTTPParams, which is how we avoid re-entering the secret manager
-// (and its MetaTransaction mutex) from under VgiTransaction::Start on HTTP
-// transport.
+// Initialized once per catalog; see the declaration in vgi_attach_parameters.hpp
+// for why BEGIN must never reach the secret manager (duckdb#22258).
 std::shared_ptr<HTTPParams> VgiAttachParameters::GetOrInitHttpParams(
     ClientContext &context, const std::string &url, bool single_attempt) const {
 	std::lock_guard<std::mutex> lock(http_params_mutex_);
 	if (!cached_http_params_) {
 		auto owned = InitHttpParamsWithSecrets(context, url);
-		// Initialize both concrete provider types before publishing either cache.
-		// HTTPParams has no virtual clone; copying its base would lose HTTPFS TLS
-		// and credential fields. Doing this later inside BEGIN would deadlock on
-		// the MetaTransaction mutex already held by VgiTransaction::Start.
+		// Initialize both sets now: copying an HTTPParams base would lose the
+		// HTTPFS TLS and credential fields, and doing it later inside BEGIN
+		// would deadlock.
 		auto single_owned = InitHttpParamsWithSecrets(context, url);
 		single_owned->retries = 0;
-		// Mirror the per-call ApplyHttpTimeout that HttpPostArrowIpcInternal
-		// used to do. Captured once at cache-init time — vgi_http_timeout_seconds
-		// changes won't be picked up without re-ATTACH. See the TODO on the
-		// method declaration.
+		// Captured once: a later vgi_http_timeout_seconds needs a re-ATTACH.
 		Value timeout_val;
 		if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
 			owned->timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
@@ -213,25 +188,19 @@ std::shared_ptr<VgiHttpClientPool> VgiAttachParameters::GetOrInitHttpClientPool(
 	return http_client_pool_;
 }
 
-// ============================================================================
-// RPC-based Catalog API Helper
-// ============================================================================
-
 // extra_info for a worker that answered a catalog RPC but broke the protocol
 // (missing/empty/mis-shaped response).
 static ErrorInfo CatalogProtocolViolation(const std::string &method_name, const std::string &worker_path) {
 	return std::move(ErrorInfo(error_subtype::kProtocolViolation).Rpc(method_name).Worker(worker_path));
 }
 
-// Rethrow the in-flight exception with the catalog RPC's context (method,
-// catalog, entity) added to its extra_info. Must be called from inside a catch
-// block. Preserves the exception's concrete type and its message byte-for-byte;
-// fields the inner exception already carries win over the ones added here.
-//   - VgiRpcException is rebuilt as VgiRpcException: callers pattern-match on
-//     it (capability fallback, catalog_version probe, vgi_extension.cpp).
-//   - InterruptException passes through untouched.
-//   - Exception types ThrowTypedException cannot rebuild faithfully (HTTP,
-//     INTERNAL, PERMISSION, ...) and non-DuckDB exceptions pass through.
+// Call from inside a catch block: rethrow with the RPC's method / catalog /
+// entity added to extra_info, keeping the concrete type and the message
+// byte-for-byte (fields the exception already carries win).
+//   - VgiRpcException stays a VgiRpcException: callers match on its error_kind
+//     (capability fallback, catalog_version probe, COPY-format discovery).
+//   - InterruptException, types ThrowTypedException cannot rebuild faithfully
+//     (HTTP, INTERNAL, PERMISSION, ...) and non-DuckDB exceptions pass through.
 [[noreturn]] static void RethrowWithCatalogRpcContext(const CatalogRpcContext &ctx, const std::string &method_name) {
 	auto context_info = [&]() {
 		ErrorInfo info;
@@ -268,26 +237,18 @@ static ErrorInfo CatalogProtocolViolation(const std::string &method_name, const 
 			throw;
 		}
 	}
-	// Non-DuckDB exceptions propagate out of the try above unchanged.
 }
 
-// Invoke a unary RPC catalog method and return the raw unary response.
-// Delegates to InvokePooledUnaryRpc which handles pool acquire/release, stderr
-// draining (critical — without it, long-running catalogs hang when the worker
-// stderr pipe buffer fills), and stale-pool retry.
-//
-// `protocol` selects the routing key (and the URL's protocol segment on HTTP).
-// Only `vgi.v3` methods have entries in the schema registry, so request
-// validation applies to those alone; other protocols' callers decode by name.
+// Every catalog RPC goes through here (InvokePooledUnaryRpc does pooling,
+// stderr draining and stale-pool retry). `protocol` selects the routing key
+// (the URL's protocol segment on HTTP). Only vgi.v3 methods are in the schema
+// registry, so only they get request validation.
 static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const std::string &method_name,
                                             const VgiBatchPtr &params, ClientContext &context,
                                             const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL) {
 	CatalogRpcInstrumentation instr(context, ctx, method_name);
 	try {
-		// Validate the outgoing request against the registered params schema.
-		// Catches encoder drift in BuildXxxParams (e.g. flipped nullability,
-		// missing fields) at the C++ boundary, before it turns into an opaque
-		// failure on the worker side.
+		// Catch request-builder drift here rather than as an opaque worker error.
 		if (protocol.name == VGI_MAIN_PROTOCOL.name) {
 			ValidateRequestSchema(params, method_name, ctx.params->worker_path());
 		}
@@ -301,38 +262,31 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		                      "rpc_catalog",
 		                      ctx.params->auth(),
 		                      ctx.params->cookie_jar()};
-		// The dispatcher enforces single-attempt mutation policy while retaining
-		// healthy subprocess pool reuse; pool selection does not control replay.
+		// Replay policy (single attempt for mutations) is the dispatcher's, not
+		// tied to pool selection.
 		opts.tcp_proxy = ctx.params->tcp_proxy();
 		opts.iroh = ctx.params->iroh();
-		// Cache-hit on the HTTP path: avoids re-entering the secret manager (and
-		// thus the MetaTransaction mutex) for RPCs invoked from inside
-		// VgiTransaction::Start. No-op for subprocess transport. See the TODO on
-		// VgiAttachParameters::GetOrInitHttpParams.
+		// Cached HTTPParams: RPCs from inside VgiTransaction::Start must not reach
+		// the secret manager (see VgiAttachParameters::GetOrInitHttpParams).
 		if (IsHttpTransport(ctx.params->worker_path()) || IsHttpiTransport(ctx.params->worker_path())) {
 			if (IsHttpTransport(ctx.params->worker_path())) {
 				opts.cached_http_params = ctx.params->GetOrInitHttpParams(
 				    context, ctx.params->worker_path(), RequiresSingleAttemptUnary(method_name));
 			}
-			// Keep-alive client pool: consecutive catalog RPCs reuse TCP/TLS
-			// connections instead of handshaking per call.
+			// Keep-alive pool: reuse TCP/TLS connections across catalog RPCs.
 			opts.http_client_pool = ctx.params->GetOrInitHttpClientPool();
-			// Share the catalog's capability snapshot with the streaming
-			// connections: whichever path first sees the server's
+			// Shared with the streaming connections: whichever first sees
 			// VGI-Supported-Encodings settles the codec for both.
 			opts.server_caps = ctx.params->server_caps();
 		} else if (IsContainerSharedLocation(ctx.params->worker_path())) {
-			// An oci:// container served over HTTP is reached on a loopback URL
-			// resolved per call, but its catalog RPCs need the same two caches:
-			// without them every RPC re-probes /health and initializes HTTP
-			// parameters with a secret lookup, which throws inside
-			// VgiTransaction::Start (catalog_transaction_begin).
+			// An oci:// container served over HTTP needs the same caches: without
+			// them each RPC re-probes /health and does a secret lookup, which
+			// throws inside VgiTransaction::Start (catalog_transaction_begin).
 			opts.cached_http_params = ctx.params->GetOrInitHttpParams(
 			    context, ctx.params->worker_path(), RequiresSingleAttemptUnary(method_name));
 			opts.server_caps = ctx.params->server_caps();
 		}
-		// Forward launcher overrides for `launch:` LOCATIONs.  Empty
-		// optionals on every other transport — no per-call cost.
+		// Launcher overrides (`launch:` LOCATIONs only).
 		if (ctx.params->launcher_idle_timeout_seconds().has_value()) {
 			opts.launcher_idle_timeout =
 			    std::chrono::seconds(*ctx.params->launcher_idle_timeout_seconds());
@@ -345,16 +299,13 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		instr.MarkOk();
 		return result;
 	} catch (const std::exception &e) {
-		// typeid().name() gives the demangled-or-mangled C++ type — close enough
-		// for triage. The full message goes in error_message; consumers that need
-		// the DuckDB ExceptionType can re-parse there.
+		// typeid().name() may be mangled; good enough for triage.
 		instr.NoteException(typeid(e).name(), e.what());
 		RethrowWithCatalogRpcContext(ctx, method_name);
 	}
 }
 
-// Extract result binary bytes from a unary RPC response batch,
-// then deserialize to a RecordBatch.
+// Unwrap the `result` envelope and validate it against the schema registry.
 static VgiBatchPtr ExtractAndDeserializeResult(
     const UnaryResponseResult &response, const std::string &method_name, const std::string &worker_path) {
 	// An empty envelope or a NULL result is a void/absent result, not an error.
@@ -368,19 +319,15 @@ static VgiBatchPtr ExtractAndDeserializeResult(
 	return result;
 }
 
-// Invoke a void-response RPC. After dispatch, run the response through the
-// schema registry to catch drift: the worker must return an empty envelope
-// (or empty inner batch) for methods registered as void. Any payload triggers
-// a clear mismatch error instead of being silently discarded.
+// For void methods the registry requires an empty envelope (or empty inner
+// batch); a payload is a mismatch error, not silently dropped.
 static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &method_name,
                           const VgiBatchPtr &params, ClientContext &context) {
 	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 	ExtractAndDeserializeResult(response, method_name, ctx.params->worker_path());
 }
 
-// ============================================================================
-// vgi_rpc.Reflection.v1
-// ============================================================================
+// Non-vgi.v3 protocols (vgi_rpc.Reflection.v1, ...)
 
 VgiBatchPtr InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
                                                         const VgiProtocolId &protocol, const std::string &method_name,
@@ -391,8 +338,7 @@ VgiBatchPtr InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &con
 	auto reflection_violation = [&]() {
 		return ErrorInfo(error_subtype::kProtocolViolation).Rpc(protocol_name + "/" + method_name).Worker(worker_path);
 	};
-	// The ordinary unary envelope: a structured return rides as one serialized
-	// IPC batch in a binary `result` column.
+	// The structured return is one serialized IPC batch in a binary `result` column.
 	auto result_col = response.batch->GetColumnByName("result");
 	if (!result_col || result_col.type().type != NANOARROW_TYPE_BINARY) {
 		throw IOException(reflection_violation(), "%s/%s reply carried no binary 'result' column [worker: %s]",
@@ -433,9 +379,7 @@ VgiBatchPtr InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
 	return InvokeProtocolUnary(ctx, context, kReflection, "list_protocols", nullptr);
 }
 
-// ============================================================================
-// Typed Catalog RPC Functions
-// ============================================================================
+// Typed catalog RPCs
 
 std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, ClientContext &context,
                                             bool worker_debug, bool use_pool,
@@ -445,12 +389,7 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 	                                            std::shared_ptr<void> worker_artifact_anchor,
 	                                            const std::string &tcp_proxy,
 	                                            std::shared_ptr<IrohClientConfig> iroh) {
-	// Use the config struct so launcher overrides flow into the temp_params —
-	// same rationale as InvokeCatalogAttach below. Without these, this RPC
-	// would prime the launcher cache with [defaults]; the user's subsequent
-	// ATTACH (carrying overrides) would then trip the cache-pin's
-	// BinderException, breaking even one-shot queries with custom launcher
-	// options.
+	// Launcher overrides must reach temp_params (see the declaration).
 	VgiAttachParametersConfig temp_cfg;
 	temp_cfg.worker_path = worker_path;
 	temp_cfg.worker_debug = worker_debug;
@@ -512,11 +451,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	                                    const std::string &tcp_proxy,
 	                                    std::shared_ptr<IrohClientConfig> iroh,
 	                                    ServerCapabilities *discovered_capabilities) {
-	// Use the config struct so launcher overrides flow into the temp_params.
-	// Without these, the catalog_attach RPC would prime the launcher cache
-	// with [defaults]; the subsequent real ATTACH (carrying overrides) would
-	// then trip the cache pin's BinderException, breaking even one-shot
-	// queries with custom launcher options.
+	// Launcher overrides must reach temp_params, as in InvokeCatalogs.
 	VgiAttachParametersConfig temp_cfg;
 	temp_cfg.worker_path = worker_path;
 	temp_cfg.worker_debug = worker_debug;
@@ -631,8 +566,7 @@ bool HasType(const VgiColumn &column, int type) {
 	return column && column.type().type == type;
 }
 
-// Arrow C++'s BinaryArray covers binary and (its subclass) utf8, but not the large
-// or view variants; the casts this replaces accepted exactly those two.
+// Binary or utf8 only — not the large or view variants.
 bool IsBinaryOrUtf8(const VgiColumn &column) {
 	if (!column) {
 		return false;
@@ -1057,8 +991,7 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
                                                    const std::string &schema_name, const std::string &table_name,
                                                    ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	// catalog_table_get's Protocol schema always includes at_unit/at_value (nullable);
-	// the overload without time-travel passes std::nullopt for both.
+	// at_unit/at_value are always present (nullable) on the wire.
 	auto params =
 	    generated::BuildCatalogTableGetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
 	                                          /*at_unit=*/std::nullopt, /*at_value=*/std::nullopt, OptTxn(ctx));
@@ -1117,10 +1050,6 @@ std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
 	return ParseViewInfo(info_batches[0], worker_path);
 }
 
-// Protocol 3.3: catalog_table_scan_branches_get is the only scan-discovery RPC
-// (catalog_table_scan_function_get and the client fallback to it are gone;
-// every worker that passes the 3.3 version check serves branches). A worker
-// answering MethodNotImplemented is a protocol error, reported as such.
 VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value,
@@ -1150,9 +1079,7 @@ VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
 	return ParseScanBranchesResult(context, result_batch, worker_path);
 }
 
-// ============================================================================
-// Table Write Function Get
-// ============================================================================
+// Table write function get
 
 static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
     const CatalogRpcContext &ctx, const std::string &rpc_method,
@@ -1202,9 +1129,7 @@ VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
 	                                          schema_name, table_name, context);
 }
 
-// ============================================================================
-// Transaction Lifecycle
-// ============================================================================
+// Transaction lifecycle
 
 int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
@@ -1217,17 +1142,9 @@ int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &contex
 		}
 		return generated::Decode<generated::CatalogVersionResponse>(result_batch, 0, worker_path).version;
 	} catch (const VgiRpcException &e) {
-		// Only a worker that does not implement catalog_version maps to 0
-		// ("unknown version": the caller clears its cache as a safe fallback).
-		// This used to be catch (...), which also swallowed interrupts, auth
-		// failures, transport errors and worker crashes, turning each into a
-		// silent cache clear. The narrowing is safe because the probe uses the
-		// same rule as the catalog_table_scan_branches_get fallback and the
-		// COPY-format discovery in vgi_extension.cpp: match the typed
-		// error_kind=method_not_implemented marker only. A worker too old to
-		// send that marker also fails the exact major.minor protocol_version
-		// check at dispatch, so it cannot get this far anyway. Every other
-		// failure now reaches the user.
+		// Only method_not_implemented maps to 0 ("unknown version": the caller
+		// clears its cache). Interrupts, auth, transport and worker failures
+		// must reach the user, not turn into a silent cache clear.
 		if (e.GetErrorKind() == error_kind::kMethodNotImplemented) {
 			return 0;
 		}
@@ -1258,9 +1175,7 @@ void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContex
 	InvokeVoidRpc(ctx, "catalog_transaction_rollback", params, context);
 }
 
-// ============================================================================
-// DDL Operations
-// ============================================================================
+// DDL
 
 bool InvokeCatalogTableCreate(
     const CatalogRpcContext &ctx,
@@ -1275,9 +1190,8 @@ bool InvokeCatalogTableCreate(
 	                            on_conflict, constraint_definitions, ctx.transaction_opaque_data);
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 	auto params = generated::BuildCatalogTableCreateParams(request_bytes);
-	// Protocol 3.3: the reply says whether this call created the table (false:
-	// IF NOT EXISTS found an existing one). It is required: a CTAS appends to
-	// the table only when this call created it.
+	// `created` is required: a CTAS appends to the table only when this call
+	// created it.
 	const auto &worker_path = ctx.params->worker_path();
 	auto response = InvokeRpcMethod(ctx, "catalog_table_create", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_create", worker_path);
@@ -1440,9 +1354,7 @@ void InvokeCatalogTableNotNullDrop(
 	InvokeVoidRpc(ctx, "catalog_table_not_null_drop", params, context);
 }
 
-// ============================================================================
-// View DDL Operations
-// ============================================================================
+// View DDL
 
 void InvokeCatalogViewCreate(
     const CatalogRpcContext &ctx,
@@ -1522,20 +1434,17 @@ void InvokeCatalogSchemaDrop(
 	InvokeVoidRpc(ctx, "catalog_schema_drop", params, context);
 }
 
-// ============================================================================
-// Table Function Cardinality
-// ============================================================================
+// Table function cardinality
 
 TableFunctionCardinalityResult InvokeTableFunctionCardinality(
     const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
     const std::vector<uint8_t> &bind_opaque_data, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
 
-	// Build the TableFunctionCardinalityRequest batch and serialize to IPC bytes
 	auto request_batch = BuildTableFunctionCardinalityRequest(bind_request_bytes, bind_opaque_data);
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 
-	// Wrap in {request: binary} (the protocol's TableFunctionCardinalityParams shape)
+	// Wrapped as {request: binary}.
 	auto params = generated::BuildTableFunctionCardinalityParams(request_bytes);
 
 	auto response = InvokeRpcMethod(ctx, "table_function_cardinality", params, context);
@@ -1546,15 +1455,10 @@ TableFunctionCardinalityResult InvokeTableFunctionCardinality(
 	return ParseTableFunctionCardinalityResult(result_batch, worker_path);
 }
 
-// ============================================================================
-// Scan Planning (splits)
-// ============================================================================
+// Scan planning (splits)
 
-//! Parse one ``PlanResponse`` batch into a page.
-//!
-//! ``splits`` and ``scope`` are required. An EMPTY splits list is legal — a
-//! fully-pruned scan plans zero splits, and that must produce an empty result
-//! rather than an error.
+// `splits` and `scope` are required. An EMPTY splits list is legal: a
+// fully-pruned scan plans zero splits and yields an empty result.
 VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
                                      const std::string &worker_path) {
 	VgiScanPlanPage page;
@@ -1591,9 +1495,8 @@ VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
 				throw IOException(violation("splits"),
 				                  "VGI worker '%s' returned a null entry in plan 'splits'", worker_path);
 			}
-			// Decode the protocol-3.1 fields DuckDB consumes. The outer split
-			// cell remains zero-copy; generated decoding copies only the token
-			// and optional exact key tuple that survive planning.
+			// The split cell stays zero-copy; only the token and optional key
+			// tuple are copied out.
 			auto split_batch = DeserializeFromIpcBytesZeroCopy(BinaryCell(batch, values, i));
 			if (!split_batch || split_batch->num_rows() == 0) {
 				throw IOException(CatalogProtocolViolation("table_function_plan", worker_path).Set(error_key::kField, "splits"),
@@ -1719,15 +1622,9 @@ VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch,
 	return page;
 }
 
-//! Plan a table-function scan into named, independently redeemable splits.
-//!
-//! Bounded on three axes, because this runs on the scheduling thread and a worker
-//! that paginates forever would otherwise hang the query with no diagnosis:
-//! a page cap, a total split cap, and a cancellation check every page.
-//!
-//! A breach THROWS rather than proceeding with what arrived. Scanning a partial
-//! enumeration would silently return a subset of the table — wrong results wearing
-//! the costume of a successful query — so truncate-and-proceed is never correct here.
+// Runs on the scheduling thread, so the bounds (see the declaration) turn a worker
+// that paginates forever into an error. A breach THROWS: scanning a partial
+// enumeration would silently return a subset of the table.
 VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
                                     const std::vector<uint8_t> &bind_request_bytes,
                                     const std::vector<uint8_t> &bind_opaque_data,
@@ -1737,12 +1634,9 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
                                     ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
 
-	// Bounds. Deliberately generous: they exist to turn a hang into a legible
-	// error, not to second-guess a worker's split count.
-	// Read from the session so an operator can raise it for a worker that
-	// legitimately paginates a very large table — this bounds PAGES, not splits,
-	// so the reachable split count is this times the worker's page size, which
-	// may sit far below the split cap below.
+	// Deliberately generous bounds: they turn a hang into an error, not police
+	// split counts. The page cap is a setting so it can be raised for a worker
+	// that legitimately paginates a very large table.
 	idx_t max_pages = defaults::SPLIT_PLAN_MAX_PAGES;
 	Value max_pages_value;
 	if (context.TryGetCurrentSetting("vgi_split_plan_max_pages", max_pages_value) &&
@@ -1758,32 +1652,10 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	plan.function_name = function_name;
 	std::deque<std::vector<uint8_t>> pending_cursors;
 	pending_cursors.emplace_back();
-	// Split disjointness is the WORKER's obligation and is not policed here.
-	//
-	// A paginated enumeration must not hand out the same split twice; violating
-	// that returns duplicate rows. The client used to dedup by token, then to
-	// refuse on a repeat, and neither earned its keep:
-	//
-	//   It cost every scan to guard an unused one. Detection needs a set holding a
-	//   COPY of every token beside the vector already holding them — on a plan near
-	//   the cap that is hundreds of MB of duplicated bytes plus the hashing, paid by
-	//   every user of every split scan, to police parallel cursor fan-out that no
-	//   client emits.
-	//
-	//   It could not hold uniformly. Detection compares token bytes; a keyless
-	//   worker stamps deterministically and a keyed one seals under a fresh random
-	//   nonce, so the check ran on the development transport and never on the one a
-	//   distributed engine uses.
-	//
-	//   It could not repair anything. The most a client can do with a duplicate is
-	//   refuse the query — swapping one worker bug for a different error message.
-	//
-	// So it is a contract, like the worker's obligation to keep a SINGLE_VALUE
-	// split single-valued before reporting partitioning, or to keep splits
-	// replayable, or to keep redemption state cross-process. None of those are
-	// checked here either. Should a stable split identity ever land on the wire
-	// (deterministic sealing, or a plaintext split_id), enforcing this becomes
-	// cheap and uniform and is worth revisiting; until then it is the worker's.
+	// Split disjointness across pages is the WORKER's obligation and is not
+	// checked (a duplicate split returns duplicate rows). Token comparison is
+	// costly near the cap and cannot work uniformly: keyed workers seal tokens
+	// under a random nonce. Revisit if a stable split id reaches the wire.
 	idx_t pages = 0;
 	std::optional<std::vector<uint8_t>> first_key_grouping;
 	bool key_grouping_consistent = true;
@@ -1820,11 +1692,8 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 		pages++;
 
 		auto page = ParseVgiScanPlanPage(result_batch, worker_path);
-		// Plan-level facts come from the FIRST page, keyed on the page count
-		// rather than on `splits.empty()`. A leading page may legally carry zero
-		// splits and a cursor (a worker still enumerating), and keying on
-		// emptiness let each such page overwrite these — so what survived was the
-		// LAST empty page's values, not the first page's.
+		// Plan-level facts come from the FIRST page. Key on the page count, not
+		// on splits.empty(): leading pages may legally carry zero splits.
 		if (pages == 1) {
 			plan.max_workers = page.max_workers;
 			plan.catalog_version = page.catalog_version;
@@ -1863,30 +1732,23 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	return plan;
 }
 
-// ============================================================================
-// Column Statistics
-// ============================================================================
+// Column statistics
 
-// Build DuckDB BaseStatistics from min/max Values and metadata.
-// Uses DuckDB's BaseStatistics::FromConstantType + Merge to handle all types
-// (numeric, string, decimal, list, struct, etc.) without manual type dispatch.
+// BaseStatistics::FromConstant(min) merged with FromConstant(max), so DuckDB
+// handles every stats type without a hand-written type dispatch.
 static unique_ptr<BaseStatistics> BuildColumnStatistics(
     const LogicalType &duck_type, const Value &min_val, const Value &max_val,
     bool has_null, bool has_not_null, int64_t distinct_count,
     bool has_contains_unicode, bool contains_unicode,
     bool has_max_string_length, uint64_t max_string_length) {
 
-	// Use DuckDB's FromConstant to build stats from min, then Merge with max to
-	// expand the range. This delegates all type-specific logic (NumericStats,
-	// StringStats, ListStats, etc.) to DuckDB internals — no manual type dispatch.
 	if (min_val.IsNull() && max_val.IsNull()) {
 		return make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(duck_type));
 	}
 
-	// Cast values to the target type so FromConstant dispatches to the correct
-	// stats type (e.g., GEOMETRY_STATS for geometry columns). For types that
-	// share the same physical representation but have no registered cast
-	// (e.g., BLOB → GEOMETRY), reinterpret the value with the target type.
+	// Cast to the column type so FromConstant picks the right stats type (e.g.
+	// GEOMETRY_STATS); with no registered cast but the same physical type (BLOB
+	// -> GEOMETRY), reinterpret instead.
 	auto cast_value = [&](const Value &val) -> Value {
 		if (val.IsNull()) {
 			return val;
@@ -1897,8 +1759,6 @@ static unique_ptr<BaseStatistics> BuildColumnStatistics(
 		try {
 			return val.DefaultCastAs(duck_type);
 		} catch (...) {
-			// Cast not available — if the physical types match, reinterpret
-			// the value with the target logical type (e.g., BLOB → GEOMETRY)
 			if (val.type().InternalType() == duck_type.InternalType()) {
 				return val.WithType(duck_type);
 			}
@@ -1914,19 +1774,17 @@ static unique_ptr<BaseStatistics> BuildColumnStatistics(
 		result.Merge(BaseStatistics::FromConstant(cast_value(max_val)));
 	}
 
-	// Override null/valid flags (FromConstantType sets CANNOT_HAVE_NULL by default)
+	// FromConstant of a non-null value sets CANNOT_HAVE_NULL; widen as reported.
 	if (has_null) {
 		result.SetHasNull();
 	}
 	if (has_not_null) {
 		result.SetHasNoNull();
 	}
-	if (distinct_count >= 0) {
-		result.SetDistinctCount(static_cast<idx_t>(distinct_count));
-	}
+	// FromConstant sets distinct_count = 1; DuckDB treats 0 as unknown.
+	result.SetDistinctCount(distinct_count >= 0 ? static_cast<idx_t>(distinct_count) : 0);
 
-	// String-specific fields — must guard with type check to avoid accessing
-	// the wrong union member (UB if called on NUMERIC_STATS etc.)
+	// StringStats on another stats type reads the wrong union member (UB).
 	if (result.GetStatsType() == StatisticsType::STRING_STATS) {
 		if (has_contains_unicode && contains_unicode) {
 			StringStats::SetContainsUnicode(result);
@@ -1939,12 +1797,9 @@ static unique_ptr<BaseStatistics> BuildColumnStatistics(
 	return result.ToUnique();
 }
 
-// Convert a deserialized ColumnStatistics RecordBatch into a name → BaseStatistics map.
-// Shared by `catalog_table_column_statistics_get` and `table_function_statistics`, which
-// use the same wire shape (columns: column_name, min [union], max [union], has_null,
-// has_not_null, distinct_count, contains_unicode?, max_string_length?).
-// `log_source_key` / `log_source_value` identify the RPC source in log records
-// (e.g. {"table", "public.users"} or {"function_name", "sequence"}).
+// Wire shape: column_name, min [union], max [union], has_null, has_not_null,
+// distinct_count, contains_unicode?, max_string_length?. log_source_key/value
+// identify the source in logs (e.g. {"table", "public.users"}).
 std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
     const VgiBatchPtr &result_batch,
     const std::vector<LogicalType> &column_types,
@@ -1956,9 +1811,7 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatistic
 		return out;
 	}
 
-	// Convert Arrow RecordBatch → DuckDB DataChunk using DuckDB's Arrow scanner.
-	// Correctly handles all types (string, decimal, timestamp, union, etc.)
-	// without manual per-type conversion.
+	// DuckDB's Arrow scanner converts every type, including the min/max unions.
 	ArrowSchemaWrapper schema_root;
 	ExportSchema(result_batch->schema(), schema_root);
 
@@ -2014,7 +1867,6 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatistic
 			}
 			auto &duck_type = type_it->second;
 
-			// Extract min/max from the UNION-typed columns.
 			auto min_union_val = stats_chunk.data[name_indexes["min"]].GetValue(i);
 			auto max_union_val = stats_chunk.data[name_indexes["max"]].GetValue(i);
 
@@ -2083,11 +1935,9 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 	const char *method_name = "catalog_table_column_statistics_get";
 	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 
-	// Custom decode path (uses DeserializeFromIpcBytesWithMetadata to preserve
-	// IPC batch custom_metadata, where cache_max_age_seconds lives). The outer
-	// envelope is validated here with the same rigor as ExtractAndDeserializeResult,
-	// then ValidateResponseSchema is a no-op (method is registered dynamic) but we
-	// keep it for symmetry with the rest of the codebase.
+	// Not ExtractAndDeserializeResult: the inner batch's custom_metadata carries
+	// cache_max_age_seconds. ValidateResponseSchema is a no-op here (the method
+	// is registered dynamic) but kept for symmetry.
 	DeserializedBatch deserialized;
 	if (response.batch && response.batch->num_rows() != 0) {
 		deserialized.batch =
@@ -2100,7 +1950,6 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 	}
 	ValidateResponseSchema(deserialized.batch, method_name, worker_path);
 
-	// Extract cache_max_age_seconds from IPC batch custom_metadata
 	if (deserialized.custom_metadata) {
 		int key_idx = deserialized.custom_metadata->FindKey("cache_max_age_seconds");
 		if (key_idx >= 0) {
@@ -2135,9 +1984,7 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
 	const char *method_name = "table_function_statistics";
 	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 
-	// Response envelope: {result: binary|null}. Null result → no stats available
-	// (method returns Optional[bytes] in vgi-python; shape of the bytes varies
-	// per function and is validated by ParseColumnStatisticsBatch downstream).
+	// Null result: no stats. The payload shape is function-specific.
 	auto result_batch = ExtractAndDeserializeResult(response, method_name, worker_path);
 	if (!result_batch) {
 		return {};
@@ -2147,9 +1994,7 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
 	                                   worker_path, "function_name", function_name, context);
 }
 
-// ============================================================================
-// Table Function dynamic_to_string
-// ============================================================================
+// Table function dynamic_to_string
 
 InsertionOrderPreservingMap<std::string> InvokeTableFunctionDynamicToString(
     const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
@@ -2171,24 +2016,18 @@ InsertionOrderPreservingMap<std::string> InvokeTableFunctionDynamicToString(
 		}
 		return ParseTableFunctionDynamicToStringResult(result_batch, worker_path);
 	} catch (const std::exception &e) {
-		// EXPLAIN ANALYZE must never fail because of a profiler-only RPC.
-		// Log and surface an empty map; the caller will append the intrinsic
-		// keys it knows from the global state.
+		// EXPLAIN ANALYZE must never fail because of a profiler-only RPC; the
+		// caller still appends the keys it knows from the global state.
 		VGI_LOG(context, "table_function.dynamic_to_string_error",
 		        {{"worker_path", worker_path}, {"error", e.what()}});
 		return {};
 	}
 }
 
-// ============================================================================
-// Enum parsing functions
-// ============================================================================
+// Enum parsing
 
-// Enforce that a wire enum string parsed to a known value. The parser helpers
-// return std::nullopt for unrecognized strings; this turns that into a loud
-// IOException so a worker typo, protocol skew, or newer worker-side enum
-// variant surfaces instead of being silently masked as a default (which would
-// run with behavior inconsistent with what the worker declared).
+// An unrecognized wire enum (typo, protocol skew, newer variant) is a protocol
+// error, never silently defaulted to behavior the worker did not declare.
 template <typename T>
 static T RequireKnownEnum(std::optional<T> parsed, const std::string &raw, const char *field_name,
                           const std::string &worker_path, const std::string &fn_name) {
@@ -2310,9 +2149,7 @@ static AggregateDistinctDependent FromWire(generated::AggregateDistinctDependent
 	           : AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
 }
 
-// ============================================================================
 // Result parsing
-// ============================================================================
 
 vector<Value> BatchRowToValues(ClientContext &context, const VgiBatchPtr &batch, int64_t row) {
 	vector<Value> result;
@@ -2320,10 +2157,7 @@ vector<Value> BatchRowToValues(ClientContext &context, const VgiBatchPtr &batch,
 		return result;
 	}
 
-	// DuckDB's own Arrow scanner does the conversion, so every type DuckDB can
-	// read from Arrow is supported, with the column types ArrowSchemaToDuckDBTypes
-	// assigns (int8..uint64 / float / double / bool / utf8 / binary map onto the
-	// matching DuckDB scalar types).
+	// DuckDB's Arrow scanner converts, so every type DuckDB reads from Arrow works.
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> types;
@@ -2477,7 +2311,7 @@ CatalogAttachResult ParseCatalogAttachResult(const VgiBatchPtr &batch,
 	result.comment = wire.comment.value_or("");
 	result.tags = std::move(wire.tags);
 	result.supports_column_statistics = wire.supports_column_statistics;
-	// Globally-published functions (protocol 1.3.0+): each a serialized FunctionInfo.
+	// Globally-published functions: each a serialized FunctionInfo.
 	for (const auto &gf_bytes : wire.global_functions) {
 		result.global_functions.push_back(ParseFunctionInfo(DeserializeFromIpcBytes(gf_bytes), 0, worker_path));
 	}
@@ -2564,9 +2398,8 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
 		return ParseScanFunctionResult(context, DeserializeFromIpcBytes(*bytes), worker_path);
 	};
 	info.scan_function = decode_inlined(wire.scan_function);
-	// Protocol 3.2 scan planning. Unknown values and a filtered table that also
-	// inlines its scan redirect are worker bugs: reject them at catalog load so
-	// the error names the catalog, not a later query.
+	// Reject unknown scan_planning, or a filtered table that inlines its scan
+	// redirect, at catalog load so the error names the catalog, not a later query.
 	info.scan_planning = wire.scan_planning;
 	if (info.scan_planning != "bind" && info.scan_planning != "filtered") {
 		throw IOException(ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path).Set(error_key::kField, "scan_planning"),
@@ -2600,9 +2433,9 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
 	}
 
 
-	// Required filters are mandatory successor metadata, including an explicit
-	// empty outer list. Reject malformed/legacy values rather than disabling
-	// enforcement through value_or()'s missing/type-mismatch fallback.
+	// required_filters is mandatory (an explicit empty outer list is required).
+	// Reject malformed values; a value_or() fallback would silently disable
+	// enforcement.
 	auto fail_required = [&](const std::string &reason) {
 		throw InvalidInputException(
 		    ErrorInfo(error_subtype::kProtocolViolation).Worker(worker_path)
@@ -2658,7 +2491,7 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
 		info.required_filters.push_back(std::move(group));
 	}
 
-	// Validate: UPDATE/DELETE require a row ID column
+	// UPDATE/DELETE require a row ID column.
 	if ((info.write_result_modes.count("update") || info.write_result_modes.count("delete")) &&
 	    info.row_id_column < 0) {
 		throw InvalidInputException(
@@ -2733,10 +2566,8 @@ VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const VgiBatchPtr &batch,
 	return info;
 }
 
-// Shared helper: decode the nested-IPC argument batch (the "arguments" binary
-// field on both ScanFunctionResult and ScanBranch) into positional+named Values.
-// Field names matching ``arg_<N>`` are routed to positional slot N; everything
-// else becomes a named argument.
+// Decode a nested-IPC argument batch (ScanFunctionResult / ScanBranch
+// `arguments`): field `arg_<N>` goes to positional slot N, anything else is named.
 static void DecodeScanArguments(ClientContext &context,
                                 const std::vector<uint8_t> &arguments_bytes,
                                 duckdb::vector<Value> &positional_out,
@@ -2754,11 +2585,8 @@ static void DecodeScanArguments(ClientContext &context,
 		const auto &field_name = schema->field_names()[static_cast<size_t>(i)];
 		auto &duck_value = values[i];
 		if (field_name.rfind("arg_", 0) == 0) {
-			// Cap to a sane ceiling: a worker-supplied index is used to size the
-			// positional vector, so an unbounded value (e.g. "arg_9999999999")
-			// would force a multi-GB allocation. >1000 positional args to a
-			// single function is not a real workload — treat it as a protocol
-			// error rather than honoring the resize.
+			// The worker-supplied index sizes the positional vector, so cap it
+			// (e.g. "arg_9999999999" would force a multi-GB allocation).
 			constexpr size_t kMaxPositionalArgs = 1000;
 			size_t idx;
 			bool is_positional = false;
@@ -2766,7 +2594,7 @@ static void DecodeScanArguments(ClientContext &context,
 				idx = std::stoul(field_name.substr(4));
 				is_positional = true;
 			} catch (const std::exception &) {
-				// Not a numeric arg_<N> suffix — fall through to named handling.
+				// Not a numeric suffix: a named argument.
 				named_out[field_name] = duck_value;
 			}
 			if (is_positional) {
@@ -2796,15 +2624,9 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const VgiB
 	return result;
 }
 
-// Parse the result of catalog_table_scan_branches_get. The outer batch is a
-// 1-row record with a list<binary> column carrying serialized ScanBranch
-// 1-row batches; each branch's `arguments` field is itself a nested IPC
-// stream of typed scalars. The branch_filter SQL string (when non-empty) is
-// parsed eagerly via Parser(ParserOptions::Builtin()).ParseExpressionList — the resulting
-// ParsedExpression lives on the catalog entry alongside the branches list.
-// We do NOT bind the expression here; binding happens in the rewriter where
-// a Binder + the branch's column list are in hand. See plan: §C++ wiring
-// sketch "branch_filter parse-at-attach, re-bind-per-rewrite, no bound cache".
+// Each branch is a serialized 1-row ScanBranch whose `arguments` is a nested IPC
+// batch. branch_filter is parsed here but NOT bound: binding happens in the
+// rewriter, which has a Binder and the branch's columns.
 VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
                                                const VgiBatchPtr &batch,
                                                const std::string &worker_path) {
@@ -2816,14 +2638,11 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 	}
 
 	auto wire = generated::Decode<generated::ScanBranchesResult>(batch, 0, worker_path);
-	// Top-level required_extensions: the union across branches.
+	// The union across branches.
 	result.required_extensions = std::move(wire.required_extensions);
-	// Each branch is the IPC bytes of a 1-row ScanBranch batch.
 	const auto &branch_blobs = wire.branches;
-	// Zero branches parse successfully: protocol 3.2 makes it the legal "no
-	// rows" answer for a scan_planning='filtered' table. Bind-time callers
-	// (VgiTableEntry::GetScanFunctionImpl, for 'bind' tables) still reject it
-	// as a protocol violation.
+	// Zero branches is the legal "no rows" answer for a scan_planning='filtered'
+	// table; VgiTableEntry rejects it for 'bind' tables.
 
 	result.branches.reserve(branch_blobs.size());
 	std::vector<size_t> writable_ordinals;
@@ -2834,12 +2653,11 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 		branch.function_name = std::move(branch_wire.function_name);
 		DecodeScanArguments(context, branch_wire.arguments, branch.positional_arguments, branch.named_arguments);
 
-		// branch_filter is nullable; absent / NULL → empty string == unconstrained.
+		// Absent / NULL means unconstrained.
 		branch.branch_filter = branch_wire.branch_filter.value_or("");
 		if (!branch.branch_filter.empty()) {
-			// Parse inside the try, validate outside it: the empty-result check
-			// below throws its own BinderException, which must not be re-wrapped
-			// as a "parse error".
+			// Validate outside the try so these BinderExceptions are not
+			// re-wrapped as a "parse error".
 			duckdb::vector<duckdb::unique_ptr<ParsedExpression>> exprs;
 			try {
 				exprs = Parser(ParserOptions::Builtin()).ParseExpressionList(branch.branch_filter);
@@ -2860,10 +2678,8 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 				                      "VGI branch_filter parsed to no expressions [worker: " + worker_path +
 				                          ", filter: " + branch.branch_filter + "]");
 			}
-			// branch_filter is exactly one SQL expression (protocol 3.2 makes
-			// this explicit). Protocol 3.1 clients silently kept exprs[0] and
-			// dropped the rest, so a branch scoped by "a < 5, b > 7" returned
-			// rows outside its declared scope.
+			// Exactly one expression: keeping only exprs[0] of "a < 5, b > 7"
+			// would return rows outside the branch's declared scope.
 			if (exprs.size() > 1) {
 				throw BinderException(ErrorInfo(error_subtype::kProtocolViolation)
 				                          .Worker(worker_path)
@@ -2878,7 +2694,7 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 			branch.parsed_branch_filter = std::move(exprs[0]);
 		}
 
-		// Protocol 3.2 branch statistics.
+		// Branch statistics.
 		if (branch_wire.row_count.has_value() && *branch_wire.row_count < 0) {
 			throw BinderException(ErrorInfo(error_subtype::kProtocolViolation)
 			                          .Worker(worker_path)
@@ -2892,43 +2708,27 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 			branch.column_statistics = std::move(*branch_wire.column_statistics);
 		}
 
-		// writable flag is non-nullable on the wire — surface a loud error
-		// if the worker emits NULL. (Legacy single-function workers go
-		// through WrapLegacyAsOneBranch and never reach this parser, so
-		// they don't need a fallback default here.)
 		branch.writable = branch_wire.writable;
 		if (branch.writable) {
 			writable_ordinals.push_back(i);
 		}
 
-		// Catalog-table branch fields (nullable; empty ⇒ function branch). A
-		// non-empty source_table selects the catalog-table kind — the branch
-		// scans source_catalog.source_schema.source_table in a companion catalog.
+		// A non-empty source_table makes a catalog-table branch: it scans
+		// source_catalog.source_schema.source_table in a companion catalog.
 		branch.source_catalog = branch_wire.source_catalog.value_or("");
 		branch.source_schema = OptionalSchemaNameFromPath(branch_wire.source_schema_path, "ScanBranch.source_schema_path");
 		branch.source_table = branch_wire.source_table.value_or("");
 
-		// Function branch only: DuckDB 1.5 schema the function_name is
-		// registered in. Empty for a catalog-table/format branch or a pre-1.5.0
-		// peer — same nullable-string convention as source_catalog/etc above.
+		// Function branch only: the schema function_name is registered in.
 		branch.schema_name = OptionalSchemaNameFromPath(branch_wire.schema_path, "ScanBranch.schema_path");
 
-		// Format-branch fields (P4). A non-empty format_name with no function and
-		// no source_table selects the format kind: read these locations as this
-		// format.
+		// A non-empty format_name makes a format branch: read format_locations
+		// as that format.
 		branch.format_name = branch_wire.format_name.value_or("");
 		branch.format_locations.assign(branch_wire.format_locations.begin(), branch_wire.format_locations.end());
 		{
-			// Reader options, carried as a 1-row IPC batch whose COLUMN NAMES are
-			// the option names — the same shape as `arguments`, so the same
-			// decoder reads it. Absent / NULL means no options.
-			//
-			// This column existed on neither side for a while: the rewriter has
-			// always consumed `format_options` as the reader's named arguments,
-			// but nothing ever parsed it, so it was permanently empty. Because
-			// the rewriter ASSIGNS rather than merges, that made it impossible to
-			// pass a single reader option to a format branch — `header`, `delim`,
-			// `union_by_name` all silently unreachable.
+			// Reader options: same shape as `arguments` (column names are option
+			// names). The rewriter ASSIGNS them as the reader's named arguments.
 			const auto &opts_bytes = branch_wire.format_options;
 			if (!opts_bytes.empty()) {
 				duckdb::vector<Value> unused_positional;
@@ -2943,10 +2743,8 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 			}
 		}
 
-		// Three-way discriminator, enforced HERE rather than at bind. A branch that
-		// sets two identifying fields is a worker bug; catching it at bind would
-		// blame the query instead of the catalog, and the message would arrive far
-		// from the thing that produced it.
+		// Exactly one branch kind, enforced at catalog load so the error blames
+		// the catalog, not a later query.
 		{
 			const int kinds = static_cast<int>(branch.IsFunctionBranch()) +
 			                  static_cast<int>(!branch.source_table.empty()) +
@@ -2977,11 +2775,9 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 		result.branches.push_back(std::move(branch));
 	}
 
-	// At-most-one-writable invariant. Multiple writable arms would violate
-	// DuckDB's single-writable-catalog-per-transaction rule
-	// (duckdb/src/transaction/meta_transaction.cpp:257-261) if UPDATE/DELETE
-	// ever land, and even for INSERT it makes the routing target ambiguous.
-	// Reject loudly at catalog-load.
+	// At most one writable branch: more makes the INSERT target ambiguous (and
+	// would break DuckDB's one-writable-catalog-per-transaction rule,
+	// MetaTransaction::ModifyDatabase, for UPDATE/DELETE).
 	if (writable_ordinals.size() > 1) {
 		std::string ordinals_csv;
 		for (size_t i = 0; i < writable_ordinals.size(); i++) {
@@ -3000,14 +2796,11 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 	return result;
 }
 
-// ============================================================================
 // DuckDB type conversion
-// ============================================================================
 
-// Render required_filters (CNF: an AND of OR-groups) as a compact JSON array of
-// arrays of raw paths, e.g. [[["accession_number"]],[["ticker"],["cik"]]]. Surfaced on
-// the extension-injected `vgi_required_filters` table tag so callers can discover
-// the requirement via duckdb_tables().tags before hitting the BinderException.
+// required_filters (CNF: an AND of OR-groups) as JSON arrays of raw paths, e.g.
+// [[["accession_number"]],[["ticker"],["cik"]]], for the `vgi_required_filters`
+// tag, so callers can discover the requirement via duckdb_tables().tags.
 static std::string RenderRequiredFiltersJson(const std::vector<std::vector<std::vector<std::string>>> &groups) {
 	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
 	yyjson_mut_val *outer = yyjson_mut_arr(doc);
@@ -3041,8 +2834,6 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	for (auto &[key, val] : table_info.tags) {
 		create_info.tags[key] = val;
 	}
-	// Expose the required-filter requirement to SQL callers as a reserved tag
-	// (extension-injected, `vgi_`-prefixed) so it's discoverable pre-query.
 	if (!table_info.required_filters.empty()) {
 		create_info.tags["vgi_required_filters"] = RenderRequiredFiltersJson(table_info.required_filters);
 	}
@@ -3050,7 +2841,6 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	if (table_info.arrow_schema) {
 		auto type_schema = NativeColumnTypeSchema(table_info.arrow_schema, schema_name);
 		if (table_info.row_id_column >= 0) {
-			// Convert the row_id field type to DuckDB LogicalType
 			const auto &rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
 			if (ReadNativeColumnDefault(rowid_field, schema_name) ||
 			    ReadNativeColumnGenerated(rowid_field, schema_name)) {
@@ -3065,7 +2855,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			ArrowSchemaToDuckDBTypes(context, rowid_schema, c_schema, arrow_table, types, names);
 			table_info.rowid_type = types[0];
 
-			// Build filtered schema excluding the row_id field
+			// The row_id field is not a user column.
 			auto filtered_schema = type_schema->RemoveField(table_info.row_id_column);
 			ArrowSchemaToColumnList(context, filtered_schema, create_info.columns);
 		} else {
@@ -3073,12 +2863,12 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		}
 	}
 
-	// Apply NOT NULL constraints
+	// Constraint indexes are shifted down past the removed row_id column.
 	for (auto idx : table_info.not_null_constraints) {
 		int adjusted = idx;
 		if (table_info.row_id_column >= 0) {
 			if (idx == table_info.row_id_column) {
-				continue; // Skip row_id column
+				continue;
 			}
 			if (idx > table_info.row_id_column) {
 				adjusted--;
@@ -3087,14 +2877,13 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		create_info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(adjusted)));
 	}
 
-	// Apply UNIQUE constraints
 	for (auto &cols : table_info.unique_constraints) {
 		vector<duckdb::Identifier> col_names;
 		for (auto idx : cols) {
 			int adjusted = idx;
 			if (table_info.row_id_column >= 0) {
 				if (idx == table_info.row_id_column) {
-					continue; // Skip row_id column
+					continue;
 				}
 				if (idx > table_info.row_id_column) {
 					adjusted--;
@@ -3113,14 +2902,13 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		}
 	}
 
-	// Apply PRIMARY KEY constraints (UniqueConstraint with is_primary_key=true)
 	for (auto &cols : table_info.primary_key_constraints) {
 		vector<duckdb::Identifier> col_names;
 		for (auto idx : cols) {
 			int adjusted = idx;
 			if (table_info.row_id_column >= 0) {
 				if (idx == table_info.row_id_column) {
-					continue; // Skip row_id column
+					continue;
 				}
 				if (idx > table_info.row_id_column) {
 					adjusted--;
@@ -3138,7 +2926,6 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		}
 	}
 
-	// Apply FOREIGN KEY constraints
 	for (auto &fk : table_info.foreign_key_constraints) {
 		ForeignKeyInfo fk_info;
 		fk_info.type = ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE;
@@ -3206,8 +2993,8 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	return create_info;
 }
 
-// Arrow C++ DataType::Equals: the field's own name, nullability and metadata are not
-// part of its type; child fields compare by name, type and nullability.
+// Type equality: the field's own name, nullability and metadata are not part of
+// its type; child fields compare by name, type and nullability.
 static bool DataTypesEqual(const ArrowSchema &a, const ArrowSchema &b) {
 	if (std::string(a.format ? a.format : "") != std::string(b.format ? b.format : "") ||
 	    a.n_children != b.n_children) {
@@ -3245,9 +3032,8 @@ VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
 	info.schema_name = SchemaNameFromPath(wire.schema_path, "FunctionInfo.schema_path");
 	info.tags = std::move(wire.tags);
 	info.function_type = FromWire(wire.function_type);
-	// Protocol 3.3: "public" (or null/absent) or "table_only". Anything else is a
-	// worker bug that must fail loudly: guessing would either expose a function
-	// the worker meant to hide or hide one it meant to expose.
+	// "public" (or absent) or "table_only"; anything else fails loudly, since a
+	// guess could expose a function the worker meant to hide, or vice versa.
 	if (wire.visibility && *wire.visibility != "public") {
 		if (*wire.visibility == "table_only") {
 			info.visibility = VgiFunctionVisibility::TableOnly;
@@ -3272,8 +3058,8 @@ VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
 		info.order_preservation = FromWire(*wire.order_preservation);
 	}
 
-	// DuckDB exposes example SQL directly; retain the structured descriptions
-	// in its discovery tag so workers need not transmit a duplicate copy.
+	// DuckDB keeps only the example SQL; the full examples go in the
+	// vgi.example_queries tag unless the worker set it.
 	const bool synthesize_examples = !wire.examples.empty() && info.tags.find("vgi.example_queries") == info.tags.end();
 	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> examples_doc(
 	    synthesize_examples ? yyjson_mut_doc_new(nullptr) : nullptr, &yyjson_mut_doc_free);
@@ -3334,9 +3120,8 @@ VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
 		info.output_schema = DeserializeSchema(wire.output_schema);
 	}
 
-	// Typed parameter defaults ride as an IPC-serialized one-row RecordBatch. Keep
-	// the bytes on VgiFunctionInfo so DuckDB 1.5 can preserve the VGI 2.0 contract
-	// even though its scalar/aggregate registration API cannot install defaults yet.
+	// Typed parameter defaults: a one-row IPC batch, validated here and kept as
+	// bytes (DuckDB's scalar/aggregate registration cannot install defaults).
 	auto &parameter_defaults = wire.parameter_default_values;
 	if (parameter_defaults) {
 		auto defaults_batch = DeserializeFromIpcBytes(*parameter_defaults);
@@ -3393,8 +3178,7 @@ VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
 		info.parameter_default_values_bytes = std::move(*parameter_defaults);
 	}
 
-	// Table function capabilities. late_materialization is nullopt for workers whose
-	// metadata predates it; the gate in vgi_table_entry.cpp treats that as "not capable".
+	// late_materialization nullopt means "not capable" (VgiTableEntry's gate).
 	info.projection_pushdown = wire.projection_pushdown;
 	info.filter_pushdown = wire.filter_pushdown;
 	info.sampling_pushdown = wire.sampling_pushdown;
@@ -3405,15 +3189,14 @@ VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
 	}
 
 	info.max_workers = wire.max_workers;
-	// supports_batch_index: the function emits ``vgi_batch_index`` in each batch's
-	// metadata, threaded through ``TableFunction::get_partition_data`` so ordered
-	// sinks can reassemble parallel output (and skips the FIXED_ORDER
-	// MaxThreads=1 clamp — see vgi_table_function_set.cpp).
+	// supports_batch_index: batches carry vgi_batch_index metadata, surfaced via
+	// get_partition_data so ordered sinks reassemble parallel output (and the
+	// FIXED_ORDER MaxThreads=1 clamp is skipped).
 	info.supports_batch_index = wire.supports_batch_index;
-	// split_token_ttl_seconds: nullopt means unbounded, NOT "expires immediately".
 	info.supports_splits = wire.supports_splits;
 	info.filters_exactly_applied = wire.filters_exactly_applied;
 	info.supports_positions = wire.supports_positions;
+	// nullopt means unbounded, NOT "expires immediately".
 	info.split_token_ttl_seconds = wire.split_token_ttl_seconds;
 	// partition_kind mirrors DuckDB's TablePartitionInfo; only SINGLE_VALUE_PARTITIONS
 	// materially affects planning today (vgi_table_function_set.cpp).
@@ -3450,26 +3233,20 @@ VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
 	return info;
 }
 
-// ============================================================================
-// Secret Extraction from DuckDB SecretManager
-// ============================================================================
+// Secret extraction from DuckDB's SecretManager
 
-// Extract key-value pairs from a KeyValueSecret into a map.
-// Must be called while the secret reference is still valid.
+// Copies out; call while the secret reference is still valid.
 static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret &kv_secret) {
 	std::map<std::string, Value> kv_pairs;
-	// Add standard fields from BaseSecret
 	kv_pairs["type"] = Value(kv_secret.GetType());
 	kv_pairs["provider"] = Value(kv_secret.GetProvider());
 	kv_pairs["name"] = Value(kv_secret.GetName());
-	// Add all custom key-value entries
 	for (const auto &[k, v] : kv_secret.secret_map) {
 		kv_pairs[k.GetIdentifierName()] = v;
 	}
-	// Add the secret's scope prefixes (newline-joined), set AFTER the secret_map
-	// loop so it is reliable for worker-side scope matching. Lets a worker that
-	// requested several scopes pick the right secret per path (e.g. per S3
-	// bucket). Empty for an unscoped secret (matches anything as a fallback).
+	// Scope prefixes, newline-joined, written AFTER secret_map so a "scope" key
+	// there cannot override it: workers match paths against it (e.g. per S3
+	// bucket). Empty for an unscoped secret.
 	const auto &scope = kv_secret.GetScope();
 	std::string joined_scope;
 	for (idx_t i = 0; i < scope.size(); i++) {
@@ -3482,12 +3259,9 @@ static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret 
 	return kv_pairs;
 }
 
-// Insert a resolved secret's fields into `result`, keyed by the secret's unique
-// name so multiple secrets of the same type (e.g. several S3 buckets) all
-// survive. Requesting the same secret via several scopes dedups naturally (same
-// name). The serialized `type`/`scope`/... fields let the worker select per
-// path via `Secrets::for_scope`. (No name should be empty, but fall back to the
-// type to avoid an empty key colliding.)
+// Keyed by secret name, so several secrets of one type (e.g. S3 buckets) all
+// survive and the same secret found via several scopes dedups. An empty name
+// (not expected) falls back to the type.
 static void InsertResolvedSecret(std::map<std::string, std::map<std::string, Value>> &result,
                                  const std::string &secret_type, const KeyValueSecret &kv_secret) {
 	std::string key = kv_secret.GetName().GetIdentifierName();
@@ -3510,7 +3284,7 @@ std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
 
 	for (const auto &req : requirements) {
 		if (!req.name.empty()) {
-			// Name-based lookup (optionally constrained by type)
+			// By name; the type must also match.
 			auto secret_entry = secret_manager.GetSecretByName(transaction, req.name);
 			if (secret_entry) {
 				auto &base_secret = secret_entry->secret;
@@ -3522,7 +3296,7 @@ std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
 				}
 			}
 		} else {
-			// Scope-based lookup (unscoped if scope is empty)
+			// By scope (unscoped when empty) and type.
 			auto match = secret_manager.LookupSecret(transaction, req.scope, req.secret_type);
 			if (match.HasMatch()) {
 				auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&match.GetSecret());

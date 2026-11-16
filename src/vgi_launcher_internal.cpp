@@ -15,15 +15,80 @@ namespace duckdb {
 namespace vgi {
 namespace launcher {
 
-// ---------------------------------------------------------------------------
-// Hash + canonical JSON
-// ---------------------------------------------------------------------------
+namespace {
+
+// Decodes `s` the way Python's os.fsdecode does on a UTF-8 filesystem encoding
+// (strict UTF-8 + surrogateescape): each byte outside a well-formed sequence
+// becomes the lone surrogate U+DC00+byte. argv, cwd and os.environ all reach
+// the Python launcher through that decoder.
+std::vector<uint32_t> DecodeSurrogateEscape(const std::string &s) {
+	std::vector<uint32_t> out;
+	out.reserve(s.size());
+	const auto *p = reinterpret_cast<const unsigned char *>(s.data());
+	const size_t n = s.size();
+	size_t i = 0;
+	while (i < n) {
+		const unsigned char b0 = p[i];
+		size_t len = 0;
+		unsigned char lo = 0x80, hi = 0xBF; // valid range of the second byte
+		if (b0 < 0x80) {
+			out.push_back(b0);
+			++i;
+			continue;
+		} else if (b0 >= 0xC2 && b0 <= 0xDF) {
+			len = 2;
+		} else if (b0 >= 0xE0 && b0 <= 0xEF) {
+			len = 3;
+			if (b0 == 0xE0) {
+				lo = 0xA0;
+			} else if (b0 == 0xED) {
+				hi = 0x9F;
+			}
+		} else if (b0 >= 0xF0 && b0 <= 0xF4) {
+			len = 4;
+			if (b0 == 0xF0) {
+				lo = 0x90;
+			} else if (b0 == 0xF4) {
+				hi = 0x8F;
+			}
+		}
+		bool ok = len != 0 && i + len <= n;
+		if (ok) {
+			ok = p[i + 1] >= lo && p[i + 1] <= hi;
+			for (size_t k = 2; ok && k < len; ++k) {
+				ok = p[i + k] >= 0x80 && p[i + k] <= 0xBF;
+			}
+		}
+		if (!ok) {
+			// Continuation bytes never start a valid sequence, so escaping one
+			// byte and resyncing equals Python's maximal-subpart handling.
+			out.push_back(0xDC00u + b0);
+			++i;
+			continue;
+		}
+		uint32_t cp = b0 & (len == 2 ? 0x1F : len == 3 ? 0x0F : 0x07);
+		for (size_t k = 1; k < len; ++k) {
+			cp = (cp << 6) | (p[i + k] & 0x3F);
+		}
+		out.push_back(cp);
+		i += len;
+	}
+	return out;
+}
+
+void AppendUnicodeEscape(std::string &out, uint32_t unit) {
+	char buf[8];
+	std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(unit));
+	out.append(buf);
+}
+
+} // namespace
 
 std::string EncodeJsonString(const std::string &s) {
 	std::string out;
 	out.reserve(s.size() + 2);
 	out.push_back('"');
-	for (unsigned char c : s) {
+	for (uint32_t c : DecodeSurrogateEscape(s)) {
 		switch (c) {
 		case '"':
 			out.append("\\\"");
@@ -47,23 +112,15 @@ std::string EncodeJsonString(const std::string &s) {
 			out.append("\\t");
 			break;
 		default:
-			if (c < 0x20) {
-				// Control char: \u00xx
-				char buf[8];
-				std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-				out.append(buf);
-			} else {
-				// Printable ASCII or UTF-8 byte — pass through.  Python's
-				// json.dumps with default ensure_ascii=True would escape
-				// non-ASCII bytes as \uXXXX, but the launcher's hash is
-				// computed from the *bytes* of `json.dumps(..., separators=...)`
-				// without ensure_ascii=False, so non-ASCII goes through
-				// Python's escape path.  Our env subset is VGI_RPC_*
-				// values — ASCII-safe in practice.  If the user smuggles
-				// non-ASCII into a VGI_RPC_* value, hashes will diverge
-				// from Python until we mirror its \uXXXX escaping.  Test
-				// vectors enforce this contract.
+			if (c >= 0x20 && c <= 0x7E) {
 				out.push_back(static_cast<char>(c));
+			} else if (c < 0x10000) {
+				// ensure_ascii escapes everything outside ' '..'~', DEL included.
+				AppendUnicodeEscape(out, c);
+			} else {
+				const uint32_t v = c - 0x10000;
+				AppendUnicodeEscape(out, 0xD800 | (v >> 10));
+				AppendUnicodeEscape(out, 0xDC00 | (v & 0x3FF));
 			}
 			break;
 		}
@@ -86,17 +143,26 @@ std::string BuildCanonicalJson(const std::vector<std::string> &argv, const std::
 	out.append("],\"cwd\":");
 	out.append(EncodeJsonString(cwd));
 	out.append(",\"env\":{");
-	bool first = true;
+	// sort_keys orders by code point. Byte order agrees for valid UTF-8 but not
+	// once surrogate escapes (U+DC80..U+DCFF) are mixed with multi-byte chars.
+	std::vector<std::pair<std::vector<uint32_t>, const std::pair<const std::string, std::string> *>> keyed;
+	keyed.reserve(env_subset.size());
 	for (const auto &kv : env_subset) {
-		// std::map iterates in key order, which for std::less<std::string>
-		// is byte-lex ASCII order — matches Python's sort_keys=True.
+		keyed.emplace_back(DecodeSurrogateEscape(kv.first), &kv);
+	}
+	std::sort(keyed.begin(), keyed.end(),
+	          [](const decltype(keyed)::value_type &a, const decltype(keyed)::value_type &b) {
+		          return a.first < b.first;
+	          });
+	bool first = true;
+	for (const auto &entry : keyed) {
 		if (!first) {
 			out.push_back(',');
 		}
 		first = false;
-		out.append(EncodeJsonString(kv.first));
+		out.append(EncodeJsonString(entry.second->first));
 		out.push_back(':');
-		out.append(EncodeJsonString(kv.second));
+		out.append(EncodeJsonString(entry.second->second));
 	}
 	out.append("}}");
 	return out;
@@ -106,11 +172,8 @@ std::string ComputeLauncherHash(const std::vector<std::string> &argv, const std:
                                 const std::map<std::string, std::string> &env_subset) {
 	std::string payload = BuildCanonicalJson(argv, cwd, env_subset);
 
-	// Raw mbedtls C API rather than duckdb_mbedtls::MbedTlsWrapper —
-	// the wrapper's translation unit also drags in DuckDB exception
-	// machinery (for AES error paths), which would force the unit-test
-	// binary to link a large chunk of libduckdb.  Going direct keeps
-	// the test binary's link surface minimal.
+	// Raw mbedtls, not duckdb_mbedtls::MbedTlsWrapper: the wrapper pulls in
+	// DuckDB exceptions, which the unit-test binary would then have to link.
 	unsigned char digest[32];
 	mbedtls_sha256_context ctx;
 	mbedtls_sha256_init(&ctx);
@@ -120,7 +183,6 @@ std::string ComputeLauncherHash(const std::vector<std::string> &argv, const std:
 	mbedtls_sha256_finish(&ctx, digest);
 	mbedtls_sha256_free(&ctx);
 
-	// Format the first 8 bytes as 16 lowercase hex chars.
 	char hex[17];
 	for (size_t i = 0; i < 8; ++i) {
 		std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
@@ -140,14 +202,8 @@ FilterVgiRpcEnv(const std::vector<std::pair<std::string, std::string>> &env) {
 	return out;
 }
 
-// ---------------------------------------------------------------------------
-// State directory resolution
-// ---------------------------------------------------------------------------
-
 std::string ResolveStateDir(const std::string &xdg_runtime_dir, const std::string &tmpdir, uint32_t euid) {
 #if defined(_WIN32)
-	// Windows has no XDG_RUNTIME_DIR or euid. Mirror vgi_rpc/launcher.py's
-	// `tempfile.gettempdir() / "vgi-rpc"` (no euid suffix).
 	(void)xdg_runtime_dir;
 	(void)euid;
 	std::string base = tmpdir.empty() ? "." : tmpdir;
@@ -160,7 +216,6 @@ std::string ResolveStateDir(const std::string &xdg_runtime_dir, const std::strin
 		return xdg_runtime_dir + "/vgi-rpc";
 	}
 	std::string base = tmpdir.empty() ? "/tmp" : tmpdir;
-	// Strip trailing slashes so we don't produce //vgi-rpc-501 etc.
 	while (base.size() > 1 && base.back() == '/') {
 		base.pop_back();
 	}
@@ -168,14 +223,10 @@ std::string ResolveStateDir(const std::string &xdg_runtime_dir, const std::strin
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// Rendezvous path-length validation
-// ---------------------------------------------------------------------------
-
 void ValidateRendezvousPathLength(const std::string &path) {
 #if defined(_WIN32)
-	// Windows named-pipe names (`\\.\pipe\<name>`) cap the <name> at 256 chars;
-	// be conservative and bound the whole address well under that.
+	// Named-pipe names (`\\.\pipe\<name>`) cap <name> at 256 chars; bounding
+	// the whole address at 256 is conservative.
 	constexpr std::size_t kMaxPipeName = 256;
 	if (path.size() > kMaxPipeName) {
 		throw std::invalid_argument("vgi launcher: named-pipe name too long (" +
@@ -192,15 +243,8 @@ void ValidateRendezvousPathLength(const std::string &path) {
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// `launch:` location string parsing
-// ---------------------------------------------------------------------------
-
 namespace {
 
-// State machine for POSIX-ish shell-quote parsing.  We don't expand
-// variables, glob, or do command substitution — just enough quoting to
-// let users embed paths with spaces.
 enum class ShlexState { kDefault, kInDouble, kInSingle };
 
 void FlushToken(std::string &token, std::vector<std::string> &out, bool &has_token) {
@@ -233,8 +277,7 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload) {
 				has_token = true;
 			} else if (c == '\\') {
 #if defined(_WIN32)
-				// On Windows, backslash is a path separator, not a shell escape —
-				// keep it literal so `C:\path\to\worker` survives intact.
+				// Backslash is a path separator on Windows (`C:\path\to\worker`).
 				token.push_back(c);
 				has_token = true;
 #else
@@ -256,12 +299,10 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload) {
 				state = ShlexState::kDefault;
 			} else if (c == '\\' && i + 1 < payload.size()) {
 #if defined(_WIN32)
-				// Backslash is a literal path separator on Windows.
 				token.push_back('\\');
 #else
 				char next = payload[i + 1];
-				// Only a few sequences are special inside double-quotes
-				// per POSIX; everything else preserves the backslash.
+				// POSIX: only these are escapes inside "…"; otherwise keep the backslash.
 				if (next == '"' || next == '\\' || next == '$' || next == '`' || next == '\n') {
 					token.push_back(next);
 					++i;
@@ -275,7 +316,6 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload) {
 			break;
 
 		case ShlexState::kInSingle:
-			// Single quotes are raw — no escapes.
 			if (c == '\'') {
 				state = ShlexState::kDefault;
 			} else {
@@ -296,10 +336,6 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload) {
 	return out;
 }
 
-// ---------------------------------------------------------------------------
-// Discovery-line parsing
-// ---------------------------------------------------------------------------
-
 DiscoveryParseResult ParseDiscoveryLine(std::string &buffer, const std::string &expected_path,
                                          const std::string &prefix) {
 	while (true) {
@@ -309,7 +345,6 @@ DiscoveryParseResult ParseDiscoveryLine(std::string &buffer, const std::string &
 		}
 		std::string line = buffer.substr(0, newline);
 		buffer.erase(0, newline + 1);
-		// Tolerate \r\n line endings.
 		if (!line.empty() && line.back() == '\r') {
 			line.pop_back();
 		}
@@ -320,13 +355,9 @@ DiscoveryParseResult ParseDiscoveryLine(std::string &buffer, const std::string &
 			}
 			return DiscoveryParseResult::kMismatch;
 		}
-		// Non-UNIX: line is third-party noise; skip it and keep scanning.
+		// Lines without the prefix are third-party noise.
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Transport detection
-// ---------------------------------------------------------------------------
 
 bool IsUnixLocation(const std::string &location) {
 	const std::string prefix = "unix://";

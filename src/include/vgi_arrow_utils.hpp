@@ -19,17 +19,9 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// Settings Extraction
-// ============================================================================
-
 // Fetch the named settings from the client context, skipping any that are unset.
 std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
                                                 const std::vector<std::string> &setting_names);
-
-// ============================================================================
-// C ABI exports
-// ============================================================================
 
 // Export a schema to C ABI format (deep copy, owned by `out`; a previous export is released).
 void ExportSchema(const VgiSchemaPtr &schema, ArrowSchemaWrapper &out);
@@ -37,73 +29,47 @@ void ExportSchema(const VgiSchemaPtr &schema, ArrowSchemaWrapper &out);
 // Export a batch to C ABI format; the array keeps the batch's buffers alive.
 void ExportRecordBatch(const VgiBatchPtr &batch, ArrowArrayWrapper &out);
 
-// ============================================================================
-// DuckDB Type Extraction
-// ============================================================================
-
-// Extract DuckDB types and column names from an ArrowTableSchema
-// The ArrowTableSchema should already be populated via ArrowTableFunction::PopulateArrowTableSchema
+// `arrow_table` must already be populated via ArrowTableFunction::PopulateArrowTableSchema.
 void GetDuckDBTypesFromArrowTable(const ArrowTableSchema &arrow_table, const ArrowSchema &c_schema,
                                   vector<LogicalType> &types, vector<string> &names);
 
-// ============================================================================
-// High-Level Conversion Utilities
-// ============================================================================
-
-// Full conversion: schema -> DuckDB types
-// This combines:
-//   1. Export schema to C ABI
-//   2. Populate ArrowTableSchema via DuckDB's built-in conversion
-//   3. Extract DuckDB types and names
-//
-// Parameters:
-//   context: DuckDB client context (needed for DBConfig)
-//   schema: schema to convert
-//   c_schema_out: Output C ABI schema wrapper (for later use with ArrowToDuckDB)
-//   arrow_table_out: Output ArrowTableSchema (for later use with ArrowToDuckDB)
-//   types: Output DuckDB logical types
-//   names: Output column names
+// The one Arrow -> DuckDB type conversion (never hand-switch on Arrow type ids):
+// exports `schema` to C ABI, populates `arrow_table_out` via DuckDB's own
+// conversion and extracts types and names. `c_schema_out`/`arrow_table_out`
+// are kept for later ArrowToDuckDB data conversion. Rejects Arrow fields VGI
+// does not support (NotImplementedException).
 void ArrowSchemaToDuckDBTypes(ClientContext &context, const VgiSchemaPtr &schema,
                               ArrowSchemaWrapper &c_schema_out, ArrowTableSchema &arrow_table_out,
                               vector<LogicalType> &types, vector<string> &names);
 
-// Simplified conversion: schema -> DuckDB ColumnList
-// Use this when you only need column definitions (e.g., for CreateTableInfo)
-// and don't need to keep the ArrowTableSchema for data conversion.
 void ArrowSchemaToDuckDBTypes(ClientContext &context, const VgiSchemaPtr &schema,
                              ArrowSchemaWrapper &c_schema_out, ArrowTableSchema &arrow_table_out,
                              vector<LogicalType> &types, vector<Identifier> &names);
 
+// Column definitions only (e.g. for CreateTableInfo), when the ArrowTableSchema
+// is not needed for data conversion.
 void ArrowSchemaToColumnList(ClientContext &context, const VgiSchemaPtr &schema, ColumnList &columns);
 
-// Convert DuckDB ColumnList to Arrow Schema
-// This is the inverse of ArrowSchemaToColumnList: takes DuckDB column definitions
-// and produces an Arrow schema using DuckDB's ArrowConverter via the C ABI bridge.
+// Inverse of ArrowSchemaToColumnList, via DuckDB's ArrowConverter.
 VgiSchemaPtr DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns,
                                        const std::string &owner_schema = "");
 
-// ============================================================================
-// DuckDB DataChunk / Type to Arrow Conversion
-// ============================================================================
+// Arrow export options for anything sent to a worker. The session's own
+// options can ask for view layouts (BLOB/BIT export as binary_view from
+// arrow_output_version 1.4, plus produce_arrow_string_view and
+// arrow_output_list_view), which the IPC encoder cannot write and workers need not
+// read. Timezone, offset size and lossless conversion follow the session.
+ClientProperties VgiWireClientProperties(ClientContext &context);
 
 // Convert DuckDB DataChunk to a batch named after `schema`'s fields (types are DuckDB's
 // ArrowConverter output for the chunk's types; a 0-row chunk yields an empty batch of `schema`)
 VgiBatchPtr DataChunkToArrow(ClientContext &context, DataChunk &chunk, const VgiSchemaPtr &schema);
 
-// Cached-input version of DataChunkToArrow for hot-path scalar-style callers
-// where every batch shares the same logical types, names, extension types, and
-// client properties. The caller maintains a small cache (typically on a per-
-// thread local-state struct) and passes the four cached structures in by const
-// ref. This skips the per-batch
-//   * vector<LogicalType> + vector<string> push-backs,
-//   * ClientProperties copy,
-//   * ArrowTypeExtensionData::GetExtensionTypes() lookup
-// that DataChunkToArrow does internally — they are all stable for the lifetime
-// of the function call (e.g. a scalar's input schema never changes after bind).
-//
-// The caller is responsible for ensuring the cached vectors match `chunk`'s
-// column layout. Calls with mismatched shapes are undefined behaviour (no
-// runtime check — this is the cost of the fast path).
+// DataChunkToArrow for hot-path callers whose batches all share types, names,
+// extension types and client properties (e.g. a scalar's input after bind):
+// the caller caches those (typically in local state) instead of rebuilding
+// them per batch. The cached vectors MUST match `chunk`'s column layout; a
+// mismatch is undefined behaviour (no runtime check).
 VgiBatchPtr DataChunkToArrowCached(
     ClientContext &context, DataChunk &chunk,
     const VgiSchemaPtr &schema,
@@ -112,43 +78,26 @@ VgiBatchPtr DataChunkToArrowCached(
     const ClientProperties &cached_client_props,
     const unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> &cached_extension_types);
 
-// Build a schema from DuckDB logical types and names
 VgiSchemaPtr BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
                                         const vector<string> &names);
 VgiSchemaPtr BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
                                       const vector<Identifier> &names);
 
-// ============================================================================
-// Schema Reconciliation
-// ============================================================================
-
-// Reconcile a RecordBatch produced by DuckDB to the schema a worker declared.
-//
-// DuckDB's LogicalType system can't preserve every Arrow attribute on the
-// round-trip:
-//   * nullability flags (LogicalType has no nullable bit; ArrowConverter
-//     always emits nullable=true)
-//   * TIMESTAMP_TZ unit/tz collapses to us-precision + session timezone
-//   * decimal precision/scale shifts in some narrow cases
-//
-// This helper takes a batch DataChunkToArrow produced and returns a new batch
-// whose schema is ``target_schema``:
-//   * where every node has the same physical layout (only names, nullability flags,
-//     metadata or a timestamp's timezone differ) the batch is relabeled zero-copy;
-//   * otherwise the batch is rebuilt, converting the leaves that differ: timestamp /
-//     time / duration unit rescale, integer width changes, string <-> large_string,
-//     binary <-> large_binary, dictionary -> its value type, decimal width change.
-//
-// Fast path: when the schemas are equal (ignoring metadata) the input batch is
-// returned unchanged.
-//
-// Throws IOException if a column cannot be converted to the target type (e.g.,
-// genuinely incompatible logical types).
+// Reconcile a batch DataChunkToArrow produced to the schema a worker declared.
+// DuckDB's LogicalType loses Arrow attributes on the round trip (nullability:
+// ArrowConverter always emits nullable; timestamp unit/timezone; decimal
+// precision). Returns a batch whose schema is ``target_schema``:
+//   * unchanged when the schemas are equal (ignoring metadata);
+//   * relabeled zero-copy when every node has the same physical layout (only
+//     names, nullability, metadata, a timestamp's timezone or a decimal's
+//     precision differ);
+//   * otherwise rebuilt, converting leaves: timestamp/time/duration unit
+//     rescale, integer width/sign changes, integer -> floating point,
+//     string/binary variants, decimal bit-width changes (32/64/128/256, same
+//     scale), dictionary -> its value type.
+// Throws IOException for any other difference (including a decimal scale
+// change, which DuckDB's write path never produces).
 VgiBatchPtr ReconcileBatchToSchema(const VgiBatchPtr &batch, const VgiSchemaPtr &target_schema);
-
-// ============================================================================
-// DuckDB Value to Arrow Conversion
-// ============================================================================
 
 // Function arguments for the bind call: a one-row batch whose single column "args" is
 // a struct with positional_0, positional_1, ..., named_<name> fields.
@@ -163,41 +112,30 @@ struct ArrowArguments {
 	}
 };
 
-// Convert DuckDB Values to Arrow arguments struct using ArrowAppender
-// Creates a struct with fields named positional_0, positional_1, etc.
-// Each field's type is preserved from the DuckDB Value type
+// Each field keeps its DuckDB Value's type (via ArrowAppender).
 ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Value> &positional_args,
                                         const vector<std::pair<string, Value>> &named_args = {});
 
-// Build a settings RecordBatch from a map of setting name → DuckDB Value
-// Creates a single-row RecordBatch where each field preserves its DuckDB type as Arrow type
-// Uses DataChunk + ArrowAppender to ensure proper type conversion (same pattern as BuildArgumentsFromValues)
+// A single-row batch with one column per setting, each keeping its DuckDB type.
 VgiBatchPtr BuildSettingsBatch(ClientContext &context, const std::map<std::string, Value> &settings);
 
-// Build a secrets RecordBatch from a map of secret_type → {key → Value}
-// Creates a single-row RecordBatch where each column is a struct containing the secret's key-value pairs
-// Returns empty vector if no secrets. Each struct column preserves DuckDB types as Arrow types.
+// IPC bytes of a single-row batch with one struct column per secret type
+// (secret_type → {key → Value}, DuckDB types preserved); empty when there are
+// no non-empty secrets.
 std::vector<uint8_t> BuildSecretsBatch(ClientContext &context,
                                         const std::map<std::string, std::map<std::string, Value>> &secrets);
 
-// ============================================================================
-// Function Argument Schema Parsing
-// ============================================================================
-
-// Result of parsing function argument schema with positional/named/varargs distinction
-// Named arguments are identified by metadata key "vgi_arg" with value "named"
-// Varargs arguments are identified by metadata key "vgi_varargs" with value "true"
+// A function's arguments schema split by field metadata: "vgi_arg"="named" ->
+// named_parameters; "vgi_varargs"="true" -> varargs (not a positional slot);
+// "vgi_type"="table" -> a TABLE positional slot; the rest positional in order.
 struct FunctionArgumentTypes {
 	vector<LogicalType> positional_types;
 	vector<string> positional_names;
 	vector<bool> positional_is_const;  // Parallel to positional_types: true if param is a constant
 	case_insensitive_map_t<LogicalType> named_parameters;
-	// Varargs support: if has_varargs is true, function accepts additional arguments of varargs_type
 	bool has_varargs = false;
 	LogicalType varargs_type = LogicalType::ANY;
-	// Table input support: position of the table input argument (-1 if none)
-	// Table inputs are marked with vgi_type: table metadata in the Arrow schema
-	// These become TABLE parameters in DuckDB function registration
+	// Index among the positional args of the TABLE input, or -1.
 	int table_input_position = -1;
 	string table_input_name;
 
@@ -206,9 +144,6 @@ struct FunctionArgumentTypes {
 	}
 };
 
-// Parse function argument schema, distinguishing positional from named arguments
-// Arguments with metadata "vgi_arg: named" are placed in named_parameters
-// Others are treated as positional arguments in schema field order
 FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const VgiSchemaPtr &schema);
 
 } // namespace vgi

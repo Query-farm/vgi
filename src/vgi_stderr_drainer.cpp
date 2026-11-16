@@ -46,24 +46,9 @@ StderrDrainer::~StderrDrainer() {
 	}
 }
 
-int StderrDrainer::ReleaseFd() {
-	stop_.store(true, std::memory_order_relaxed);
-	if (thread_.joinable()) {
-		thread_.join();
-	}
-	int fd = fd_;
-	fd_ = -1;
-	return fd;
-}
-
 std::string StderrDrainer::CaptureStderrSnapshot() {
-	// Ask the reader to drain to EOF, then join. Deliberately NOT stop_: stop_ is
-	// checked at the top of the reader loop, so setting it here would race a
-	// reader thread that has not been scheduled yet (freshly spawned worker that
-	// died immediately) and return an empty snapshot even though the worker's
-	// stderr is sitting unread in the pipe. drain_to_eof_ instead makes the
-	// reader keep reading until the write end closes (the worker has exited, so
-	// that is immediate) or a short idle timeout elapses.
+	// drain_to_eof_, not stop_: see the field comment. The reader keeps reading
+	// until EOF, an idle quantum, or the 1s drain deadline.
 	drain_to_eof_.store(true, std::memory_order_relaxed);
 	if (thread_.joinable()) {
 		thread_.join();
@@ -91,15 +76,11 @@ std::string StderrDrainer::CaptureStderrSnapshot() {
 	return result;
 }
 #else  // Emscripten (HTTP-only)
-// No subprocess stderr pipe exists on this build; the drainer is never
-// constructed with a real fd. Defined so the always-compiled worker pool /
-// FunctionConnection (which hold a unique_ptr<StderrDrainer>) link.
+// No subprocess stderr pipe on this build; defined so the always-compiled
+// holders of a unique_ptr<StderrDrainer> link.
 StderrDrainer::StderrDrainer(int) : fd_(-1) {
 }
 StderrDrainer::~StderrDrainer() {
-}
-int StderrDrainer::ReleaseFd() {
-	return -1;
 }
 std::string StderrDrainer::CaptureStderrSnapshot() {
 	return "";
@@ -155,8 +136,7 @@ void StderrDrainer::ThreadLoop() {
 				break;
 			}
 		}
-		// Wait (with a timeout / poll quantum) so we can periodically check the
-		// stop flag — a blocking read would prevent the destructor from joining.
+		// Poll with a timeout: a blocking read would keep the destructor from joining.
 #if VGI_POSIX_TRANSPORT
 		int poll_result = poll(&pfd, 1, 100); // 100ms
 		if (poll_result < 0) {
@@ -166,9 +146,8 @@ void StderrDrainer::ThreadLoop() {
 			break;
 		}
 		if (poll_result == 0) {
-			// Idle. In drain-to-EOF mode an idle poll means the worker is not
-			// (yet) writing; give it one quantum, then give up so the caller's
-			// join() can't hang on a worker that outlives the error path.
+			// In drain-to-EOF mode give up after two idle quanta so join()
+			// can't hang on a worker that outlives the error path.
 			if (drain_to_eof_.load(std::memory_order_relaxed) && ++idle_polls_while_draining >= 2) {
 				break;
 			}
@@ -207,9 +186,7 @@ void StderrDrainer::ThreadLoop() {
 			if (!line.empty()) {
 				std::lock_guard<std::mutex> lock(mutex_);
 				if (lines_.size() >= kMaxBufferedLines) {
-					// Drop the oldest line. erase(begin) is O(n) but at
-					// 1024 it's a few microseconds and only happens when
-					// the consumer is slow.
+					// erase(begin) is O(n), but n is capped at kMaxBufferedLines.
 					lines_.erase(lines_.begin());
 					dropped_lines_++;
 				}
@@ -227,7 +204,7 @@ void StderrDrainer::ThreadLoop() {
 		lines_.push_back(std::move(line_buffer));
 	}
 
-	// Note: fd is NOT closed here — the destructor or ReleaseFd() decides.
+	// The fd is NOT closed here — the destructor closes it.
 }
 #endif // VGI_SUBPROCESS_TRANSPORT
 

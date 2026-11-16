@@ -7,8 +7,6 @@
 #include "storage/vgi_schema_entry.hpp"
 #include "vgi_logging.hpp"
 
-// Side-channel diag bumps for threading-deadlock diagnostics. Mirrors the
-// http_wasm.cc. On native it's a weak symbol that resolves to null; we no-op.
 namespace duckdb {
 
 VgiCatalogSet::VgiCatalogSet(Catalog &catalog, VgiSchemaEntry *schema) : catalog_(catalog), schema_entry_(schema) {
@@ -23,10 +21,8 @@ void VgiCatalogSet::ResolveEagerLoadParamsLocked() {
 	if (schema_entry_) {
 		estimated_count_ = ObjectCountFor(schema_entry_->GetEstimatedCounts(), kind);
 	}
-	// else: schema_entry_ is null (e.g. VgiSchemaSet) — leave estimated_count_
-	// at its default of 1 so any threshold >= 1 trivially eager-loads. Sets
-	// without a single-entry override would already eager-load on first
-	// GetEntry anyway, so this is just for symmetry.
+	// Without a schema (VgiSchemaSet) estimated_count_ stays 1, so any
+	// threshold >= 1 eager-loads.
 	eager_load_resolved_ = true;
 }
 
@@ -43,9 +39,6 @@ bool VgiCatalogSet::ShouldEagerLoadLocked() {
 	return estimated_count_ <= threshold_;
 }
 
-// Helper: read the trust_empty_kinds setting WITHOUT holding entry_lock_.
-// Called outside the lock so DuckDB's setting-registry mutex never sits
-// inside our entry_lock_ critical section (lock-order inversion risk).
 bool VgiCatalogSet::ReadTrustEmptyKinds(ClientContext &context) {
 	Value trust_val;
 	if (context.TryGetCurrentSetting("vgi_trust_empty_kinds", trust_val) && !trust_val.IsNull()) {
@@ -70,19 +63,10 @@ bool VgiCatalogSet::ShouldBypassRpcLocked(ClientContext &context, bool trust_emp
 	return trust_empty_kinds;
 }
 
-// Backwards-compatible overload that reads the setting itself.
-// PREFERRED: callers should read the setting outside the lock and pass it in.
-bool VgiCatalogSet::ShouldBypassRpcLocked(ClientContext &context) {
-	return ShouldBypassRpcLocked(context, ReadTrustEmptyKinds(context));
-}
-
-void VgiCatalogSet::MarkPopulatedLocked() {
+void VgiCatalogSet::MarkPopulated() {
 	std::lock_guard<std::mutex> lock(entry_lock_);
-	// Clobber the count to a non-zero value so ShouldBypassRpcLocked stops
-	// firing. We do NOT reset eager_load_resolved_: re-resolution would
-	// re-read GetEstimatedCounts() from the immutable schema_info_ and
-	// re-set estimated_count_=0, undoing the flip. The asymmetry is
-	// deliberate.
+	// Keep eager_load_resolved_ true: re-resolving would re-read the immutable
+	// schema counts and restore estimated_count_ = 0, undoing the flip.
 	estimated_count_ = 1;
 	eager_load_resolved_ = true;
 }
@@ -108,16 +92,9 @@ void VgiCatalogSet::CacheMissingEntryLocked(const std::string &name, uint64_t ex
 	missing_entries_.insert(name);
 }
 
-// Serialize concurrent loads. First caller fires LoadEntries; later callers
-// wait on load_lock_ (no entry_lock_ held during wait), see is_loaded_=true
-// after the first finishes, and skip the load. No RPC duplication.
-//
-// Mirrors UnityCatalog UCTableSet::EnsureLoaded (~/Development/unity_catalog).
 void VgiCatalogSet::EnsureLoaded(ClientContext &context, bool honor_empty_hint) {
-	// Pre-read setting outside any lock — avoids lock-order inversion with
-	// DuckDB's setting registry.
+	// Read outside any lock (see ReadTrustEmptyKinds).
 	const bool trust_empty_kinds = honor_empty_hint && ReadTrustEmptyKinds(context);
-	// Check is_loaded_ briefly under entry_lock_ — quick path when already loaded.
 	// A load the zero-count hint skipped is not a load for a caller that
 	// ignores the hint.
 	auto loaded = [&]() {
@@ -134,11 +111,9 @@ void VgiCatalogSet::EnsureLoaded(ClientContext &context, bool honor_empty_hint) 
 			return;
 		}
 	}
-	// Serialize loads. Holding load_lock_ does NOT block GetEntry's cache
-	// reads (they only need entry_lock_). LoadEntries fires its RPC outside
-	// entry_lock_ and acquires entry_lock_ briefly per-entry insertion.
+	// Holding load_lock_ does not block cache reads, which need only entry_lock_.
 	std::lock_guard<std::mutex> load_lk(load_lock_);
-	// Re-check under load_lock_ — another thread may have just finished.
+	// Another thread may have just finished the load.
 	{
 		std::lock_guard<std::mutex> entry_lk(entry_lock_);
 		if (loaded()) {
@@ -154,15 +129,11 @@ void VgiCatalogSet::EnsureLoaded(ClientContext &context, bool honor_empty_hint) 
 }
 
 optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const std::string &name) {
-	// Pre-read setting OUTSIDE entry_lock_ — DuckDB's setting registry has
-	// its own mutex; calling into it while holding entry_lock_ creates a
-	// lock-order inversion that has shown up in WASM hang traces.
+	// Read outside entry_lock_ (see ReadTrustEmptyKinds).
 	const bool trust_empty_kinds = ReadTrustEmptyKinds(context);
 
-	// Fast path: cache hit (or bypass). Hold entry_lock_ only for the map
-	// lookup + the bypass-flag write. Capture the outcome/result, then LOG
-	// AFTER releasing the lock — VGI_LOG goes through DuckDB's log manager
-	// which has its own mutex, same inversion risk.
+	// Log only after releasing entry_lock_: DuckDB's log manager has its own
+	// mutex (same inversion risk).
 	optional_ptr<CatalogEntry> result = nullptr;
 	const char *outcome = nullptr;
 	{
@@ -183,8 +154,6 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 		return result;
 	}
 
-	// Cache miss — trigger load (single-flight via load_lock_). LoadEntries
-	// runs WITHOUT entry_lock_ held; re-entrant binder walks are now safe.
 	bool was_loaded_before;
 	{
 		std::lock_guard<std::mutex> lock(entry_lock_);
@@ -192,7 +161,6 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 	}
 	EnsureLoaded(context);
 
-	// Re-check cache under entry_lock_, capture result + outcome, log outside.
 	{
 		std::lock_guard<std::mutex> lock(entry_lock_);
 		auto it = entries_.find(name);
@@ -258,15 +226,10 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetHiddenEntry(ClientContext &context,
 }
 
 void VgiCatalogSet::CreateEntryLocked(unique_ptr<CatalogEntry> entry) {
-	// Called from LoadEntries while entry_lock_ is held by GetEntry/Scan.
-	//
-	// Skip if a same-named entry already exists. DuckDB's binder retains raw
-	// CatalogEntry* values across the bind, and a re-entrant Scan triggered
-	// from inside that bind (e.g. Catalog::GetAllSchemas walking sibling
-	// catalogs) would otherwise destroy entries the bind is still using —
-	// see ColumnIsGenerated → ColumnList::GetColumn(0) UAF that surfaces as
-	// "Logical column index 0 out of range". Refresh goes through
-	// ClearEntries() / vgi_clear_cache() at safe points instead.
+	// First wins: DuckDB's binder retains raw CatalogEntry* across the bind, and
+	// a re-entrant load from inside it (e.g. Catalog::GetAllSchemas walking
+	// sibling catalogs) would otherwise destroy entries still in use (a UAF).
+	// Refresh goes through ClearEntries()/HarvestEntries() at safe points.
 	missing_entries_.erase(entry->name.GetIdentifierName());
 	if (entries_.find(entry->name.GetIdentifierName()) != entries_.end()) {
 		return;
@@ -284,12 +247,9 @@ void VgiCatalogSet::DropEntry(const std::string &name) {
 }
 
 void VgiCatalogSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
-	// Trigger load (single-flight, no entry_lock_ held during RPC).
 	EnsureLoaded(context);
 
-	// Snapshot entries under entry_lock_ briefly; invoke callback OUTSIDE
-	// the lock to avoid holding entry_lock_ while user code runs (which
-	// could re-enter the catalog and deadlock on the same lock).
+	// The callback runs outside entry_lock_: it may re-enter the catalog.
 	std::vector<CatalogEntry *> snapshot;
 	{
 		std::lock_guard<std::mutex> lock(entry_lock_);

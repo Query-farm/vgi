@@ -1,0 +1,62 @@
+# name: test/sql/integration/table_in_out/echo/arrow_output_options.test
+# description: Session Arrow export options must not change what VGI sends a
+#              worker. From arrow_output_version 1.4 DuckDB exports BLOB and BIT
+#              as binary_view, and produce_arrow_string_view / arrow_output_list_view
+#              ask for view layouts too; the IPC encoder cannot write views, so
+#              any BLOB argument used to fail with "Expected a valid enum
+#              ArrowType value but found 40".
+# group: [vgi_integration_table_in_out_echo]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET arrow_output_version = '1.5';
+
+query T
+SELECT b::VARCHAR FROM example.main.echo((SELECT 'ab'::BLOB AS b));
+----
+ab
+
+# BIT exports as plain binary (without lossless conversion) and comes back as a
+# BLOB holding DuckDB's BIT bytes (padding count, then data): the same as under
+# the default arrow_output_version.
+query T
+SELECT hex(b) FROM example.main.echo((SELECT '101'::BIT AS b));
+----
+05FD
+
+statement ok
+SET produce_arrow_string_view = true;
+
+statement ok
+SET arrow_output_list_view = true;
+
+query TT
+SELECT s, l::VARCHAR FROM example.main.echo((SELECT 'abc' AS s, [1, 2, 3] AS l));
+----
+abc	[1, 2, 3]
+
+query T
+SELECT example.main.upper_case(s) FROM (VALUES ('x'), ('y')) t(s) ORDER BY 1;
+----
+X
+Y
+
+statement ok
+RESET arrow_output_version;
+
+statement ok
+RESET produce_arrow_string_view;
+
+statement ok
+RESET arrow_output_list_view;
+
+statement ok
+DETACH example;

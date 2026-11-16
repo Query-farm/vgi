@@ -132,5 +132,31 @@ percentile must be in [0, 1]
 # Cleanup
 # ============================================================================
 
+# ============================================================================
+# Plan copy: const params are erased at bind, so a copied plan must not be
+# re-resolved by the erased types (Serialization Error). CTE inlining copies it.
+# ============================================================================
+
+query IRR
+WITH c AS NOT MATERIALIZED (SELECT i % 2 g, example.main.vgi_percentile(i::DOUBLE, 0.5) p FROM range(10) t(i) GROUP BY g)
+SELECT c1.g, c1.p, c2.p FROM c c1 JOIN c c2 USING (g) ORDER BY 1;
+----
+0	4.0	4.0
+1	5.0	5.0
+
+query IRR
+WITH c AS (SELECT i % 2 g, example.main.vgi_percentile(i::DOUBLE, 0.5) p FROM range(10) t(i) GROUP BY g)
+SELECT c1.g, c1.p, c2.p FROM c c1 JOIN c c2 USING (g) ORDER BY 1 LIMIT 2;
+----
+0	4.0	4.0
+1	5.0	5.0
+
+# Two different constants in one SELECT stay distinct (no CSE merge).
+query RR
+SELECT example.main.vgi_percentile(i::DOUBLE, 0.2), example.main.vgi_percentile(i::DOUBLE, 0.8) FROM range(10) t(i);
+----
+2.0	8.0
+
+
 statement ok
 DETACH example;
