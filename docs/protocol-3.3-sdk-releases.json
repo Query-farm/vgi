@@ -102,6 +102,15 @@
         "vgi-csharp": "0.26.1",
         "vgi-java": "0.48.1 (uncommented schema sent as NULL; no decimal32/64 in arrow-java, decimal file excluded)"
       }
+    },
+    {
+      "date": "2026-11-16",
+      "note": "Per-schema function registration (Go), stream input decode errors (C++ RPC), read-only example.contract fixture (C++); wire unchanged (3.3.0).",
+      "releases": {
+        "vgi-go": "0.42.2 (scan and write functions homed and keyed per schema; a different function reusing a name in one schema panics)",
+        "vgi-rpc-cpp": "0.11.1 (a stream call whose input cannot be decoded fails instead of completing on partial input)",
+        "vgi-cpp": "0.16.1 (read-only example.contract fixture; vgi-rpc-cpp 0.11.1)"
+      }
     }
   ]
 }
