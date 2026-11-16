@@ -10,10 +10,6 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// Listing / cache / generations (std only)
-// ============================================================================
-
 VgiProtocolListing PreReflectionListing() {
 	VgiProtocolListing listing;
 	listing.predates_reflection = true;

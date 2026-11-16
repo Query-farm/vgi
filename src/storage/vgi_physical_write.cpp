@@ -30,12 +30,10 @@ namespace duckdb {
 
 // Write-input schemas (the Arrow batches the extension streams to an insert,
 // update or delete function) mark every field nullable, at every nesting
-// level. DuckDB does not enforce a VGI table's NOT NULL before the write call:
-// the worker does, per vgi.constraint.enforce.v1, and reports the violation
-// itself. Keeping the table's non-nullable flags here would put an INSERT or
-// UPDATE of NULL into a NOT NULL column on the wire as an invalid Arrow batch
-// (a non-nullable field holding nulls) that a strict Arrow reader rejects
-// before the worker can apply its constraint check.
+// level. The worker, not DuckDB, enforces a VGI table's NOT NULL (per
+// vgi.constraint.enforce.v1); keeping non-nullable flags would turn a NULL
+// write into an invalid Arrow batch that a strict reader rejects before the
+// worker can report the violation.
 // The one exception: a map's entries struct and its keys stay non-nullable, as
 // the Arrow format requires (DuckDB map keys are never NULL); its values are
 // marked like any other field.
@@ -64,10 +62,9 @@ static vgi::VgiSchemaPtr NullableWriteInputSchema(const vgi::VgiSchemaPtr &schem
 	return vgi::VgiSchema::Adopt(output.get());
 }
 
-// Resolve a write-function discovery result, preferring the inlined value on
-// VgiTableInfo when the worker populated it (skips the corresponding
-// catalog_table_*_function_get RPC). The trampoline parameter dispatches to
-// InvokeCatalogTableInsert/Update/DeleteFunctionGet on cache miss.
+// Resolve a write-function discovery result: the value inlined on VgiTableInfo
+// when the worker supplied one (saves the catalog_table_*_function_get RPC),
+// else `fetch()`.
 template <typename FetchFn>
 static vgi::VgiScanFunctionResult
 ResolveWriteFunction(ClientContext &context, VgiTableEntry &table, const char *operation,
@@ -98,10 +95,9 @@ using namespace vgi;
 // entries in the worker-claimed schema, the table's schema and the catalog's
 // default schema (a virtual ``topics.<topic>`` table may route INSERT to
 // ``main.kafka_topic_insert``), then those schemas' hidden (protocol 3.3
-// table_only) sets, where every SDK now lists write functions. Write functions
-// are always worker RPCs, so the system catalog is never consulted, and an
-// unlisted one is a BinderException: before 3.3 it silently lost has_finalize
-// and the bind request named no schema.
+// table_only) sets, where SDKs list write functions. Write functions are always
+// worker RPCs, so the system catalog is never consulted. An unlisted one is a
+// BinderException, since has_finalize and the bind's schema come from the entry.
 struct ResolvedWriteFunction {
 	//! The schema the function resolved in; the bind request names it, since a
 	//! worker may register the same name in several schemas.
@@ -137,18 +133,12 @@ static ResolvedWriteFunction ResolveWriteFunctionEntry(ClientContext &context, V
 	return result;
 }
 
-// ============================================================================
-// Helper: Set up a write connection to a VGI worker function
-// ============================================================================
+// Write connection setup
 
-// Build a one-row Arrow RecordBatch of write options to pass to the worker.
-// The batch is self-describing and extensible — new options are just new fields.
-//
-// Protocol 3.3: the batch is exactly ``result_mode: utf8 not null``. The
-// former ``on_conflict`` / ``on_conflict_columns`` fields are gone: DuckDB's
-// binder rewrites every INSERT ... ON CONFLICT / INSERT OR REPLACE into a
-// MERGE before PlanInsert (bind_insert.cpp GenerateMergeInto), so they could
-// only ever say "throw" / empty. VGI emulates MERGE with ordinary write calls
+// The one-row write-options batch. Protocol 3.3: exactly
+// ``result_mode: utf8 not null``. There are no on-conflict options: DuckDB's
+// binder rewrites INSERT ... ON CONFLICT / INSERT OR REPLACE into a MERGE
+// (Binder::GenerateMergeInto), which VGI emulates with ordinary write calls
 // (VgiCatalog::PlanMergeInto).
 static VgiBatchPtr BuildWriteOptions(bool return_chunk) {
 	static const VgiSchemaPtr schema = MakeSchema({
@@ -174,8 +164,8 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
 
-	// Pass write_options as a named argument (serialized as binary)
-	// Include positional arguments from the write function result (e.g., table_name for generic functions)
+	// write_options rides as a BLOB named argument, alongside the arguments the
+	// write-function discovery returned (e.g. table_name for generic functions).
 	vector<std::pair<string, Value>> named_args;
 	if (write_options) {
 		auto options_bytes = SerializeToIpcBytes(write_options);
@@ -212,15 +202,11 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
 	return SetupWriteResult {std::move(connection), std::move(bind_result)};
 }
 
-// Helper: Validate that a worker-emitted RETURNING batch matches the table's
-// user-column schema. Without this, a worker that mistakenly emits a
-// (count BIGINT) batch (or any wrong shape) for a RETURNING write triggers
-// a SIGSEGV inside ArrowTableFunction::ArrowToDuckDB — that converter
-// dereferences ArrowTableSchema metadata for each input column position and
-// trusts the caller to have aligned the schema.
-//
-// We compare field count + per-field name + type. Nullability is intentionally
-// ignored because DuckDB's Arrow exporter forces nullable=true on every field.
+// RETURNING batches must match the table's user-column schema: ArrowToDuckDB
+// trusts the caller to have aligned it and crashes on a wrong shape (e.g. a
+// count batch). ValidateReturningSchema compares field count, names and types;
+// top-level nullability is ignored because DuckDB's Arrow exporter marks every
+// field nullable.
 //! Type equality with Arrow C++ ``DataType::Equals`` semantics: a node's own
 //! nullability belongs to its field, not its type, so only nested children compare it.
 static bool SameDataType(const ArrowSchema &a, const ArrowSchema &b) {
@@ -279,7 +265,7 @@ static void ValidateReturningSchema(const VgiSchemaPtr &expected, const VgiSchem
 	}
 }
 
-// Helper: Read the count from a response batch (count column)
+// The affected-row count from a ``count: int64 not null`` response batch.
 static idx_t ReadCountFromBatch(const VgiBatchPtr &batch) {
 	if (!batch || batch->num_rows() == 0) {
 		return 0;
@@ -312,15 +298,9 @@ static idx_t ReadCountFromBatch(const VgiBatchPtr &batch) {
 	return total;
 }
 
-// Helper: Finalize a write connection — read remaining responses, destroy connection.
-//
-// When ``gstate.has_finalize`` is true (worker declared has_finalize on the
-// write function's metadata), invoke ``PerformFinalizeInit`` instead of a
-// plain ``CloseInputWriter`` — that triggers the worker's
-// ``cls.finalize(params)`` classmethod and lets it stream a final batch (or
-// raise) for end-of-statement reconciliation. The standard ReadDataBatch
-// loop below picks up the finalize-phase output the same way it picks up
-// per-Sink response batches.
+// Close the write (via a FINALIZE phase when gstate.has_finalize), sum the
+// remaining count batches, including any finalize-phase output, and drop the
+// connection.
 static idx_t FinalizeWriteConnection(VgiWriteGlobalState &gstate) {
 	if (gstate.has_finalize) {
 		// PerformFinalizeInit closes the input writer internally and re-runs
@@ -346,19 +326,18 @@ static idx_t FinalizeWriteConnection(VgiWriteGlobalState &gstate) {
 	return total;
 }
 
-// Helper: Load an Arrow RecordBatch into an ArrowScanLocalState.
-// Same pattern as LoadBatchIntoScanState in vgi_table_in_out_impl.cpp.
+// Load a batch into an ArrowScanLocalState (as LoadBatchIntoScanState does).
 static void LoadResponseBatch(ArrowScanLocalState &scan_state, const VgiBatchPtr &batch) {
 	auto chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(batch, *chunk);
 	scan_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
 	scan_state.chunk_offset = 0;
-	// Reset() clears owned_data in array_states — REQUIRED so ArrowToDuckDB
-	// takes ownership of the new chunk's data
+	// Reset() clears owned_data in array_states; required so ArrowToDuckDB
+	// takes ownership of the new chunk's data.
 	scan_state.Reset();
 }
 
-// Helper: Produce count or RETURNING rows from source
+// Source: the changed-row count, or the RETURNING rows collected in Sink.
 static SourceResultType WriteGetDataInternal(VgiWriteGlobalState &gstate, VgiWriteSourceState &source_state,
                                              DataChunk &chunk, bool return_chunk) {
 	if (!return_chunk) {
@@ -371,7 +350,6 @@ static SourceResultType WriteGetDataInternal(VgiWriteGlobalState &gstate, VgiWri
 		return SourceResultType::FINISHED;
 	}
 
-	// RETURNING mode: scan from ColumnDataCollection (deep-copied in Sink)
 	if (!source_state.returned) {
 		gstate.return_collection.InitializeScan(source_state.scan_state);
 		source_state.returned = true;
@@ -393,9 +371,7 @@ static vector<LogicalType> WriteOutputTypes(const LogicalOperator &op, bool retu
 	return types;
 }
 
-// ============================================================================
-// INSERT Implementation
-// ============================================================================
+// INSERT
 
 VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
                                      bool return_chunk_p)
@@ -420,32 +396,16 @@ InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
 	return result;
 }
 
-// Write-refusal split for multi-branch tables. INSERT is permitted when
-// exactly one branch declares writable=true. UPDATE/DELETE/MERGE always
-// refuse on multi-branch tables — the cross-arm-target semantics question
-// has no clean answer (loud-error / silent-scope / refuse each carry UX
-// trade-offs without engine precedent), and the conservative choice is
-// to refuse and direct the user to per-branch dispatch via a
-// catalog scan of the specific branch.
-//
-// Both helpers issue a fresh branches RPC (via catalog_table_scan_branches_get,
-// which falls back to the legacy single-function path for older workers).
-// For single-branch tables (size <= 1) they're no-ops; only multi-branch
-// tables hit the refusal logic. Writes don't use AT (...) so empty strings
-// are correct here.
+// Multi-branch write refusal. INSERT is allowed when a branch declares
+// writable=true (ParseScanBranchesResult enforces at most one); UPDATE/DELETE/
+// MERGE always refuse, since cross-arm target semantics are undefined. Both
+// helpers skip the catalog_table_scan_branches_get RPC when the table is known
+// single-branch, and are no-ops for one branch. Writes never use AT (...).
 
-// INSERT permits writes when at least one branch declares writable=true.
-// (ParseScanBranchesResult already enforces at-most-one-writable, so the
-// linear scan below sees 0 or 1 writable branches.) Short-circuits on
-// the cheap multi-branch hint to avoid an RPC on every INSERT to a
-// single-branch VGI table.
-//
-// Returns the writable arm's function_name when the table is multi-branch
-// and a writable arm exists; std::nullopt when the table is single-branch
-// (no disambiguation needed). The C++ caller forwards this value to the
-// worker via the catalog_table_insert_function_get RPC so the worker can
-// dispatch the INSERT against a verified key, instead of re-resolving the
-// writable arm internally and hoping the C++ side and the worker agree.
+// Returns the writable arm's function_name for a multi-branch table, nullopt
+// for a single-branch one. The caller forwards it in
+// catalog_table_insert_function_get so the worker dispatches to the arm the
+// client verified rather than re-resolving it.
 static std::optional<std::string> RefuseInsertIfMultiBranchUnwritable(ClientContext &context,
                                                                       VgiTableEntry &table_entry) {
 	if (table_entry.IsKnownSingleBranchNoAT()) {
@@ -471,12 +431,7 @@ static std::optional<std::string> RefuseInsertIfMultiBranchUnwritable(ClientCont
 	                       table_entry.ParentSchema().name.GetIdentifierName(), table_entry.name.GetIdentifierName()));
 }
 
-// UPDATE/DELETE/MERGE always refuse on multi-branch tables, regardless of
-// any branch's writable flag. The cross-arm-target UX question is open
-// (loud-error vs. silent-scope vs. refuse) and refusing is the
-// conservative answer until concrete customer requirements arrive.
-// Short-circuits on the cheap multi-branch hint to avoid an RPC on every
-// write to a single-branch VGI table.
+// UPDATE/DELETE/MERGE refuse on multi-branch tables regardless of writable flags.
 static void RefuseUpdateDeleteIfMultiBranch(ClientContext &context, VgiTableEntry &table_entry, const char *operation) {
 	if (table_entry.IsKnownSingleBranchNoAT()) {
 		return; // cheap path: no RPC, no multi-branch refusal applies
@@ -553,8 +508,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	if (return_chunk) {
-		// RETURNING expects the worker to emit batches with the table's
-		// user-column schema (sans rowid). Same shape used by GetLocalSinkState.
+		// RETURNING rows come back in the table's user-column schema (sans
+		// rowid), the shape GetLocalSinkState converts.
 		gstate->expected_returning_schema = input_schema;
 	}
 	input_schema = NullableWriteInputSchema(input_schema);
@@ -575,9 +530,9 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 }
 
 unique_ptr<LocalSinkState> VgiPhysicalInsert::GetLocalSinkState(ExecutionContext &context) const {
-	// Build response schema (table columns sans row_id) for RETURNING Arrow→DuckDB conversion
-	// For CTAS, insert_table may be null (table created in GetGlobalSinkState), but
-	// return_chunk is always false so the response schema is only used for count output.
+	// Response schema (table columns sans row_id) for RETURNING conversion. CTAS
+	// has no insert_table yet (it is created in GetGlobalSinkState) and never
+	// returns rows, so it gets an empty schema.
 	if (insert_table) {
 		auto &table_info = insert_table->GetTableInfo();
 		auto response_schema = NativeColumnTypeSchema(table_info.arrow_schema, table_info.schema_name);
@@ -586,7 +541,6 @@ unique_ptr<LocalSinkState> VgiPhysicalInsert::GetLocalSinkState(ExecutionContext
 		}
 		return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 	}
-	// CTAS: use a minimal schema — RETURNING is never used for CTAS
 	auto empty_schema = VgiSchema::Empty();
 	return make_uniq<VgiWriteLocalSinkState>(context.client, empty_schema, GetTypes());
 }
@@ -609,7 +563,7 @@ SinkResultType VgiPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chu
 		auto response = gstate.connection->ReadDataBatch();
 		if (response && response->num_rows() > 0) {
 			if (gstate.return_chunk) {
-				// For DO NOTHING, response may have fewer rows than input (conflicts skipped)
+				// The worker may return fewer rows than it was sent, never more.
 				D_ASSERT(NumericCast<idx_t>(response->num_rows()) <= chunk.size());
 				D_ASSERT(NumericCast<idx_t>(response->num_rows()) <= STANDARD_VECTOR_SIZE);
 
@@ -667,9 +621,7 @@ SourceResultType VgiPhysicalInsert::GetDataInternal(ExecutionContext &context, D
 	return WriteGetDataInternal(gstate, source_state, chunk, return_chunk);
 }
 
-// ============================================================================
-// DELETE Implementation
-// ============================================================================
+// DELETE
 
 VgiPhysicalDelete::VgiPhysicalDelete(PhysicalPlan &plan, LogicalDelete &op, VgiTableEntry &table_p, bool return_chunk_p,
                                      idx_t rowid_index_p)
@@ -715,8 +667,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
 	if (return_chunk) {
-		// DELETE RETURNING surfaces the deleted rows in the table's user-column
-		// schema (sans rowid). Same shape used by GetLocalSinkState below.
+		// DELETE RETURNING rows use the table's user-column schema (sans rowid).
 		auto response_schema = value_schema;
 		if (table_info.row_id_column >= 0) {
 			response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());
@@ -754,10 +705,8 @@ SinkResultType VgiPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chu
 
 	{
 		lock_guard<mutex> guard(gstate.write_lock);
-		// DuckDB does not de-duplicate the row ids of a DELETE on a non-native
-		// table: DELETE ... USING with several matching source rows sends a
-		// target row once per match. Send each row id once per write call, so
-		// the worker counts it once and RETURNING lists it once.
+		// Send each row id once (see VgiRowIdSet), so the worker counts it once
+		// and RETURNING lists it once.
 		const auto kept = gstate.deleted_rowids.Filter(rowid_chunk);
 		if (kept == 0) {
 			return SinkResultType::NEED_MORE_INPUT;
@@ -807,9 +756,7 @@ SourceResultType VgiPhysicalDelete::GetDataInternal(ExecutionContext &context, D
 	return WriteGetDataInternal(gstate, source_state, chunk, return_chunk);
 }
 
-// ============================================================================
-// UPDATE Implementation
-// ============================================================================
+// UPDATE
 
 VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
                                      bool return_chunk_p, vector<PhysicalIndex> columns_p,
@@ -853,8 +800,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	// declared table schema rather than re-deriving via DuckDB's Arrow
 	// converter, so the worker sees its declared types. Every field is then
 	// marked nullable (NullableWriteInputSchema): NOT NULL is the worker's to
-	// enforce. The C++ ReconcileBatchToSchema helper reshapes incoming
-	// batches to match this schema before they hit the IPC writer.
+	// enforce. WriteInputBatch reconciles each batch to this schema
+	// (ReconcileBatchToSchema) before writing it.
 	VgiSchemaPtr input_schema = VgiSchema::Empty();
 	for (auto &col_idx : columns) {
 		auto &col = table_columns.GetColumn(col_idx);
@@ -874,8 +821,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
 	if (return_chunk) {
-		// UPDATE RETURNING surfaces the updated rows in the table's user-column
-		// schema (sans rowid). Same shape used by GetLocalSinkState below.
+		// UPDATE RETURNING rows use the table's user-column schema (sans rowid).
 		auto response_schema = value_schema;
 		if (table_info.row_id_column >= 0) {
 			response_schema = response_schema->RemoveField(table_info.row_id_column)->WithMetadata(VgiMetadata());

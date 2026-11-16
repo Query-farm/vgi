@@ -16,46 +16,36 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// VgiAggregateWindowLocalState
-// ============================================================================
-// Placement-new'd into DuckDB's l_state buffer. The buffer is sized by
-// VgiAggregateStateSize() which returns max(sizeof(VgiAggregateState),
-// sizeof(VgiAggregateWindowLocalState)) so the same buffer serves both
-// code paths. Discriminated by the tag field (must be at offset 0, same
-// as VgiAggregateState::tag).
+// Placement-new'd by VgiAggregateWindowInit into the window *global* state
+// buffer (despite the name). VgiAggregateStateSize() sizes that buffer for the
+// larger of this and VgiAggregateState; `tag` must stay at offset 0, matching
+// VgiAggregateState::tag, so teardown can tell them apart.
 
 struct VgiAggregateWindowLocalState {
 	VgiAggregateStateTag tag = VgiAggregateStateTag::WINDOW;
 	// Assigned in VgiAggregateWindowInit from the ExecState counter.
 	int64_t partition_id = -1;
-	// Cached bind_data pointer so the per-row window callback doesn't need
-	// to re-fetch from AggregateInputData.
 	const VgiAggregateBindData *bind_data = nullptr;
 };
 
-// ============================================================================
-// Window callbacks
-// ============================================================================
-
 // Called once per partition with the full partition data. Assigns a
-// partition_id, ships the partition via aggregate_window_init RPC, and
-// stashes the partition_id on the l_state.
+// partition_id, ships the partition via aggregate_window_init, and stores the
+// partition_id in g_state.
 void VgiAggregateWindowInit(AggregateInputData &aggr_input_data,
                              const WindowPartitionInput &partition,
                              data_ptr_t g_state);
 
-// Called once per output row. Sends aggregate_window RPC with
-// (rid, subframes) and writes the returned scalar into result[rid].
+// Per-row fallback: one aggregate_window RPC per output row. DuckDB prefers the
+// batch callback below whenever it is registered (it always is), so this runs
+// only on an engine that ignores window_batch.
 void VgiAggregateWindow(AggregateInputData &aggr_input_data,
                          const WindowPartitionInput &partition,
                          const_data_ptr_t g_state, data_ptr_t l_state,
                          const SubFrames &subframes, Vector &result, idx_t rid);
 
-// Batched variant — called once per Evaluate() with frame bounds for all
-// `count` output rows pre-computed. Issues a single aggregate_window_batch
-// RPC that returns a count-row result batch, which is copied into `result`
-// at positions [0..count). Reduces RPCs from N to ~N/STANDARD_VECTOR_SIZE.
+// Batched variant: DuckDB calls it once per WindowCustomAggregator::Evaluate
+// with all `count` rows' subframes; one aggregate_window_batch RPC fills
+// result[0..count).
 void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data,
                               const WindowPartitionInput &partition,
                               const_data_ptr_t g_state, data_ptr_t l_state,

@@ -16,15 +16,11 @@ struct DBConfig;
 
 namespace vgi {
 
-// ============================================================================
-// LogicalVgiLateralBatch
-// ============================================================================
 // Installed by VgiLateralBatchRewriter in place of a correlated (decorrelated,
-// projected_input) LogicalGet of a blended VGI table-in-out function. Replicates
-// the LogicalGet's column-binding / type shape exactly ([worker output cols under
-// table_index | the child's projected/outer cols]) so the enclosing DELIM_JOIN and
-// parent operators are unaffected — the rewrite is transparent. CreatePlan builds
-// the batched PhysicalVgiLateralBatch instead of the row-by-row
+// projected_input) LogicalGet of a blended VGI table-in-out function. Keeps the
+// LogicalGet's exact binding/type shape ([worker output cols under table_index |
+// the child's projected/outer cols]) so the enclosing DELIM_JOIN and parents are
+// unaffected. CreatePlan builds PhysicalVgiLateralBatch instead of the row-by-row
 // PhysicalTableInOutFunction.
 
 class LogicalVgiLateralBatch : public LogicalExtensionOperator {
@@ -39,16 +35,15 @@ public:
 	//! Worker output column types (the leading base_idx columns).
 	vector<LogicalType> worker_output_types;
 	//! Worker-original column indices of the leading base_idx output columns (from
-	//! LogicalGet::GetColumnIds()). When the function supports projection pushdown,
-	//! DuckDB's UNUSED_COLUMNS pass narrows these to the referenced worker columns;
-	//! they are threaded to the worker as the wire projection so it emits exactly
-	//! this narrow set, and drive the projected ArrowToDuckDB remap.
+	//! LogicalGet::GetColumnIds(), narrowed by DuckDB's UNUSED_COLUMNS pass). With
+	//! projection pushdown they are sent as the wire projection and drive the
+	//! projected ArrowToDuckDB remap; otherwise they are the identity.
 	vector<column_t> worker_column_ids;
 	//! Echo of VgiTableInOutBindData::projection_pushdown — gates whether the wire
 	//! projection is sent (sending it to a non-projecting worker mis-projects).
 	bool projection_pushdown;
-	//! Worker output column bindings (ColumnBinding(table_index, i)); snapshot at
-	//! rewrite so we don't depend on the child for these.
+	//! Worker output column bindings (ColumnBinding(table_index, i)), snapshotted at
+	//! rewrite so they don't depend on the child.
 	vector<ColumnBinding> worker_bindings;
 
 public:
@@ -71,19 +66,13 @@ private:
 	unique_ptr<LogicalGet> sql_source;
 };
 
-// ============================================================================
-// PhysicalVgiLateralBatch
-// ============================================================================
-// Pipeline Operator (Execute, no Sink/Source). Replaces the row-by-row
-// PhysicalTableInOutFunction for a correlated blended VGI table-in-out call:
-// ships the WHOLE input chunk's worker-input columns to the worker in ONE
-// exchange, reads one output batch (+ per-output-row provenance), stamps the
-// correlated columns onto each output row by the provenance, and drains a 1->N
-// output larger than STANDARD_VECTOR_SIZE across HAVE_MORE_OUTPUT calls.
-//
-// Spike (v1): 1->1 identity provenance only (assumes output rows == input rows,
-// stamps by row index), ParallelOperator()=false. Provenance + 1->N + parallel
-// follow.
+// Pipeline operator (Execute only) replacing the row-by-row
+// PhysicalTableInOutFunction for a correlated blended VGI table-in-out call: ships
+// each input chunk's worker-input columns to the worker in one exchange per call
+// (split by input_rows_per_call), reads the output with its per-output-row
+// provenance (vgi_rpc.parent_row; identity when absent), stamps the correlated
+// columns onto each output row by that provenance, and drains output larger than
+// STANDARD_VECTOR_SIZE across HAVE_MORE_OUTPUT calls.
 
 class PhysicalVgiLateralBatch : public PhysicalOperator {
 public:
@@ -103,10 +92,7 @@ public:
 	idx_t input_length;
 	//! First output column index of the projected/outer columns.
 	idx_t base_idx;
-	//! Worker-original column indices of the leading base_idx output columns. When
-	//! projection_pushdown is set, threaded to the worker as the wire projection so
-	//! it emits exactly this narrow set, and used to drive the projected
-	//! ArrowToDuckDB remap (arrow_scan_is_projected=true).
+	//! See LogicalVgiLateralBatch::worker_column_ids.
 	vector<column_t> worker_column_ids;
 	//! Whether the function supports projection pushdown (gates threading the wire
 	//! projection + the projected ArrowToDuckDB read).
@@ -120,8 +106,8 @@ public:
 	                           GlobalOperatorState &gstate, OperatorState &state) const override;
 
 	bool ParallelOperator() const override {
-		// Each pipeline-executor thread owns its OperatorState -> its own substream_id
-		// -> its own worker (Phase A per-substream fan-out). No shared connection.
+		// Each thread's OperatorState has its own substream_id and worker; no
+		// connection is shared.
 		return true;
 	}
 
@@ -135,7 +121,6 @@ public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
-// OptimizerExtension registration (defined in vgi_lateral_batch_operator.cpp).
 void RegisterVgiLateralBatchRewriter(DBConfig &config);
 
 } // namespace vgi

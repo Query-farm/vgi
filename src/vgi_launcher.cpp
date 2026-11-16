@@ -1,9 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-// AF_UNIX worker launcher — POSIX-only.  Under emscripten the entire
-// translation unit collapses to nothing; LAUNCH/UNIX LOCATION schemes
-// surface a clear "not supported in WASM" error at the dispatch layer
-// (see vgi_function_connection.cpp, vgi_unary_rpc.cpp).
+// Worker launcher: AF_UNIX on POSIX, named pipes on Windows. Without either
+// (emscripten) this TU is empty and the dispatch layer rejects launch: / unix://.
 #include "vgi_platform.hpp"
 
 #if VGI_POSIX_TRANSPORT
@@ -57,30 +55,17 @@ ErrorInfo LauncherLocalInfo(int err = 0) {
 	return info;
 }
 
-// ---------------------------------------------------------------------------
-// Centralised worker-pid reaper
-// ---------------------------------------------------------------------------
-// Per-spawn detached ``waitpid`` threads collide with hosts that install
-// their own SIGCHLD handler (Python embedded, etc.) and accumulate stack +
-// kernel-tid resources for the worker's full lifetime (potentially hours
-// at the default 300 s idle timeout, multiplied by every spawn this DuckDB
-// process performs).  One shared reaper polls registered pids with
-// ``WNOHANG``: races with another reaper just return ``ECHILD``, no
-// corruption; the kernel's auto-reap under ``SIG_IGN`` likewise just
-// drains our registry without us having ever called ``waitpid``.
+// One shared reaper polls registered pids with ``WNOHANG`` instead of a
+// blocking ``waitpid`` thread per spawn (which would live as long as each
+// worker). Hosts with their own SIGCHLD handler or ``SIG_IGN`` are harmless:
+// a pid reaped elsewhere just returns ECHILD and is dropped.
 
 class PidReaper {
 public:
 	static PidReaper &Instance() {
-		// Intentionally leaked (same rationale as VgiWorkerPool / VgiResultCache):
-		// Run() executes on a DETACHED thread that locks mu_ for the whole process
-		// lifetime. A function-local ``static PidReaper inst;`` is destroyed during
-		// __cxa_finalize at process exit while that thread is still running, so its
-		// next mu_.lock() hits a destroyed mutex → std::mutex::lock() throws EINVAL
-		// → uncaught on the reaper thread → std::terminate → SIGABRT. (Observed as an
-		// intermittent teardown abort under the parallel cross-SDK test matrix.)
-		// Leaking keeps mu_ (and pids_) alive so the detached reaper never races
-		// static teardown.
+		// Intentionally leaked: Run() loops forever on a detached thread that
+		// keeps locking mu_. A static instance would be destroyed at exit while
+		// that thread runs, and locking the destroyed mutex throws -> SIGABRT.
 		static PidReaper *inst = new PidReaper();
 		return *inst;
 	}
@@ -135,17 +120,11 @@ private:
 	bool started_ = false;
 };
 
-// Hard cap on bytes we'll buffer waiting for the worker's discovery line.
-// A misbehaving (or hostile) worker that prints unbounded prefix noise
-// would otherwise OOM the launcher process.
+// Cap on bytes buffered before the discovery line, so a hostile worker printing
+// unbounded noise cannot OOM us.
 constexpr std::size_t kDiscoveryBufferLimit = 1u << 20; // 1 MiB
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// Read environment as a flat (key, value) list.  Used to pass to the launcher
-// helpers' env filter so we hash only VGI_RPC_* entries.
+// Environment as (key, value) pairs, for FilterVgiRpcEnv.
 std::vector<std::pair<std::string, std::string>> SnapshotEnvironment() {
 	std::vector<std::pair<std::string, std::string>> out;
 	for (char **e = environ; e && *e; ++e) {
@@ -164,14 +143,12 @@ std::string EnvOr(const char *name, const char *fallback) {
 	return v ? std::string(v) : (fallback ? std::string(fallback) : std::string());
 }
 
-// Recursive mkdir up to and including *path*, mode 0700 on each created
-// directory.  Existing directories are left alone.  Throws IOException on
-// any error other than "already exists".
+// mkdir -p with mode 0700 for created directories. Throws IOException on any
+// error other than an existing directory.
 void MkdirRecursive(const std::string &path) {
 	if (path.empty() || path == "/") {
 		return;
 	}
-	// Walk the path and mkdir each component.
 	for (size_t i = 1; i <= path.size(); ++i) {
 		if (i < path.size() && path[i] != '/') {
 			continue;
@@ -195,15 +172,13 @@ void MkdirRecursive(const std::string &path) {
 	}
 }
 
-// Owns an open lockfile fd; releases the flock (and closes the fd) on scope
-// exit unless ``Release()`` is called.
+// Owns a lockfile fd holding an exclusive flock; closing the fd releases it.
 class FlockGuard {
 public:
 	FlockGuard() = default;
 
-	// Open *path* (creating with mode 0600 if missing) and acquire an
-	// exclusive ``flock`` with a wall-clock budget of ``timeout``.  Throws
-	// IOException on timeout or unrecoverable error.
+	// Open (creating 0600) and flock *path*, waiting up to ``timeout``.
+	// Throws IOException on timeout or error.
 	static FlockGuard Acquire(const std::string &path, std::chrono::milliseconds timeout) {
 		int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
 		if (fd < 0) {
@@ -212,16 +187,13 @@ public:
 			                  std::strerror(err));
 		}
 		auto deadline = std::chrono::steady_clock::now() + timeout;
-		// flock(2) doesn't have a native timeout; spin on LOCK_NB with a
-		// small sleep until the deadline.  ~50ms granularity is fine for
-		// the rare-contention case (typically zero-wait or minutes-of-spawn).
+		// flock(2) has no timeout: poll LOCK_NB every 50ms until the deadline.
 		while (true) {
 			if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
 				return FlockGuard(fd);
 			}
-			// EINTR (signal storm under profilers) is treated identically
-			// to EWOULDBLOCK — sleep before retrying so we never burn CPU
-			// in a tight loop.
+			// EINTR is treated like EWOULDBLOCK (sleep, retry), so a signal
+			// storm cannot make this a busy loop.
 			if (errno != EWOULDBLOCK && errno != EINTR) {
 				int saved = errno;
 				::close(fd);
@@ -257,8 +229,7 @@ public:
 
 	void Release() {
 		if (fd_ >= 0) {
-			// Closing the fd implicitly releases the lock (POSIX
-			// guarantees: ``flock`` ranges by open file description).
+			// flock locks belong to the open file description; close releases.
 			::close(fd_);
 			fd_ = -1;
 		}
@@ -269,7 +240,7 @@ private:
 	int fd_ = -1;
 };
 
-// Resolve the per-user state directory + ensure it exists.
+// Resolve the per-user state directory and create it if needed.
 std::string ResolveAndEnsureStateDir(const std::optional<std::string> &override_dir) {
 	std::string dir;
 	if (override_dir.has_value()) {
@@ -279,9 +250,8 @@ std::string ResolveAndEnsureStateDir(const std::optional<std::string> &override_
 		                                 static_cast<uint32_t>(::geteuid()));
 	}
 	MkdirRecursive(dir);
-	// Tighten mode + ownership-check on POSIX.  The Python launcher does
-	// the same — this catches cases where /tmp/vgi-rpc-$UID was created by
-	// a different user and a malicious one tries to MITM via symlinks.
+	// Force 0700 and require our ownership (as the Python launcher does): a
+	// state dir pre-created by another user could otherwise MITM our sockets.
 	::chmod(dir.c_str(), 0700);
 	struct stat st;
 	if (::stat(dir.c_str(), &st) != 0) {
@@ -296,18 +266,11 @@ std::string ResolveAndEnsureStateDir(const std::optional<std::string> &override_
 	return dir;
 }
 
-// Connect probe — true iff a worker is listening on path.
-//
-// A listener whose accept queue is full is alive, only busy — and a false
-// "dead" here is destructive, because Launch() then unlinks the socket out
-// from under the live worker and spawns a duplicate, orphaning the original
-// and racing clients onto a vanished path.  Linux reports a full queue as
-// EAGAIN, distinct from the ECONNREFUSED of an unbound socket, so it counts as
-// alive.  macOS reports both as ECONNREFUSED, so a refusal is re-probed briefly
-// before it is believed; a socket left by a dead worker pays that once.  This
-// asks "is anything listening", not "is it responsive": a connect lands in the
-// queue of a worker that never accepts, so a successful one never proved that
-// either.  Mirrors ``vgi_rpc.launcher._probe``.
+// True iff a worker is listening on path (not whether it is responsive).
+// A false "dead" is destructive: Launch() would unlink the live worker's socket
+// and spawn a duplicate. So a full accept queue counts as alive (Linux: EAGAIN),
+// and since macOS reports a full queue as ECONNREFUSED too, a refusal is
+// re-probed briefly before it is believed. Mirrors ``vgi_rpc.launcher._probe``.
 bool ProbeAlive(const std::string &path) {
 	static const std::chrono::milliseconds kRefusedBackoff[] = {
 	    std::chrono::milliseconds(50), std::chrono::milliseconds(100), std::chrono::milliseconds(200)};
@@ -539,8 +502,8 @@ struct SpawnResult {
 };
 
 // `cat`, used as the worker's stderr sink once it is ready (see
-// HandOffStderrToSink). "" when there is none, and stderr is then discarded
-// from the start, as it always was.
+// HandOffStderrToSink); "" when absent, and stderr is then discarded from the
+// start.
 const std::string &StderrSinkProgram() {
 	static const std::string program = []() -> std::string {
 		for (const char *candidate : {"/bin/cat", "/usr/bin/cat"}) {
@@ -637,18 +600,11 @@ SpawnResult SpawnWorker(const std::vector<std::string> &final_argv,
 }
 
 // Hand the worker's stderr pipe to a detached `cat` writing to /dev/null.
-//
-// A launch: worker is shared and outlives this DuckDB process, so once it is
-// ready its stderr cannot stay a pipe that this process reads: on exit the
-// read end would close and the worker's next stderr write would fail (EPIPE,
-// or death by SIGPIPE for a worker that resets that signal). Nor can it be a
-// file, which would grow without bound for as long as the worker runs. The
-// sink drains the pipe for exactly as long as the worker (and anything it
-// spawned) keeps it open, then exits. It ignores the terminal's job-control
-// signals so a Ctrl-C in the DuckDB shell cannot remove it from under a
-// worker that survives that Ctrl-C.
-//
-// Returns the sink's pid, or -1 with *error set.
+// The shared worker outlives this process, so its stderr cannot stay a pipe we
+// read (our exit would make its next write EPIPE/SIGPIPE) nor a file (unbounded
+// growth). The sink lives as long as the pipe's writers and ignores terminal
+// job-control signals, so a Ctrl-C in the shell cannot kill it under a worker
+// that survives the Ctrl-C. Returns the sink's pid, or -1 with *error set.
 pid_t HandOffStderrToSink(int stderr_fd, std::string *error) {
 	const std::string &sink = StderrSinkProgram();
 	std::optional<CloexecPipe> status_pipe;
@@ -788,15 +744,10 @@ std::string JoinArgv(const std::vector<std::string> &argv) {
 	return out;
 }
 
-// Read from `stdout_fd` until either ParseDiscoveryLine returns kFound, the
-// worker exits, or `deadline` passes.  On success: closes the pipe (forcing
-// SIGPIPE on any contract-violating worker that writes more stdout), hands
-// a captured stderr pipe to the sink, and hands the worker pid to the
-// singleton reaper.  Throws IOException on any failure, with whatever the
-// worker wrote to stderr meanwhile.
-//
-// Buffer is hard-capped at ``kDiscoveryBufferLimit`` so a hostile or
-// runaway worker can't OOM us with unbounded prefix noise.
+// Read `stdout_fd` until ParseDiscoveryLine returns kFound, the worker exits,
+// or `deadline` passes (buffer capped at kDiscoveryBufferLimit). On success:
+// hands captured stderr to the sink, closes stdout, and registers the pid with
+// PidReaper. Throws IOException on failure, including the worker's stderr.
 void WaitForReadinessAndDetach(pid_t worker_pid, int stdout_fd, int stderr_fd,
                                 const std::vector<std::string> &worker_argv, const std::string &expected_path,
                                 std::chrono::steady_clock::time_point deadline) {
@@ -861,7 +812,6 @@ void WaitForReadinessAndDetach(pid_t worker_pid, int stdout_fd, int stderr_fd,
 			     error_subtype::kTransportFailure);
 		}
 		if (sel == 0) {
-			// Loop will hit deadline check.
 			continue;
 		}
 		if (startup_stderr.fd() >= 0 && FD_ISSET(startup_stderr.fd(), &rfds)) {
@@ -881,8 +831,7 @@ void WaitForReadinessAndDetach(pid_t worker_pid, int stdout_fd, int stderr_fd,
 			int status = 0;
 			while (::waitpid(worker_pid, &status, 0) < 0 && errno == EINTR) {
 			}
-			// Decode the raw waitpid status: printing it verbatim made exit
-			// 127 read as 32512.
+			// Decode the raw waitpid status (exit 127 is raw 32512).
 			if (WIFSIGNALED(status)) {
 				const int sig = WTERMSIG(status);
 				throw IOException(launch_info(error_subtype::kWorkerKilled)
@@ -933,25 +882,17 @@ void WaitForReadinessAndDetach(pid_t worker_pid, int stdout_fd, int stderr_fd,
 				PidReaper::Instance().Register(sink_pid);
 				startup_stderr.Close(); // the sink holds its own copy now
 			}
-			// Close our read end of the worker's stdout.  The cross-language
-			// launcher contract says the worker must not write to stdout
-			// after the UNIX:<path> line — a contract-violating worker
-			// gets SIGPIPE here, which is the right outcome (the bug is
-			// in the worker, and a noisy crash beats a silent thread leak
-			// on our side).
+			// The launcher contract forbids stdout after the discovery line;
+			// a worker that writes more gets SIGPIPE, which is intended
+			// (better than keeping a reader alive on our side).
 			::close(stdout_fd);
 			PidReaper::Instance().Register(worker_pid);
 			return;
 		}
-		// kNeedMore — keep reading.
 	}
 }
 
 } // namespace
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 std::string Launch(const LaunchConfig &cfg) {
 	if (cfg.worker_argv.empty()) {
@@ -960,7 +901,6 @@ std::string Launch(const LaunchConfig &cfg) {
 
 	std::string state_dir = ResolveAndEnsureStateDir(cfg.state_dir_override);
 
-	// Resolve socket / lock paths.
 	std::string sock_path;
 	std::string lock_path;
 	if (cfg.socket_path_override.has_value()) {
@@ -968,9 +908,8 @@ std::string Launch(const LaunchConfig &cfg) {
 		lock_path = sock_path + ".lock";
 	} else {
 		auto env_subset = launcher::FilterVgiRpcEnv(SnapshotEnvironment());
-		// Snapshot cwd as the launcher sees it.  Workers honour the same
-		// cwd because fork() inherits it.  Allocate dynamically so deeply
-		// nested CI paths (Bazel, etc.) longer than 4 KiB don't truncate.
+		// cwd is part of the hash because the forked worker inherits it.
+		// Grown dynamically: CI paths can exceed 4 KiB.
 		std::string cwd;
 		std::size_t buf_size = 4096;
 		while (true) {
@@ -980,9 +919,7 @@ std::string Launch(const LaunchConfig &cfg) {
 				break;
 			}
 			if (errno != ERANGE) {
-				// Unable to read cwd — empty string still produces a valid
-				// hash; leaves a documented edge case if the cwd is
-				// inaccessible (e.g. unreadable parent dirs).
+				// Unreadable cwd: hash with an empty cwd.
 				break;
 			}
 			if (buf_size > (1u << 20)) { // 1 MiB ceiling — no real cwd is this long
@@ -995,8 +932,6 @@ std::string Launch(const LaunchConfig &cfg) {
 		lock_path = state_dir + "/" + hash + ".lock";
 	}
 
-	// Translate any std::invalid_argument out of pure helpers into the
-	// appropriate DuckDB exception at this single boundary.
 	try {
 		launcher::ValidateRendezvousPathLength(sock_path);
 	} catch (const std::invalid_argument &e) {
@@ -1005,24 +940,20 @@ std::string Launch(const LaunchConfig &cfg) {
 
 	auto guard = FlockGuard::Acquire(lock_path, cfg.connect_timeout);
 
-	// Inside the lock: probe for an existing healthy worker, else spawn.
+	// Under the lock: reuse a live worker, else spawn.
 	if (ProbeAlive(sock_path)) {
 		return sock_path;
 	}
 	// Stale socket file (worker crashed or never bound).  Best-effort unlink.
 	::unlink(sock_path.c_str());
 
-	// Build final argv with --unix and --idle-timeout appended.
 	std::vector<std::string> argv = cfg.worker_argv;
 	argv.emplace_back("--unix");
 	argv.push_back(sock_path);
 	argv.emplace_back("--idle-timeout");
 	{
-		// Per docs/launcher-protocol.md: decimal seconds in plain notation,
-		// no scientific.  ``%g`` switches to ``%e`` past 1e6, which would
-		// silently mangle large idle-timeout values; ``%.3f`` keeps
-		// millisecond precision and we strip trailing zeros to match the
-		// other implementations.
+		// docs/launcher-protocol.md requires plain decimal seconds (no
+		// exponent, which %g would emit): %.3f, trailing zeros stripped.
 		double sec = static_cast<double>(cfg.idle_timeout.count()) / 1000.0;
 		char buf[64];
 		std::snprintf(buf, sizeof(buf), "%.3f", sec);
@@ -1039,15 +970,13 @@ std::string Launch(const LaunchConfig &cfg) {
 		argv.emplace_back(std::move(s));
 	}
 
-	// Capture stderr while the worker starts, so a failure can say why; a
-	// user-chosen stderr file, or no `cat` to drain it afterwards, keeps the
-	// old behaviour (file / discard).
+	// Capture stderr during startup so a failure can say why, unless the user
+	// chose a stderr file or there is no `cat` sink to drain it afterwards.
 	const bool capture_stderr = !cfg.worker_stderr_path.has_value() && !StderrSinkProgram().empty();
 	auto spawn = SpawnWorker(argv, cfg.worker_stderr_path, capture_stderr);
 	auto deadline = std::chrono::steady_clock::now() + cfg.worker_startup_timeout;
 	WaitForReadinessAndDetach(spawn.pid, spawn.stdout_fd, spawn.stderr_fd, cfg.worker_argv, sock_path, deadline);
 
-	// Lock auto-releases as guard goes out of scope on return.
 	return sock_path;
 }
 
@@ -1056,17 +985,10 @@ std::string Launch(const LaunchConfig &cfg) {
 
 #elif defined(_WIN32)
 
-// ===========================================================================
-// Windows launcher — named-pipe rendezvous.
-//
-// CPython has no AF_UNIX on Windows, so the launch: worker is reached via a
-// Windows named pipe (\\.\pipe\vgi-rpc-<hash>) served by serve_named_pipe. This
-// is a parallel implementation of Launch() that mirrors the POSIX flow: hash →
-// rendezvous name, system-wide spawn election (named mutex instead of flock),
-// probe-or-spawn, read the PIPE:<name> discovery line, detach. The cross-platform
-// hash / argv / discovery-parse helpers are shared (vgi_launcher_internal).
-// UNTESTED on macOS CI — validated on the Windows build machine.
-// ===========================================================================
+// Windows launcher. CPython has no AF_UNIX on Windows, so the worker serves a
+// named pipe (\\.\pipe\vgi-rpc-<hash>). Mirrors the POSIX flow (hash ->
+// rendezvous name, named mutex instead of flock, probe-or-spawn, PIPE:<name>
+// discovery line, detach) using the shared vgi_launcher_internal helpers.
 
 #include "vgi_launcher.hpp"
 
@@ -1383,9 +1305,8 @@ std::string Launch(const LaunchConfig &cfg) {
 	} else {
 		auto env_subset = launcher::FilterVgiRpcEnv(WinEnvSnapshot());
 		auto hash = launcher::ComputeLauncherHash(cfg.worker_argv, WinCwd(), env_subset);
-		// Pipe name + mutex name both derive from the hash, so every process
-		// pointing at the same (argv, cwd, VGI_RPC_*-env) tuple agrees on the
-		// rendezvous and serialises spawns against the same mutex.
+		// Pipe and mutex names both derive from the hash, so all processes
+		// with the same tuple share the rendezvous and the spawn mutex.
 		pipe_name = "\\\\.\\pipe\\vgi-rpc-" + hash;
 		mutex_name = "vgi-rpc-" + hash;
 	}

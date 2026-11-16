@@ -17,10 +17,8 @@
 
 #include <cstring>
 
-// Generated request builders — exposes ``duckdb::vgi::generated::Build<Name>Params(...)``
-// definitions that mirror the schemas in ``generated/vgi_protocol_schemas.hpp``.
-// Including here is the only TU that pulls them in; the file is header-only
-// inline functions, so ODR is satisfied by the single inclusion.
+// Generated ``generated::Build<Name>Params(...)`` request builders (header-only
+// inline functions).
 #include "generated/vgi_request_builders.hpp"
 
 namespace duckdb {
@@ -28,9 +26,9 @@ namespace vgi {
 
 namespace {
 
-// Validate a nested payload decoded from IPC bytes. `what` names it in the
-// message ("[worker: nested IPC payload]", unchanged) but is not a worker
-// location, so it is reported as `field` rather than `worker_path`/`transport`.
+// Validate a nested payload decoded from IPC bytes. `what` appears in the
+// message as "[worker: <what>]" but is not a worker location, so extra_info
+// reports it as `field` instead of `worker_path`/`transport`.
 void ValidateNestedBatch(const VgiBatchPtr &batch, WorkerBatchValidation level, const char *what) {
 	try {
 		ValidateWorkerBatch(batch.get(), level, what);
@@ -94,12 +92,7 @@ void FillDictionary(ArrowArray *array, const std::vector<std::string> &dictionar
 
 } // namespace
 
-// ============================================================================
-// Single-row builders (declared in vgi_rpc_types.hpp).
-// ============================================================================
-//
-// "Required" non-Optional helpers always emit a non-null entry; the Optional helpers
-// are what the codegen calls into.
+// Single-row builders (contract in vgi_rpc_types.hpp).
 
 ArrowArray BuildStructScalar(const VgiColumn &value, const ArrowSchema &field, bool nullable) {
 	if (value) {
@@ -321,9 +314,7 @@ ArrowArray BuildOptionalStringMapScalar(const std::optional<std::vector<std::pai
 	});
 }
 
-// ============================================================================
-// Enum Serialization
-// ============================================================================
+// Enum serialization
 
 ArrowArray BuildEnumArray(const std::string &value, const std::vector<std::string> &dictionary_values) {
 	int16_t index = -1;
@@ -353,9 +344,7 @@ ArrowArray BuildOptionalEnumArray(const std::optional<std::string> &value,
 	});
 }
 
-// ============================================================================
-// IPC Bytes Serialization
-// ============================================================================
+// IPC bytes serialization
 
 namespace {
 //! Writes straight into a std::vector<uint8_t>.
@@ -479,9 +468,7 @@ std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string
 	    generated::BuildForeignKeyInfo(fk_columns, pk_columns, referenced_table, SingleSchemaPath(referenced_schema)));
 }
 
-// ============================================================================
-// BindResponse Parsing
-// ============================================================================
+// BindResponse parsing
 
 BindResponseResult ParseBindResponse(const VgiBatchPtr &batch, const std::string &worker_path) {
 	auto wire = generated::Decode<generated::BindResponse>(batch, 0, worker_path);
@@ -538,9 +525,7 @@ BindResponseResult ParseBindResponse(const VgiBatchPtr &batch, const std::string
 	return result;
 }
 
-// ============================================================================
-// BindSecretScopeResponse Parsing
-// ============================================================================
+// BindSecretScopeResponse parsing
 
 std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(const VgiBatchPtr &batch) {
 	if (!batch || batch->num_rows() == 0) {
@@ -567,9 +552,7 @@ std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(con
 	return result;
 }
 
-// ============================================================================
-// GlobalInitResponse Parsing
-// ============================================================================
+// GlobalInitResponse parsing
 
 GlobalInitResponseResult ParseGlobalInitResponse(const VgiBatchPtr &batch, const std::string &worker_path) {
 	auto wire = generated::Decode<generated::GlobalInitResponse>(batch, 0, worker_path);
@@ -580,9 +563,7 @@ GlobalInitResponseResult ParseGlobalInitResponse(const VgiBatchPtr &batch, const
 	return result;
 }
 
-// ============================================================================
-// Response Item Unwrapping
-// ============================================================================
+// Response item unwrapping
 
 namespace {
 //! The `items` list column's element range in row 0, or false when absent/null.
@@ -677,30 +658,7 @@ std::vector<std::string> UnwrapStringResponseItems(const VgiBatchPtr &batch) {
 	return items;
 }
 
-// ============================================================================
-// TableFunctionCardinalityRequest / TableCardinality
-// ============================================================================
-
-
-
-//! Build the inner ``TableFunctionPlanRequest`` record for the scan-planning RPC.
-//!
-//! Only the fields DuckDB can actually supply are populated. Notably ``row_limit``
-//! is NOT among them: ``TableFunctionInitInput`` carries no limit, and the Top-N
-//! ``order_by_limit`` means something different ("top K by that column"), so
-//! sending it here would be a lie. DataFusion supplies row_limit from
-//! ``TableProvider::scan(limit)``; DuckDB leaves it null.
-//!
-//! ``target_split_bytes`` is omitted when 0. DuckDB has no basis to invent a byte
-//! target — it claims splits greedily as interchangeable units — and a fabricated
-//! default would be actively wrong for a compute-bound worker where bytes do not
-//! predict cost. ``min_splits`` IS sent, because thread count is the one sizing
-//! fact DuckDB genuinely knows.
-
-
-// ============================================================================
-// TableFunctionDynamicToStringRequest / Response
-// ============================================================================
+// Table function response parsing
 
 
 InsertionOrderPreservingMap<std::string>
@@ -730,29 +688,7 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const VgiBatc
 	return result;
 }
 
-// ============================================================================
-// Inner request builders (Complex bucket — kept hand-coded)
-// ============================================================================
-
-//! Describe what THIS client can do, so a worker can tailor what it advertises.
-//!
-//! Sent on every attach. Without it a worker has to guess, and guessing wrong is
-//! expensive in both directions: assume too much and the client cannot read what
-//! comes back; assume too little and the worker streams rows it could have handed
-//! over as a file reference.
-//!
-//! ``native_formats`` is the load-bearing one — it is what lets a worker return a
-//! FORMAT branch ("read these 40 parquet files") instead of materializing rows.
-//! It lists formats DuckDB reads natively; extension-provided readers are omitted
-//! because whether they are loadable is a per-session question this static list
-//! cannot answer.
-
-
-
-// ============================================================================
-// Inner request records (generated: src/generated/vgi_protocol_records.hpp)
-// ============================================================================
-//
+// Inner request records (generated: src/generated/vgi_protocol_records.hpp).
 // Each builder fills the generated record and encodes it with ToBatch, which
 // produces exactly the protocol schema (every declared field, in order, with
 // the declared type and nullability). Exactness is load-bearing: vgi-rpc-go

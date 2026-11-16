@@ -25,12 +25,9 @@ namespace vgi {
 
 struct VgiSecretRequirement;
 
-// ============================================================================
-// HttpFunctionConnection - HTTP transport for VGI function connections
-// ============================================================================
-// Implements the IFunctionConnection interface using stateless HTTP POST requests.
-// Each operation (bind, init, exchange) is a separate HTTP request.
-// Server-side state is carried via opaque stream_state tokens in batch metadata.
+// IFunctionConnection over stateless HTTP POSTs: bind, init and each exchange
+// are separate requests; server-side state rides opaque stream_state /
+// call_state tokens in batch metadata.
 
 class HttpFunctionConnection : public IFunctionConnection {
 public:
@@ -46,14 +43,10 @@ public:
 
 	~HttpFunctionConnection() override = default;
 
-	// Set shared state for dynamic filter pushdown via tick batches
-	// Reset per-init stream state, KEEPING http_client_ — the keep-alive client is
-	// the connection here (there is no pooling), so dropping it would cost a fresh
-	// TCP+TLS handshake per split.
-	//
-	// call_state_token_ is explicitly documented as NOT cleared per turn, so it has
-	// to be cleared here by hand: a stale one would address the previous split's
-	// server-side call state from the next split's requests.
+	// Resets per-init stream state but keeps http_client_ (the keep-alive client
+	// is the connection; dropping it costs a TCP+TLS handshake per split). Also
+	// clears call_state_token_, which survives turns but must not address the
+	// previous split's server-side call state.
 	void ResetForNextSplit() override;
 
 	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
@@ -61,9 +54,8 @@ public:
 		tick_filter_cursor_.Reset();
 	}
 
-	// Bind RPC. See IFunctionConnection::PerformBindRpc.
 	BindResult PerformBindRpc() override;
-	// HTTP has no spawn step; this is a no-op satisfying the interface.
+	// HTTP has no spawn step.
 	void EnsureWorkerSpawned() override {}
 	void SetInputSchema(const VgiSchemaPtr &input_schema) override;
 	void SetSchemaName(const std::string &schema_name) override {
@@ -89,7 +81,6 @@ public:
 	}
 	void UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) override;
 
-	// Init RPC. bind_result must come from a prior PerformBindRpc.
 	InitResult PerformInit(const BindResult &bind_result,
 	                       const std::vector<int32_t> &projection_ids = {},
 	                       VgiBufferPtr pushdown_filters = nullptr,
@@ -102,7 +93,6 @@ public:
 	                       const std::vector<std::string> &split_tokens = {}) override;
 	void PerformFinalizeInit(const BindResult &bind_result) override;
 
-	// Phase 3: Data exchange
 	void OpenInputWriter() override;
 	void WriteInputBatch(const VgiBatchPtr &batch) override;
 	void CloseInputWriter() override;
@@ -110,7 +100,7 @@ public:
 	void CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) override;
 
 
-	// ========== Table sink+source RPC family ==========
+	// Buffered table functions (table_buffering_*).
 	std::vector<uint8_t>
 	RpcTableBufferingProcess(const std::string &function_name,
 	                           const std::vector<uint8_t> &execution_id,
@@ -149,27 +139,24 @@ public:
 		cond_sent_ = false;
 	}
 
-	// State queries
 	bool IsTableInOut() const override { return input_schema_ != nullptr; }
 	bool IsFinished() const override { return data_finished_; }
 	void MarkDataFinished() override { data_finished_ = true; }
 
-	// Identity/diagnostics
 	std::string GetExecutionIdHex() const override;
 	std::string GetAttachOpaqueDataDigest() const override;
 	std::string GetTransactionOpaqueDataDigest() const override;
 	std::string GetConnIdHex() const override { return conn_id_hex_; }
 
-	// Lifecycle (no-ops for HTTP — no subprocess to pool)
+	// No subprocess to wait for or pool.
 	int Wait() override { return 0; }
 	std::unique_ptr<PooledWorker> ReleaseForPooling() override { return nullptr; }
 
-	// Non-copyable
 	HttpFunctionConnection(const HttpFunctionConnection &) = delete;
 	HttpFunctionConnection &operator=(const HttpFunctionConnection &) = delete;
 
 private:
-	// Per-checkout correlation id (8 hex). Generated at construction.
+	// Per-connection correlation id, generated at construction.
 	std::string conn_id_hex_;
 	std::string base_url_;  // e.g. "http://localhost:8000/vgi"
 	std::string function_name_;
@@ -179,61 +166,48 @@ private:
 	std::vector<uint8_t> attach_opaque_data_;
 	std::vector<uint8_t> transaction_opaque_data_;
 	std::vector<uint8_t> global_execution_id_;
-	// Stable client-minted per-substream id (parallel streaming table-in-out);
-	// folded onto every InitRequest. Empty = none. Set via SetSubstreamId.
+	// Client-minted per-substream id (parallel streaming table-in-out), sent on
+	// every InitRequest. Empty = none.
 	std::vector<uint8_t> substream_id_;
 	ClientContext &context_;
-	// Reused keep-alive HTTP client for this connection's per-batch hot path
-	// (/init + every /init/exchange POST). Created lazily on first use and
-	// reused across all subsequent exchange requests so a large scan doesn't
-	// open a fresh TCP connection per 2048-row vector. Single-threaded per
-	// connection (HTTPClient is not thread-safe); the off-thread cancel path
-	// deliberately does NOT touch this — it uses a fresh client.
+	// Keep-alive client for this connection's requests (bind, /init, every
+	// exchange), created lazily. HTTPClient is not thread-safe, so the
+	// off-thread CancelStream must not use it (it uses a fresh client).
 	duckdb::unique_ptr<HTTPClient> http_client_;
 	bool worker_debug_;
 	std::map<std::string, Value> settings_;
 	std::vector<VgiSecretRequirement> required_secrets_;
-	std::shared_ptr<VgiAttachParameters> attach_params_;  // for auth()
+	std::shared_ptr<VgiAttachParameters> attach_params_;
 
-	// State tracking. Bind is just an RPC; nothing tracked on the connection.
 	bool init_done_ = false;
 	bool data_finished_ = false;
 	std::vector<uint8_t> execution_id_;
 
-	// Output schema captured at PerformInit time (from the BindResult passed
-	// in). Used purely as a fallback during exchange-mode reads when the
-	// server returns no batches: we synthesize a 0-row batch with this
-	// schema rather than nullptr, so downstream callers see an empty result
-	// instead of EOS. Not bind state — just streaming-shape data.
+	// From the BindResult at PerformInit. An exchange reply with no batches
+	// returns a 0-row batch of this schema, so callers see an empty result
+	// rather than EOS. vgi_query also checks its output stream against it.
 	VgiSchemaPtr cached_output_schema_;
 
-	// Input schema for exchange mode
+	// Set = exchange mode.
 	VgiSchemaPtr input_schema_;
 
-	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
+	// Bind-request context (empty = none): time-travel AT clause, owning schema,
+	// argument names, COPY FROM / TO.
 	std::string at_unit_;
 	std::string at_value_;
-	// Catalog schema owning the function (empty = none). See SetSchemaName.
 	std::string schema_name_;
 	std::optional<std::vector<std::optional<std::string>>> argument_names_;
-
-	// COPY ... FROM context for the bind request (empty = none). See SetCopyFromContext.
 	std::optional<CopyFromBindContext> copy_from_;
-
-	// COPY ... TO context for the bind request (empty = none). See SetCopyToContext.
 	std::optional<CopyToBindContext> copy_to_;
 
-	// Server capabilities. Harvested from the capability headers the server
-	// middleware stamps on every response this connection receives (/init and
-	// /exchange POSTs), shared per-catalog via attach_params_, with the HEAD
-	// /health probe as a last-resort fallback in ReadDataBatch.
+	// Harvested from every response's capability headers and shared per catalog
+	// via attach_params_; ReadDataBatch probes (HttpDiscoverCapabilities) only
+	// when no snapshot exists or a probed one expired.
 	ServerCapabilities capabilities_;
 
-	// Best snapshot we currently have for this server, for seeding a request's
-	// in/out capability slot — that is what lets HttpPostArrowIpc pick the
-	// right request Content-Encoding up front (identity for a server that
-	// advertised no codecs) instead of discovering it from a rejection. Falls
-	// back to the per-catalog cache the first time this connection asks.
+	// Best known snapshot, seeding a request's in/out capability slot so the
+	// request Content-Encoding is right on the first try. Falls back to the
+	// per-catalog cache.
 	ServerCapabilities CurrentCapabilities() {
 		if (!capabilities_.discovered && attach_params_) {
 			capabilities_ = attach_params_->LoadServerCapabilities();
@@ -241,8 +215,7 @@ private:
 		return capabilities_;
 	}
 
-	// Publish freshly-harvested capabilities to this connection and (when
-	// attached) the per-catalog cache, so sibling connections start warm.
+	// Store harvested capabilities here and in the per-catalog cache.
 	void PublishHarvestedCapabilities(const ServerCapabilities &caps) {
 		if (!caps.discovered) {
 			return;
@@ -253,51 +226,35 @@ private:
 		}
 	}
 
-	// HTTP streaming state
 	std::string stream_state_token_;
-	// Set once from the /init response and echoed on every later request for
-	// this stream. Unlike stream_state_token_ it is NOT cleared per turn --
-	// the worker never sends it again, so dropping it would leave later
-	// requests unable to resolve their call state on a cold worker.
+	// Set from the /init response and echoed on every later request of the
+	// stream. Not cleared per turn: the worker sends it only once, and later
+	// requests need it to resolve their call state on a cold worker.
 	std::string call_state_token_;
-	// Raw vgi_batch_index value parsed off the most recent data batch's
-	// custom_metadata, or INVALID if absent. Validated in
-	// VgiTableFunctionImpl's InstallBatch on the consumer thread.
+	// Per-batch metadata of the most recently returned data batch, raw (the
+	// consumer, VgiTableFunctionImpl's InstallBatch, validates/decodes):
+	// vgi_batch_index (INVALID if absent), base64-decoded
+	// vgi_partition_values#b64 IPC bytes and vgi_rpc.parent_row#b64 int32[]
+	// (empty if absent), and the vgi.cache.* advertisement.
 	idx_t last_batch_index_ = DConstants::INVALID_INDEX;
-	// Base64-decoded raw IPC bytes from the most recent data batch's
-	// ``vgi_partition_values#b64`` metadata. Empty when the key is
-	// absent. IPC decode happens in InstallBatch on the consumer thread.
 	std::string last_partition_values_bytes_;
-	// Raw little-endian int32[] from the most recent data batch's
-	// ``vgi_rpc.parent_row#b64`` metadata (batched-lateral provenance). Empty absent.
 	std::string last_parent_row_bytes_;
 	std::vector<VgiBatchPtr> buffered_batches_;
-	// Parallel to ``buffered_batches_``: ``vgi_batch_index`` parsed off
-	// each batch's custom_metadata at buffer time (or INVALID if absent).
-	// We must capture this here because ``ReadDataBatch`` later returns
-	// batches from the buffer WITHOUT the original wire metadata.
+	// Parallel to buffered_batches_: the same metadata captured at buffer time,
+	// since buffered batches are returned without their wire metadata.
 	std::vector<idx_t> buffered_batch_indexes_;
-	// Parallel to ``buffered_batches_``: ``vgi_partition_values#b64``
-	// base64-decoded bytes per batch (empty when absent). Same reason
-	// as ``buffered_batch_indexes_``: the buffered path returns batches
-	// without their wire metadata, so we stash the bytes here.
 	std::vector<std::string> buffered_partition_values_bytes_;
-	// Parallel to ``buffered_batches_``: ``vgi_rpc.parent_row#b64`` bytes per batch.
 	std::vector<std::string> buffered_parent_row_bytes_;
-	// Parsed vgi.cache.* advertisement off the most recent data batch, and its
-	// parallel-to-buffered_batches_ per-batch capture (same rationale as the
-	// batch_index / partition_values vectors above). Result-cache capture reads
-	// GetLastCacheControl() on the first batch.
 	VgiCacheControl last_cache_control_;
 	std::vector<VgiCacheControl> buffered_cache_controls_;
 	size_t buffered_batch_index_ = 0;
-	// Conditional-revalidation validators (M6) sent once on the first tick.
+	// Conditional-revalidation validators, sent once (on the init request, or
+	// else the first exchange).
 	std::string cond_if_none_match_;
 	std::string cond_if_modified_since_;
 	bool cond_sent_ = false;
 	bool is_producer_mode_ = false;
 
-	// Exchange mode pending input
 	VgiBatchPtr pending_input_;
 	// pending_input_ is a continuation tick: its request carries vgi.status: CONTINUE.
 	bool pending_tick_ = false;
@@ -306,24 +263,23 @@ private:
 	bool input_writer_opened_ = false;
 	bool input_writer_closed_ = false;
 
-	// Dynamic filter state for tick-based pushdown
+	// Dynamic filter pushdown via tick metadata.
 	shared_ptr<TickFilterState> tick_filter_state_;
 	// Which delta of tick_filter_state_ the current stream has been sent.
 	TickFilterCursor tick_filter_cursor_;
 
-	// Helper: serialize a batch with optional stream_state token as metadata
+	// Serialize a request batch with the stream/call tokens, filter delta,
+	// validators and continuation status as metadata.
 	std::vector<uint8_t> SerializeBatchWithState(const VgiBatchPtr &batch,
 	                                              const VgiSchemaPtr &schema);
 
-	// Helper: extract stream_state from batch metadata, strip it, return the cleaned batch
+	// Capture stream_state / call_state tokens from metadata; returns `batch`.
 	VgiBatchPtr ExtractStreamState(
 	    const VgiBatchPtr &batch,
 	    const VgiMetadataPtr &metadata);
 
-	// Helper: read all data batches from an owning IPC stream buffer (starting
-	// at offset). Batches zero-copy reference ``owned`` (kept alive by their
-	// refcounted buffer slices), so the caller hands over ownership and the
-	// payload is materialized exactly once.
+	// Buffer all data batches of the IPC stream in `owned` from `offset`. The
+	// batches zero-copy reference `owned`, so the payload is never copied.
 	void BufferDataBatches(VgiBufferPtr owned, size_t offset = 0);
 };
 

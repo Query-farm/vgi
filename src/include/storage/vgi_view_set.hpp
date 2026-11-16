@@ -13,7 +13,7 @@ class VgiViewSet : public VgiCatalogSet {
 public:
 	VgiViewSet(Catalog &catalog, VgiSchemaEntry &schema);
 
-	// Override GetEntry to do on-demand single-view loading
+	// Loads a single view on demand when the set is not eagerly loaded.
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const std::string &name);
 
 protected:

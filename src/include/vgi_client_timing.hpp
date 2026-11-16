@@ -2,10 +2,8 @@
 //
 // Opt-in client-side per-pass timing for the VGI data round trip, symmetric to
 // the worker's `[vgi-shm] timeline`. Enabled with VGI_RPC_CLIENT_TIMING; a
-// process-wide accumulator prints a breakdown at exit. Single global accumulator
-// (atomics) — under threads>1 each worker thread's passes still sum into the same
-// buckets, so the proportions hold; the benchmark runs threads=1 for clean
-// per-query attribution.
+// single process-wide atomic accumulator prints a breakdown at exit. Under
+// threads>1 all threads sum into the same buckets.
 #pragma once
 
 #include <atomic>
@@ -24,12 +22,10 @@ struct ClientTiming {
 	std::atomic<uint64_t> batches {0};
 
 	static ClientTiming &Instance();
-	// Cached getenv check (computed once).
 	static bool Enabled();
 };
 
-// Adds the elapsed wall time to `target` (relaxed) on scope exit. No-op cost is
-// a steady_clock read per construction/destruction; callers guard with
+// Adds the elapsed wall time to `target` on scope exit. Callers guard with
 // ClientTiming::Enabled() so the disabled path never constructs one.
 class ScopedNs {
 public:

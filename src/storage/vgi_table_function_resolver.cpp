@@ -32,8 +32,7 @@ void AddCandidate(std::vector<std::string> &schemas, const std::string &schema) 
 
 optional_ptr<TableFunctionCatalogEntry> LookupVisible(ClientContext &context, Catalog &catalog,
                                                       const std::string &schema, const std::string &function_name) {
-	// The same call the pre-3.3 code made from each of its three call sites; see
-	// the comment in VgiTableEntry::GetScanFunctionImpl before changing it.
+	// Keep this exact lookup: see the worker-schema rule in ResolveVgiTableFunction.
 	return catalog.GetEntry<TableFunctionCatalogEntry>(context, Identifier(schema), Identifier(function_name),
 	                                                   OnEntryNotFound::RETURN_NULL);
 }
@@ -55,8 +54,10 @@ VgiResolvedTableFunction ResolveVgiTableFunction(ClientContext &context, const V
 	VgiResolvedTableFunction result;
 
 	// Visible order: a worker-claimed third schema, the table's, the default.
-	// A worker-claimed schema equal to the table's or the default is resolved by
-	// the table/default lookup itself, never by a separate call.
+	// A worker-claimed schema equal to the table's or the default must go through
+	// that same lookup, never a separate call: a separate lookup (even with an
+	// identical name) was observed to disable filter/projection pushdown on a
+	// later bind (cache/filter_pushdown_keys.test); cause not understood.
 	const bool worker_schema_is_third_schema = !request.worker_schema.empty() &&
 	                                           request.worker_schema != request.table_schema &&
 	                                           request.worker_schema != request.default_schema;
@@ -74,12 +75,7 @@ VgiResolvedTableFunction ResolveVgiTableFunction(ClientContext &context, const V
 			return result;
 		}
 	}
-	// A worker function scan (and every write function) resolves to the worker's
-	// own hidden (table_only) function before any DuckDB built-in, so a hidden
-	// scan named like a built-in (range, glob, query, ...) binds the worker's
-	// function. Only a format branch's reader is a DuckDB function by
-	// construction: it skips the hidden sets entirely, so a built-in reader name
-	// never forces a function listing RPC.
+	// Hidden sets before built-ins; format readers skip them (see header).
 	if (!request.format_reader) {
 		for (const auto &schema : schemas) {
 			if (auto entry = LookupHidden(context, catalog, schema, request.function_name)) {

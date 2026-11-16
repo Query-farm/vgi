@@ -90,10 +90,9 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 		return SecretMatch();
 	}
 
-	// Reentrancy guard: when endpoint_ is http(s)://, the outgoing RPC re-enters
-	// LookupSecret(type="http") on this same thread (InitializeParameters ->
-	// HTTPFSUtil -> KeyValueSecretReader). Break the cycle by short-circuiting
-	// any nested call BEFORE any locking. RAII so it clears on every exit path.
+	// Reentrancy guard: the outgoing HTTP RPC re-enters LookupSecret(type="http")
+	// on this thread (httpfs parameter setup reads secrets). Short-circuit nested
+	// calls before taking any lock.
 	static thread_local bool in_lookup = false;
 	if (in_lookup) {
 		return SecretMatch();
@@ -114,7 +113,7 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 	std::shared_ptr<InflightLookup> leader;
 	std::shared_ptr<InflightLookup> waiter;
 
-	// 1) Cache check + single-flight bookkeeping under the cache lock.
+	// 1) Cache check + single-flight bookkeeping.
 	{
 		std::lock_guard<std::mutex> lk(cache_mutex_);
 		PruneExpiredCachesLocked(now);
@@ -166,8 +165,7 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 		return SecretMatch();
 	}
 
-	// 2b) Leader: fetch with no lock held (so the nested http re-entry and the
-	// HTTP round-trip never contend on cache_mutex_).
+	// 2b) Leader: fetch with no lock held.
 	FetchResult fr;
 	std::exception_ptr err;
 	try {
@@ -176,7 +174,6 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 		err = std::current_exception();
 	}
 
-	// Compute the effective TTL and a shareable copy of the secret.
 	std::shared_ptr<const KeyValueSecret> shared_secret;
 	int64_t ttl = 0;
 	if (!err && fr.found && fr.secret) {
@@ -194,9 +191,8 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 		shared_secret = std::make_shared<const KeyValueSecret>(*fr.secret);
 	}
 
-	// 3) Publish to the caches and drop the in-flight entry. On *failure* we
-	// deliberately cache nothing — masking a transport/auth error behind a
-	// negative entry would hide an outage as a silent "no credential".
+	// 3) Publish and drop the in-flight entry. Failures are not cached: a
+	// negative entry would turn an outage into a silent "no credential".
 	{
 		std::lock_guard<std::mutex> lk(cache_mutex_);
 		inflight_.erase(key);
@@ -245,13 +241,10 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 VgiRemoteSecretStorage::FetchResult
 VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
                                     optional_ptr<CatalogTransaction> transaction) {
-	// Resolve a usable ClientContext. On the httpfs / DB-filesystem path the
-	// lookup runs under the system transaction whose `context` is null, so mint
-	// a transient connection and transaction. Current DuckDB HTTP secret
-	// resolution consults ClientContext::ActiveTransaction, so a bare connection
-	// fails before the RPC is sent. One per fetch keeps this thread-safe
-	// (ClientContext is not safe to share); destruction rolls the read-only
-	// transaction back after the request.
+	// The httpfs path looks secrets up under a system transaction with a null
+	// context, so mint a connection with an open transaction (HTTP secret
+	// resolution needs ClientContext::ActiveTransaction). One per fetch, since a
+	// ClientContext is not shareable; destruction rolls the transaction back.
 	unique_ptr<Connection> owned_conn;
 	ClientContext *ctx = nullptr;
 	if (transaction && transaction->context) {
@@ -265,9 +258,6 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 	ScopedTimer timer("secret.lookup");
 	const auto rpc_start = std::chrono::high_resolution_clock::now();
 
-	// A legitimate "not found" returns found=false (no throw). Any transport /
-	// auth / protocol failure is wrapped in a clear, attributable IOException and
-	// surfaced to the caller — never silently degraded to "no credential".
 	try {
 		auto params = generated::BuildSecretLookupParams(path, type);
 
@@ -283,8 +273,7 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 
 		auto inner = UnwrapResultEnvelope(response.batch, "secret_lookup", ErrorInfo().Url(endpoint_));
 
-		// Validate against our own schema — the secret protocol deliberately does
-		// NOT enter the shared catalog schema registry.
+		// The secret protocol is not in the catalog schema registry; check here.
 		if (!inner->schema()->Equals(*generated::SecretLookupResultSchema(), /*check_metadata=*/false)) {
 			throw IOException(ErrorInfo(error_subtype::kProtocolViolation),
 			                  "response schema mismatch (expected %s, got %s)",
@@ -322,11 +311,9 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 		const auto raw_message = RawMessageOf(e);
 		VGI_LOG(*ctx, "secret.lookup",
 		        {{"endpoint", endpoint_}, {"type", type}, {"outcome", "error"}, {"error", raw_message}});
-		// The inner error's fields win, error_subtype included: an AUTH_REQUIRED /
-		// AUTH_FAILED / TRANSPORT_FAILURE from the RPC says what to do about it,
-		// which SECRET_LOOKUP_FAILED alone does not. SECRET_LOOKUP_FAILED is the
-		// subtype only when the inner error carried none. secret_type and url are
-		// added either way (Merge-style: only where missing).
+		// The inner error's fields win, error_subtype included (AUTH_REQUIRED etc.
+		// is more actionable); SECRET_LOOKUP_FAILED, secret_type and url fill in
+		// only where missing.
 		auto info = ExtraInfoOf(e);
 		info.erase("stack_trace_pointers");
 		info.emplace(error_key::kErrorSubtype, error_subtype::kSecretLookupFailed);
@@ -351,10 +338,8 @@ VgiRemoteSecretStorage::Synthesize(ClientContext &context, const string &type, c
 
 	auto secret = make_uniq<KeyValueSecret>(prefix_paths, Identifier(type), Identifier(secret_provider), Identifier(secret_name));
 
-	// Convert the one-row values RecordBatch → DuckDB DataChunk via the Arrow→DuckDB
-	// bridge, then read each column's row-0 cell as a fully-typed Value (string,
-	// int64, bool, struct, list, nested — whatever the worker shipped). Same
-	// pattern as the column-statistics decode in vgi_catalog_api.cpp.
+	// Arrow -> DataChunk via DuckDB's Arrow scan, then take row 0 of each column
+	// as a typed Value.
 	if (values_batch && values_batch->num_rows() >= 1) {
 		ArrowSchemaWrapper schema_root;
 		ExportSchema(values_batch->schema(), schema_root);

@@ -63,8 +63,8 @@ void CheckLocationPolicy(ClientContext &context, const std::string &location, Lo
 	auto transport = ClassifyLocationForPolicy(location, entry, refusal);
 	if (!transport) {
 		VGI_LOG(context, "location_policy.refused", {{"entry", LocationEntryPointName(entry)}, {"reason", "internal"}});
-		// PermissionException has no extra_info constructor; nothing in VGI
-		// catches it by type, so the base Exception with PERMISSION is equivalent.
+		// Base Exception with PERMISSION: PermissionException has no extra_info
+		// constructor, and nothing catches it by type.
 		throw Exception(ErrorInfo(error_subtype::kUnsupported), ExceptionType::PERMISSION, refusal);
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);

@@ -1,23 +1,14 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
-// Client side of vgi_rpc.Reflection.v1: which protocols a worker hosts.
+// Client side of vgi_rpc.Reflection.v1: which protocols a worker hosts, so
+// optional features (attach tickets, report services, identity) are discovered
+// rather than assumed, e.g. HostsProtocol(context, catalog, "vgi.attach_tickets.v1").
 //
-// The extension's own optional features (attach tickets, report services,
-// identity) are separate vgi-rpc protocols, discovered rather than assumed:
-//
-//     auto v = vgi::HostsProtocol(context, catalog, "vgi.attach_tickets.v1");
-//     if (v) {
-//         ... the worker hosts it, at version *v ("" if it declares none) ...
-//     }
-//
-// The answer is fetched lazily, once per attached catalog, through the
-// catalog's own connection and auth, and cached on its VgiAttachParameters:
-// DETACH drops it, and it is refetched after the extension re-establishes the
-// worker connection (see WorkerConnectionGeneration) or vgi_clear_cache().
-//
-// A worker that predates reflection is not an error: it is treated (and
-// cached) as hosting exactly `vgi.v3`.
+// Fetched lazily once per attached catalog with its own connection and auth,
+// cached on its VgiAttachParameters, and refetched after the worker connection
+// is re-established (WorkerConnectionGeneration) or vgi_clear_cache(). A worker
+// that predates reflection is treated (and cached) as hosting exactly `vgi.v3`.
 
 #include <memory>
 #include <optional>

@@ -36,31 +36,19 @@ enum SlotLane : int32_t {
 	C2W_CLOSED = 3,
 	W2C_WRITE_POS = 4,      // worker -> client ring
 	W2C_READ_POS = 5,
-	// Worker->client "closed" lane. 0 = open; when the worker finishes serving a claim
-	// it stores its OWN claim id here (not a constant 1) — a claim-id close TOKEN. The
-	// client treats w2c as EOS only when W2C_CLOSED == the slot's current STATE (its own
-	// claim). This makes slot reuse race-free: on the error path the client frees the
-	// slot (STATE->0) before the worker's serve finishes (it can't drain w2c during the
-	// C++ exception unwind — the query is interrupted, so reads bail), so a NEW scan may
-	// reclaim + reset the slot while the old worker is still finishing. That stale
-	// worker's late close writes the OLD claim id, which != the new claim's STATE, so the
-	// new client ignores it (no phantom "Stream header EOF") and waits for its own
-	// worker. Paired with the worker bailing from a blocked ring op when STATE != served
-	// (so a reclaimed slot's serve thread can't wedge). Additive: a worker that stores 1
-	// still reads as "closed" for a same-claim reader iff STATE==1, but the C++ side never
-	// uses claim id 1, so mixed old workers simply never spuriously-close a reused slot.
+	// 0 = open; the worker closes by storing its served claim id, and the client
+	// sees EOS only when W2C_CLOSED == SLOT_STATE. A stale worker finishing after
+	// the slot was released and reclaimed therefore cannot close the new claim's
+	// stream. See docs/sab_transport_abi.md.
 	W2C_CLOSED = 6,
-	// Optional claim-safe terminal transport metadata. A terminal error belongs
-	// to the current claim only when SLOT_TERMINAL_CLAIM == SLOT_STATE. This is
-	// the same stale-writer guard as W2C_CLOSED and prevents a late adapter error
-	// from poisoning a region slot after release + reclaim.
+	// Optional terminal transport error; valid only when SLOT_TERMINAL_CLAIM ==
+	// SLOT_STATE (same stale-writer guard as W2C_CLOSED).
 	SLOT_TERMINAL_CLAIM = 7,
 	SLOT_TERMINAL_CODE = 8,
 	SLOT_TERMINAL_DETAIL = 9,
-	// Slot mutation ownership. slot_open CASes this lane from 0 to its
-	// prospective claim, resets while STATE remains free, then release-publishes
-	// STATE. A worker CASes 0->its served claim around one ring mutation. Neither
-	// reset nor a stale worker can therefore update positions across reuse.
+	// Mutation ownership: slot_open CASes 0->claim, resets the slot while STATE is
+	// still free, then release-publishes STATE; a worker CASes 0->served claim
+	// around each ring mutation. Neither can move positions across a reuse.
 	SLOT_RESERVATION = 10,
 };
 constexpr int32_t kSlotControlBytes = 64; // control block, cache-line isolated
@@ -74,20 +62,15 @@ enum Feature : uint32_t {
 };
 constexpr uint32_t kSupportedFeatures = kFeatureTerminalTransportError;
 
-// state values. STATE=0 is free; a claim stores a UNIQUE nonzero id (from the
-// HDR_CLAIM_SEQ counter) rather than a constant 1, so the per-slot worker
-// dispatcher can tell "still my claim" from "already reclaimed by the next scan"
-// (STATE 1->0->1 would otherwise be an ABA race that wedges await_release). The
-// native harness uses a single serve per slot (await is a no-op there) and may
-// still store 1. kSlotClaimed is retained for that native path.
+// SLOT_STATE: 0 = free, else a unique claim id from HDR_CLAIM_SEQ. A constant
+// "claimed" value would make release+reclaim an ABA race that wedges the worker
+// dispatcher. kSlotClaimed is for the native single-serve harness only.
 constexpr int32_t kSlotFree = 0;
 constexpr int32_t kSlotClaimed = 1;
-// closed flag
 constexpr int32_t kOpen = 0;
 constexpr int32_t kClosed = 1;
 
-// Default ring capacity per direction (bytes). Tunable; the ring is the chunker,
-// so correctness does not depend on it — only throughput.
+// Bytes per direction; affects throughput only (the ring chunks the stream).
 constexpr int32_t kDefaultRingCap = 64 * 1024;
 
 inline int32_t SlotStride(int32_t ring_cap) {
@@ -105,17 +88,16 @@ inline int32_t SlotStride(int32_t ring_cap) {
 extern "C" {
 // Ensure the worker for `location` exists and is wired to the channel. 0 = ok.
 int vgi_wasm_ensure_worker(const char *location, int region_offset);
-// Claim a free slot (CAS state 0->1, reset rings). >=0 slot id, or <0 on exhaustion.
+// Claim a free slot (fresh claim id, rings reset). >=0 slot id, or <0 on exhaustion.
 int vgi_wasm_slot_open(const char *location, int region_offset);
 // Blocking write of all n bytes into the slot's c2w ring. Returns n, or <0 on cancel.
 int vgi_wasm_slot_write(int region_offset, int slot, const uint8_t *data, int n);
-// Signal EOS on the c2w (input) ring (CloseInputWriter).
+// Signal EOS on the c2w (input) ring; ends the worker's serve loop (teardown only).
 void vgi_wasm_slot_write_eos(int region_offset, int slot);
 // Read up to n bytes from the w2c ring. >0 = bytes read, 0 = EOS (worker closed +
-// drained). Two negative sentinels: VGI_SAB_WOULD_BLOCK (-2) = the ring was empty for a
-// bounded wait (the caller must poll query-cancellation and retry, so an in-flight
-// prefetch read on a DuckDB task thread doesn't block DuckDB's error/cancel busy-wait
-// forever — see docs/sab_transport_abi.md "Cancellation"); any other <0 = hard error.
+// drained), kSabWouldBlock = empty after a bounded wait (poll query cancellation and
+// retry, so a blocked read can't stall DuckDB's cancel busy-wait),
+// kSabTerminalTransportError = see vgi_wasm_slot_terminal_error; other <0 = hard error.
 int vgi_wasm_slot_read(int region_offset, int slot, uint8_t *data, int n);
 // Read claim-safe metadata after kSabTerminalTransportError. Returns 1 only
 // when metadata belongs to the slot's current claim, otherwise 0.

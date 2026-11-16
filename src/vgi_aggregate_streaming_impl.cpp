@@ -17,11 +17,8 @@ namespace vgi {
 
 namespace {
 
-// Build aggregate_streaming_open request batch matching
-// vgi.protocol.AggregateStreamingOpenRequest field-for-field.
-//
-// arguments: bytes (Arguments.serialize_to_bytes() — empty for the v1
-// streaming operator until we wire const-arg passing through the operator).
+// The streaming operator passes no constant arguments yet: `arguments` is
+// always the empty envelope built by VgiAggregateStreamingOpen.
 VgiBatchPtr BuildStreamingOpenRequest(
     const std::string &function_name,
     const std::string &schema_name,
@@ -74,10 +71,6 @@ VgiBatchPtr BuildStreamingCloseRequest(
 
 } // anonymous namespace
 
-// ============================================================================
-// Public entry points
-// ============================================================================
-
 VgiStreamingSession VgiAggregateStreamingOpen(
     ClientContext &context,
     const VgiAggregateBindData &bind_data,
@@ -85,21 +78,11 @@ VgiStreamingSession VgiAggregateStreamingOpen(
     int64_t partition_key_count,
     int64_t order_key_count) {
 
-	// Build an empty Arguments envelope: a 1-row RecordBatch with a single
-	// ``args: struct<>`` column whose only row is an empty struct. The
-	// Python ``Arguments.serialize_to_bytes()`` produces this exact shape
-	// for the no-const-args case (see vgi/arguments.py — it uses
-	// ``pa.array([{}], type=pa.struct([]))``), and the deserializer reads
-	// ``batch.column("args")[0]`` so the batch must be length-1.
-	//
-	// (The existing ``BuildAggregateBindRequest`` produces a 0-row batch in
-	// this branch — that path doesn't trip in practice because real bind
-	// requests always carry at least one positional/named arg, so the
-	// 0-row branch is dead code. The streaming protocol *can* exercise
-	// it, hence the explicit 1-row construction here.)
+	// Empty Arguments envelope: ONE valid, empty `args: struct<>` row. Python's
+	// Arguments.deserialize_from_bytes reads batch.column("args")[0], so a
+	// zero-row batch would fail there.
 	std::vector<uint8_t> arguments_bytes;
 	{
-		// Length-1 struct<> column (one valid, empty row) with no child fields.
 		VgiBatchBuilder builder(MakeSchema({type::Struct({}).Named("args")}));
 		append::FinishElement(builder.column(0));
 		builder.FinishRow();

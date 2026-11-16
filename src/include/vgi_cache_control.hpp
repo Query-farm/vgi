@@ -4,11 +4,8 @@
 #include "vgi_ipc.hpp"
 
 // vgi.cache.* metadata vocabulary + the parsed cache-control advertisement.
-//
-// Kept in its own lightweight header (no Arrow, no heavy deps) so the widely
-// included IFunctionConnection interface can expose GetLastCacheControl()
-// without pulling in the full result-cache machinery. Arrow appears only as a
-// forward-declared shared_ptr parameter to the parser.
+// A lightweight header so IFunctionConnection can expose GetLastCacheControl()
+// without pulling in the result-cache machinery.
 
 #include <cstdint>
 #include <memory>
@@ -28,24 +25,17 @@ constexpr const char *VGI_CACHE_LAST_MODIFIED_KEY = "vgi.cache.last_modified";
 constexpr const char *VGI_CACHE_REVALIDATABLE_KEY = "vgi.cache.revalidatable";
 constexpr const char *VGI_CACHE_STALE_WHILE_REVALIDATE_KEY = "vgi.cache.stale_while_revalidate";
 constexpr const char *VGI_CACHE_STALE_IF_ERROR_KEY = "vgi.cache.stale_if_error";
-// 304-equivalent + request-side conditional keys (revalidation milestone).
+// 304-equivalent response key, then the request-side conditional keys.
 constexpr const char *VGI_CACHE_NOT_MODIFIED_KEY = "vgi.cache.not_modified";
-// Per-partition caching opt-in: when a SINGLE_VALUE_PARTITIONS function sets this,
-// the client ALSO caches the result split by partition value (one entry per distinct
-// partition-value tuple), so a later `=`/`IN`-filtered scan reuses per-partition
-// entries. Additive — today's whole-scan entry is still stored/served. See CLAUDE.md
-// "Per-Partition Result Cache".
+// Per-partition caching opt-in (SINGLE_VALUE_PARTITIONS functions): the result is
+// also cached split by partition-value tuple, so a later `=`/`IN`-filtered scan
+// reuses those entries. Additive to the whole-scan entry. See docs/result_cache.md.
 constexpr const char *VGI_CACHE_PARTITION_SCOPE_KEY = "vgi.cache.partition_scope";
-// Per-VALUE memoization opt-in for exchange-mode MAPS (scalar / batched correlated
-// LATERAL). When set, the client ALSO memoizes each distinct worker-input tuple's
-// output keyed on that tuple, so the same value serves without the worker on a later
-// chunk / query. DEFAULT OFF, and deliberately so: a per-value serve carries a fixed
-// per-entry cost (key probe + decode + assembly) that only pays back when the worker
-// call it replaces is MORE expensive than that. For a cheap arithmetic map it is a
-// large net loss — measured ~50x slower than simply calling the worker. Only the
-// function author knows whether a call is expensive enough (a model inference, a
-// geocode, a rate-limited HTTP fetch); the engine cannot infer it, so this is an
-// explicit advertisement rather than a heuristic.
+// Per-value memoization opt-in for exchange-mode maps (scalar / batched
+// correlated LATERAL): each distinct input tuple's output is memoized. Off by
+// default: a per-value serve has a fixed per-entry cost that only pays off for
+// expensive calls (and is a large loss for cheap ones). Only the function author
+// knows which, so it is an explicit advertisement, not a heuristic.
 constexpr const char *VGI_CACHE_PER_VALUE_KEY = "vgi.cache.per_value";
 constexpr const char *VGI_CACHE_IF_NONE_MATCH_KEY = "vgi.cache.if_none_match";
 constexpr const char *VGI_CACHE_IF_MODIFIED_SINCE_KEY = "vgi.cache.if_modified_since";
@@ -55,10 +45,8 @@ constexpr const char *VGI_CACHE_IF_MODIFIED_SINCE_KEY = "vgi.cache.if_modified_s
 constexpr const char *VGI_CACHE_SCOPE_CATALOG = "catalog";
 constexpr const char *VGI_CACHE_SCOPE_TRANSACTION = "transaction";
 
-// Upper bound on any worker-advertised / default TTL (seconds). A hostile or
-// buggy worker advertising ttl≈INT64_MAX would otherwise overflow the expiry
-// arithmetic (steady_clock time_point / wall-clock int64 addition) — UB. Clamp
-// to 10 years, which is "effectively forever" for a result cache.
+// Clamp for any TTL (seconds; 10 years): a worker advertising ttl≈INT64_MAX
+// would otherwise overflow the expiry arithmetic (UB).
 constexpr int64_t VGI_CACHE_MAX_TTL_SECONDS = 315360000;
 
 // The subset of `vgi.cache.*` a worker advertised on a result's first batch.
@@ -68,20 +56,17 @@ struct VgiCacheControl {
 	std::optional<int64_t> ttl_seconds;   // relative freshness (wins over expires)
 	std::string expires_rfc3339;          // absolute freshness deadline (empty = none)
 	std::string scope = VGI_CACHE_SCOPE_CATALOG;
-	std::string etag;                     // validator (revalidation milestone)
-	std::string last_modified;            // validator (revalidation milestone)
+	std::string etag;                     // validator
+	std::string last_modified;            // validator
 	bool revalidatable = false;
 	std::optional<int64_t> stale_while_revalidate;
 	std::optional<int64_t> stale_if_error;
 	// 304-equivalent: worker asserts the stored payload is still fresh. Carried
 	// on a 0-row batch alongside a fresh ttl/expires (used to slide the entry).
 	bool not_modified = false;
-	// Opt-in to per-partition caching (SINGLE_VALUE_PARTITIONS only). Additive to
-	// the whole-scan cache; the split at capture is gated on this.
+	// See VGI_CACHE_PARTITION_SCOPE_KEY.
 	bool partition_scope = false;
-	// Opt-in to per-VALUE memoization (exchange-mode maps). Default off — see
-	// VGI_CACHE_PER_VALUE_KEY above. Independent of Cacheable(): a function may be
-	// whole-result cacheable without per-value memoization paying off.
+	// See VGI_CACHE_PER_VALUE_KEY. Independent of Cacheable().
 	bool per_value = false;
 
 	// Opt-in: a freshness key present and not explicitly no_store.

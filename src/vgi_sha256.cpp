@@ -2,10 +2,8 @@
 #include "vgi_sha256.hpp"
 
 #if defined(__EMSCRIPTEN__)
-// Engine-exported primitive: computes SHA-256 inside the main module (where mbedtls
-// is available) and writes 32 raw bytes to out_hash. Declared/used identically by
-// vgi_oauth.cpp; defined in the engine (haybarn-wasm lib/src/http_wasm.cc) and listed
-// in the engine's dynamic export list.
+// Engine-exported (haybarn-wasm): SHA-256 computed in the main module, 32 raw
+// bytes written to out_hash. Also declared in vgi_oauth.cpp.
 extern "C" void duckdb_wasm_sha256(const void *data, int len, void *out_hash);
 #else
 #include "mbedtls_wrapper.hpp"

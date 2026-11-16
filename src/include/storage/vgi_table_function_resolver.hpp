@@ -49,29 +49,22 @@ struct VgiResolvedTableFunction {
 	bool hidden = false;
 };
 
-//! The ONE resolver for the functions a VGI table names. Single-branch scans
-//! (VgiTableEntry::GetScanFunctionImpl), multi-branch arms
-//! (vgi_multi_scan_rewriter.cpp) and writes (vgi_physical_write.cpp) all use it,
-//! so a function's capabilities (projection/filter/sampling pushdown,
-//! required_secrets, late materialization, partitioning, ordering, filter
-//! profiles, has_finalize, ...) come from the same listing entry everywhere.
+//! The one resolver for the functions a VGI table names, used by single-branch
+//! scans (VgiTableEntry::GetScanFunctionImpl), multi-branch arms
+//! (vgi_multi_scan_rewriter.cpp) and writes (vgi_physical_write.cpp), so a
+//! function's capabilities come from the same listing entry everywhere.
 //!
 //! Order:
-//!   1. the visible entries: the worker-claimed schema (only when it names a third
-//!      schema, neither the table's nor the default; see the comment in
-//!      GetScanFunctionImpl about cache/filter_pushdown_keys.test), the table's
-//!      schema, then the catalog's default schema;
-//!   2. the hidden (table_only) set of those same schemas, in the same order, so
-//!      a hidden worker scan named like a DuckDB built-in (range, glob, query)
-//!      binds the worker's function, not the built-in;
-//!   3. the system catalog, when request.allow_system_catalog.
-//! A format branch's reader (request.format_reader) is a DuckDB function by
-//! construction: it skips step 2 (so a built-in reader name never forces a
-//! function listing RPC) and goes straight from step 1 to step 3.
+//!   1. visible entries: the worker-claimed schema (only when it is neither the
+//!      table's nor the default), the table's schema, the catalog's default;
+//!   2. the hidden (table_only) sets of those schemas, so a hidden worker scan
+//!      named like a built-in (range, glob, query) binds the worker's function;
+//!   3. the system catalog, when allow_system_catalog.
+//! A format branch's reader (format_reader) skips step 2, so a built-in reader
+//! name never forces a function listing RPC.
 //!
 //! Throws a BinderException naming the worker, catalog, table and function when
-//! nothing resolves: the worker must list every function its tables name. There
-//! is no silent fallback to "no capabilities".
+//! nothing resolves: there is no fallback to "no capabilities".
 VgiResolvedTableFunction ResolveVgiTableFunction(ClientContext &context, const VgiTableFunctionRequest &request);
 
 } // namespace vgi

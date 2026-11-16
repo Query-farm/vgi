@@ -1,10 +1,9 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// COPY ... TO backed by a VGI worker. DuckDB's PhysicalCopyToFile drives the
-// copy_to_* callbacks below; we forward DataChunks to reusable sink workers using
-// the buffered-table Sink+Combine RPCs (table_buffering_process /
-// table_buffering_combine) and let the worker's combine() perform the terminal
-// destination write. There is no Source phase. See docs/copy_to.md.
+// COPY ... TO backed by a VGI worker: PhysicalCopyToFile drives the copy_to_*
+// callbacks, chunks go to sink workers via table_buffering_process, and the
+// worker's table_buffering_combine performs the destination write. See
+// docs/copy_to.md.
 #include "vgi_copy_to_impl.hpp"
 
 #include <deque>
@@ -32,9 +31,6 @@ namespace vgi {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Bind data — self-contained sink config produced by VgiCopyToBind.
-// ---------------------------------------------------------------------------
 struct VgiCopyToBindData : public FunctionData {
 	std::shared_ptr<VgiAttachParameters> attach_params;
 	std::vector<uint8_t> attach_opaque_data;
@@ -67,12 +63,12 @@ struct VgiCopyToBindData : public FunctionData {
 	}
 };
 
-// Per-format option specs (name -> DuckDB type), parsed from the options schema.
 struct OptionSpec {
 	std::string name;
 	LogicalType type;
 };
 
+// Lower-cased option name -> declared name and type.
 std::map<std::string, OptionSpec> ResolveOptionSpecs(ClientContext &context,
                                                       const VgiSchemaPtr &options_schema) {
 	std::map<std::string, OptionSpec> specs;
@@ -90,11 +86,8 @@ std::map<std::string, OptionSpec> ResolveOptionSpecs(ClientContext &context,
 	return specs;
 }
 
-// ---------------------------------------------------------------------------
-// Operator state — GlobalFunctionData/LocalFunctionData subclasses.
-// (Different base classes from the buffered operator's GlobalSinkState, so the
-// cancel/teardown machinery is re-implemented here, not inherited.)
-// ---------------------------------------------------------------------------
+// GlobalFunctionData/LocalFunctionData, not the buffered operator's sink
+// states, so the cancel/teardown logic is re-implemented here.
 class VgiCopyToGlobalState : public GlobalFunctionData {
 public:
 	explicit VgiCopyToGlobalState(DatabaseInstance *db_p) : db(db_p) {
@@ -104,13 +97,13 @@ public:
 	DatabaseInstance *db = nullptr;
 	std::vector<uint8_t> execution_id; // minted once in initialize_global
 
-	// Retained init worker — used as the combine worker in finalize (always
-	// exists, even for empty input). Cleared on the happy path after release.
+	// Retained init worker: performs the combine in finalize, so it exists even
+	// for empty input.
 	std::unique_ptr<IFunctionConnection> init_worker;
 
-	// Completed sink workers available to the next batch. DuckDB2's legacy
-	// COPY adapter creates local state per batch rather than per thread, so
-	// retaining every connection until finalize would grow without bound.
+	// Completed sink workers available to the next batch. DuckDB's legacy COPY
+	// batch adapter creates local state per batch, not per thread, so a fresh
+	// worker per local state would grow without bound.
 	std::mutex workers_mutex;
 	std::vector<std::unique_ptr<IFunctionConnection>> workers;
 	std::vector<std::vector<uint8_t>> state_ids;
@@ -123,10 +116,8 @@ public:
 };
 
 VgiCopyToGlobalState::~VgiCopyToGlobalState() {
-	// On the happy path finalize already released every worker to the pool and
-	// cleared these vectors, so this loop is a no-op. On an error path any
-	// surviving worker may be parked in a blocking RPC on a thread we no longer
-	// control — cancel-dispatch it (same machinery the buffered operator uses).
+	// Finalize empties these on success. On an error path a surviving worker
+	// may be parked in a blocking RPC, so cancel-dispatch it.
 	auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
 	auto reclaim_or_cancel = [&](std::unique_ptr<IFunctionConnection> conn) {
 		if (!conn) {
@@ -148,15 +139,13 @@ VgiCopyToGlobalState::~VgiCopyToGlobalState() {
 	state_ids.clear();
 
 	// Best-effort table_buffering_destructor to free the worker's BoundStorage
-	// rows for this execution_id. Skipped if the session ended or init never
-	// completed; swallows on error (destructors must not throw).
+	// rows for this execution_id; must not throw.
 	if (!execution_id.empty() && attach_params) {
 		auto context_lock = context_weak.lock();
 		if (context_lock) {
 			try {
-				// COPY TO has no catalog schema to name (the handler is reached
-				// through a FORMAT alias, not a schema-qualified call), so the
-				// schema stays empty and serialises as null.
+				// The handler is reached through a FORMAT alias, so there is no
+				// schema to name (serialises as null).
 				auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, /*schema_name=*/"",
 				                                                             execution_id, attach_opaque_data);
 				vgi::UnaryRpcOptions opts {*context_lock,
@@ -188,9 +177,8 @@ VgiCopyToGlobalState::~VgiCopyToGlobalState() {
 class VgiCopyToLocalState : public LocalFunctionData {
 public:
 	~VgiCopyToLocalState() override {
-		// Error path: this batch still owns a connection (Combine never ran — it
-		// moves the connection into gstate.workers[], nulling this one). Cancel-
-		// dispatch it so a blocking RPC unblocks; otherwise drop.
+		// Still owning a connection means Combine never ran (error path):
+		// cancel-dispatch it so a blocking RPC unblocks.
 		if (!connection) {
 			return;
 		}
@@ -209,8 +197,8 @@ public:
 	DatabaseInstance *db = nullptr;
 };
 
-// Build acquire params for the execution phase (init_global mints execution_id
-// when empty; sink threads pass the published id for secondary init).
+// Empty global_execution_id: init mints one (initialize_global). Sinks pass
+// the published id for secondary init.
 FunctionConnectionParams BuildCopyToAcquireParams(const VgiCopyToBindData &bd,
                                                    const std::vector<uint8_t> &global_execution_id) {
 	FunctionConnectionParams params;
@@ -246,12 +234,7 @@ void ReleaseWorkerToPool(std::unique_ptr<IFunctionConnection> conn, const VgiCop
 			return;
 		}
 	}
-	// else drop — destructor closes the connection cleanly.
 }
-
-// ---------------------------------------------------------------------------
-// copy_to callbacks
-// ---------------------------------------------------------------------------
 
 unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
                                        const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
@@ -261,14 +244,10 @@ unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindI
 	auto &carrier = input.function_info->Cast<VgiCopyToFunctionInfo>();
 	const auto &copy_info = input.info;
 
-	// Note: generic write options (PARTITION_BY / PER_THREAD_OUTPUT / file
-	// rotation) are stripped from copy_info.options by the binder before this
-	// point (bind_copy.cpp clears+refills options), so they can't be caught here.
-	// They are rejected at VgiCopyToInitializeOperator instead, where the
-	// PhysicalCopyToFile flags are visible. (FILE_SIZE_BYTES is auto-rejected by
-	// DuckDB because we don't set rotate_files.)
-
-	// Validate + coerce format options against the handler's option schema.
+	// DuckDB's binder strips generic write options (PARTITION_BY,
+	// PER_THREAD_OUTPUT, ...) from copy_info.options before this point, so
+	// VgiCopyToInitializeOperator rejects them from the PhysicalCopyToFile flags.
+	// FILE_SIZE_BYTES is rejected by DuckDB since cf.file_size_bytes is unset.
 	auto specs = ResolveOptionSpecs(context, carrier.options_schema);
 	vector<std::pair<string, Value>> named_args;
 	for (auto &entry : copy_info.options) {
@@ -294,7 +273,6 @@ unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindI
 		named_args.emplace_back(spec_it->second.name, std::move(*coerced));
 	}
 
-	// The source columns become the worker's input_schema (rides the bind).
 	auto input_schema = BuildArrowSchemaFromDuckDB(context, sql_types, IdentifiersToStrings(names));
 	auto arguments = vgi::BuildArgumentsFromValues(context, /*positional=*/{}, named_args);
 	auto settings = ExtractVgiSettings(context, carrier.setting_names);
@@ -333,15 +311,11 @@ unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindI
 	return std::move(bind_data);
 }
 
-// Re-bind the worker against `path` and republish the result to bind_data. Used
-// when DuckDB hands initialize_global a path that differs from the bind-time
-// destination — the `use_tmp_file` case, where PhysicalCopyToFile writes to a
-// `tmp_<name>` sibling and renames it to the final name at finalize
-// (MoveTmpFile). The worker must write to *that* temp path, so we re-issue the
-// bind with copy_to.file_path = path and overwrite bd.bind_result + bd.file_path.
-// Because initialize_global runs exactly once before any sink, the sink-thread
-// secondary inits (which reuse bd.bind_result) observe the updated path — they
-// must, or a combine that lands on a sink worker would write the wrong path.
+// Re-bind with copy_to.file_path = path and overwrite bd.bind_result / file_path.
+// Needed for use_tmp_file: PhysicalCopyToFile hands initialize_global a
+// `tmp_<name>` path and renames it at finalize (MoveTmpFile), so the worker must
+// write there. initialize_global runs once before any sink, so every sink's
+// secondary init (which reuses bd.bind_result) sees the updated path.
 void RebindCopyToForPath(ClientContext &context, VgiCopyToBindData &bd, const string &path) {
 	CopyToBindContext copy_ctx;
 	copy_ctx.format = bd.format;
@@ -370,11 +344,7 @@ unique_ptr<GlobalFunctionData> VgiCopyToInitializeGlobal(ClientContext &context,
 	auto *db = &DatabaseInstance::GetDatabase(context);
 	auto gstate = make_uniq<VgiCopyToGlobalState>(db);
 
-	// DuckDB writes via a temp file by default (use_tmp_file) and renames it to
-	// the final destination at finalize; the path it hands us here is that temp
-	// path, which may differ from the bind-time destination. Re-bind so the
-	// worker writes exactly where DuckDB expects (else MoveTmpFile fails because
-	// the temp file was never created). No-op when the paths already match.
+	// See RebindCopyToForPath (use_tmp_file hands us a temp path).
 	if (file_path != bd.file_path) {
 		RebindCopyToForPath(context, bd, file_path);
 	}
@@ -384,10 +354,8 @@ unique_ptr<GlobalFunctionData> VgiCopyToInitializeGlobal(ClientContext &context,
 	gstate->attach_params = bd.attach_params;
 	gstate->context_weak = context.shared_from_this();
 
-	// Acquire one worker and run init to mint the execution_id. This worker is
-	// retained as the combine worker (used in finalize, incl. empty input).
-	// initialize_global runs exactly once before any sink, so no init handshake
-	// / condvar is needed — the published execution_id is race-free.
+	// Init mints the execution_id; the worker is kept for the combine. Runs once
+	// before any sink, so publishing execution_id needs no synchronisation.
 	auto params = BuildCopyToAcquireParams(bd, /*global_execution_id=*/{});
 	auto acquired = AcquireConnectionForInit(context, params);
 	auto init_result = acquired.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
@@ -409,9 +377,8 @@ void VgiCopyToSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalF
 	auto &gstate = gstate_p.Cast<VgiCopyToGlobalState>();
 	auto &lstate = lstate_p.Cast<VgiCopyToLocalState>();
 
-	// DuckDB may create a new local state for each flushed batch. Reuse a
-	// completed sink worker and its accumulated state before creating another;
-	// workers remain private to one concurrent sink at a time.
+	// Local state may be per batch: reuse a completed sink worker and its state
+	// before creating another. A worker serves one sink at a time.
 	if (!lstate.connection) {
 		lstate.db = gstate.db;
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
@@ -443,8 +410,7 @@ void VgiCopyToCombine(ExecutionContext & /*context*/, FunctionData & /*bind_data
 	if (!lstate.connection) {
 		return; // this thread sank no rows
 	}
-	// Moving the connection into gstate.workers[] nulls lstate.connection, so
-	// ~VgiCopyToLocalState won't cancel-dispatch it (finalize pools it instead).
+	// Moving the connection out stops ~VgiCopyToLocalState cancel-dispatching it.
 	std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 	gstate.workers.push_back(std::move(lstate.connection));
 	gstate.state_ids.push_back(lstate.state_id);
@@ -460,18 +426,16 @@ void VgiCopyToFinalize(ClientContext &context, FunctionData &bind_data_p, Global
 		state_ids_snapshot = gstate.state_ids;
 	}
 
-	// The retained init worker performs the terminal combine (merge + write +
-	// close). It always exists — so an empty-input COPY (no sink workers, empty
-	// state_ids) still writes an empty/header file via the worker's combine().
+	// The init worker always exists, so an empty-input COPY still reaches the
+	// worker's combine() and writes an empty/header-only file.
 	if (!gstate.init_worker) {
 		throw InternalException("VgiCopyToFinalize: missing init worker (initialize_global did not run)");
 	}
 	(void)gstate.init_worker->RpcTableBufferingCombine(gstate.function_name, gstate.execution_id,
 	                                                   state_ids_snapshot);
 
-	// Happy path: release every worker cleanly to the pool and clear the gstate
-	// so the destructor doesn't cancel-dispatch healthy connections. (If the
-	// combine RPC above throws, we skip this and the destructor reclaims them.)
+	// Pool the workers so the destructor doesn't cancel-dispatch them (if the
+	// combine threw, the destructor cancels them instead).
 	ReleaseWorkerToPool(std::move(gstate.init_worker), bd);
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
@@ -486,10 +450,8 @@ void VgiCopyToFinalize(ClientContext &context, FunctionData &bind_data_p, Global
 }
 
 void VgiCopyToInitializeOperator(GlobalFunctionData & /*gstate*/, const PhysicalOperator &op) {
-	// Reject the multi-file write modes the VGI sink doesn't implement. This runs
-	// once, right after initialize_global and before any sink, so a user passing
-	// PARTITION_BY / PER_THREAD_OUTPUT / FILE_SIZE_BYTES gets a clean error rather
-	// than a directory-as-file failure deep in the worker.
+	// Runs once before any sink: reject the multi-file write modes cleanly rather
+	// than fail on a directory-as-file deep in the worker.
 	auto &copy_op = op.Cast<PhysicalCopyToFile>();
 	if (copy_op.partition_output || copy_op.per_thread_output || copy_op.Rotate()) {
 		throw NotImplementedException(
@@ -499,17 +461,14 @@ void VgiCopyToInitializeOperator(GlobalFunctionData & /*gstate*/, const Physical
 }
 
 CopyFunctionExecutionMode VgiCopyToExecutionMode(bool /*preserve_insertion_order*/, bool /*supports_batch_index*/) {
-	// Parallel sink: copy_to_sink runs concurrently; each active sink owns a
-	// worker (shard), combine merges. Order is not preserved (the sink has
-	// no batch_index); order-sensitive writers opt into the ordered mode below.
+	// Each concurrent sink owns a worker (shard) and combine merges; order is
+	// not preserved (no batch_index).
 	return CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
 }
 
 CopyFunctionExecutionMode VgiCopyToExecutionModeOrdered(bool preserve_insertion_order, bool /*supports_batch_index*/) {
-	// Ordered writer (Meta.sink_order_dependent): single-threaded sink so one
-	// worker receives every batch in source order. Only meaningful when DuckDB
-	// is preserving insertion order; if the user turned that off there is no
-	// order to preserve, so fall back to the parallel sharded write.
+	// Ordered writer (sink_order_dependent): one sink thread, so one worker sees
+	// every batch in source order — unless insertion order isn't preserved.
 	return preserve_insertion_order ? CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE
 	                                : CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
 }
@@ -523,9 +482,7 @@ void InstallVgiCopyToCallbacks(CopyFunction &cf, bool ordered) {
 	cf.copy_to_sink = VgiCopyToSink;
 	cf.copy_to_combine = VgiCopyToCombine;
 	cf.copy_to_finalize = VgiCopyToFinalize;
-	// Per-format execution mode is selected here (execution_mode is a bare
-	// function pointer with no access to bind data, so we pick the right one at
-	// registration time — one CopyFunction instance per format).
+	// execution_mode cannot see bind data, so the mode is chosen per format here.
 	cf.execution_mode = ordered ? VgiCopyToExecutionModeOrdered : VgiCopyToExecutionMode;
 	cf.initialize_operator = VgiCopyToInitializeOperator;
 }

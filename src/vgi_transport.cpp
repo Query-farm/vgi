@@ -17,8 +17,7 @@ bool IsHttpTransport(const std::string &worker_path) {
 }
 
 bool IsUnixLocation(const std::string &worker_path) {
-	// Delegate to the launcher's pure helper so the scheme contract is
-	// defined in exactly one place (and reused by the unit tests there).
+	// The launcher's helper owns the scheme contract.
 	return launcher::IsUnixLocation(worker_path);
 }
 

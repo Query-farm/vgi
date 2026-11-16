@@ -93,8 +93,7 @@ bool SameTypeStructure(const ArrowSchema &a, const ArrowSchema &b) {
 	                  WorkerBatchValidationName(level), detail);
 }
 
-// The detail text in Arrow C++'s Status::ToString() spelling, which the
-// malformed-batch tests (and anything matching on the message) key on.
+// Keeps the "Invalid: ..." detail spelling the malformed-batch tests match on.
 std::string NanoarrowDetail(const ArrowError &error, ArrowErrorCode code) {
 	std::string message = error.message[0] ? std::string(error.message) : std::string(std::strerror(code));
 	if (message.find("dictionary index") != std::string::npos) {
@@ -103,10 +102,9 @@ std::string NanoarrowDetail(const ArrowError &error, ArrowErrorCode code) {
 	return "Invalid: " + message;
 }
 
-// Arrow's ValidateFull also checked that every utf8 / large_utf8 value is valid
-// UTF-8; nanoarrow's FULL level does not. Walk every string node (nested
-// children and dictionary values included), over the node's whole length, as
-// Arrow did. Returns false and fills `detail` on the first invalid value.
+// nanoarrow's FULL level does not check UTF-8: walk every string node (nested
+// children and dictionary values included) over its whole length. Returns false
+// and fills `detail` on the first invalid value.
 bool ValidateUtf8(const ArrowArrayView &view, std::string &detail) {
 	if (view.storage_type == NANOARROW_TYPE_STRING || view.storage_type == NANOARROW_TYPE_LARGE_STRING) {
 		const int64_t length = view.length;
@@ -232,13 +230,11 @@ void ValidateWorkerBatch(const VgiBatch *batch, WorkerBatchValidation level, con
 	if (!batch || level == WorkerBatchValidation::NONE) {
 		return;
 	}
-	// Buffer-size checks need the real body sizes, which only the IPC decoder had.
+	// Body-size checks need sizes only the IPC decoder saw; it records failures here.
 	if (!batch->structural_error().empty()) {
 		ThrowMalformed(level, worker, "Invalid: " + batch->structural_error());
 	}
-	// structural -> nanoarrow DEFAULT (buffer sizes vs. lengths and offsets, per
-	// column); full -> FULL (every offset, union id, dictionary index) plus the
-	// UTF-8 pass Arrow's ValidateFull did.
+	// Levels map to nanoarrow DEFAULT / FULL (+ ValidateUtf8); see WorkerBatchValidation.
 	ArrowArrayView view;
 	ArrowError error;
 	ArrowErrorInit(&error);

@@ -430,7 +430,7 @@ void DecodeNativeConstraints(VgiTableInfo &info, bool check_nullability) {
 			const auto &path = paths[0];
 			ResolveNotNullPath(info, path);
 			required.insert(path);
-			// DuckDB 1.5 represents NOT NULL only on top-level columns. Preserve
+			// DuckDB's NotNullConstraint names only a top-level column. Preserve
 			// nested facts in info.constraints and Arrow nullability; the negotiated
 			// provider enforces writes. A required child must never make its parent
 			// nonnullable or supply the identity for ALTER COLUMN parent DROP NOT NULL.

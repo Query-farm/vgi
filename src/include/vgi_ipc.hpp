@@ -15,9 +15,7 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// Byte streams
-// ============================================================================
+// --- Byte streams ---
 
 class VgiInputStream {
 public:
@@ -96,9 +94,7 @@ private:
 	std::string bytes_;
 };
 
-// ============================================================================
-// Stream reader / writer
-// ============================================================================
+// --- Stream reader / writer ---
 
 //! IPC body compression for writing.
 struct VgiIpcWriteOptions {
@@ -171,9 +167,7 @@ private:
 	bool closed_ = false;
 };
 
-// ============================================================================
-// One-shot helpers
-// ============================================================================
+// --- One-shot helpers ---
 
 //! An encapsulated Schema message (no end-of-stream marker).
 VgiBufferPtr SerializeSchema(const VgiSchema &schema);

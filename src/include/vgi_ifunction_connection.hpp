@@ -53,12 +53,6 @@ struct VgiSecretRequirement;
 struct CopyFromBindContext;
 struct CopyToBindContext;
 
-// ============================================================================
-// IFunctionConnection - Abstract interface for VGI function connections
-// ============================================================================
-// Both subprocess (FunctionConnection) and HTTP (HttpFunctionConnection) implement
-// this interface. All call sites store unique_ptr<IFunctionConnection>.
-
 // Shared state for dynamic filter values that tighten during execution.
 // Written by the table scan (after Top-N sink updates), read by the connection (before tick).
 struct TickFilterState {
@@ -67,17 +61,14 @@ struct TickFilterState {
 	string encoded_filters;
 	//! True when encoded_filters contains the latest delta.
 	bool has_filters = false;
-	//! Bumped each time a new delta replaces encoded_filters. A connection sends
-	//! a delta once per stream: only when this differs from the generation it last
-	//! sent (see TickFilterCursor), never again on every tick.
+	//! Bumped each time a new delta replaces encoded_filters; each stream is sent
+	//! a given delta once (TickFilterCursor).
 	uint64_t generation = 0;
 };
 
-//! Per-connection record of which TickFilterState delta the CURRENT stream has
-//! already been sent. Every connection kind shares this so the rule lives once.
-//! Reset whenever a new stream starts on the connection (a fresh init, the next
-//! split, a new shared TickFilterState): the new stream's worker has seen no
-//! delta, so it must receive the latest one on its first tick.
+//! Which TickFilterState delta the current stream has been sent (shared by all
+//! connection kinds). Reset whenever a new stream starts (fresh init, next split,
+//! new TickFilterState) so its first tick carries the latest delta.
 struct TickFilterCursor {
 	uint64_t sent_generation = 0;
 
@@ -101,25 +92,17 @@ class IFunctionConnection {
 public:
 	virtual ~IFunctionConnection() = default;
 
-	// Tick metadata: set shared state for dynamic filter pushdown via tick batches.
-	// The connection reads this before each tick and includes it as custom metadata.
+	// Dynamic filter state, read before each tick and sent as tick metadata.
 	virtual void SetTickFilterState(shared_ptr<TickFilterState> state) = 0;
 
-	// Reset per-init stream state so PerformInit can run again for the NEXT split,
-	// keeping the transport. Releasing to the pool between splits would mean a
-	// fresh TCP+TLS handshake per split on HTTP, which has no pooling at all.
+	// Reset per-init stream state so PerformInit can run again for the next split
+	// on the same transport (like PerformFinalizeInit). Must first close the input
+	// writer (IPC EOS) so the worker's tick reader ends; otherwise the next init is
+	// written inside an unterminated tick stream and the subprocess hangs.
 	//
-	// Modelled on PerformFinalizeInit, which is the existing tested
-	// re-init-on-a-live-connection path. Its first action is the load-bearing one:
-	// CLOSE THE INPUT WRITER (IPC EOS on stdin) so the worker's tick reader
-	// terminates. Skip that and PerformInit installs a new stream writer over the
-	// same fd while the old stream is still open, writing the next init request
-	// *inside* an unterminated tick stream — the subprocess mis-frames and hangs.
-	//
-	// A failure here must leave the connection POISONED, not idle: ReleaseForPooling
-	// gates on `init_done_ && !data_finished_`, and clearing both before a failed
-	// init would make a broken connection look reusable, so the next checkout would
-	// read this split's init response as its own stream header.
+	// A failure must leave the connection poisoned, not idle: ReleaseForPooling
+	// gates on `init_done_ && !data_finished_`, so clearing both before a failed
+	// init would let the next checkout read this split's init response.
 	virtual void ResetForNextSplit() = 0;
 
 	//! True only for the cached-replay connection, which streams our own captured
@@ -130,105 +113,75 @@ public:
 		return false;
 	}
 
-	//! Mark this connection unusable because a split init failed partway.
-	//!
-	//! ResetForNextSplit clears the in-flight flags before the next init is
-	//! written, so a throw between the two leaves the connection looking IDLE
-	//! with an unanswered init request on the wire. Pooled, the next checkout
-	//! reads that response as its own stream header. The window is not
-	//! hypothetical: an interrupt during a split init reaches it, because the
-	//! read waits on cancellation before consuming anything.
+	//! Mark this connection unusable because a split init failed partway (e.g.
+	//! interrupted): ResetForNextSplit already cleared the in-flight flags, so it
+	//! would otherwise look idle with an unanswered init on the wire.
 	virtual void MarkSplitInitFailed() {
 	}
 
-	// Send the VGI bind RPC. Spawns the worker subprocess on first call
-	// (subprocess transport only) and runs the bind protocol — including
-	// any secret-scope retry — returning the resulting BindResult by value.
-	// The connection does NOT cache the result; callers thread it into the
-	// matching PerformInit / PerformFinalizeInit call.
+	// Send the bind RPC (spawning a subprocess worker on first call), including
+	// any secret-scope retry. Not cached: callers pass the result to
+	// PerformInit / PerformFinalizeInit.
 	virtual BindResult PerformBindRpc() = 0;
 
-	// Ensure the underlying worker is ready to receive RPCs. PerformBindRpc
-	// has historically been the lazy-spawn hook for subprocess transport
-	// (proc_ was created on first bind); call sites that skip the on-wire
-	// bind — they have a cached BindResult and go straight to PerformInit —
-	// must invoke this to materialize the subprocess before issuing init.
-	// HTTP transport has no spawn step; this is a no-op there.
+	// Spawn the subprocess worker if needed. Callers that skip PerformBindRpc
+	// (cached BindResult, straight to PerformInit) must call this first.
+	// No-op where there is no spawn step (HTTP).
 	virtual void EnsureWorkerSpawned() = 0;
 
 	virtual void SetInputSchema(const VgiSchemaPtr &input_schema) = 0;
 
-	// Set the time-travel AT clause (empty = none) carried into the bind request
-	// so function-backed tables can read it at init via init_call.bind_call.at_value.
-	// Default no-op: only the real subprocess/HTTP connections override it.
+	// Time-travel AT clause (empty = none) carried in the bind request, so
+	// function-backed tables see it at init via init_call.bind_call.at_value.
 	virtual void SetAtClause(const std::string &at_unit, const std::string &at_value) {
 		(void)at_unit;
 		(void)at_value;
 	}
 
-	// Set the catalog schema that owns this function, carried into the bind
-	// request. A worker may register the same function name in several schemas,
-	// so the bare name does not identify the implementation — the worker
-	// resolves (schema_name, function_name). Empty = none, which leaves the
-	// worker to look the name up across every schema.
-	// Default no-op: only the real subprocess/HTTP/webworker connections override it.
+	// Catalog schema owning this function, carried in the bind request: one
+	// name may exist in several schemas. Empty = worker searches every schema.
 	virtual void SetSchemaName(const std::string &schema_name) {
 		(void)schema_name;
 	}
 
-	// Set resolved argument names for the bind request. The list is aligned
-	// with the complete logical argument order; null elements are unnamed
-	// varargs. A null list means the engine cannot provide names.
+	// Argument names for the bind request, aligned with the logical argument
+	// order; null elements are unnamed varargs, a null list means unknown.
 	virtual void SetArgumentNames(
 	    const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
 		(void)argument_names;
 	}
 
-	// Set the stable, client-minted per-substream id carried on the InitRequest
-	// for the parallel streaming table-in-out path (see InitRequest.substream_id).
-	// It is the same for this substream's init / process / finalize, so a
-	// finalize that lands on a different HTTP backend can still key the
-	// substream's shared state. Empty = none (serial path / not table-in-out).
-	// Default no-op: only the real subprocess/HTTP connections override it.
+	// Client-minted InitRequest.substream_id for parallel streaming table-in-out:
+	// stable across the substream's init / process / finalize, so a finalize on a
+	// different HTTP backend still finds its state. Empty = none.
 	virtual void SetSubstreamId(const std::vector<uint8_t> &substream_id) {
 		(void)substream_id;
 	}
 
-	// Set the COPY ... FROM context (source path + target schema) carried into
-	// the bind request so a worker CopyFromFunction reads it at bind/init via
-	// init_call.bind_call.copy_from. Default no-op: only the real
-	// subprocess/HTTP connections override it.
+	// COPY ... FROM context (source path + target schema) for the bind request
+	// (init_call.bind_call.copy_from).
 	virtual void SetCopyFromContext(const CopyFromBindContext &copy_from) {
 		(void)copy_from;
 	}
 
-	// Set the COPY ... TO context (destination path + format) carried into the
-	// bind request so a worker CopyToFunction reads it at bind/init via
-	// init_call.bind_call.copy_to. Default no-op: only the real
-	// subprocess/HTTP connections override it.
+	// COPY ... TO context (destination path + format) for the bind request
+	// (init_call.bind_call.copy_to).
 	virtual void SetCopyToContext(const CopyToBindContext &copy_to) {
 		(void)copy_to;
 	}
 
-	// Update input schema for execute phase (after bind, before OpenInputWriter)
-	// Used when reusing bind connection and actual DataChunk types differ from bind types
+	// Replace the input schema after bind, before OpenInputWriter, when the
+	// actual DataChunk types differ from the bind types.
 	virtual void UpdateInputSchemaForExecution(const VgiSchemaPtr &input_schema) = 0;
 
-	// Send the VGI init RPC. The bind_result must come from a prior
-	// PerformBindRpc on this connection — its bind_request_bytes,
-	// output_schema_bytes, and opaque_data are folded into the InitRequest.
+	// Send the init RPC; `bind_result` (from PerformBindRpc) is folded into the
+	// InitRequest.
 	//
-	// `init_opaque_data` is the opaque blob returned by the worker's
-	// primary init (`InitResult::opaque_data`). For secondary inits — those
-	// against a connection constructed with a non-empty `global_execution_id`
-	// — pass the primary's opaque bytes here so the worker echoes them in
-	// `init_response.opaque_data`. The worker's secondary-init branch reads
-	// this field directly and skips `on_init`; without it, secondaries
-	// always see `None` and break any function that uses init opaque data.
-	// Empty `{}` for primary inits.
-	// finalize_state_id is opaque worker-chosen bytes returned from
-	// table_buffering_combine. Empty (b"") is a legitimate value;
-	// nullopt means "no finalize_state_id supplied" (non-finalize phases).
+	// `init_opaque_data`: empty for a primary init. A secondary init (connection
+	// built with a non-empty `global_execution_id`) must pass the primary's
+	// InitResult::opaque_data: the worker skips on_init and uses it directly.
+	// `finalize_state_id`: worker bytes from table_buffering_combine (empty is
+	// valid); nullopt outside finalize phases.
 	virtual InitResult PerformInit(const BindResult &bind_result,
 	                               const std::vector<int32_t> &projection_ids = {},
 	                               VgiBufferPtr pushdown_filters = nullptr,
@@ -239,11 +192,8 @@ public:
 	                               const std::vector<uint8_t> &init_opaque_data = {},
 	                               const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt,
 	                               const std::vector<std::string> &split_tokens = {}) = 0;
-	// Arm conditional-revalidation validators (M6) sent on the NEXT PerformInit
-	// via the init request's custom_metadata (vgi.cache.if_none_match /
-	// vgi.cache.if_modified_since). Empty strings clear the corresponding key.
-	// Default no-op: connection types that don't do RPCs (cached replay) ignore
-	// it. Must be called before PerformInit.
+	// Conditional-revalidation validators (vgi.cache.if_none_match /
+	// if_modified_since) for the next PerformInit's metadata; empty clears a key.
 	virtual void SetConditionalRequest(const std::string & /*if_none_match*/,
 	                                   const std::string & /*if_modified_since*/) {}
 
@@ -252,34 +202,18 @@ public:
 	// original bind via bind_result.
 	virtual void PerformFinalizeInit(const BindResult &bind_result) = 0;
 
-	// Phase 3: Data exchange
 	virtual void OpenInputWriter() = 0;
 	virtual void WriteInputBatch(const VgiBatchPtr &batch) = 0;
 	virtual void CloseInputWriter() = 0;
 	virtual VgiBatchPtr ReadDataBatch() = 0;
 
-	// ========== Buffered Table Function RPCs ==========
-	// Used only when the function declared Meta.table_buffering = True. The
-	// connection must have been initialized via PerformInit(..., phase="TABLE_BUFFERING")
-	// before any of these are called.
+	// Buffered table function RPCs (Meta.table_buffering), after
+	// PerformInit(phase="TABLE_BUFFERING"). The Source-phase finalize is a
+	// producer stream: PerformInit(phase="TABLE_BUFFERING_FINALIZE",
+	// finalize_state_id) then ReadDataBatch until EOS.
 
-	// Sink one input batch into the worker's per-(execution_id, state_id) state.
-	// The C++ side assigns state_ids from an atomic counter — one per Sink
-	// thread. Multiple chunks for the same state_id accumulate into the same
-	// worker-side state instance.
-	//
-	// `batch_index` is forwarded only when the operator declared
-	// RequiredPartitionInfo()=BatchIndex() (because the worker's
-	// Meta.requires_input_batch_index=True). Pass nullopt otherwise. Workers
-	// that need source ordering accumulate (batch_index, payload) tuples and
-	// sort in combine().
-	// --- Table sink+source (buffered) RPC family ---
-	//
-	// Source-phase finalize is a producer-mode stream opened via
-	// PerformInit(phase="TABLE_BUFFERING_FINALIZE", finalize_state_id=N)
-	// and drained via ReadDataBatch until null (EOS).
-
-	// Returns the worker-chosen state_id (opaque bytes) for this batch.
+	// Sink one input batch; returns the worker-chosen state_id (opaque bytes).
+	// `batch_index` is set only when the worker requires input batch indexes.
 	virtual std::vector<uint8_t>
 	RpcTableBufferingProcess(const std::string &function_name,
 	                           const std::vector<uint8_t> &execution_id,
@@ -295,34 +229,19 @@ public:
 	RpcTableBufferingDestructor(const std::string &function_name,
 	                              const std::vector<uint8_t> &execution_id) = 0;
 
-	// Most recent stream-state token observed on this connection
-	// (HTTP only). Returns empty on subprocess. Used by the cancel
-	// dispatcher to address the right worker under HTTP pooling.
+	// Most recent stream-state token (HTTP only; empty otherwise), used by the
+	// cancel dispatcher to address the stream.
 	virtual std::vector<uint8_t> GetLastStateToken() const = 0;
 
-	// Most recent ``vgi_batch_index`` value observed in the data batch's
-	// wire custom_metadata. Set inside ``ReadDataBatch`` immediately after
-	// the metadata is parsed; read by ``InstallBatch`` on the consumer
-	// thread to populate ``VgiTableFunctionLocalState::current_batch_index``.
-	// Returns ``DConstants::INVALID_INDEX`` for connections whose worker
-	// did not opt in to batch_index (no metadata key present). Default
-	// implementation returns INVALID so transports that don't yet
-	// implement parse (e.g. legacy connection types) safely report
-	// "no batch_index seen."
+	// ``vgi_batch_index`` from the last data batch's metadata (set in
+	// ReadDataBatch, read by InstallBatch); INVALID_INDEX when absent.
 	virtual idx_t GetLastBatchIndex() const {
 		return duckdb::DConstants::INVALID_INDEX;
 	}
 
-	// Most recent ``vgi_partition_values#b64`` payload observed in the
-	// data batch's wire custom_metadata, base64-decoded into raw Arrow
-	// IPC stream bytes. Empty string when the metadata key is absent.
-	// Decoding the bytes into a 2-row RecordBatch + validation happens
-	// in ``InstallBatch`` on the consumer (pipeline-executor) thread,
-	// NOT here — uniform error reporting across transports, and the
-	// HTTP buffer path stashes raw bytes alongside batches without
-	// paying for the IPC decode until the consumer asks.
-	// Default returns empty so connections that don't yet implement
-	// the parse safely report "no partition_values seen."
+	// The last data batch's ``vgi_partition_values#b64`` as raw Arrow IPC bytes
+	// (empty when absent). Decoding and validation happen in InstallBatch on the
+	// consumer thread, uniformly across transports.
 	virtual const std::string &GetLastPartitionValuesBytes() const {
 		static const std::string kEmpty;
 		return kEmpty;
@@ -332,7 +251,6 @@ public:
 	// ``vgi_rpc.parent_row#b64`` metadata: for each output row, the 0-based index
 	// of the input row that produced it (batched-lateral provenance). Empty = no
 	// provenance on this batch (the operator assumes identity for a 1->1 map).
-	// Default empty so connections that don't implement the parse report "none."
 	virtual const std::string &GetLastParentRowBytes() const {
 		static const std::string kEmpty;
 		return kEmpty;
@@ -342,8 +260,7 @@ public:
 	// batch carried ``vgi.status: HAVE_MORE_OUTPUT``: the worker has more output for
 	// the same input batch, and the only valid next input is a continuation tick
 	// (WriteContinuationTick). Every such reply's parent_row indexes that same input.
-	// Set inside ``ReadDataBatch``. Default false: connections that never reach a
-	// worker (cached replay) never continue.
+	// Set in ReadDataBatch.
 	virtual bool GetLastMoreOutput() const {
 		return false;
 	}
@@ -355,30 +272,20 @@ public:
 		throw NotImplementedException("This VGI connection type cannot continue an exchange's output");
 	}
 
-	// Parsed `vgi.cache.*` cache-control advertisement observed on the most
-	// recent data batch's wire custom_metadata. Set inside ``ReadDataBatch``
-	// (per batch); the result-cache capture layer reads it on the FIRST batch
-	// (the only one a worker advertises on) via the same lockstep timing as
-	// GetLastBatchIndex. Default returns present=false so transports/connection
-	// types that don't parse it report "not cacheable."
+	// `vgi.cache.*` advertisement parsed from the last data batch (set in
+	// ReadDataBatch); the result cache reads it after the first batch, the only
+	// one a worker advertises on.
 	virtual VgiCacheControl GetLastCacheControl() const {
 		return {};
 	}
 
-	// Cancel the current stream. Called off-thread by VgiCancelDispatcher
-	// from a destructor-triggered teardown; may throw (dispatcher catches).
-	// - Subprocess: writes a zero-row batch with VGI_RPC_CANCEL_KEY custom
-	//   metadata on the input writer. state_token is ignored.
-	// - HTTP: POSTs {state, cancel} to /{method}/exchange addressed by
-	//   state_token (the most recent token seen on the stream).
+	// Cancel the current stream; called off-thread by VgiCancelDispatcher and
+	// may throw. Subprocess: a zero-row batch with VGI_RPC_CANCEL_KEY metadata
+	// (state_token ignored). HTTP: a cancel exchange addressed by state_token.
 	//
-	// ``live_context`` MUST be a context guaranteed alive for the duration of
-	// this call — the dispatcher passes its long-lived bot connection's
-	// context. The connection's own ``context_`` is a reference to the
-	// originating query's ClientContext, which is typically already destroyed
-	// by the time the dispatcher runs this off-thread (use-after-free of its
-	// Logger otherwise). Implementations must route all logging / HTTP through
-	// ``live_context``, never ``context_``.
+	// Route all logging / HTTP through ``live_context`` (the dispatcher's
+	// long-lived connection), never ``context_``: the originating query's
+	// ClientContext is usually destroyed by then.
 	virtual void CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) = 0;
 
 	// State queries
@@ -391,34 +298,22 @@ public:
 	// Short SHA-256 digests (OpaqueDigest), never the raw values.
 	virtual std::string GetAttachOpaqueDataDigest() const = 0;
 	virtual std::string GetTransactionOpaqueDataDigest() const = 0;
-	//! Stable short hex id for this connection checkout. Generated at construction,
-	//! unique per IFunctionConnection instance regardless of transport. Use as the
-	//! primary correlation key in log lines: one `conn=<hex>` covers the full
-	//! bind → init → data → release lifecycle for a single checkout.
+	//! Short hex id unique per connection instance: the log correlation key for
+	//! one checkout's bind → init → data → release.
 	virtual std::string GetConnIdHex() const = 0;
-	//! OS process id of the worker, only meaningful for subprocess transport.
-	//! Returns std::nullopt for HTTP (the C++ client does not own the worker
-	//! process and cannot know its pid). Subprocess implementations return
-	//! the spawned worker's pid. Use this only for human-readable diagnostics
-	//! (debugger attach, stderr correlation); use GetConnIdHex() for the
-	//! transport-neutral connection identifier in log fields.
+	//! The worker's pid for subprocess transport, nullopt otherwise. For human
+	//! diagnostics only; log fields use GetConnIdHex().
 	virtual std::optional<pid_t> GetSubprocessPid() const {
 		return std::nullopt;
 	}
 
 	// Lifecycle
 	virtual int Wait() = 0;
-	// ReleaseForPooling hands the worker process back to the pool if the
-	// connection is in a poolable state (worker alive and parked at its
-	// RPC accept-loop). Returns nullptr otherwise.
+	// The worker for the pool if alive and parked at its RPC loop, else nullptr.
 	virtual std::unique_ptr<PooledWorker> ReleaseForPooling() = 0;
 };
 
-// ============================================================================
-// Factory functions
-// ============================================================================
-
-// Create a connection of the appropriate type (subprocess or HTTP) based on worker_path.
+// A connection of the type worker_path selects.
 std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::string &worker_path, const std::string &function_name,
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,

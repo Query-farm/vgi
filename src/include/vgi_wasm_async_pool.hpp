@@ -3,20 +3,12 @@
 
 // WASM-only: a pre-spawned, bounded thread pool for std::async-style work.
 //
-// Why: in MAIN_MODULE=1 + pthreads Emscripten builds with side modules loaded
-// dynamically at runtime, calling pthread_create AFTER side modules are
-// dlopen'd is unreliable (upstream emscripten issues #19425, #19199, #13303).
-// The function tables get out of sync between main and pthread contexts,
-// producing "table index is out of bounds" crashes or silent hangs.
-//
-// The workaround: spawn worker pthreads ONCE, at extension load time (when
-// only the main side module is loaded and pthread_create demonstrably works),
-// and keep them alive in a poll loop for the lifetime of the process.
-// Subsequent async work is dispatched via a queue, not via new pthread_create.
-//
-// Also serves a second purpose: bounded concurrency. Per-connection HTTP
-// servers don't need to handle unbounded parallel requests — capping the
-// pool size caps the in-flight RPC count.
+// In MAIN_MODULE=1 + pthreads Emscripten builds, pthread_create after side
+// modules are dlopen'd is unreliable (emscripten #19425, #19199, #13303):
+// function tables desync, giving "table index is out of bounds" crashes or
+// hangs. So workers are spawned once, at extension load, and live for the
+// process; later work goes through the queue. The pool size also caps the
+// number of in-flight RPCs.
 
 #ifdef __EMSCRIPTEN__
 
@@ -40,13 +32,10 @@ class VgiWasmAsyncPool {
 public:
 	static VgiWasmAsyncPool &Instance();
 
-	// Idempotent: first call spawns the workers; subsequent calls no-op.
-	// Must be called from a context where pthread_create works reliably —
-	// in our build that's extension load time.
+	// Idempotent. Must first be called where pthread_create works (extension
+	// load). Failed pthread_create calls are skipped, so the pool may be smaller.
 	void EnsureStarted(int num_workers);
 
-	// Submit a callable that returns R. Returns a std::future<R> that
-	// completes when a worker picks up and runs the task.
 	template <typename F>
 	auto Submit(F &&task) -> std::future<typename std::invoke_result<F>::type> {
 		using R = typename std::invoke_result<F>::type;

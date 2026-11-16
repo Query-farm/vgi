@@ -52,9 +52,7 @@ void LogWorkerPoolRelease(ClientContext &context, const PoolReleaseLogFields &f,
 	VGI_LOG(context, f.event_name, fields);
 }
 
-// Cached check for VGI_STDERR_LOG environment variable
 bool VgiStderrLogEnabled() {
-	// Use a static atomic to cache the result after first check
 	// -1 = not checked yet, 0 = disabled, 1 = enabled
 	static std::atomic<int> cached_value {-1};
 
@@ -63,16 +61,13 @@ bool VgiStderrLogEnabled() {
 		return value == 1;
 	}
 
-	// First call - check environment variable
 	const char *env = std::getenv("VGI_STDERR_LOG");
 	bool enabled = env && std::string(env) == "1";
 	cached_value.store(enabled ? 1 : 0, std::memory_order_relaxed);
 	return enabled;
 }
 
-// Cached check for VGI_STDERR_LOG_PRETTY environment variable
 bool VgiStderrLogPrettyEnabled() {
-	// Use a static atomic to cache the result after first check
 	// -1 = not checked yet, 0 = disabled, 1 = enabled
 	static std::atomic<int> cached_value {-1};
 
@@ -81,14 +76,12 @@ bool VgiStderrLogPrettyEnabled() {
 		return value == 1;
 	}
 
-	// First call - check environment variable
 	const char *env = std::getenv("VGI_STDERR_LOG_PRETTY");
 	bool enabled = env && std::string(env) == "1";
 	cached_value.store(enabled ? 1 : 0, std::memory_order_relaxed);
 	return enabled;
 }
 
-// Format current wall-clock time as YYYY-MM-DDTHH:MM:SS.mmm (local time, 23 chars).
 string VgiStderrTimestampPrefix() {
 	auto now = std::chrono::system_clock::now();
 	auto secs = std::chrono::system_clock::to_time_t(now);
@@ -144,19 +137,16 @@ vector<pair<string, string>> BuildConnLogFields(const vgi::IFunctionConnection &
 	return fields;
 }
 
-// Write log message to stderr in human-readable format
 void VgiLogToStderr(const string &event, const vector<pair<string, string>> &info) {
-	// Mutex to prevent interleaved output from multiple threads
+	// Keeps lines from different threads from interleaving.
 	static std::mutex stderr_mutex;
 	std::lock_guard<std::mutex> lock(stderr_mutex);
 
 	auto ts = VgiStderrTimestampPrefix();
 
 	if (VgiStderrLogPrettyEnabled()) {
-		// Pretty format: sorted keys with indentation
 		std::cerr << ts << " [VGI] " << event << std::endl;
 
-		// Sort key-value pairs alphabetically by key
 		auto sorted_info = info;
 		std::sort(sorted_info.begin(), sorted_info.end(),
 		          [](const auto &a, const auto &b) { return a.first < b.first; });
@@ -165,7 +155,6 @@ void VgiLogToStderr(const string &event, const vector<pair<string, string>> &inf
 			std::cerr << "      " << kv.first << ": " << kv.second << std::endl;
 		}
 	} else {
-		// Compact format: single line
 		std::cerr << ts << " [VGI] " << event;
 		for (const auto &kv : info) {
 			std::cerr << " " << kv.first << "=" << kv.second;
@@ -202,14 +191,6 @@ string VgiLogType::ConstructLogMessage(const string &event, const vector<pair<st
 	return Value::STRUCT(std::move(child_list)).ToString();
 }
 
-// ============================================================================
-// Log Message Handling from batch custom metadata
-// ============================================================================
-
-// Check if a batch contains a log message (zero rows with vgi.log_* metadata).
-// If it's an EXCEPTION, throws IOException with the message, traceback, and worker context.
-// For other log levels, logs to DuckDB if context is provided.
-// Returns true if the batch was a log message, false otherwise.
 bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadataPtr &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid, const std::string &execution_id_hex,
                            const std::string &attach_opaque_data_digest, const std::string &transaction_opaque_data_digest,
@@ -219,13 +200,11 @@ bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadata
 		return false;
 	}
 
-	// Check for log metadata in the custom metadata (per-batch metadata from IPC)
 	if (!custom_metadata) {
 		return false;
 	}
 
-	// Look for vgi_rpc.log_level and vgi_rpc.log_message (new protocol)
-	// Also check legacy vgi.log_level for backwards compatibility during migration
+	// vgi_rpc.log_*, falling back to the legacy vgi.log_* keys.
 	int64_t level_idx = custom_metadata->FindKey("vgi_rpc.log_level");
 	int64_t message_idx = custom_metadata->FindKey("vgi_rpc.log_message");
 	if (level_idx < 0) {
@@ -235,10 +214,8 @@ bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadata
 		message_idx = custom_metadata->FindKey("vgi.log_message");
 	}
 
-	// log_level is the authoritative signal. log_message MAY be absent
-	// (buggy worker, or future protocol where the level alone is the
-	// event). Treat missing message as empty string so we still surface
-	// the event instead of swallowing it.
+	// log_level is the authoritative signal; a missing log_message is treated as
+	// empty so the event is still surfaced rather than swallowed.
 	if (level_idx < 0) {
 		return false;
 	}
@@ -246,8 +223,7 @@ bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadata
 	std::string log_level = custom_metadata->value(level_idx);
 	std::string log_message = (message_idx >= 0) ? custom_metadata->value(message_idx) : std::string();
 
-	// Parse vgi_rpc.log_extra if present (contains traceback for exceptions)
-	// Also check legacy vgi.log_extra for backwards compatibility
+	// vgi_rpc.log_extra (or legacy vgi.log_extra) carries the exception traceback.
 	std::string traceback;
 	std::string exception_type;
 	std::string extra_error_kind;
@@ -285,10 +261,8 @@ bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadata
 		}
 	}
 
-	// Read top-level error_kind metadata key — a stable token (e.g.
-	// "method_not_implemented") that callers can pattern-match on without
-	// substring-searching the message text. Mirrors vgi-rpc Python's
-	// metadata.ERROR_KIND_KEY (see vgi-rpc commit adding MethodNotImplementedError).
+	// error_kind: a stable token (e.g. "method_not_implemented") callers can match
+	// without searching the message text (vgi-rpc metadata.ERROR_KIND_KEY).
 	std::string error_kind;
 	int64_t kind_idx = custom_metadata->FindKey("vgi_rpc.error_kind");
 	if (kind_idx >= 0) {
@@ -306,20 +280,15 @@ bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadata
 		error_code = extra_error_code;
 	}
 
-	// Handle based on log level
 	if (log_level == "EXCEPTION") {
-		// Construct error message with traceback (worker context is in extra_info)
+		// Worker context goes in extra_info, not the message.
 		std::string full_message = "VGI Worker Exception: " + log_message;
 		if (!traceback.empty()) {
 			full_message += "\n" + traceback;
 		}
-		// Throw InvalidInputException (not IOException) so the retry logic in
-		// InvokePooledUnaryRpc does NOT retry user-code errors. Retrying is
-		// unsafe for stateful aggregate operations and masks the real error.
-		// When `error_kind` is set, throws the typed VgiRpcException subclass
-		// instead so capability-detection callers can pattern-match.
-		// The traceback stays in the message for the CLI and is also its own
-		// field, so a caller can show the worker's message without it.
+		// Not an IOException, so it is never retried (see ThrowVgiUserException).
+		// The traceback stays in the message for the CLI and is also its own field,
+		// so a caller can show the worker's message without it.
 		vgi::ErrorInfo extra_info(vgi::error_subtype::kWorkerException);
 		extra_info.Set(vgi::error_key::kExceptionType, exception_type).Set(vgi::error_key::kTraceback, traceback);
 		if (error_context) {
@@ -329,9 +298,7 @@ bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadata
 		                           extra_info);
 	}
 
-	// For non-exception log levels, log to DuckDB if we have a context
 	if (context) {
-		// Create log info with worker context and level for debugging
 		vector<pair<string, string>> info;
 		if (!conn_id_hex.empty()) {
 			info.emplace_back("conn", conn_id_hex);
@@ -357,7 +324,6 @@ bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadata
 			info.emplace_back("traceback", traceback);
 		}
 
-		// Log at the level specified by the worker
 		LogLevel duckdb_level = ParseLogLevel(log_level);
 		VGI_LOG_LEVEL(*context, duckdb_level, log_message, info);
 	}

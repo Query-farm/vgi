@@ -3,11 +3,9 @@
 
 #include "vgi_ipc.hpp"
 //
-// Arrow IPC byte streams over a SAB duplex slot — the transport analog of
-// FdInputStream/FdOutputStream (vgi_arrow_ipc.hpp), but backed by the ring stubs
-// (vgi_sab_abi.hpp) instead of a pipe fd. A `WebWorkerFunctionConnection` hands
-// these to the same Arrow StreamReader/StreamWriter the subprocess path uses, so
-// the producer/exchange streaming logic is reused unchanged.
+// IPC byte streams over a SAB duplex slot: the analog of FdInputStream /
+// FdOutputStream (vgi_arrow_ipc.hpp) backed by the ring stubs in vgi_sab_abi.hpp,
+// so WebWorkerFunctionConnection reuses the subprocess streaming logic.
 //
 // SabOutputStream::Write  -> vgi_wasm_slot_write   (blocking, c2w ring)
 // SabInputStream::Read    -> vgi_wasm_slot_read    (blocking, w2c ring; 0 = EOS)

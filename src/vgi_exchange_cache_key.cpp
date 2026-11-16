@@ -33,11 +33,6 @@ std::string Sha256Hex(const std::string &bytes) {
 
 } // namespace
 
-// ----------------------------------------------------------------------------
-// Promoted canonical key-component serializers (single definition; was static in
-// vgi_table_function_impl.cpp — that TU now includes this header and calls these).
-// ----------------------------------------------------------------------------
-
 std::string SerializeSettingsForKey(const std::map<std::string, Value> &settings) {
 	std::string out;
 	for (const auto &kv : settings) { // std::map iterates in sorted key order
@@ -62,25 +57,15 @@ std::string SerializeArgumentsForKey(const VgiBatchPtr &arguments_batch) {
 	if (!arguments_batch) {
 		return "";
 	}
-	// Deterministic: the same argument values/types always serialize to the same bytes.
-	// nanoarrow's encoding (not Arrow C++'s ToString text), so keys changed once with the
-	// nanoarrow migration.
 	return Sha256Hex(SerializeRecordBatch(arguments_batch)->ToString());
 }
 
-// ----------------------------------------------------------------------------
-// Input hashing
-// ----------------------------------------------------------------------------
 
 std::string HashInputBatchOrdered(const VgiBatchPtr &input_batch) {
 	if (!input_batch) {
 		return "";
 	}
-	// Deterministic IPC-stream framing: the same batch always serializes to the same
-	// bytes (no message custom_metadata is written). These bytes are nanoarrow's IPC
-	// encoding, which can differ byte-wise from the Arrow C++ writer's, so keys
-	// persisted by an Arrow C++ build changed once with the nanoarrow migration (old
-	// entries simply miss and age out).
+	// Deterministic: no message custom_metadata is written.
 	auto buffer = SerializeRecordBatch(input_batch);
 	return Sha256Hex(buffer->ToString());
 }
@@ -88,20 +73,17 @@ std::string HashInputBatchOrdered(const VgiBatchPtr &input_batch) {
 std::string HashInputChunkUnordered(ClientContext & /*context*/, DataChunk &chunk) {
 	const idx_t count = chunk.size();
 	if (count == 0 || chunk.ColumnCount() == 0) {
-		// Empty / column-less input: a stable constant hash (all such chunks are
-		// interchangeable for keying). Distinct from any non-empty chunk.
+		// All empty / column-less chunks share one constant hash.
 		return Sha256Hex("vgi-exchange-empty-input");
 	}
-	// One canonical, NULL-aware, all-types order-preserving blob per row over ALL
-	// columns of the chunk (correlated columns included — see the LATERAL note).
+	// One sort-key blob per row over ALL columns (see the header).
 	vector<OrderModifiers> mods(chunk.ColumnCount(), OrderModifiers(OrderType::ASCENDING, OrderByNullType::NULLS_LAST));
 	Vector keys(LogicalType::BLOB);
 	CreateSortKeyHelpers::CreateSortKey(chunk, mods, keys);
 	keys.Flatten(count);
 	auto key_data = FlatVector::GetData<string_t>(keys);
 
-	// Collect the per-row blobs and sort them → canonical multiset serialization
-	// (order-independent; duplicates preserved so cardinality is part of identity).
+	// Sorting makes it order-independent; duplicates are kept.
 	std::vector<std::string> rows;
 	rows.reserve(count);
 	for (idx_t i = 0; i < count; i++) {
@@ -109,10 +91,7 @@ std::string HashInputChunkUnordered(ClientContext & /*context*/, DataChunk &chun
 	}
 	std::sort(rows.begin(), rows.end());
 
-	// Serialize the sorted multiset into one buffer and hash it once — byte-identical
-	// to streaming the same (count ":" then per-row "len:bytes") sequence, and WASM-safe
-	// (see VgiSha256Hex). The rows are already materialized above, so one-shot vs
-	// incremental is equivalent here (this is a per-chunk key, not a large blob).
+	// Layout: count ":" then "len:bytes" per row.
 	std::string buf;
 	buf += std::to_string(static_cast<uint64_t>(count));
 	buf += ":";
@@ -127,10 +106,8 @@ std::string HashInputChunkUnordered(ClientContext & /*context*/, DataChunk &chun
 std::string CanonicalPartitionTupleKey(ClientContext & /*context*/, const std::vector<Value> &tuple,
                                        const std::vector<LogicalType> &partition_types) {
 	D_ASSERT(tuple.size() == partition_types.size());
-	// One-row chunk of the partition columns in declared order. Cast each Value to the
-	// declared partition type so the capture side (min-value decoded from
-	// vgi_partition_values, already the declared Arrow type) and the serve side (filter
-	// constants, which may arrive as a coercible literal type) produce identical bytes.
+	// The cast matters on the serve side: filter constants may arrive as a different
+	// (coercible) literal type than the declared partition type.
 	DataChunk chunk;
 	duckdb::vector<LogicalType> dtypes(partition_types.begin(), partition_types.end());
 	chunk.Initialize(Allocator::DefaultAllocator(), dtypes, 1);
@@ -160,8 +137,6 @@ std::vector<std::string> HashInputRowsPerValue(ClientContext & /*context*/, Data
 	keys.Flatten(count);
 	auto key_data = FlatVector::GetData<string_t>(keys);
 	for (idx_t i = 0; i < count; i++) {
-		// "v:" discriminator: a per-batch/-chunk input_hash is pure hex, so this prefix
-		// guarantees per-value and per-unit keys never collide in the shared keyspace.
 		out[i] = "v:" + Sha256Hex(std::string(key_data[i].GetData(), key_data[i].GetSize()));
 	}
 	return out;
@@ -179,7 +154,6 @@ std::vector<std::string> InputRowSortKeys(ClientContext & /*context*/, DataChunk
 	keys.Flatten(count);
 	auto key_data = FlatVector::GetData<string_t>(keys);
 	for (idx_t i = 0; i < count; i++) {
-		// Raw canonical blob — the arena compares it by value; no SHA, no prefix.
 		out[i].assign(key_data[i].GetData(), key_data[i].GetSize());
 	}
 	return out;
@@ -221,15 +195,6 @@ std::string FinalizeInputDigest(uint64_t sum_lo, uint64_t sum_hi, uint64_t row_c
 	return Sha256Hex(std::string(reinterpret_cast<const char *>(buf), sizeof(buf)));
 }
 
-// ----------------------------------------------------------------------------
-// Static key builder
-// ----------------------------------------------------------------------------
-
-// Sync the database-wide cache config (byte caps, disk dir/caps, compression) from
-// this query's settings into the database cache, so SET takes effect on the exchange path
-// exactly as it does on the producer path (which does this before eligibility). Without
-// this the cache's disk_dir stays empty and allow_disk=true is a silent no-op.
-// ConfigureIfChanged is lock-free when the settings are unchanged (the steady state).
 void SyncResultCacheSettings(ClientContext &context) {
 	VgiResultCache::Settings s;
 	Value sv;
@@ -263,12 +228,10 @@ void SyncResultCacheSettings(ClientContext &context) {
 	u64("vgi_result_cache_pack_target_bytes", s.pack_target_bytes);
 	u64("vgi_result_cache_pack_compaction_dead_pct", s.pack_compaction_dead_pct);
 	GetResultCache(context).ConfigureIfChanged(s);
-	// The per-value memo arena is a separate registry with its own byte budget; it shares
-	// the same configured max_bytes independently. This is NOT a combined cap.
+	// The memo arena has its own budget of the same size — NOT a combined cap.
 	GetMemoArenaRegistry(context).SetMaxBytes(static_cast<int64_t>(s.max_bytes));
-	// `SET vgi_result_cache_dir` turns on the per-value disk tier (same-host multi-process
-	// + cross-restart warm reuse); `..._per_value_disk_max_bytes` caps its on-disk size
-	// (LRU eviction + expired-row reaping), 0 = unlimited.
+	// vgi_result_cache_dir also enables the per-value disk tier, capped by
+	// vgi_result_cache_per_value_disk_max_bytes (0 = unlimited).
 	uint64_t pv_disk_max = defaults::RESULT_CACHE_PER_VALUE_DISK_MAX_BYTES;
 	Value pdmv;
 	if (context.TryGetCurrentSetting("vgi_result_cache_per_value_disk_max_bytes", pdmv) && !pdmv.IsNull()) {
@@ -289,33 +252,27 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	reason = nullptr;
 	catalog_version = 0;
 
-	// Apply cache config from this query's settings (disk tier, caps) to the database cache.
 	SyncResultCacheSettings(context);
 
-	// Global master switch.
 	Value master;
 	if (context.TryGetCurrentSetting("vgi_result_cache", master) && !master.GetValue<bool>()) {
 		reason = "disabled_global";
 		return false;
 	}
-	// Per-catalog opt-out.
 	if (!attach_params || !attach_params->cache()) {
 		reason = "disabled_attach";
 		return false;
 	}
-	// A secret-dependent result is keyed on secret_scope — a fingerprint of the
-	// secrets the bind sent, never their values — so rotation or removal is
-	// visible on the very next call as a miss. A secret-dependent bind with no
-	// fingerprint has nothing to key on: fail closed for every exchange shape.
+	// secret_scope is a fingerprint, never secret values. Without one there is
+	// nothing to key on: fail closed.
 	if (secret_dependent && secret_scope.empty()) {
 		reason = "secret_fingerprint_missing";
 		return false;
 	}
 
-	// Identity + version. Catalog-attached functions resolve a VgiCatalog by name so
-	// the runtime catalog_version gates freshness (0 = unknown → never cache; a bump
-	// or vgi_clear_cache() invalidates). A catalog-less call falls back to worker-path
-	// identity, TTL-only (version stays 0 = "no version dimension").
+	// A catalog-attached function is keyed on the runtime catalog_version (0 =
+	// unknown, never cache; a bump or vgi_clear_cache() invalidates). Otherwise
+	// fall back to worker-path identity, TTL-only (version 0).
 	std::string identity_scope;
 	const std::string &cat = attach_params->catalog_name();
 	if (!cat.empty()) {
@@ -327,8 +284,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 				reason = "unknown_version";
 				return false;
 			}
-			// SECURITY-CRITICAL: fold the caller's auth principal into identity_scope
-			// so two identities never share a cache entry. "" → fail closed.
+			// SECURITY: identity_scope carries the auth principal; "" fails closed.
 			identity_scope = BuildCatalogIdentityScope(cat, attach_params->auth());
 			if (identity_scope.empty()) {
 				reason = "identity_unresolved";
@@ -360,9 +316,8 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	key.catalog_version = catalog_version;
 	key.shape_key = operator_kind; // SHAPE discriminator — see VgiResultCacheKey::shape_key
 	key.secret_scope = secret_dependent ? secret_scope : "";
-	// Producer-only dimensions stay empty for exchange-mode: at_unit/at_value,
-	// filter_bytes, order_by_hint, sample_hint, transaction_id. input_hash is set by
-	// the caller per memoization event.
+	// Producer-only dimensions (at_unit/at_value, filter_bytes, order_by_hint,
+	// sample_hint, transaction_id) stay empty; the caller sets input_hash.
 	return true;
 }
 
@@ -376,13 +331,8 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 	                                         catalog_name, catalog_version, reason, operator_kind);
 }
 
-// ----------------------------------------------------------------------------
-// Per-unit memoization serve / store
-// ----------------------------------------------------------------------------
-
-// Process-static local FileSystem for disk-backed replay. A FileHandle keeps a
-// reference to the FileSystem that opened it, so the FS must outlive the handle —
-// a process-static FileSystem outlives the database-owned replay entries.
+// Process-static: a FileHandle references the FileSystem that opened it, so the
+// FS must outlive the database-owned replay entries.
 namespace {
 FileSystem &ExchangeReplayFs() {
 	static std::unique_ptr<FileSystem> fs = FileSystem::CreateLocal();
@@ -392,9 +342,8 @@ FileSystem &ExchangeReplayFs() {
 
 VgiBatchPtr DeserializeCachedRecordBatch(const VgiResultCacheEntry &entry,
                                                                  const VgiCachedBatch &cached) {
-	// In-RAM (memory tier or a materialized disk entry) uses cached.ipc directly. A
-	// disk-STREAMING entry (Lookup returned it TOC-only for a payload > max_entry_bytes)
-	// has ipc==nullptr; positioned-read just this batch's bytes from the blob file.
+	// Lookup returns a disk entry TOC-only (ipc==nullptr) when its payload exceeds
+	// max_entry_bytes.
 	VgiBufferPtr ipc = cached.ipc;
 	if (!ipc && cached.disk_ipc_offset >= 0) {
 		auto handle = ExchangeReplayFs().OpenFile(entry.disk_path, FileFlags::FILE_FLAGS_READ);
@@ -435,10 +384,9 @@ void SlideRevalidatedExchangeEntry(VgiResultCache &cache, const VgiResultCacheEn
                                    int64_t /*default_ttl_seconds*/, bool allow_disk) {
 	auto fresh = std::make_shared<VgiResultCacheEntry>(entry); // shallow copy (shared Buffers)
 	fresh->stored_at = std::chrono::steady_clock::now();
-	// A fresh ttl on the not_modified batch wins; else reuse the PRIOR lifetime so a
-	// validator-only 304 slides forward — and, crucially, an always-revalidate entry
-	// (prior lifetime 0 / immediately stale) stays immediately stale so it keeps
-	// revalidating (do NOT fall to a positive default). Mirrors the producer.
+	// A ttl on the not_modified batch wins; else reuse the PRIOR lifetime, so an
+	// always-revalidate entry (lifetime 0) stays immediately stale. Do NOT fall
+	// back to a positive default.
 	int64_t ttl = cc.ttl_seconds.value_or(0);
 	if (ttl <= 0 && !entry.never_expires) {
 		auto prior =
@@ -457,8 +405,8 @@ void SlideRevalidatedExchangeEntry(VgiResultCache &cache, const VgiResultCacheEn
 	if (!cc.last_modified.empty()) {
 		fresh->last_modified = cc.last_modified;
 	}
-	// An immediately-stale (always-revalidate) entry is memory-only: LookupForRevalidation
-	// probes the in-memory index, and a disk immediately-stale blob is un-loadable.
+	// Immediately-stale entries are memory-only: LookupForRevalidation probes only
+	// the in-memory index, and a disk immediately-stale blob is un-loadable.
 	bool eff_allow_disk = allow_disk && (entry.never_expires || fresh->expires_at > fresh->stored_at);
 	cache.Insert(fresh, eff_allow_disk);
 }
@@ -475,9 +423,8 @@ ExchangeStoreResult StoreExchangeMemoEntry(VgiResultCache &cache, const VgiResul
 	if (!cc.present || cc.no_store || !cc.Cacheable()) {
 		return skip("not_cacheable");
 	}
-	// v1: exchange caching supports catalog scope only. A transaction-scoped result
-	// (output depends on transaction-local state) is process-/txn-ephemeral; refuse
-	// rather than risk serving it across transactions.
+	// Exchange caching supports catalog scope only; refuse transaction-scoped
+	// results rather than risk serving them across transactions.
 	if (cc.TransactionScoped()) {
 		return skip("transaction_scoped");
 	}
@@ -485,14 +432,9 @@ ExchangeStoreResult StoreExchangeMemoEntry(VgiResultCache &cache, const VgiResul
 	if (ttl > VGI_CACHE_MAX_TTL_SECONDS) {
 		ttl = VGI_CACHE_MAX_TTL_SECONDS;
 	}
-	// A positive ttl is required UNLESS this is the "always-revalidate" (HTTP no-cache)
-	// contract: ttl=0 + a validator (etag) + revalidatable — stored but immediately
-	// stale, so every read revalidates via a conditional request and a 304 reuses the
-	// stored bytes. Such an entry is memory-only (LookupForRevalidation probes memory;
-	// a disk immediately-stale blob is un-loadable).
+	// ttl=0 is the always-revalidate (HTTP no-cache) contract: stored immediately
+	// stale, memory-only, every read revalidates and a 304 reuses the bytes.
 	const bool immediately_stale = ttl <= 0;
-	// B3: per-value callers refuse the immediately-stale contract outright — LookupBatch
-	// has no revalidation path, so such an entry churns (stored then evicted every probe).
 	if (immediately_stale && !allow_immediately_stale) {
 		return skip("immediately_stale_per_value");
 	}
@@ -519,7 +461,7 @@ ExchangeStoreResult StoreExchangeMemoEntry(VgiResultCache &cache, const VgiResul
 		if (!b) {
 			continue;
 		}
-		auto buffer = SerializeRecordBatch(b); // self-contained IPC (schema+batch)
+		auto buffer = SerializeRecordBatch(b); // self-contained IPC (schema + batch)
 		VgiCachedBatch cb;
 		cb.ipc = buffer;
 		cb.rows = b->num_rows();
@@ -533,10 +475,8 @@ ExchangeStoreResult StoreExchangeMemoEntry(VgiResultCache &cache, const VgiResul
 	entry->rows = rows;
 	entry->total_bytes = bytes;
 
-	// [S9] Every eligible exchange memo may go to disk regardless of payload size — a
-	// small-but-expensive result is exactly where a warm disk cache pays off. Per-chunk
-	// file fan-out is bounded instead by the reaper's exchange ref-count cap
-	// (vgi_result_cache_exchange_disk_max_refs), not by excluding tiny entries here.
+	// No minimum size for disk: small-but-expensive results benefit most. File
+	// fan-out is bounded by vgi_result_cache_exchange_disk_max_refs in the reaper.
 	if (!cache.Insert(std::move(entry), eff_allow_disk)) {
 		return skip("too_large_for_memory");
 	}

@@ -8,23 +8,13 @@
 #include <string>
 #include <vector>
 
-// VgiSchema appears only as a shared_ptr member below, so a forward
-// declaration suffices here. The full <arrow/api.h> umbrella is expensive and
-// vgi_protocol.hpp is reached by ~34 TUs; the definition is only needed in the
-// .cpp files that build or dereference BindResult::output_schema (which already
-// pull in Arrow via vgi_rpc_types.hpp). Mirrors the vgi_logging.hpp pattern.
 namespace duckdb {
 namespace vgi {
-
-// ============================================================================
-// vgi_rpc-based Function Protocol Types
-// ============================================================================
 
 // Provider guarantee for repeated scans of the exact same bind state in one
 // statement. Independent binds and prepared executions need not share a snapshot.
 enum class BindRepeatability : uint8_t { UNKNOWN, STABLE_WITHIN_QUERY };
 
-// Result from bind RPC call
 struct BindResult {
 	VgiSchemaPtr output_schema;
 	std::vector<uint8_t> opaque_data;            // From BindResponse
@@ -44,18 +34,16 @@ struct BindResult {
 	BindRepeatability repeatability = BindRepeatability::UNKNOWN;
 };
 
-// Result from init RPC call
 struct InitResult {
 	std::vector<uint8_t> execution_id;
 	int64_t max_workers = 1;
 	std::vector<uint8_t> opaque_data;
 };
 
-// ORDER BY + LIMIT hint from DuckDB's RowGroupPruner optimizer.
-// Passed to worker as nullable fields on the InitRequest.
-// Workers may use this to optimize server-side ordering and early termination.
+// ORDER BY + LIMIT hint from DuckDB's RowGroupPruner optimizer, sent to the
+// worker as nullable InitRequest fields.
 struct OrderByHint {
-	std::string column_name;  // Column name to order by
+	std::string column_name;
 	std::string direction;    // "ASC" or "DESC"
 	std::string null_order;   // "NULLS_FIRST" or "NULLS_LAST"
 	int64_t row_limit = -1;   // Combined limit+offset, -1 = no limit

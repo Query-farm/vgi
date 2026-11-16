@@ -25,26 +25,21 @@ class CatalogAuth;
 class SessionCookieJar;
 struct VgiAttachParameters;
 
-// One cancellation request draining through the dispatcher. Built
-// inside a noexcept destructor and handed off to the worker thread;
-// the dispatcher then calls connection->CancelStream() off-thread.
+// A cancellation built in a noexcept destructor; the dispatcher calls
+// connection->CancelStream() off-thread.
 struct CancelRequest {
-	// Transferred ownership: the destructor hands the connection to
-	// the dispatcher. Kept alive until the cancel completes, then
-	// released (not returned to the pool — a cancelled stream is
-	// unsafe to re-use).
+	// Owned until the cancel completes, then released — never returned to the
+	// pool (a cancelled stream is unsafe to reuse).
 	std::unique_ptr<IFunctionConnection> connection;
 
-	// HTTP-only: the most recent state-token seen on the stream. Used
-	// to address the right server-side session. Empty on subprocess.
+	// HTTP-only: latest state token, addressing the server-side session.
 	std::vector<uint8_t> state_token;
 };
 
-// One streaming-close request. Used by the streaming-window operator
-// state's destructor to surrender a worker-side aggregate_streaming
-// session without requiring a ClientContext on the destruction thread.
-// The dispatcher synthesises a minimal VgiAggregateBindData from these
-// fields and dispatches aggregate_streaming_close on its bot Connection.
+// Lets the streaming-window operator state's destructor close a worker-side
+// aggregate_streaming session without a ClientContext on that thread. The
+// dispatcher builds a minimal VgiAggregateBindData from these fields and calls
+// VgiAggregateStreamingClose on its bot context.
 struct StreamingCloseRequest {
 	std::shared_ptr<VgiAttachParameters> attach_params;
 	std::string function_name;
@@ -67,12 +62,11 @@ constexpr VgiCancelWorkerStart kDefaultCancelWorkerStart = VgiCancelWorkerStart:
 constexpr VgiCancelWorkerStart kDefaultCancelWorkerStart = VgiCancelWorkerStart::kOnFirstUse;
 #endif
 
-// Process-wide (per-DatabaseInstance) background thread that drains
-// CancelRequests from destructors. See plan file for rationale: keeps
-// std::bad_alloc and TLS/HTTPS exceptions off the destructor stack,
-// and owns an unregistered bot ClientContext while user connections are open.
-// The last connection closing suspends work and releases that context, breaking
-// the DatabaseInstance -> dispatcher -> context -> DatabaseInstance cycle.
+// Per-DatabaseInstance background thread that drains requests queued by
+// destructors, keeping std::bad_alloc and TLS/HTTPS exceptions off the
+// destructor stack. Owns an unregistered bot ClientContext while user
+// connections are open; the last connection closing suspends work and releases
+// it, breaking the DatabaseInstance -> dispatcher -> context cycle.
 class VgiCancelDispatcher {
 public:
 	explicit VgiCancelDispatcher(DatabaseInstance &db,
@@ -82,15 +76,12 @@ public:
 	VgiCancelDispatcher(const VgiCancelDispatcher &) = delete;
 	VgiCancelDispatcher &operator=(const VgiCancelDispatcher &) = delete;
 
-	// Enqueue a cancel request. Safe to call from a destructor — does
-	// not allocate in steady state and never throws. Returns false on
-	// saturation or after shutdown; caller should not retry.
+	// Safe from a destructor: never throws. Returns false on saturation, while
+	// suspended, after shutdown, or (kExplicitOnly) before the worker runs;
+	// callers should not retry.
 	bool Enqueue(CancelRequest req) noexcept;
 
-	// Enqueue a streaming-close request. Same noexcept / saturation
-	// contract as Enqueue. Used by the streaming-window operator state's
-	// destructor to surrender a worker-side session without needing a
-	// ClientContext on the destruction thread.
+	// Same contract as Enqueue.
 	bool EnqueueStreamingClose(StreamingCloseRequest req) noexcept;
 
 	// Start the worker thread now rather than on first use. Idempotent. Throws
@@ -105,13 +96,10 @@ public:
 	void Suspend();
 	void Resume();
 
-	// Test-only: synchronously drain pending work on the caller's
-	// thread. Does not interact with the worker thread.
+	// Test-only: drain pending work synchronously on the caller's thread.
 	void DrainForTesting();
 
-	// Test-only: accessor used to confirm destructors enqueue. Combined
-	// across both queues; tests inspecting one queue type alone are not
-	// supported.
+	// Test-only: pending count summed across both queues.
 	size_t PendingCountForTesting() const noexcept {
 		return pending_count_.load(std::memory_order_relaxed);
 	}
@@ -155,9 +143,7 @@ private:
 	std::condition_variable cv_;
 };
 
-// Look up the VGI cancel dispatcher for a DatabaseInstance. Returns
-// nullptr if the VGI storage extension isn't registered on this
-// instance (should not happen in practice; defensive).
+// nullptr if the VGI storage extension isn't registered on this instance.
 VgiCancelDispatcher *FindVgiCancelDispatcher(DatabaseInstance &db);
 
 } // namespace vgi

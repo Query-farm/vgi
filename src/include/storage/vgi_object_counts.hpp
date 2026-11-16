@@ -7,10 +7,8 @@
 
 namespace duckdb {
 
-// Per-object-kind counts unpacked from the SchemaInfo / threshold-setting maps
-// at construction time. Keys are matched against VgiCatalogSet::CacheKindName().
-// The hot path (VgiCatalogSet::GetEntry) reads scalar fields off this struct
-// directly — no map lookups, no string compares.
+// Per-object-kind counts unpacked from the SchemaInfo / threshold-setting maps.
+// Keys are VgiCatalogSet::CacheKindName() values.
 struct VgiObjectCounts {
 	int64_t table = 1;
 	int64_t view = 1;
@@ -21,12 +19,12 @@ struct VgiObjectCounts {
 	int64_t macro = 1;
 };
 
-// Build a VgiObjectCounts from a wire-side map. Missing keys take ``default_value``
-// so callers can pick the policy: 1 (treat absent as "small, eager-load") for
-// estimated counts, or the threshold default (e.g. 1000) for thresholds.
+// Missing keys take `default_value`: 1 ("small, eager-load") for estimated
+// counts, the threshold default for thresholds. Unknown keys are ignored.
 VgiObjectCounts ObjectCountsFromMap(const std::map<std::string, int64_t> &m, int64_t default_value);
 
-// Reverse lookup — used only at construction sites, never on the hot path.
+// String lookup; VgiCatalogSet::ResolveEagerLoadParamsLocked calls it once per set
+// and caches the result. Unknown kinds return 1.
 int64_t ObjectCountFor(const VgiObjectCounts &counts, const std::string &kind);
 
 } // namespace duckdb

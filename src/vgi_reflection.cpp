@@ -15,9 +15,7 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// Decoding (tolerant: by name, unknown columns ignored, defaults applied)
-// ============================================================================
+// Decoding is tolerant: by name, unknown columns ignored, defaults applied.
 
 namespace {
 
@@ -129,10 +127,6 @@ VgiProtocolListing DecodeProtocolList(const VgiBatchPtr &batch, const std::strin
 }
 
 } // namespace
-
-// ============================================================================
-// RPC
-// ============================================================================
 
 bool IsReflectionNotHostedError(const std::exception &e) {
 	if (auto *rpc = dynamic_cast<const VgiRpcException *>(&e)) {

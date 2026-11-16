@@ -4,13 +4,10 @@
 #include "vgi_ipc.hpp"
 
 // Catalog discovery metadata: the POD types the worker advertises (settings,
-// secrets, schemas, tables, views, macros, functions) and the parsers that
-// build them from Arrow RecordBatches. Split out of vgi_catalog_api.hpp.
+// secrets, schemas, tables, views, macros, functions) and their parsers.
 //
-// Batches and schemas appear here only as VgiSchemaPtr / VgiBatchPtr (vgi_arrow.hpp,
-// which needs only the C data interface structs)
-// and IPC decoding stays in the .cpp files that actually deserialize.
-// Keep metadata-only consumers cheap to compile; do not include
+// Batches and schemas appear only as VgiSchemaPtr / VgiBatchPtr; IPC decoding
+// stays in the .cpp files. Keep this header cheap: do not include
 // "vgi_rpc_types.hpp" here.
 
 #include <cstdint>
@@ -26,65 +23,55 @@
 #include "duckdb/function/function.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
 
-// Cumulative layering: attach ⊂ metadata ⊂ rpc. Metadata and connection
-// parameters are almost always used together (CatalogRpcContext bundles them),
-// and vgi_attach_parameters.hpp is tiny and Arrow-free, so including it here
-// spares the many [metadata + attach] consumers a second include without
-// dragging in anything heavy.
+// Cumulative layering: attach ⊂ metadata ⊂ rpc (vgi_attach_parameters.hpp is
+// tiny and Arrow-free).
 #include "vgi_attach_parameters.hpp"
 #include "vgi_query_rpc.hpp"
 
-// Arrow types appear only as shared_ptr members / parameters below — see the
-// file header. Forward declarations only.
 namespace duckdb {
 
 class ClientContext;
 
 namespace vgi {
 
-// A setting exposed by a VGI worker
-// Parsed from serialized Setting objects in CatalogAttachResult
+// A setting exposed by a VGI worker (CatalogAttachResult.settings).
 struct VgiSetting {
-	std::string name;                     // Setting name (e.g., "vgi_verbose_mode")
-	std::string description;              // Human-readable description
-	LogicalType type;                     // DuckDB logical type
-	Value default_value;                  // Default value (may be NULL if required)
+	std::string name;
+	std::string description;
+	LogicalType type;
+	Value default_value;                  // May be NULL
 };
 
-// An attach-time option declared by a VGI catalog.
-// Same wire format as VgiSetting; semantic difference is that attach options
-// are delivered once during catalog_attach, not resent per call.
+// An attach-time option declared by a VGI catalog. Same wire format as
+// VgiSetting, but delivered once during catalog_attach rather than per call.
 struct VgiAttachOptionSpec {
 	std::string name;
 	std::string description;
 	LogicalType type;
 	Value default_value;
 	// The caller must supply this option at ATTACH time. Mutually exclusive
-	// with a default: an option that falls back to a value is always
-	// satisfiable without the caller. Absent from a worker that predates the
-	// field, which reads as false.
+	// with a default. Absent on the wire reads as false.
 	bool required = false;
 	// The option is a credential: never written to the result-cache key in plain
 	// text (a salted HMAC instead), redacted from duckdb_databases(), never
-	// logged. Absent from a worker that predates the field, which reads as false.
+	// logged. Absent on the wire reads as false.
 	bool secret = false;
 };
 
 // A parameter definition for a VGI secret type
 struct VgiSecretTypeParam {
-	std::string name;        // Key name (e.g., "secret_string")
-	LogicalType type;        // Value type — any DuckDB type (VARCHAR, INTEGER, BOOLEAN, etc.)
-	bool redact = false;     // Whether this key should be redacted in SHOW SECRETS
+	std::string name;
+	LogicalType type;
+	bool redact = false;     // Redacted in SHOW SECRETS
 	bool required = false;   // vgi_required field metadata: CREATE SECRET must supply it
 	std::string description; // vgi_doc field metadata (empty = undocumented)
 };
 
-// A secret type exposed by a VGI worker
-// Parsed from serialized SecretTypeSpec objects in CatalogAttachResult
+// A secret type exposed by a VGI worker (CatalogAttachResult.secret_types).
 struct VgiSecretType {
-	std::string name;                           // Secret type name (e.g., "vgi_example")
-	std::string description;                    // Human-readable description
-	std::vector<VgiSecretTypeParam> parameters; // Key-value parameter definitions
+	std::string name;
+	std::string description;
+	std::vector<VgiSecretTypeParam> parameters;
 	std::string doc_url;                        // vgi_doc_url schema metadata (empty = none)
 };
 
@@ -95,11 +82,10 @@ struct VgiSecretRequirement {
 	std::string scope;          // Empty = not specified (dynamic — resolved at bind time)
 };
 
-// A companion catalog the client should ATTACH when this VGI catalog attaches
-// (lakehouse federation). Parsed from serialized AttachCatalogInfo objects in
-// CatalogAttachResult.attach_catalogs. Attached at VGI-attach time with a
-// never-clobber conflict policy + scheme allowlist; detached (refcounted) on
-// DETACH. See vgi_extension.cpp companion-attach + docs/companion_catalogs.md.
+// A companion catalog to ATTACH alongside this VGI catalog (lakehouse
+// federation; CatalogAttachResult.attach_catalogs). Attached with a
+// never-clobber policy and scheme allowlist; detached (refcounted) on DETACH.
+// See docs/companion_catalogs.md.
 struct VgiAttachCatalogInfo {
 	std::string alias;                          // ATTACH alias; also a catalog-table branch's source_catalog
 	std::string target;                         // ATTACH target — path or DSN (e.g. "ducklake:sqlite:/m.sqlite")
@@ -110,12 +96,9 @@ struct VgiAttachCatalogInfo {
 	std::string secret_ref;                     // Optional credential to pre-resolve via Orchard; empty = catch-all
 };
 
-// Defined further down in this header; CatalogAttachResult carries a vector of
-// them for the worker's globally-published functions. Forward-declared so the
-// discovery POD stays where it is in the file's reading order.
 struct VgiFunctionInfo;
 
-// Result of catalog_attach call
+// Result of catalog_attach.
 struct CatalogAttachResult {
 	std::vector<uint8_t> attach_opaque_data;
 	bool supports_transactions = false;
@@ -124,18 +107,15 @@ struct CatalogAttachResult {
 	int64_t catalog_version = 0;
 	bool attach_opaque_data_required = false;
 	std::optional<std::string> default_schema = "main";
-	std::vector<VgiSetting> settings;             // Extension options exposed by this catalog
-	std::vector<VgiSecretType> secret_types;      // Secret types exposed by this catalog
-	std::vector<VgiAttachCatalogInfo> attach_catalogs; // Companion catalogs to ATTACH at VGI-attach time
-	std::string comment;                          // Optional comment describing this catalog
-	std::map<std::string, std::string> tags;      // Optional key-value tags for this catalog
+	std::vector<VgiSetting> settings;
+	std::vector<VgiSecretType> secret_types;
+	std::vector<VgiAttachCatalogInfo> attach_catalogs;
+	std::string comment;
+	std::map<std::string, std::string> tags;
 	bool supports_column_statistics = false;      // Whether any tables provide column statistics
-	// Functions this catalog asks the client to ALSO publish into DuckDB's
-	// global function namespace (system.main), so they are callable unqualified.
-	// `name`/`schema_name` stay the real dispatch coordinates — the globally
-	// visible name is derived by applying `global_function_prefix`. Empty =
-	// this catalog publishes nothing globally. Protocol 1.3.0+; older workers
-	// omit the field. See docs/global_functions.md.
+	// Functions also published into system.main, callable unqualified.
+	// `name`/`schema_name` stay the dispatch coordinates; the visible name
+	// applies `global_function_prefix`. See docs/global_functions.md.
 	std::vector<VgiFunctionInfo> global_functions;
 	// Prefix applied to each global_functions entry to form its globally visible
 	// name (`<prefix>_<name>`). Empty = publish bare names.
@@ -147,7 +127,7 @@ struct CatalogAttachResult {
 	std::string resolved_implementation_version;
 	// The worker serves catalog_contents: the whole catalog in one RPC instead
 	// of catalog_schemas + a catalog_schema_contents_* call per schema and kind.
-	// Older workers omit the field and read as false. See docs/catalog_contents.md.
+	// See docs/catalog_contents.md.
 	bool supports_catalog_contents = false;
 	// Immutable explicit-query agreement, selected only after an opt-in offer.
 	std::optional<VgiQueryCapabilities> query_pushdown;
@@ -157,14 +137,9 @@ struct CatalogAttachResult {
 // One published data version of a catalog, surfaced via catalog_catalogs().
 // Mirrors vgi-python CatalogDataVersionRelease.
 struct VgiCatalogReleaseInfo {
-	// Concrete published version (e.g. "1.0.0"). Non-empty per protocol.
-	std::string version;
-	// Release timestamp in microseconds since Unix epoch (UTC). Worker-asserted
-	// non-nullable on the wire; defaults to 0 if a worker ever omits it.
-	int64_t released_at_us = 0;
-	// One-line human summary. Empty when the worker has no opinion.
+	std::string version; // Non-empty per protocol
+	int64_t released_at_us = 0; // Microseconds since Unix epoch (UTC)
 	std::string summary;
-	// Optional per-release link to detailed notes. Empty when null on the wire.
 	std::string notes_url;
 };
 
@@ -174,78 +149,58 @@ struct VgiCatalogInfo {
 	std::string name;
 	std::string implementation_version;  // empty = worker has no opinion
 	std::string data_version_spec;       // empty = worker has no opinion
-	// Attach-time options this catalog accepts. Used for pre-attach discovery
-	// and for bind-time validation in VgiCatalogAttach.
+	// Attach-time options this catalog accepts (pre-attach discovery and
+	// validation at ATTACH).
 	std::vector<VgiAttachOptionSpec> attach_option_specs;
-	// Published data versions for this catalog, newest-first. Empty when the
-	// worker doesn't track release history.
-	std::vector<VgiCatalogReleaseInfo> releases;
-	// Where this worker's code lives (repo, build, docs). Empty when the
-	// worker doesn't advertise a source location.
+	std::vector<VgiCatalogReleaseInfo> releases; // Newest-first
 	std::string source_url;
 };
 
-// Schema metadata from the worker
 struct VgiSchemaInfo {
 	std::string name;
 	std::vector<std::string> path;
 	std::optional<std::string> comment;
 	std::map<std::string, std::string> tags;
-	// Approximate population per object kind, keyed by VgiCatalogSet::CacheKindName()
-	// ("table", "view", "scalar_function", "aggregate_function", "table_function",
-	// "macro", "index"). Empty when the worker doesn't populate the field; missing
-	// keys mean "no opinion" — the eager-load threshold treats them as 1, biasing
-	// toward bulk LoadEntries() for unspecified populations.
+	// Approximate population per object kind, keyed by VgiCatalogSet::CacheKindName().
+	// Missing keys mean "no opinion" and count as 1 for the eager-load threshold,
+	// biasing toward bulk LoadEntries().
 	std::map<std::string, int64_t> estimated_object_count;
 };
 
-// A function the extension calls for a table: an inlined TableInfo.scan_function, or a write function (catalog_table_{insert,update,delete}_function_get)
-// This enables catalogs to delegate scanning to any DuckDB function (e.g., read_parquet, iceberg_scan)
+// A DuckDB function the extension calls for a table (e.g. read_parquet,
+// iceberg_scan): an inlined TableInfo.scan_function, or a write function
+// (catalog_table_{insert,update,delete}_function_get).
 struct VgiScanFunctionResult {
-	std::string function_name;                              // The DuckDB function to call (e.g., "read_parquet")
-	duckdb::vector<Value> positional_arguments;             // Positional arguments for the function
-	std::map<std::string, Value> named_arguments;           // Named arguments for the function
+	std::string function_name;
+	duckdb::vector<Value> positional_arguments;
+	std::map<std::string, Value> named_arguments;
 	std::vector<std::string> required_extensions;           // Extensions to load before calling
-	// DuckDB 1.5 schema containing function_name; adapted from VGI 2.0 schema_path. Empty when
-	// the worker doesn't know (pre-1.5.0 peer) or the function is a native DuckDB
-	// function with no VGI-side schema of its own (e.g. read_parquet) — callers
-	// fall back to the pre-1.5.0 table-schema/default-schema heuristic in that case.
+	// Schema holding function_name, from the wire schema_path. Empty when the
+	// worker sends none, e.g. for a native DuckDB function such as read_parquet.
 	std::string schema_name;
 };
 
-// One physical-source branch within a multi-branch table. The C++ rewriter
-// (VgiMultiScanRewriter, pre_optimize_function) constructs a LogicalGet per
-// branch and stitches them under a LogicalSetOperation(UNION_ALL, ...).
-// `branch_filter` is the raw SQL expression text (parsed at catalog-load,
-// re-bound per rewrite) that the rewriter AND's into the branch's scan
-// before pushdown.
+// One physical-source branch within a multi-branch table. VgiMultiScanRewriter
+// (pre_optimize_function) builds a LogicalGet per branch under a UNION ALL and
+// ANDs `branch_filter` (one SQL expression) into each branch's scan.
 struct VgiScanBranch {
 	std::string function_name;                              // e.g. "vgi_table_scan", "iceberg_scan", "read_parquet"
 	duckdb::vector<Value> positional_arguments;
 	std::map<std::string, Value> named_arguments;
 	std::string branch_filter;                              // Empty == unconstrained
-	// Cached after first parse at catalog-load. NOT bound — re-binding from
-	// the parsed form happens at every rewriter invocation so schema drift
-	// across ATTACH/DETACH / vgi_clear_cache() doesn't corrupt cached
-	// column bindings. Empty when branch_filter is empty or parsing failed.
-	// See plan: §C++ wiring sketch "branch_filter parse-at-attach, ..." bullet.
+	// Parsed at catalog load but NOT bound: each rewrite re-binds it, so schema
+	// drift across ATTACH/DETACH or vgi_clear_cache() cannot leave stale column
+	// bindings. Null when branch_filter is empty (a parse failure throws).
 	duckdb::unique_ptr<ParsedExpression> parsed_branch_filter;
-	// Declares this branch as the INSERT target for the multi-branch
-	// table. At most one branch per table may set this (enforced in
-	// ParseScanBranchesResult). UPDATE/DELETE/MERGE remain refused on
-	// multi-branch tables regardless of this flag; the contract is
-	// INSERT-only until cross-arm semantics have customer-driven evidence.
+	// The INSERT target of the multi-branch table; at most one branch per table
+	// (enforced in ParseScanBranchesResult). UPDATE/DELETE/MERGE are refused on
+	// multi-branch tables regardless.
 	bool writable = false;
 
-	// Catalog-table branch (Approach 3). When function_name is empty and
-	// source_table is set, this branch scans an attached-catalog BASE TABLE —
-	// typically a companion catalog advertised via
-	// CatalogAttachResult.attach_catalogs (e.g. a DuckLake table). The rewriter
-	// binds it via TableCatalogEntry::GetScanFunction (3-arg, with
-	// EntryLookupInfo) rather than TableFunction::bind, so the companion's
-	// snapshot/pruning semantics are honored. The companion must already be
-	// attached (the manifest handles that at VGI-attach time). See
-	// vgi_multi_scan_rewriter.cpp:BindCatalogTableArm.
+	// Catalog-table branch: scans a BASE TABLE of an already-attached catalog,
+	// typically a companion (e.g. DuckLake). BindCatalogTableArm binds it via the
+	// 3-arg TableCatalogEntry::GetScanFunction so the companion's
+	// snapshot/pruning semantics are honored.
 	std::string source_catalog;
 	std::string source_schema;
 	std::string source_table;
@@ -253,12 +208,9 @@ struct VgiScanBranch {
 		return function_name.empty() && !source_table.empty();
 	}
 
-	// --- Format branch (P4) ---------------------------------------------------
-	// A branch that names a FORMAT plus locations rather than a function or a
-	// catalog table: "read these paths as this format". The rewriter binds it via
-	// the format's registered reader (parquet, csv, iceberg, ...), so a worker can
-	// hand back "these 40 parquet files" without needing a function per format or
-	// knowing the reader's argument spelling.
+	// Format branch: "read these locations as this format", bound via the
+	// format's registered reader, so the worker need not know reader argument
+	// spellings.
 	std::string format_name;
 	std::vector<std::string> format_locations;
 	std::map<std::string, Value> format_options;
@@ -266,29 +218,19 @@ struct VgiScanBranch {
 		return function_name.empty() && source_table.empty() && !format_name.empty();
 	}
 
-	// The three branch kinds are mutually exclusive, and the discriminator is
-	// which of the three identifying fields is populated:
-	//
-	//   function branch  -> function_name
-	//   catalog table    -> source_table   (function_name empty)
-	//   format branch    -> format_name    (function_name AND source_table empty)
-	//
-	// Checked at parse rather than at bind: a branch that sets two of them is a
-	// worker bug, and discovering it at bind time would attribute the failure to
-	// the query instead of to the catalog.
+	// The three branch kinds are mutually exclusive: exactly one of
+	// function_name / source_table / format_name is set. Checked at parse so a
+	// worker bug is attributed to the catalog rather than the query.
 	bool IsFunctionBranch() const {
 		return !function_name.empty();
 	}
 
-	// Function branch only: DuckDB 1.5 schema containing function_name, adapted from schema_path. Empty when
-	// registered in. Empty for a catalog-table/format branch, a pre-1.5.0 peer,
-	// or a native DuckDB function — not to be confused with source_schema above,
-	// which names a catalog-table branch's SOURCE table's schema, a different,
-	// older field.
+	// Function branch only: the schema holding function_name (wire schema_path).
+	// Empty for other branch kinds or a native DuckDB function. Distinct from
+	// source_schema, the catalog-table branch's source table schema.
 	std::string schema_name;
 
-	// --- Protocol 3.2 branch statistics (docs/protocol/scan-planning.md) -------
-	// Estimated rows before any predicate; cardinality only, never exact.
+	// Protocol 3.2 branch statistics. Estimated rows before any predicate.
 	std::optional<int64_t> row_count;
 	// Raw serialize_column_statistics IPC payload (same wire shape as
 	// TableInfo.column_statistics), keyed by the table's declared column names.
@@ -301,11 +243,12 @@ struct VgiScanBranch {
 // protocol 3.3. (VgiScanFunctionResult remains the shape of the write-function
 // RPCs and of an inlined TableInfo.scan_function.)
 struct VgiScanBranchesResult {
-	std::vector<VgiScanBranch> branches;                    // One or more; empty list is loud-rejected at parse
+	// Zero branches parse: the legal "no rows" answer for a 'filtered' table.
+	// Bind-time callers reject an empty list.
+	std::vector<VgiScanBranch> branches;
 	std::vector<std::string> required_extensions;           // Union across all branches
 };
 
-// Table metadata from the worker
 struct VgiTableInfo {
 	std::string name;
 	std::string schema_name;
@@ -322,16 +265,14 @@ struct VgiTableInfo {
 	std::vector<uint8_t> definition_revision;
 	std::map<std::string, std::vector<std::vector<uint8_t>>> not_null_constraint_refs;
 
-	// Constraint indices
 	std::vector<int> not_null_constraints;
 	std::vector<std::vector<int>> unique_constraints;
 	std::vector<std::string> check_constraints;
 	std::vector<std::vector<int>> primary_key_constraints;
 
-	// Foreign key constraints (deserialized from IPC bytes)
 	struct ForeignKey {
-		std::vector<std::string> fk_columns;        // Column names in this table
-		std::vector<std::string> pk_columns;        // Column names in referenced table
+		std::vector<std::string> fk_columns;        // Columns in this table
+		std::vector<std::string> pk_columns;        // Columns in the referenced table
 		std::string referenced_table;
 		std::string referenced_schema;
 	};
@@ -341,20 +282,16 @@ struct VgiTableInfo {
 	// operation is unsupported; modes are ordered count < rows < changes.
 	std::map<std::string, std::string> write_result_modes;
 
-	// Column statistics capability — indicates this table can provide column-level statistics
 	bool supports_column_statistics = false;
 
-	// Optional inlined function-discovery results. When populated, the
-	// extension uses the cached value and skips the corresponding
-	// catalog_table_{scan,insert,update,delete}_function_get RPC. Workers
-	// whose function args change more frequently than catalog_version
-	// (rotating credentials, presigned URLs, per-transaction snapshots)
-	// must leave these unset so the per-bind RPC continues to fire.
+	// Optional inlined function-discovery results; when set, the matching
+	// catalog_table_*_function_get RPC is skipped. Workers whose function args
+	// change faster than catalog_version (rotating credentials, presigned URLs)
+	// must leave these unset.
 	std::optional<VgiScanFunctionResult> scan_function;
-	// Protocol 3.2: "bind" resolves the scan redirect at bind time (3.1
-	// behaviour); "filtered" defers catalog_table_scan_branches_get to the
-	// pre-optimizer rewrite, which sends the query's predicates as
-	// pushdown_filters. Validated at parse (no inlined scan_function).
+	// "bind" resolves the scan redirect at bind time; "filtered" defers
+	// catalog_table_scan_branches_get to the pre-optimizer rewrite, which sends
+	// the query's predicates. "filtered" forbids an inlined scan_function.
 	std::string scan_planning = "bind";
 	bool IsFilteredScanPlanning() const {
 		return scan_planning == "filtered";
@@ -363,37 +300,20 @@ struct VgiTableInfo {
 	std::optional<VgiScanFunctionResult> update_function;
 	std::optional<VgiScanFunctionResult> delete_function;
 
-	// Optional inlined cardinality. When populated, the extension uses
-	// these directly and skips the per-bind ``table_function_cardinality``
-	// RPC. Use for read-only or slow-changing tables. Workers whose
-	// cardinality changes faster than ``catalog_version`` (e.g. live
-	// counters) must leave these unset so the per-bind RPC continues to
-	// fire.
+	// Optional inlined cardinality; skips the per-bind table_function_cardinality
+	// RPC. Must be unset when cardinality changes faster than catalog_version.
 	std::optional<int64_t> cardinality_estimate;
 	std::optional<int64_t> cardinality_max;
 
-	// Optional inlined column statistics. When populated, the extension
-	// pre-populates VgiTableEntry's stats cache from these bytes (lazily,
-	// at first GetStatistics call) and skips both the per-scan
-	// `table_function_statistics` RPC and the per-table
-	// `catalog_table_column_statistics_get` RPC. Bytes are the IPC payload
-	// produced by `serialize_column_statistics(stats, cache_max_age_seconds)`
-	// on the worker — same wire shape as the on-demand RPC's response, so the
-	// existing `ParseColumnStatisticsBatch` deserializer is reused verbatim.
-	// Workers whose statistics change faster than `catalog_version` (e.g.
-	// live counters) must leave this unset so the on-demand RPC continues
-	// to fire.
+	// Optional inlined column statistics (same IPC payload as the on-demand
+	// RPC's response). Seeds VgiTableEntry's stats cache lazily and skips the
+	// table_function_statistics / catalog_table_column_statistics_get RPCs.
+	// Must be unset when statistics change faster than catalog_version.
 	std::optional<std::vector<uint8_t>> column_statistics;
 
-	// Optional inlined bind result. Bytes are the IPC payload of
-	// `BindResponse.serialize_to_bytes()` — same wire shape the worker would
-	// have returned from a `bind` RPC. When populated,
-	// `PerformVgiTableFunctionBind` builds equivalent bind_request_bytes via
-	// `BuildBindRequestBytes` and constructs a `BindResult` directly via
-	// `BuildBindResultFromInlinedBytes`, skipping the on-wire bind RPC.
-	// Only set by workers using vgi-python's `Table(inline_bind=True)`
-	// declarative path (which is restricted to `@bind_fixed_schema`-decorated
-	// functions whose bind output is a pure function of `cls.FIXED_SCHEMA`).
+	// Optional inlined bind result: the IPC payload a `bind` RPC would return.
+	// When set, PerformVgiTableFunctionBind skips the bind RPC
+	// (BuildBindResultFromInlinedBytes). Only valid when bind output is fixed.
 	std::optional<std::vector<uint8_t>> bind_result;
 
 	// AND-of-OR groups of raw column paths. Dots and quotes are literal.
@@ -402,17 +322,15 @@ struct VgiTableInfo {
 	std::vector<std::vector<std::vector<std::string>>> required_filters;
 };
 
-// View metadata from the worker
 struct VgiViewInfo {
 	std::string name;
 	std::string schema_name;
-	std::string definition; // SQL query defining the view
+	std::string definition; // SQL query
 	std::vector<std::string> aliases; // Ordered raw output identifiers
-	std::string security; // regular or barrier; 1.5 accepts only regular
+	std::string security; // "regular" or "barrier"; only regular is accepted
 	std::optional<std::string> comment;
 	std::map<std::string, std::string> tags;
-	// Per-column comments keyed by the view's output column name. Fed into
-	// CreateViewInfo.column_comments_map so they surface via duckdb_columns().
+	// Keyed by output column name; surface via duckdb_columns().
 	std::map<std::string, std::string> column_comments;
 };
 
@@ -448,49 +366,39 @@ struct VgiMacroInfo {
 	std::map<std::string, std::string> tags;
 };
 
-// ============================================================================
-// Function Metadata Enums and Parsing
-// ============================================================================
+// ---- Function metadata ----
 
-// Type of function for DuckDB registration
-// Wire format: lowercase string ("scalar", "table", "table_buffering", "aggregate")
+// Wire format: lowercase ("scalar", "table", "table_buffering", "aggregate").
 enum class VgiFunctionType {
-	Scalar,         // Scalar function: one output per input row
+	Scalar,
 	Table,          // Streaming table function (incl. streaming table_in_out)
 	TableBuffering, // Buffered table function — Sink+Source PhysicalOperator
-	Aggregate       // Aggregate function: many inputs → one output
+	Aggregate
 };
 
 
-// Convert VgiFunctionType to string for error messages
 std::string VgiFunctionTypeToString(VgiFunctionType type);
 
-// Row order preservation behavior for table functions.
-// Wire format: uppercase enum name. Maps to DuckDB's OrderPreservationType:
-//   "PRESERVES_ORDER"    -> OrderPreservationType::INSERTION_ORDER (DuckDB default)
-//   "NO_ORDER_GUARANTEE" -> OrderPreservationType::NO_ORDER
-//   "FIXED_ORDER"        -> OrderPreservationType::FIXED_ORDER
-//                           (DuckDB serializes the pipeline -> single worker)
+// Row order preservation for table functions (wire: uppercase enum name).
+// Maps to OrderPreservationType INSERTION_ORDER / NO_ORDER / FIXED_ORDER; a
+// FIXED_ORDER source is also clamped to one thread (see bind_data fixed_order).
 enum class VgiOrderPreservation {
-	PreservesOrder,    // Output rows preserve insertion order of inputs
-	NoOrderGuarantee,  // Output order is undefined (may be reordered)
-	FixedOrder         // Output is in a fixed mandatory order; DuckDB serializes
+	PreservesOrder,
+	NoOrderGuarantee,
+	FixedOrder
 };
 
 
 // Partition shape declared by a table function over its
 // vgi.partition_column-annotated bind-schema fields. Mirrors DuckDB's
-// duckdb::TablePartitionInfo enum (partition_stats.hpp:20).
+// duckdb::TablePartitionInfo enum (duckdb/function/partition_stats.hpp).
 //
 //   "NOT_PARTITIONED"          -> TablePartitionInfo::NOT_PARTITIONED
 //   "SINGLE_VALUE_PARTITIONS"  -> TablePartitionInfo::SINGLE_VALUE_PARTITIONS
 //                                 (unlocks PhysicalPartitionedAggregate)
 //   "OVERLAPPING_PARTITIONS"   -> TablePartitionInfo::OVERLAPPING_PARTITIONS
-//                                 (wire-level declarable; no consumer in
-//                                 upstream DuckDB today)
 //   "DISJOINT_PARTITIONS"      -> TablePartitionInfo::DISJOINT_PARTITIONS
-//                                 (wire-level declarable; no consumer in
-//                                 upstream DuckDB today)
+//                                 (the last two have no DuckDB planner consumer)
 enum class VgiPartitionKind {
 	NotPartitioned,
 	SingleValuePartitions,
@@ -514,10 +422,8 @@ enum class VgiArgumentMonotonicity {
 // Parse the uppercase VGI wire spelling. Returns nullopt for unknown values.
 std::optional<VgiArgumentMonotonicity> ParseVgiArgumentMonotonicity(const std::string &value);
 
-// ============================================================================
-// Custom COPY ... FROM format advertised by a catalog (matches Python
-// CopyFromFormatInfo). The extension registers one DuckDB CopyFunction per
-// entry at ATTACH; see vgi_copy_from_impl.{hpp,cpp}.
+// Custom COPY format advertised by a catalog (Python CopyFromFormatInfo). One
+// DuckDB CopyFunction is registered per entry at ATTACH; see vgi_copy_from_impl.
 struct VgiCopyFromFormatInfo {
 	std::string format_name;       // SQL FORMAT identifier (global namespace)
 	std::string handler;           // worker table-function that performs the read
@@ -526,15 +432,12 @@ struct VgiCopyFromFormatInfo {
 	std::string description;       // intrinsic doc (handler Meta.description)
 	std::optional<std::string> comment; // free-text comment (nullopt if unset)
 	std::map<std::string, std::string> tags;
-	// Option schema: deserialized Arrow schema of the format's options, built
-	// from the handler's Arg-annotated arguments (same encoding parsed by
-	// vgi_function_arguments()). Null when the format declares no options.
+	// The format's options, from the handler's arguments (same encoding as a
+	// function arguments_schema). Null when there are none.
 	VgiSchemaPtr options_schema;
 };
 
-// ============================================================================
-// Function metadata from the worker (matches Python FunctionInfo)
-//! One page of a scan plan, plus the plan-level facts carried on every page.
+//! One split of a scan plan.
 struct VgiScanSplit {
 	//! Framework-stamped token redeemed by table_function_init.
 	std::string token;
@@ -542,6 +445,7 @@ struct VgiScanSplit {
 	std::optional<std::vector<uint8_t>> key_value;
 };
 
+//! One page of a scan plan, plus the plan-level facts carried on every page.
 struct VgiScanPlanPage {
 	//! Decoded split facts needed by the DuckDB adapter, in worker order.
 	std::vector<VgiScanSplit> splits;
@@ -573,9 +477,7 @@ struct VgiScanPlan {
 	std::optional<std::vector<std::string>> identity_key_columns;
 	//! Only for diagnostics in the bounds errors.
 	std::string function_name;
-	//! How many enumeration pages this plan took. A worker that paginates is
-	//! trading round trips for a smaller peak; seeing the count is how an operator
-	//! tells "one page" from "thirty" without instrumenting the worker.
+	//! How many enumeration pages this plan took (diagnostics).
 	idx_t pages = 0;
 };
 
@@ -595,6 +497,7 @@ enum class VgiFunctionVisibility : uint8_t {
 	TableOnly,
 };
 
+// Function metadata from the worker (Python FunctionInfo).
 struct VgiFunctionInfo {
 	std::string name;
 	std::string schema_name;
@@ -602,73 +505,50 @@ struct VgiFunctionInfo {
 	VgiFunctionVisibility visibility = VgiFunctionVisibility::Public;
 	std::string description;
 	// Short operator-facing note (e.g. "deprecated, use v2"), distinct from
-	// `description`'s intrinsic documentation — mirrors the `comment` field
-	// every other catalog object (table/view/schema) already carries.
-	// Static (worker Meta.comment) only; there is no COMMENT ON FUNCTION RPC,
-	// unlike tables/views. Empty when the worker didn't set one.
+	// `description`. Static only: there is no COMMENT ON FUNCTION RPC.
 	std::string comment;
 	std::map<std::string, std::string> tags;
 
-	// Arguments and output as deserialized Arrow schemas
 	VgiSchemaPtr arguments_schema;
 	VgiSchemaPtr output_schema;
-	// IPC-serialized one-row RecordBatch containing only parameters with
-	// defaults, in signature order. Column presence distinguishes "no default"
-	// from an explicit NULL default. DuckDB 1.5 stores this for discovery and
-	// forwards-compatible registration; DuckDB 2.0 adapters can install the
-	// values directly on FunctionSignature.
+	// IPC-serialized one-row batch of only the parameters with defaults, in
+	// signature order; column presence distinguishes "no default" from a NULL
+	// default. Validated and stored; not yet installed on the DuckDB signature.
 	std::vector<uint8_t> parameter_default_values_bytes;
 
-	// Documentation fields
-	std::vector<std::string> examples;    // SQL examples showing function usage
-	std::vector<std::string> categories;  // Function categories for organization
+	std::vector<std::string> examples;
+	std::vector<std::string> categories;
 
-	// Scalar function behavior fields (nullopt if not applicable)
-	// Uses DuckDB's FunctionStability enum (CONSISTENT, VOLATILE, CONSISTENT_WITHIN_QUERY)
 	std::optional<FunctionStability> stability;
-	// Uses DuckDB's FunctionNullHandling enum (DEFAULT_NULL_HANDLING, SPECIAL_HANDLING)
 	std::optional<FunctionNullHandling> null_handling;
 	// Scalar-only claims aligned exactly with arguments_schema declaration
 	// slots. nullopt means no claims; a vararg occupies one slot.
 	std::optional<std::vector<VgiArgumentMonotonicity>> argument_monotonicity;
 
-	// Table function capabilities (nullopt if not applicable)
 	std::optional<bool> projection_pushdown;
 	std::optional<bool> filter_pushdown;
 	std::optional<bool> sampling_pushdown;
-	// True when the worker advertises that the table participates in DuckDB's
-	// late-materialization optimizer (Meta.late_materialization). nullopt/false
-	// for older workers that omit the metadata column. Only honoured when the
-	// table also exposes a rowid virtual column and filter/projection pushdown
-	// (see GetScanFunctionImpl in vgi_table_entry.cpp).
+	// Participates in DuckDB's late-materialization optimizer. Only honoured
+	// when the table also exposes a rowid virtual column and filter/projection
+	// pushdown (see VgiTableEntry::GetScanFunctionImpl).
 	std::optional<bool> late_materialization;
 	std::optional<VgiOrderPreservation> order_preservation;
 	std::optional<int32_t> max_workers;
 
-	// True when the function opts in to per-batch ``vgi_batch_index`` tagging
-	// (Meta.supports_batch_index = True on the worker side). Triggers two
-	// registration-time effects in vgi_table_function_set.cpp:
-	//   1. ``table_func.get_partition_data = VgiGetPartitionData`` so ordered
-	//      sinks (BatchCollector, BatchInsert, BatchCopyToFile, Limit) can
-	//      reassemble parallel output in partition-id order.
-	//   2. The FIXED_ORDER ``MaxThreads()=1`` clamp is skipped; the source
-	//      stays parallel and the sink does the ordering.
+	// Per-batch ``vgi_batch_index`` tagging: installs get_partition_data so
+	// ordered sinks reassemble parallel output, and skips the FIXED_ORDER
+	// single-thread clamp (see BuildVgiTableFunctionSet).
 	bool supports_batch_index = false;
 
-	// True when the worker implements on_plan()/on_split(), i.e. the scan can be
-	// divided into named, independently redeemable splits. Read at BIND (not init)
-	// so a ``SET vgi_split_scans`` between bind and execute cannot produce a bind
-	// that assumed splits and an init that does not.
+	// The scan can be divided into named, independently redeemable splits.
+	// Combined with ``vgi_split_scans`` at bind (VgiCatalogTableFunctionBind).
 	bool supports_splits = false;
 
 	// True when the worker applies pushed-down filters exactly, so the engine may
 	// drop its own filter above the scan. No DuckDB consumer today.
 	bool filters_exactly_applied = false;
 
-	// True when the function exposes addressable positions in the data
-	// (incremental / streaming reads). No DuckDB consumer today - DuckDB has no
-	// streaming scan - but the field is on the wire so retrofitting it later would
-	// not re-shape plan().
+	// Addressable positions in the data (incremental reads). No DuckDB consumer.
 	bool supports_positions = false;
 
 	// How long a split token stays redeemable; nullopt means UNBOUNDED. A client
@@ -676,142 +556,98 @@ struct VgiFunctionInfo {
 	// and must refuse a plan whose TTL is below its own scheduling horizon.
 	std::optional<int64_t> split_token_ttl_seconds;
 
-	// Partition shape declared by the function over its
-	// ``vgi.partition_column``-annotated bind-schema fields
-	// (Meta.partition_kind on the worker side). When non-NotPartitioned,
-	// vgi_table_function_set.cpp installs:
-	//   - ``table_func.get_partition_info = VgiGetPartitionInfo``
-	//     so DuckDB's planner can pick PhysicalPartitionedAggregate for
-	//     matching GROUP BY queries (today, only SINGLE_VALUE_PARTITIONS
-	//     materially changes planner behavior).
-	//   - ``table_func.get_partition_data = VgiGetPartitionData`` (also
-	//     installed for supports_batch_index; idempotent).
-	// Per-column annotation lives in the bind schema's per-field
-	// KeyValueMetadata (``vgi.partition_column == "true"``); the C++
-	// extension walks the output_schema once at bind time and stashes
-	// the matching column indices on bind_data.
+	// Partition shape over the bind-schema fields marked
+	// ``vgi.partition_column = "true"``. When set, BuildVgiTableFunctionSet
+	// installs get_partition_info / get_partition_data so the planner can pick
+	// PhysicalPartitionedAggregate for matching GROUP BY queries.
 	VgiPartitionKind partition_kind = VgiPartitionKind::NotPartitioned;
 
-	// VGI filter-expression semantic profiles implemented by the worker.
-	// Protocol 2.0 removes the v1 supported_expression_filters name allowlist;
-	// extension functions and runtime artifacts are capability records of their own.
+	// Filter-expression semantic profiles the worker implements; extra filter
+	// functions are listed separately as capability records.
 	std::vector<std::string> filter_semantic_profiles;
 	std::vector<VgiFilterFunctionCapability> additional_filter_functions;
 
-	// Aggregate function fields - uses DuckDB's enums
 	AggregateOrderDependent order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	AggregateDistinctDependent distinct_dependent = AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
-	// True when the aggregate implements the window() callback (enables
-	// DuckDB's custom-window aggregator path with partition caching).
+	// The aggregate implements window() (DuckDB's custom-window aggregator path).
 	bool supports_window = false;
 
-	// True when the aggregate opts into the streaming-partitioned protocol
-	// (aggregate_streaming_open/_chunk/_close). The optimizer rule replaces
-	// LogicalWindow with a custom streaming operator when this is set and
-	// the query shape is compatible (cumulative frame, sorted input).
+	// Streaming-partitioned aggregate protocol: an optimizer rule replaces a
+	// compatible LogicalWindow (cumulative frame, sorted input) with a custom
+	// streaming operator.
 	bool streaming_partitioned = false;
 
-	// True when a table-in-out function declares a finalize/finish stage.
-	// DuckDB rejects ``in_out_function_final`` alongside LATERAL-projected
-	// input; we only register the finalize callback when this is set.
+	// A table-in-out function declares a finalize stage; the finalize callback
+	// is registered only then (see BuildVgiTableFunctionSet).
 	bool has_finalize = false;
 
-	// Whether this function uses the buffered Sink+Source path is encoded in
-	// ``function_type`` (TableBuffering vs Table) — there is no separate
-	// boolean flag on the wire. The optimizer extension keys off
-	// ``function_type == TableBuffering``.
-
-	// Only meaningful when ``function_type == TableBuffering``. When True,
-	// the source phase is single-threaded and ``finalize_state_ids`` drain in
-	// combine-returned order. Default False enables parallel finalize.
+	// TableBuffering only: single-threaded source; ``finalize_state_ids`` drain
+	// in combine-returned order. False enables parallel finalize.
 	bool source_order_dependent = false;
 
-	// Only meaningful when ``function_type == TableBuffering``. When True,
-	// the SINK phase runs single-threaded — every process() call arrives in
-	// source order on one worker. Mutually exclusive with
-	// requires_input_batch_index.
+	// TableBuffering only: single-threaded sink, process() calls arrive in source
+	// order on one worker. Mutually exclusive with requires_input_batch_index.
 	bool sink_order_dependent = false;
 
-	// Only meaningful when ``function_type == TableBuffering``. When True,
-	// the C++ Sink operator declares RequiredPartitionInfo()=BatchIndex() so
-	// DuckDB threads a globally-unique monotonic batch_index from the source
-	// into every process() RPC. Workers can sort by it in combine() to
-	// reconstruct source order under parallel ingest. Mutually exclusive
-	// with sink_order_dependent.
+	// TableBuffering only: the Sink requires BatchIndex partition info, so every
+	// process() RPC carries the source batch_index and combine() can restore
+	// source order under parallel ingest. Mutually exclusive with
+	// sink_order_dependent.
 	bool requires_input_batch_index = false;
 
-	// Blended ("UNNEST-style") table-in-out: the function's positional args ARE
-	// its per-row input columns (real typed args, no synthetic TABLE placeholder),
-	// so ONE registration serves f(52,13) (literal), FROM t, f(t.x,t.y) (columns),
-	// and LATERAL f(t.x,t.y). The registration enters the in-out branch on this
-	// flag even without a TABLE-typed arg, and bind builds the input schema from
-	// the declared arg names + drives the literal single-row scan-mode.
+	// Blended table-in-out: positional args are the per-row input columns, so
+	// one registration serves f(52,13), FROM t, f(t.x,t.y) and LATERAL. Bind
+	// builds the input schema from the declared arg names.
 	bool input_from_args = false;
 	// Blended only: the most input rows one worker call receives. Each input chunk
 	// is split into calls of at most this many rows. Unset = a whole chunk per call.
 	std::optional<int64_t> input_rows_per_call;
 
-	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;
 
-	// Secrets required by this function (resolved from SecretManager during bind)
+	// Resolved from the SecretManager during bind.
 	std::vector<VgiSecretRequirement> required_secrets;
 };
 
-// Parse a VgiSetting from serialized bytes (Arrow IPC format)
-// The bytes contain a single-row RecordBatch with: name, description, type, default_value
+// Parsers for IPC-serialized single-row records.
 VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path,
                            ClientContext &context);
 
-// Parse a VgiAttachOptionSpec from serialized bytes (Arrow IPC format).
-// Wire format matches VgiSetting: name, description, type, default_value.
 VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes, const std::string &worker_path,
                                           ClientContext &context);
 
-// Parse a VgiSecretType from serialized bytes (Arrow IPC format)
-// The bytes contain a single-row RecordBatch with: name, description, parameters_schema
-// parameters_schema is an IPC-serialized Arrow schema where each field defines a secret parameter
-// Field metadata {"redact": "true"} marks keys that should be redacted in SHOW SECRETS
+// parameters_schema fields define the secret's keys; {"redact": "true"} field
+// metadata marks keys redacted in SHOW SECRETS.
 VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::string &worker_path,
                                   ClientContext &context);
 
-// Parse a CatalogAttachResult from an Arrow RecordBatch
+// Parsers for metadata RecordBatches (single row unless given row_idx).
 CatalogAttachResult ParseCatalogAttachResult(const VgiBatchPtr &batch,
                                              const std::string &worker_path, ClientContext &context, bool query_offered = false);
 
-// Parse a VgiSchemaInfo from an Arrow RecordBatch (single row)
 VgiSchemaInfo ParseSchemaInfo(const VgiBatchPtr &batch, const std::string &worker_path);
 
-// Parse a VgiTableInfo from an Arrow RecordBatch (single row).
-// `context` is required to decode optional inlined ScanFunctionResults
-// (their nested IPC arguments need ArrowBatchToValues).
+// `context` decodes the arguments of inlined ScanFunctionResults.
 VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
                             const std::string &worker_path);
 
-// Parse a VgiTableInfo from an Arrow RecordBatch at a specific row (for multi-row batches)
 VgiTableInfo ParseTableInfo(ClientContext &context, const VgiBatchPtr &batch,
                             int64_t row_idx, const std::string &worker_path);
 
-// Parse multiple schemas from a batch (for schemas() call)
 std::vector<VgiSchemaInfo> ParseSchemaList(const VgiBatchPtr &batch,
                                            const std::string &worker_path);
 
-// Parse a VgiFunctionInfo from an Arrow RecordBatch at a specific row
 VgiFunctionInfo ParseFunctionInfo(const VgiBatchPtr &batch, int64_t row_idx,
                                   const std::string &worker_path);
 
-// Parse a VgiViewInfo from an Arrow RecordBatch (single row)
 VgiViewInfo ParseViewInfo(const VgiBatchPtr &batch, const std::string &worker_path);
 
-// Parse a VgiCopyFromFormatInfo from an Arrow RecordBatch (single row)
 VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const VgiBatchPtr &batch,
                                               const std::string &worker_path);
 
-// Parse a VgiMacroInfo from an Arrow RecordBatch (single row)
 VgiMacroInfo ParseMacroInfo(const VgiBatchPtr &batch, const std::string &worker_path);
 
-// Parse a VgiScanFunctionResult from an Arrow RecordBatch (single row)
-// The arguments field is a nested IPC batch with arg_0, arg_1, ... for positional args and named args by name
+// `arguments` is a nested IPC batch: arg_0, arg_1, ... positional, others named.
 VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const VgiBatchPtr &batch,
                                                const std::string &worker_path);
 

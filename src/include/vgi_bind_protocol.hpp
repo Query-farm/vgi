@@ -24,23 +24,12 @@ struct VgiSecretRequirement;
 struct CopyFromBindContext;
 struct CopyToBindContext;
 
-// ============================================================================
-// Bind Protocol Orchestration
-// ============================================================================
-
-// Callback type: given serialized bind request bytes, sends them via transport
-// and returns the deserialized bind response RecordBatch.
+// Sends serialized BindRequest bytes over the transport (subprocess, HTTP, ...)
+// and returns the transport-validated BindResponse batch.
 using BindTransportFn = std::function<VgiBatchPtr(const std::vector<uint8_t> &request_bytes)>;
 
-// Orchestrates the full bind protocol:
-// 1. Serialize arguments, settings, input_schema, secrets
-// 2. Build and send initial BindRequest via transport_fn
-// 3. Handle two-phase bind (scoped secrets) if requested by worker
-// 4. Parse final BindResponse → BindResult
-//
-// The transport_fn abstracts away subprocess vs HTTP send/receive.
-// It receives serialized BindRequest bytes and must return the deserialized
-// BindResponse RecordBatch (after validating the transport-level response).
+// Full bind: send the BindRequest, and if the worker answers with a secret-scope
+// request, resolve those secrets and resend once (a second request is an error).
 BindResult PerformBindProtocol(
     ClientContext &context,
     const std::string &function_name,
@@ -60,15 +49,9 @@ BindResult PerformBindProtocol(
     const std::string &schema_name = {},  // owning catalog schema; empty = null
     const std::optional<std::vector<std::optional<std::string>>> &argument_names = std::nullopt);
 
-// Build the IPC-serialized BindRequest bytes that PerformBindProtocol sends
-// over the wire. Factored out so the inline-bind path (which has the
-// pre-built BindResponse but still needs RPC-equivalent bind_request_bytes
-// for cardinality / statistics / init / dynamic_to_string) can produce the
-// same bytes without going through the network.
-//
-// `resolved_secrets` is the already-resolved secrets map (typed as a
-// {key: Value} for symmetry with the rest of the bind path); the function
-// constructs the secrets batch from it.
+// The IPC BindRequest bytes PerformBindProtocol sends. Also used by the inline-
+// bind path, which has the BindResponse already but still needs identical
+// request bytes for cardinality / statistics / init / dynamic_to_string.
 std::vector<uint8_t> BuildBindRequestBytes(
     ClientContext &context,
     const std::string &function_name,
@@ -88,17 +71,11 @@ std::vector<uint8_t> BuildBindRequestBytes(
     const std::string &schema_name = {},  // owning catalog schema; empty = null
     const std::optional<std::vector<std::optional<std::string>>> &argument_names = std::nullopt);
 
-// Non-network entrypoint: given pre-built bind_request_bytes (typically from
-// `BuildBindRequestBytes`) and an inlined bind_response blob (from
-// `TableInfo.bind_result`), return a populated `BindResult` ready to hand
-// to PerformInit / cardinality / statistics. Skips the wire RPC entirely.
-//
-// `resolved_secrets` must be the map that built `bind_request_bytes`: it is
-// what init hands the worker, so it is what the result cache keys on.
-//
-// Throws IOException if the inlined blob is malformed or carries a
-// secret-scope request (which can only be resolved over the RPC path).
-// Callers should catch and fall back to the on-demand bind RPC.
+// Builds a BindResult from an inlined bind_response blob (TableInfo.bind_result)
+// without a bind RPC. `resolved_secrets` must be the map that built
+// `bind_request_bytes`: init hands it to the worker, so the result cache keys
+// on it. Throws IOException if the blob is malformed or is a secret-scope
+// request (only the RPC path can resolve one); callers fall back to the RPC.
 BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_bytes,
                                            const std::vector<uint8_t> &bind_response_bytes,
                                            const std::string &worker_label, bool secret_dependent,

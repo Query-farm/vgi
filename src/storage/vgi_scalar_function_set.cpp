@@ -36,16 +36,13 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 	ScalarFunctionSet func_set {Identifier(registered_name)};
 
 	for (const auto &func_info : overloads) {
-		// Parse argument types, distinguishing positional from named arguments
-		// Named arguments have metadata "vgi_arg: named" in the Arrow schema
-		// Note: ScalarFunction doesn't support named_parameters like TableFunction does,
-		// so named arguments would need to be handled differently when execution is implemented
+		// ScalarFunction has no named parameters: named arguments only appear in
+		// the function description below.
 		vgi::FunctionArgumentTypes arg_types;
 		if (func_info.arguments_schema) {
 			arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
 		}
 
-		// Determine return type from output_schema (required, must have exactly 1 field)
 		if (!func_info.output_schema) {
 			throw InvalidInputException("Scalar function '%s' missing required output_schema", func_info.name);
 		}
@@ -54,7 +51,7 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 			                            func_info.name, func_info.output_schema->num_fields());
 		}
 
-		// Check if output type is marked as "any" type (dynamic output type)
+		// "vgi:any" or vgi_type=any marks a dynamic return type.
 		auto metadata = func_info.output_schema->field_metadata(0);
 		bool is_any_output = false;
 		if (!metadata.empty()) {
@@ -62,7 +59,6 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 			if (type_idx >= 0) {
 				is_any_output = true;
 			}
-			// Also check vgi_type metadata
 			type_idx = metadata.FindKey("vgi_type");
 			if (type_idx >= 0 && metadata.value(type_idx) == "any") {
 				is_any_output = true;
@@ -71,10 +67,8 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 
 		LogicalType return_type;
 		if (is_any_output) {
-			// Dynamic return type - use ANY
 			return_type = LogicalType::ANY;
 		} else {
-			// Static return type - convert from Arrow schema
 			ArrowSchemaWrapper c_schema;
 			ArrowTableSchema arrow_table;
 			vector<LogicalType> output_types;
@@ -91,25 +85,21 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 		// Remote execution can report errors for otherwise well-typed inputs.
 		scalar_func.SetFallible();
 
-		// Set stability from function metadata, defaulting to CONSISTENT
-		// to match the DuckDB default.
+		// Default CONSISTENT, matching DuckDB.
 		if (func_info.stability.has_value()) {
 			scalar_func.SetStability(func_info.stability.value());
 		} else {
 			scalar_func.SetStability(FunctionStability::CONSISTENT);
 		}
 
-		// Set null handling from function metadata (SPECIAL_HANDLING allows function to receive nulls)
 		if (func_info.null_handling.has_value()) {
 			scalar_func.SetNullHandling(func_info.null_handling.value());
 		}
 
-		// Set varargs if this function accepts variable arguments
 		if (arg_types.has_varargs) {
 			scalar_func.GetSignature().AddArgs("args", arg_types.varargs_type);
 		}
 
-		// Create VgiScalarFunctionInfo with worker connection details
 		auto scalar_func_info = make_shared_ptr<VgiScalarFunctionInfo>();
 		scalar_func_info->attach_params = target.attach_params;
 		scalar_func_info->attach_opaque_data = target.attach_opaque_data;
@@ -119,9 +109,7 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 		// Dispatch always uses the worker's own name, never the (possibly
 		// prefixed) name the function is registered under.
 		scalar_func_info->function_name = func_info.name;
-		// The same function name may be registered in more than one schema
-		// of this catalog; the worker needs the pair to pick the right
-		// implementation, since the bare name is not unique.
+		// A bare name is unique only within a schema; the worker needs both.
 		scalar_func_info->schema_name = target.DispatchSchema(func_info);
 		scalar_func_info->output_schema = func_info.output_schema;
 		scalar_func_info->has_dynamic_return_type = is_any_output;
@@ -131,7 +119,6 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 		scalar_func_info->setting_names = target.setting_names;
 		scalar_func_info->required_secrets = func_info.required_secrets;
 
-		// Attach the function info, init callback, and bind callback
 		scalar_func.SetExtraFunctionInfo(scalar_func_info);
 		scalar_func.SetInitStateCallback(vgi::VgiScalarFunctionInitLocalState);
 		scalar_func.SetBindCallback(vgi::VgiScalarFunctionBind);
@@ -139,13 +126,11 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 		vgi::SetVgiFunctionArgumentNames(scalar_func, arg_types.positional_names);
 		func_set.AddFunction(scalar_func);
 
-		// Create function description with full metadata
-		// Include both positional and named parameters so duckdb_functions() shows them correctly
+		// Positional and named parameters, so duckdb_functions() shows both.
 		FunctionDescription desc;
 		desc.parameter_types = arg_types.positional_types;
 		desc.parameter_names = arg_types.positional_names;
 
-		// Append named parameters to the description
 		for (const auto &[name, type] : arg_types.named_parameters) {
 			desc.parameter_types.push_back(type);
 			desc.parameter_names.push_back(name);
@@ -174,13 +159,11 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 		return;
 	}
 
-	// Extract setting names from the attach result for passing to scalar functions
 	std::vector<std::string> setting_names;
 	for (const auto &setting : attach_result->settings) {
 		setting_names.push_back(setting.name);
 	}
 
-	// Call catalog_schema_contents_functions via RPC for scalar functions
 	auto worker_path = attach_params->worker_path();
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
@@ -190,8 +173,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::SCALAR_FUNCTION_ENTRY, context);
 
-	// Group functions by name (overloads). std::map (not unordered_map)
-	// for stable iteration order — see B43 note in vgi_table_function_set.cpp.
+	// Group overloads by name; std::map for a stable registration order.
 	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
 	for (auto &func_info : function_list) {
 		if (func_info.function_type != vgi::VgiFunctionType::Scalar) {
@@ -210,7 +192,6 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 		functions_by_name[func_info.name].push_back(std::move(func_info));
 	}
 
-	// Registration target: this catalog's own schema.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
 	target.catalog_name = catalog_.GetName().GetIdentifierName();
@@ -219,13 +200,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 	target.setting_names = setting_names;
 	target.schema_name = schema_.name.GetIdentifierName();
 
-	// Create function entries
 	for (const auto &pair : functions_by_name) {
-		// Collect function descriptions for all overloads
 		vector<FunctionDescription> descriptions;
 		auto func_set = vgi::BuildVgiScalarFunctionSet(context, pair.first, pair.second, target, descriptions);
 
-		// Create function info and entry
 		CreateScalarFunctionInfo info(func_set);
 		info.SetQualifiedName(schema_.GetQualifiedName(info.GetFunctionName()));
 		info.internal = true;
@@ -234,12 +212,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 		auto function_entry = make_uniq_base<StandardEntry, ScalarFunctionCatalogEntry>(
 		    catalog_, schema_, info.Cast<CreateScalarFunctionInfo>());
 
-		// DuckDB's FunctionEntry constructor does not copy comment/tags from the
-		// CreateInfo the way schema/table/view/macro entries do, so the worker's
-		// tags must be set on the constructed entry directly — otherwise they
-		// never reach duckdb_functions().tags. Tags are an entry-level concept
-		// (not per-overload), so union them across overloads. comment is a
-		// single value (not per-overload either); take the first non-empty one.
+		// FunctionEntry's constructor does not copy comment/tags from the
+		// CreateInfo, so set them on the entry or duckdb_functions() never sees
+		// them. Both are per entry, not per overload: union the tags and take the
+		// first non-empty comment.
 		for (const auto &func_info : pair.second) {
 			for (const auto &[key, val] : func_info.tags) {
 				function_entry->tags[key] = val;

@@ -40,9 +40,7 @@ inline void Check(ArrowErrorCode code, const ArrowError &error, const char *what
 
 } // namespace
 
-// ============================================================================
-// VgiBuffer
-// ============================================================================
+// --- VgiBuffer ---
 
 VgiBufferPtr VgiBuffer::FromString(std::string bytes) {
 	auto owner = std::make_shared<std::string>(std::move(bytes));
@@ -69,10 +67,9 @@ VgiBufferPtr VgiBuffer::Wrap(const void *data, int64_t size) {
 VgiBufferPtr VgiBuffer::Allocate(int64_t size, uint8_t **out) {
 	// Uninitialized: callers overwrite every byte (reads off the wire).
 #if defined(__linux__)
-	// A large IPC body (one worker batch can be hundreds of MB) is faulted in a page at a
-	// time as read() fills it. With THP in `madvise` mode (the Amazon Linux default) glibc
-	// malloc never gets huge pages, so a 780 MB body took ~195k minor faults where Arrow
-	// C++'s allocator, which madvises, took ~8k. Ask for 2 MB pages explicitly.
+	// A large IPC body is faulted in a page at a time as read() fills it. With THP in
+	// `madvise` mode (e.g. Amazon Linux) glibc malloc never gets huge pages, so ask for
+	// 2 MB pages explicitly.
 	constexpr size_t kHugePage = size_t(2) << 20;
 	if (size >= static_cast<int64_t>(4 * kHugePage)) {
 		const size_t bytes = (static_cast<size_t>(size) + kHugePage - 1) & ~(kHugePage - 1);
@@ -101,9 +98,7 @@ VgiBufferPtr VgiBuffer::Slice(int64_t offset, int64_t length) const {
 	return std::make_shared<const VgiBuffer>(owner_, data_ + offset, length);
 }
 
-// ============================================================================
-// VgiMetadata
-// ============================================================================
+// --- VgiMetadata ---
 
 VgiMetadata VgiMetadata::FromC(const char *metadata) {
 	VgiMetadata out;
@@ -168,9 +163,7 @@ void VgiMetadata::Set(const std::string &key, std::string value) {
 	}
 }
 
-// ============================================================================
-// Type descriptions
-// ============================================================================
+// --- Type descriptions ---
 
 VgiTypeInfo DescribeType(const ArrowSchema &schema) {
 	ArrowSchemaView view;
@@ -358,9 +351,7 @@ bool TypesEqual(const ArrowSchema &a, const ArrowSchema &b, bool check_names, bo
 	return !a.dictionary || TypesEqual(*a.dictionary, *b.dictionary, check_names, check_metadata);
 }
 
-// ============================================================================
-// VgiSchema
-// ============================================================================
+// --- VgiSchema ---
 
 VgiSchema::VgiSchema() {
 	schema_.release = nullptr;
@@ -560,9 +551,7 @@ VgiSchemaPtr VgiSchema::SetField(int i, const ArrowSchema &new_field) const {
 	return StructOf(fields, MetadataBytes(schema_.metadata));
 }
 
-// ============================================================================
-// VgiColumn
-// ============================================================================
+// --- VgiColumn ---
 
 int VgiColumn::storage_type() const {
 	return view_->storage_type;
@@ -670,9 +659,7 @@ void VgiColumn::ListRange(int64_t i, int64_t &begin, int64_t &end) const {
 	}
 }
 
-// ============================================================================
-// VgiBatch
-// ============================================================================
+// --- VgiBatch ---
 
 //! Owns the struct ArrowArray a batch (and its slices) read from.
 struct VgiBatch::Holder {
@@ -998,9 +985,7 @@ const ArrowArrayView &VgiBatch::c_view() const {
 	return *view_;
 }
 
-// ============================================================================
-// Row selection
-// ============================================================================
+// --- Row selection ---
 
 namespace {
 
@@ -1268,9 +1253,7 @@ void ValidateBatch(const VgiBatch &batch, VgiValidation level) {
 	}
 }
 
-// ============================================================================
-// Building schemas
-// ============================================================================
+// --- Building schemas ---
 
 namespace type {
 namespace {
@@ -1407,9 +1390,7 @@ VgiSchemaPtr MakeSchema(const std::vector<VgiField> &fields, const VgiMetadata &
 	return VgiSchema::Adopt(&schema);
 }
 
-// ============================================================================
-// Building arrays
-// ============================================================================
+// --- Building arrays ---
 
 namespace append {
 void Null(ArrowArray *array, int64_t n) {

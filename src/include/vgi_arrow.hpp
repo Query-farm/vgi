@@ -45,9 +45,7 @@ using VgiMetadataPtr = std::shared_ptr<const VgiMetadata>;
 using VgiSchemaPtr = std::shared_ptr<const VgiSchema>;
 using VgiBatchPtr = std::shared_ptr<const VgiBatch>;
 
-// ============================================================================
-// VgiBuffer
-// ============================================================================
+// --- VgiBuffer ---
 
 class VgiBuffer {
 public:
@@ -61,7 +59,7 @@ public:
 	static VgiBufferPtr Copy(const void *data, int64_t size);
 	//! Borrow `data` without owning it; the caller keeps it alive.
 	static VgiBufferPtr Wrap(const void *data, int64_t size);
-	//! A new zeroed buffer of `size` bytes, written through `*out` before it is shared.
+	//! A new uninitialized buffer of `size` bytes; fill it through `*out` before sharing it.
 	static VgiBufferPtr Allocate(int64_t size, uint8_t **out);
 
 	const uint8_t *data() const {
@@ -94,9 +92,7 @@ private:
 	int64_t size_;
 };
 
-// ============================================================================
-// VgiMetadata
-// ============================================================================
+// --- VgiMetadata ---
 
 class VgiMetadata {
 public:
@@ -147,9 +143,7 @@ private:
 	std::vector<std::pair<std::string, std::string>> pairs_;
 };
 
-// ============================================================================
-// Type descriptions
-// ============================================================================
+// --- Type descriptions ---
 
 //! The parts of a (field) type the extension inspects: nanoarrow's ArrowType for the
 //! logical type (dictionary columns report NANOARROW_TYPE_DICTIONARY here and the
@@ -173,9 +167,7 @@ std::string TypeToString(const ArrowSchema &schema);
 //! Format, flags, children and dictionary equal (names compared iff `check_names`).
 bool TypesEqual(const ArrowSchema &a, const ArrowSchema &b, bool check_names = true, bool check_metadata = false);
 
-// ============================================================================
-// VgiSchema
-// ============================================================================
+// --- VgiSchema ---
 
 class VgiSchema : public std::enable_shared_from_this<VgiSchema> {
 public:
@@ -236,9 +228,7 @@ private:
 	VgiMetadata metadata_;
 };
 
-// ============================================================================
-// VgiColumn
-// ============================================================================
+// --- VgiColumn ---
 
 //! A borrowed read view of one array (a batch column or a nested child). Valid while the
 //! batch it came from is alive. Row arguments are logical (the view's offset applied).
@@ -305,9 +295,7 @@ private:
 	int64_t shift_ = 0;
 };
 
-// ============================================================================
-// VgiBatch
-// ============================================================================
+// --- VgiBatch ---
 
 //! How much to check when a batch is built from foreign buffers (worker data).
 enum class VgiValidation : uint8_t {
@@ -392,9 +380,7 @@ private:
 	std::unique_ptr<ArrowArrayView> view_;
 };
 
-// ============================================================================
-// Building schemas
-// ============================================================================
+// --- Building schemas ---
 
 //! A (named) type description, built with the helpers in vgi::type and turned into an
 //! ArrowSchema by VgiSchema::Make / BuildSchema.
@@ -454,9 +440,7 @@ void BuildSchema(const VgiField &field, ArrowSchema *out);
 //! A struct schema of `fields` with schema-level `metadata`.
 VgiSchemaPtr MakeSchema(const std::vector<VgiField> &fields, const VgiMetadata &metadata = VgiMetadata());
 
-// ============================================================================
-// Building arrays
-// ============================================================================
+// --- Building arrays ---
 
 //! Typed appends to a nanoarrow array that is being built (ArrowArrayStartAppending
 //! has been called). Every helper throws InternalException on failure (allocation).
@@ -499,12 +483,10 @@ private:
 	int64_t rows_ = 0;
 };
 
-// ============================================================================
-// Row selection
-// ============================================================================
+// --- Row selection ---
 
-//! Rows `rows[0..n)` of `batch` (any order, repeats allowed; no bounds check beyond an
-//! assertion-level check), as a new batch with the same schema and metadata.
+//! Rows `rows[0..n)` of `batch` (any order, repeats allowed; not bounds-checked: each
+//! must be in [0, num_rows)), as a new batch with the same schema and metadata.
 VgiBatchPtr TakeRows(const VgiBatchPtr &batch, const int64_t *rows, int64_t n);
 inline VgiBatchPtr TakeRows(const VgiBatchPtr &batch, const std::vector<int64_t> &rows) {
 	return TakeRows(batch, rows.data(), static_cast<int64_t>(rows.size()));
@@ -516,9 +498,7 @@ VgiBatchPtr ConcatBatches(const std::vector<VgiBatchPtr> &batches);
 //! Append element `row` of `src` to `dst` (built from a schema equal to src's).
 void AppendElement(ArrowArray *dst, const VgiColumn &src, int64_t row);
 
-// ============================================================================
-// Validation / errors
-// ============================================================================
+// --- Validation / errors ---
 
 //! Throws InternalException unless nanoarrow was built with atomic shared-buffer
 //! refcounts (decoded batches are released on DuckDB worker threads). Called at LOAD.

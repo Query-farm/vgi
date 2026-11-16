@@ -28,8 +28,7 @@ VgiObjectCounts ObjectCountsFromMap(const std::map<std::string, int64_t> &m, int
 		} else if (k == "macro") {
 			counts.macro = v;
 		}
-		// Unknown kinds are ignored — workers may emit forward-compatible keys
-		// for object types this client doesn't yet model.
+		// Unknown kinds are ignored for forward compatibility.
 	}
 	return counts;
 }

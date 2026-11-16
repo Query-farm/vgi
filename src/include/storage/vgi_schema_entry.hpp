@@ -74,20 +74,16 @@ public:
 	//! (duckdb_schemas() & co. read comment/tags directly).
 	void EnsureSchemaInfo();
 
-	// Estimated per-kind populations from the worker. Built once at
-	// construction from ``schema_info_.estimated_object_count`` (a
-	// map<string,int64>). Read by VgiCatalogSet::ResolveEagerLoadParamsLocked
-	// to pick the eager-vs-lazy load policy for each child set without
-	// re-walking the wire-format map.
+	//! Per-kind estimated populations (from SchemaInfo.estimated_object_count);
+	//! VgiCatalogSet::ResolveEagerLoadParamsLocked picks eager vs lazy load from it.
 	const VgiObjectCounts &GetEstimatedCounts() {
 		EnsureSchemaInfo();
 		return estimated_counts_;
 	}
 
-	// Schema-lifetime macro discovery cache. Both macro catalog sets share the
-	// same immutable metadata/name snapshot, avoiding duplicate function and
-	// opposite-macro inventory RPCs. The schema mutex never reaches back into a
-	// child set, so concurrent lazy loads cannot form a child/schema lock cycle.
+	// Schema-lifetime macro/function inventory cache shared by both macro sets,
+	// so each inventory RPC is issued once. The schema mutex never reaches back
+	// into a child set, so concurrent lazy loads cannot form a lock cycle.
 	std::vector<vgi::VgiMacroInfo> GetMacroInventory(const vgi::CatalogRpcContext &rpc_ctx, CatalogType macro_type,
 	                                                 ClientContext &context);
 	std::vector<vgi::VgiFunctionInfo> GetFunctionInventory(const vgi::CatalogRpcContext &rpc_ctx,
@@ -95,13 +91,9 @@ public:
 	std::shared_ptr<const case_insensitive_set_t> GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx,
 	                                                                    bool trust_empty_kinds, ClientContext &context);
 
-	// catalog_contents seeding. The schema set builds a seeded entry from each
-	// schema of a catalog_contents snapshot; each child set's first load then
-	// takes its seed instead of issuing catalog_schema_contents_*.
-	// Each kind's seed is consumed once. Invalidating a child set (DDL) discards
-	// its untaken seed, so that set reloads through the per-schema RPC;
-	// vgi_clear_cache() / a version bump rebuilds the schema entries from a fresh
-	// catalog_contents. The seed mutex is a leaf: nothing is called while it is held.
+	// catalog_contents seeding: each child set's first load takes its kind's seed
+	// (once) instead of issuing catalog_schema_contents_*. The seed mutex is a
+	// leaf: nothing is called while it is held.
 	//! Whether an unconsumed seed exists for a VgiCatalogSet::CacheKindName kind.
 	bool HasSeed(const std::string &kind);
 	//! Drop the unconsumed seed for a VgiCatalogSet::CacheKindName kind, so the

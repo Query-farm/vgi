@@ -35,10 +35,6 @@ bool SupportsVgiFilterV2(const vgi::VgiFunctionInfo &info) {
 }
 
 //! Read the client-side ``vgi_split_scans`` kill switch. Defaults to true.
-//!
-//! Read at BIND rather than init: the worker capability and this setting are
-//! folded into one flag on the bind data, so a ``SET`` between bind and execute
-//! cannot leave a bind that assumed splits paired with an init that did not.
 bool VgiSplitScansEnabled(ClientContext &context) {
 	Value v;
 	if (context.TryGetCurrentSetting("vgi_split_scans", v) && !v.IsNull()) {
@@ -51,8 +47,7 @@ bool VgiSplitScansEnabled(ClientContext &context) {
 
 namespace {
 
-// Extract settings from client context given a list of setting names
-// This is used for catalog-bound functions where we know which settings the catalog registered
+// Current values of the settings the catalog registered at ATTACH.
 std::map<std::string, Value> ExtractVgiSettings(ClientContext &context, const std::vector<std::string> &setting_names) {
 	std::map<std::string, Value> settings;
 
@@ -66,10 +61,7 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context, const st
 	return settings;
 }
 
-// Map the wire-format VgiOrderPreservation to DuckDB's OrderPreservationType.
-// Unset (nullopt) collapses to INSERTION_ORDER, matching DuckDB's TableFunction
-// default; FixedOrder forces Pipeline::IsOrderDependent() -> true so the planner
-// serialises the pipeline (single worker emits all rows).
+// Unset maps to INSERTION_ORDER, DuckDB's TableFunction default.
 OrderPreservationType MapOrderPreservation(std::optional<vgi::VgiOrderPreservation> v) {
 	if (!v) {
 		return OrderPreservationType::INSERTION_ORDER;
@@ -91,21 +83,15 @@ VgiTableFunctionSet::VgiTableFunctionSet(Catalog &catalog, VgiSchemaEntry &schem
     : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
-// ============================================================================
-// Bind Function - For catalog-based VGI table functions
-// ============================================================================
-
 static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                             vector<LogicalType> &return_types,
                                                             vector<Identifier> &names) {
-	// Access the VgiTableFunctionInfo attached to this function
 	auto &vgi_info = input.info->Cast<vgi::VgiTableFunctionInfo>();
 
 	auto bind_data = make_uniq<vgi::VgiTableFunctionBindData>();
 
-	// Copy connection information from the catalog function info. A function
-	// published into system.main outlives DETACH, so its live state is resolved
-	// from the attached catalog here (see ResolveVgiFunctionBinding).
+	// A function published into system.main outlives DETACH, so its live state
+	// is resolved from the attached catalog (see ResolveVgiFunctionBinding).
 	auto binding =
 	    vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.GetName().GetIdentifierName());
 	bind_data->attach_params = binding.attach_params;
@@ -117,28 +103,18 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 	bind_data->filter_semantic_profiles = vgi_info.function_info().filter_semantic_profiles;
 	bind_data->additional_filter_functions = vgi_info.function_info().additional_filter_functions;
-	// Carry the wire flag onto bind_data so InstallBatch knows whether to
-	// require/parse vgi_batch_index from each Arrow record-batch's
-	// KeyValueMetadata.
+	// InstallBatch requires vgi_batch_index batch metadata when this is set.
 	bind_data->supports_batch_index = vgi_info.function_info().supports_batch_index;
 
-	// supports_splits folds the worker's capability together with the client-side
-	// setting, at BIND. Reading the setting here rather than at init is deliberate:
-	// a ``SET vgi_split_scans`` between bind and execute would otherwise produce a
-	// bind that assumed splits and an init that did not.
+	// The setting is read at BIND, not init: a ``SET vgi_split_scans`` between
+	// bind and execute must not pair a bind that assumed splits with an init
+	// that did not.
 	bind_data->supports_splits = vgi_info.function_info().supports_splits && VgiSplitScansEnabled(context);
 	bind_data->split_token_ttl_seconds = vgi_info.function_info().split_token_ttl_seconds;
-	// FIXED_ORDER: clamps MaxThreads to 1 so DuckDB schedules the source
-	// onto a single thread. ``TableFunction::order_preservation_type`` is
-	// already set at function-registration time (see ``AddFunction`` calls
-	// below) and drives the planner's ``Pipeline::IsOrderDependent()``;
-	// the boolean here is what actually serialises the source.
-	//
-	// EXCEPT when the function opts in to batch_index: ordered sinks
-	// (BatchCollector, BatchInsert, BatchCopyToFile, Limit) reassemble
-	// output via ``TableFunction::get_partition_data``, so the source
-	// can stay parallel. Skipping the clamp here is the entire point of
-	// the batch_index feature.
+	// fixed_order clamps MaxThreads to 1, which is what actually serialises a
+	// FIXED_ORDER source (order_preservation_type only informs the planner).
+	// batch_index functions skip the clamp: ordered sinks reassemble their
+	// output via get_partition_data, so the source can stay parallel.
 	if (vgi_info.function_info().supports_batch_index) {
 		bind_data->fixed_order = false;
 	} else {
@@ -146,35 +122,26 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 		    MapOrderPreservation(vgi_info.function_info().order_preservation) == OrderPreservationType::FIXED_ORDER;
 	}
 
-	// PartitionColumns mode: carry the wire ``partition_kind`` flag onto
-	// bind_data. ``partition_column_indices`` is resolved later, after
-	// ``PerformVgiTableFunctionBind`` populates the bind result's output
-	// schema (the per-field metadata we need is only available then).
+	// partition_column_indices is resolved after PerformVgiTableFunctionBind,
+	// once the output schema's field metadata is available.
 	bind_data->partition_kind = vgi_info.function_info().partition_kind;
 
-	// Build Arrow arguments from the function call inputs
-	// input.inputs contains positional arguments passed to the function
 	vector<Value> positional_args;
 	for (auto &val : input.inputs) {
 		positional_args.push_back(val);
 	}
 
-	// Extract named arguments from input.named_parameters
 	vector<std::pair<string, Value>> named_args;
 	for (auto &[name, value] : input.named_parameters) {
 		named_args.emplace_back(name.GetIdentifierName(), value);
 	}
 
-	// Build Arrow arguments struct from both positional and named args
 	bind_data->arguments = vgi::BuildArgumentsFromValues(context, positional_args, named_args);
 
-	// Extract settings registered by this catalog
 	bind_data->settings = ExtractVgiSettings(context, binding.setting_names);
 
-	// Copy required secrets from function metadata
 	bind_data->required_secrets = vgi_info.function_info().required_secrets;
 
-	// Validate that all required settings for this function are present
 	const auto &required_settings = vgi_info.function_info().required_settings;
 	if (!required_settings.empty()) {
 		std::vector<std::string> missing_settings;
@@ -200,16 +167,10 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 		}
 	}
 
-	// Perform the common bind handshake
 	vgi::PerformVgiTableFunctionBind(context, *bind_data, return_types, names);
 
-	// Resolve partition_column_indices by walking the bind output schema
-	// for fields whose metadata carries ``vgi.partition_column = "true"``.
-	// Per-field Arrow metadata round-trips losslessly through
-	// ``pa.Schema.serialize()`` -> the IPC schema reader, which is what
-	// the bind RPC uses today. Doing this once at bind keeps
-	// ``VgiGetPartitionInfo`` cheap (O(P) membership check per planner
-	// call, no schema walk).
+	// Resolved once here so VgiGetPartitionInfo needs no schema walk per
+	// planner call.
 	if (bind_data->partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
 		const auto &out_schema = bind_data->bind_result.output_schema;
 		if (out_schema) {
@@ -221,10 +182,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 				}
 			}
 		}
-		// Registration-time invariant: ``partition_kind != NotPartitioned``
-		// requires at least one annotated field. The worker library also
-		// enforces this at resolve_metadata; we check here as defense in
-		// depth (catches partial-deployment / version-skew bugs).
+		// The worker SDK enforces this too; checked here against version skew.
 		if (bind_data->partition_column_indices.empty()) {
 			throw BinderException("VGI function '%s' declares partition_kind but no bind-schema "
 			                      "field carries vgi.partition_column metadata; mark partition "
@@ -238,20 +196,13 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	return bind_data;
 }
 
-// ============================================================================
-// Bind Function - For catalog-based VGI table-in-out functions
-// ============================================================================
-
 static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                                  vector<LogicalType> &return_types,
                                                                  vector<Identifier> &names) {
-	// Access the VgiTableFunctionInfo attached to this function
 	auto &vgi_info = input.info->Cast<vgi::VgiTableFunctionInfo>();
 
-	// Build parameters for the table-in-out bind
 	vgi::VgiTableInOutBindParams params;
-	// A function published into system.main outlives DETACH, so its live state
-	// is resolved from the attached catalog here (see ResolveVgiFunctionBinding).
+	// See VgiCatalogTableFunctionBind: resolved live because of DETACH.
 	auto binding =
 	    vgi::ResolveVgiFunctionBinding(context, vgi_info.target(), input.table_function.GetName().GetIdentifierName());
 	params.attach_params = binding.attach_params;
@@ -270,12 +221,10 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.filter_pushdown = SupportsVgiFilterV2(vgi_info.function_info());
 	params.filter_semantic_profiles = vgi_info.function_info().filter_semantic_profiles;
 	params.additional_filter_functions = vgi_info.function_info().additional_filter_functions;
-	// A3 serial opt-out: a worker that declares Meta.max_workers=1 keeps its
-	// streaming table-in-out on a single shared worker (MaxThreads()=1).
+	// max_workers=1 keeps a streaming table-in-out on one shared worker.
 	params.max_workers = vgi_info.function_info().max_workers.value_or(0);
-	// Blended (Phase B): the DECLARED positional arg names are the worker's input
-	// column names (it reads batch.column("<name>")). Re-parse the arguments schema
-	// to recover them (+ varargs flag) so bind can build the input schema by name.
+	// Blended: the declared positional arg names are the worker's input column
+	// names, so bind builds the input schema from the arguments schema.
 	params.input_from_args = vgi_info.function_info().input_from_args;
 	params.input_rows_per_call = vgi_info.function_info().input_rows_per_call;
 	params.stability = vgi_info.function_info().stability; // for the map-operator dedup gate
@@ -287,7 +236,6 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 		params.has_varargs = blended_args.has_varargs;
 	}
 
-	// Validate required settings
 	const auto &required_settings = vgi_info.function_info().required_settings;
 	if (!required_settings.empty()) {
 		std::vector<std::string> missing_settings;
@@ -313,7 +261,6 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 		}
 	}
 
-	// Use the table-in-out bind function
 	return vgi::VgiTableInOutBind(context, input, return_types, names, params);
 }
 
@@ -326,80 +273,44 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 	TableFunctionSet func_set {Identifier(registered_name)};
 
 	for (const auto &func_info : overloads) {
-		// Parse argument types, distinguishing positional from named arguments
-		// Named arguments have metadata "vgi_arg: named" in the Arrow schema
 		vgi::FunctionArgumentTypes arg_types;
 		if (func_info.arguments_schema) {
 			arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
 		}
 
-		// Check if this is a table-in-out function: either it has a TABLE input
-		// argument (classic), or it is a blended ("UNNEST-style") function whose
-		// positional args ARE its per-row input columns (input_from_args). Both
-		// register through the in_out_function path — a blended function's
-		// positional_types are real value types (no TABLE marker), so it also
-		// serves the literal f(52,13) and column FROM t, f(t.x,t.y) shapes.
+		// Table-in-out: a TABLE argument, or a blended function whose positional
+		// args are its per-row input columns (input_from_args). Blended
+		// positional_types are value types, so f(52,13) and FROM t, f(t.x,t.y) bind.
 		if (arg_types.HasTableInput() || func_info.input_from_args) {
-			// A blended function must not also declare a finalize (map-shaped).
-			// The worker's resolve_metadata already rejects this; assert as a
-			// defense against a hand-rolled/old worker that advertises both.
+			// Blended functions are map-shaped; the SDK rejects a finalize too,
+			// this guards hand-rolled or old workers.
 			if (func_info.input_from_args && func_info.has_finalize) {
 				throw InvalidInputException(
 				    "Function '%s' advertises input_from_args (blended) AND has_finalize; a blended "
 				    "RowTransformFunction is map-shaped and cannot have a finalize.",
 				    func_info.name);
 			}
-			// Create a table-in-out function
-			// Table-in-out functions use LogicalType::TABLE in args and have an in_out_function
 			TableFunction table_func(arg_types.positional_types, nullptr, VgiCatalogTableInOutFunctionBind,
 			                         vgi::VgiTableInOutInitGlobal, vgi::VgiTableInOutInitLocal);
 
-			// Set the in_out_function for processing streaming input.
 			table_func.in_out_function = vgi::VgiTableInOutFunction;
-			// Only register the finalize callback when the worker declares
-			// a finalize/finish stage. DuckDB's PhysicalTableInOutFunction
-			// throws "FinalExecute not supported for project_input" when
-			// both in_out_function_final and projected_input (LATERAL with
-			// correlated columns) are set, so leaving it unset for
-			// stateless transforms lets those functions participate in
-			// lateral joins.
-			//
-			// When the function is TableBuffering, we deliberately *omit*
-			// in_out_function_final — the OptimizerExtension rewrites the
-			// LogicalGet into PhysicalVgiTableBufferingFunction, which
-			// handles finalize through its Sink+Source lifecycle. If the
-			// rewrite is somehow missed, the operator falls back to
-			// VgiTableInOutFunction, which asserts loudly on bind_data
-			// with table_buffering=true.
+			// Register the finalize only when the worker declares one:
+			// PhysicalTableInOutFunction throws "FinalExecute not supported for
+			// project_input" when both it and projected_input (correlated
+			// LATERAL) are set. TableBuffering omits it: VgiTableBufferingRewriter
+			// moves finalize into PhysicalVgiTableBufferingFunction, and if the
+			// rewrite does not fire VgiTableInOutFunction throws.
 			const bool is_buffering = func_info.function_type == vgi::VgiFunctionType::TableBuffering;
 			if (func_info.has_finalize && !is_buffering) {
 				table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
 			}
-			// Advertise pushdown capability to DuckDB's optimizer.
-			//
-			// **Buffered (Sink+Source)** supports BOTH projection
-			// and filter pushdown. ``VgiTableBufferingRewriter`` in
-			// vgi_extension.cpp captures pushed-down state at plan
-			// time, narrows the Logical op's return_types, threads
-			// pushdown through PerformInit, and the Source's
-			// ArrowToDuckDB call uses arrow_scan_is_projected=true
-			// to read narrow worker batches positionally.
-			//
-			// **Streaming InOut** supports ONLY projection pushdown.
-			// DuckDB's planner discards ``table_filters`` for the
-			// InOut path (see duckdb/src/execution/physical_plan/
-			// plan_get.cpp:37-83 — the early-return InOut branch
-			// constructs ``PhysicalTableInOutFunction`` with no
-			// table_filters parameter and doesn't add a FILTER node
-			// above the operator). Advertising filter_pushdown=true
-			// causes the filter optimizer to push predicates into
-			// ``LogicalGet.table_filters``, where they then get
-			// silently dropped — query returns unfiltered rows.
-			// Don't advertise filter_pushdown for InOut. Filters
-			// always run via a separate FILTER node above the
-			// operator (correct behavior, just no wire-bandwidth
-			// savings). Expression pushdown is intentionally
-			// skipped for the same reason.
+			// Buffered (Sink+Source) supports projection and filter pushdown:
+			// VgiTableBufferingRewriter captures the pushed-down state at plan time.
+			// Streaming InOut supports only projection pushdown. For InOut,
+			// DuckDB's plan_get.cpp hands table_filters only to the function's init
+			// and adds no FILTER above PhysicalTableInOutFunction, so advertising
+			// filter (or expression) pushdown would make the predicates the worker's
+			// sole responsibility. Leaving it off keeps a FILTER above the operator.
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 			VgiDisableRuntimeFilterPushdown(table_func);
 			if (is_buffering) {
@@ -410,12 +321,8 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			}
 			table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 
-			// Register named parameters
-
-			// Register varargs so DuckDB accepts a blended VARARGS call
-			// (row_sum(1,2,3) -> N input columns of varargs_type). Without this
-			// the signature would carry only the named params and DuckDB would
-			// reject any positional args.
+			// Varargs lets DuckDB accept a blended VARARGS call
+			// (row_sum(1,2,3) -> N input columns of varargs_type).
 			if (arg_types.has_varargs) {
 				table_func.GetSignature().AddArgs("args", arg_types.varargs_type);
 			}
@@ -424,14 +331,12 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 				vgi::AddVgiFunctionOption(table_func, Identifier(option.first), option.second);
 			}
 
-			// Attach function info
 			table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(target, func_info);
 
 			vgi::SetVgiFunctionArgumentNames(table_func, arg_types.positional_names);
 			func_set.AddFunction(table_func);
 		} else {
-			// Create a regular table function
-			// Only positional arguments go in the function signature
+			// Only positional arguments go in the signature; named ones are options.
 			TableFunction table_func(arg_types.positional_types, vgi::VgiTableFunctionScan, VgiCatalogTableFunctionBind,
 			                         vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
@@ -448,63 +353,25 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			table_func.to_string = vgi::VgiTableFunctionToString;
 			table_func.get_metrics = vgi::VgiTableFunctionGetMetrics;
 			table_func.set_scan_order = vgi::VgiSetScanOrder;
-			// batch_index opt-in: install the partition-data callback so
-			// ordered sinks (BatchCollector, BatchInsert,
-			// BatchCopyToFile, Limit) can reassemble parallel output via
-			// ``OperatorPartitionData{batch_index}``. The matching skip
-			// of the ``fixed_order -> MaxThreads=1`` clamp lives in
-			// VgiCatalogTableFunctionBind above. Each emitted Arrow
-			// batch carries ``vgi_batch_index`` in KeyValueMetadata —
-			// see ``InstallBatch`` for the parse + monotonicity check.
+			// batch_index: ordered sinks reassemble parallel output from
+			// get_partition_data (the matching fixed_order clamp skip is in
+			// VgiCatalogTableFunctionBind).
 			if (func_info.supports_batch_index) {
 				table_func.get_partition_data = vgi::VgiGetPartitionData;
 			}
-			// PartitionColumns opt-in: install the partition-info
-			// callback so the planner can ask whether the source is
-			// SINGLE_VALUE / OVERLAPPING / DISJOINT over the GROUP BY
-			// columns. Also installs get_partition_data (idempotent if
-			// supports_batch_index already did so) — PartitionColumns
-			// mode populates the ``partition_data`` half of
-			// OperatorPartitionData with per-column (min, max).
+			// PartitionColumns: get_partition_info reports the partition shape over
+			// the GROUP BY columns; get_partition_data supplies per-column (min, max).
 			if (func_info.partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
 				table_func.get_partition_info = vgi::VgiGetPartitionInfo;
 				table_func.get_partition_data = vgi::VgiGetPartitionData;
 			}
-			// INITIALIZE_ON_SCHEDULE would move init_global into
-			// `Executor::ScheduleEventsInternal`'s eager-init loop so the
-			// pipelines' init_globals all fire from the same site at
-			// scheduling time — combined with the async kickoff in
-			// VgiTableFunctionInitGlobal, this collapses N sequential
-			// metadata RTTs into one parallel batch (the Ducklake
-			// `SELECT *` 25-table planner case).
-			//
-			// However, INITIALIZE_ON_SCHEDULE fires init_global *before*
-			// any sibling build pipeline has populated
-			// `PhysicalTableScan::dynamic_filters` (the hash join's
-			// `JoinFilterPushdownInfo::PushInFilter` only runs at build
-			// finalize). With the flag on, a VGI scan sitting on the
-			// probe side of a hash join sees an empty
-			// `op.dynamic_filters` at init and never receives the
-			// build-side InFilter — breaking join key pushdown
-			// (join_keys_pushdown.test). DuckDB's
-			// `TableScanGlobalSourceState` only combines dynamic_filters
-			// into the init_input when `HasFilters()` is already true,
-			// so there is no in-DuckDB hook to refresh the captured
-			// filter set later.
-			//
-			// Correctness wins over the Ducklake fan-out optimization.
-			// Leaving the flag off means each `Pipeline::Schedule` does
-			// kickoff + block sequentially, so 25-table metadata reads
-			// pay sum(RTT) instead of max(RTT). The async kickoff
-			// inside `VgiTableFunctionInitGlobal` still lets the
-			// pre-init connection acquire run on a background thread.
-			// TODO: a deferred-filter-capture refactor (split init
-			// into "establish session" + "set filters") could restore
-			// INITIALIZE_ON_SCHEDULE without sacrificing join pushdown.
+			// Deliberately not INITIALIZE_ON_SCHEDULE: it would run all init_globals
+			// in parallel at scheduling time (max(RTT) instead of sum(RTT) across
+			// many scans), but before a hash join's build side has filled
+			// PhysicalTableScan::dynamic_filters, so a probe-side VGI scan would
+			// never receive the join-key InFilter (join_keys_pushdown.test).
+			// Restoring it needs init split into "establish session" + "set filters".
 
-			// Register named parameters so DuckDB knows how to handle them
-
-			// Register varargs support if the function accepts additional positional arguments
 			if (arg_types.has_varargs) {
 				table_func.GetSignature().AddArgs("args", arg_types.varargs_type);
 			}
@@ -513,20 +380,17 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 				vgi::AddVgiFunctionOption(table_func, Identifier(option.first), option.second);
 			}
 
-			// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
 			table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(target, func_info);
 
 			vgi::SetVgiFunctionArgumentNames(table_func, arg_types.positional_names);
 			func_set.AddFunction(table_func);
 		}
 
-		// Create function description with full metadata
-		// Include both positional and named parameters so duckdb_functions() shows them correctly
+		// Named parameters are appended so duckdb_functions() lists them.
 		FunctionDescription desc;
 		desc.parameter_types = arg_types.positional_types;
 		desc.parameter_names = arg_types.positional_names;
 
-		// Append named parameters to the description
 		for (const auto &[name, type] : arg_types.named_parameters) {
 			desc.parameter_types.push_back(type);
 			desc.parameter_names.push_back(name);
@@ -555,13 +419,11 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 		return;
 	}
 
-	// Extract setting names from the attach result for passing to function bind
 	std::vector<std::string> setting_names;
 	for (const auto &setting : attach_result->settings) {
 		setting_names.push_back(setting.name);
 	}
 
-	// Call catalog_schema_contents_functions via RPC for table functions
 	auto worker_path = attach_params->worker_path();
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
@@ -571,26 +433,17 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 
 	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::TABLE_FUNCTION_ENTRY, context);
 
-	// Group functions by name (overloads). std::map (not unordered_map) so
-	// the iteration order over `functions_by_name` is stable across runs
-	// and stdlib versions — overload resolution treats the order in which
-	// signatures are added to a TableFunctionSet as significant for
-	// ambiguous matches, and we don't want non-determinism from libstdc++
-	// hash-bucket order leaking into user-visible function dispatch.
+	// Group overloads by name; each name's overloads keep the worker's order
+	// (DuckDB's overload resolution is order-sensitive for ambiguous matches).
+	// std::map keeps entry creation order deterministic.
 	//
-	// Protocol 3.3 table_only functions are grouped separately and built by the
-	// same code below, but published into the hidden set: the extension keeps
-	// their full description (the capabilities of the tables that name them)
-	// while Scan()/LookupEntry() never return them. A name the worker lists both
-	// ways yields one entry in each set; the public one wins wherever both are
-	// reachable.
+	// table_only functions (protocol 3.3) are built the same way but go into the
+	// hidden set, which Scan()/LookupEntry() never return. A name listed both
+	// ways gets one entry in each set.
 	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
 	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> hidden_functions_by_name;
 	for (auto &func_info : function_list) {
-		// Streaming Table and buffered TableBuffering both live in the
-		// table-function namespace; the distinction drives bind-time
-		// dispatch (streaming in_out_function vs the optimizer rewrite to
-		// PhysicalVgiTableBufferingFunction) but not registration.
+		// Table and TableBuffering share the table-function namespace.
 		if (func_info.function_type != vgi::VgiFunctionType::Table &&
 		    func_info.function_type != vgi::VgiFunctionType::TableBuffering) {
 			throw IOException(vgi::ErrorInfo(vgi::error_subtype::kProtocolViolation)
@@ -605,7 +458,6 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 		group[func_info.name].push_back(std::move(func_info));
 	}
 
-	// Registration target: this catalog's own schema.
 	vgi::VgiFunctionRegistrationTarget target;
 	target.catalog = &catalog_;
 	target.catalog_name = catalog_.GetName().GetIdentifierName();
@@ -614,14 +466,11 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	target.setting_names = setting_names;
 	target.schema_name = schema_.name.GetIdentifierName();
 
-	// Create function entries
 	auto build_entries = [&](const std::map<std::string, std::vector<vgi::VgiFunctionInfo>> &groups, bool hidden) {
 		for (const auto &pair : groups) {
-			// Collect function descriptions for all overloads
 			vector<FunctionDescription> descriptions;
 			auto func_set = vgi::BuildVgiTableFunctionSet(context, pair.first, pair.second, target, descriptions);
 
-			// Create function info and entry
 			CreateTableFunctionInfo info(func_set);
 			info.SetQualifiedName(schema_.GetQualifiedName(info.GetFunctionName()));
 			info.internal = true;
@@ -631,11 +480,9 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 			    catalog_, schema_, info.Cast<CreateTableFunctionInfo>());
 
 			// DuckDB's FunctionEntry constructor does not copy comment/tags from the
-			// CreateInfo the way schema/table/view/macro entries do, so the worker's
-			// tags must be set on the constructed entry directly — otherwise they
-			// never reach duckdb_functions().tags. Tags are an entry-level concept
-			// (not per-overload), so union them across overloads. comment is a
-			// single value (not per-overload either); take the first non-empty one.
+			// CreateInfo, so set them on the entry or duckdb_functions() never shows
+			// them. Both are entry-level: union tags across overloads, take the first
+			// non-empty comment.
 			for (const auto &func_info : pair.second) {
 				for (const auto &[key, val] : func_info.tags) {
 					function_entry->tags[key] = val;

@@ -34,10 +34,8 @@ bool SabInputStream::closed() const {
 	return !is_open_;
 }
 
-// Blocking read that fills up to `nbytes`, looping over the ring until the
-// request is satisfied or the worker signals EOS (slot_read == 0). Mirrors
-// FdInputStream::Read's fill-or-EOF loop; the IPC stream reader relies on
-// this "read as much as asked, short only at end-of-stream" contract.
+// Fill `nbytes` unless the worker signals EOS (slot_read == 0): the IPC reader
+// relies on reads being short only at end of stream (as FdInputStream::Read).
 int64_t SabInputStream::Read(int64_t nbytes, void *out) {
 	if (!is_open_) {
 		throw IOException("SabInputStream: read on closed stream");
@@ -49,12 +47,10 @@ int64_t SabInputStream::Read(int64_t nbytes, void *out) {
 		int want = static_cast<int>(nbytes - total > INT32_MAX ? INT32_MAX : nbytes - total);
 		int n = vgi_wasm_slot_read(region_offset_, slot_, dst + total, want);
 		if (n == sab::kSabWouldBlock) {
-			// The ring was empty for a bounded wait. Poll query cancellation and retry —
-			// this is what keeps a read running as a DuckDB async prefetch task
-			// interruptible: on an error/cancel DuckDB sets context.IsInterrupted() (see
-			// Executor::PushError) and busy-waits for all executor tasks to return; an
-			// uninterruptible read here would never return and would freeze the whole
-			// engine. Mirrors the subprocess WaitForReadableUntilCancel poll.
+			// Bounded wait elapsed with an empty ring: poll cancellation and retry.
+			// On error/cancel DuckDB marks the context interrupted (Executor::PushError)
+			// and waits for every task to return, so an uninterruptible read here
+			// would freeze the engine.
 			if (RpcInterrupted(context_)) {
 				throw IOException("SabInputStream: read interrupted (query cancelled)");
 			}

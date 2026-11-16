@@ -31,15 +31,8 @@
 
 namespace duckdb {
 
-// VgiNativeDelegationMarkerBindData is declared in storage/vgi_table_entry.hpp
-// so VgiRequiredFiltersOptimizer (vgi_extension.cpp) can dynamic_cast against
-// it. See the header for full docstring and lifecycle.
-
 namespace {
 
-// Marker placeholder TableFunction — never executed; the optimizer
-// extension must replace it. Mirrors MakeMultiBranchMarkerFunction in
-// vgi_multi_scan_rewriter.cpp.
 // Backstop only (bind refuses via RequireVgiOptimizerExtensions); an ordinary
 // error because an InternalException would invalidate the database.
 void NativeDelegationMarkerExecute(ClientContext &, TableFunctionInput &, DataChunk &) {
@@ -52,11 +45,9 @@ void NativeDelegationMarkerExecute(ClientContext &, TableFunctionInput &, DataCh
 
 TableFunction MakeNativeDelegationMarkerFunction() {
 	TableFunction fn("vgi_native_delegation_marker", {}, NativeDelegationMarkerExecute);
-	// No bind callback — bind_data is supplied externally by GetScanFunctionImpl.
-	// No init_global / init_local — the marker should never be executed.
-	// filter_pushdown=true so DuckDB's FilterPushdown still installs filters
-	// on this LogicalGet's table_filters; the rewriter then hands them off to
-	// the real native function on the rewritten LogicalGet.
+	// No bind/init: bind_data comes from GetScanFunctionImpl and it never runs.
+	// filter_pushdown so FilterPushdown fills table_filters, which the rewriter
+	// hands to the native function.
 	fn.filter_pushdown = true;
 	VgiDisableRuntimeFilterPushdown(fn);
 	fn.projection_pushdown = true;
@@ -80,19 +71,16 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 		return nullptr;
 	}
 
-	// Check catalog-level capability flag
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_result = vgi_catalog.attach_result();
 	if (!attach_result || !attach_result->supports_column_statistics) {
 		return nullptr;
 	}
 
-	// Check table-level capability flag
 	if (!table_info_.supports_column_statistics) {
 		return nullptr;
 	}
 
-	// Map column_id to column name before acquiring lock
 	auto &columns = GetColumns();
 	if (column_id >= columns.PhysicalColumnCount()) {
 		return nullptr;
@@ -100,19 +88,14 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 	auto &col_def = columns.GetColumn(PhysicalIndex(column_id));
 	auto column_name = col_def.GetName().GetIdentifierName();
 
-	// Two-phase: decide whether *this* call has to fetch, drop the mutex,
-	// run the RPC, then re-acquire to publish + look up. Holding the mutex
-	// across the RPC would self-deadlock on any path that re-enters
-	// GetStatistics on the same table from inside the RPC (logging,
-	// optimizer fanout, secret-manager reentry, etc.).
+	// Decide under the mutex whether this call fetches; the fetch itself runs
+	// unlocked (see StatsCache).
 	bool must_fetch = false;
 	bool concurrent_wait = false;
 	double wait_ms = 0.0;
 	auto qualifier = ParentSchema().name.GetIdentifierName() + "." + name.GetIdentifierName();
 	{
 		std::unique_lock<std::mutex> lk(stats_cache_.mutex);
-		// Wait out a concurrent fetch. The waiter then sees the freshly
-		// populated cache and skips fetching.
 		if (stats_cache_.loading) {
 			concurrent_wait = true;
 			auto wait_start = std::chrono::steady_clock::now();
@@ -128,10 +111,7 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 
 	double fetch_ms = 0.0;
 	if (must_fetch) {
-		// Both populate paths handle their own publish + cv notify. They
-		// must clear stats_cache_.loading on every exit path (success,
-		// thrown exception, or caught error). Prefer the inline-blob path
-		// when the worker pre-shipped stats — no RPC needed.
+		// Both loaders publish, clear `loading` and notify on every exit path.
 		auto fetch_start = std::chrono::steady_clock::now();
 		if (table_info_.column_statistics.has_value()) {
 			PopulateStatsCacheFromInline(context);
@@ -178,9 +158,8 @@ bool VgiTableEntry::StatsCache::IsStale() const {
 	return elapsed > std::chrono::seconds(max_age_seconds);
 }
 
-// Caller must have set stats_cache_.loading = true under the mutex; this
-// method runs the worker RPC with the mutex *released* and is responsible
-// for clearing the loading flag (and notifying waiters) on every exit.
+// Caller set stats_cache_.loading under the mutex; this runs the RPC unlocked
+// and must clear `loading` and notify waiters on every exit.
 void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 	std::unordered_map<std::string, unique_ptr<BaseStatistics>> fetched_entries;
 	int64_t fetched_max_age = -1;
@@ -191,7 +170,6 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 		auto &attach_params = vgi_catalog.attach_parameters();
 		auto &attach_result_data = vgi_catalog.attach_result();
 
-		// Build column name/type vectors from the table's schema
 		auto &columns = GetColumns();
 		std::vector<LogicalType> col_types;
 		std::vector<std::string> col_names;
@@ -214,9 +192,8 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 		fetched_max_age = rpc_result.cache_max_age_seconds;
 		ok = true;
 	} catch (const std::exception &e) {
-		// Best-effort logging; never propagate. We must always reach the
-		// publish-and-clear block below or other callers wedge forever
-		// waiting on stats_cache_.cv.
+		// Never propagate: the publish-and-clear below must run or waiters on
+		// stats_cache_.cv hang forever.
 		try {
 			auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 			VGI_LOG(context, "column_statistics.fetch_error",
@@ -230,11 +207,8 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 		// unknown — likewise, must reach publish-and-clear below
 	}
 
-	// Publish results under the mutex. Even on failure we mark the cache as
-	// "fetched" so subsequent callers don't pile up retries; max_age=-1
-	// keeps the empty cache effectively pinned, which matches the previous
-	// behaviour. The next CheckAndInvalidateCache / explicit clear will
-	// reset.
+	// Even on failure mark the cache fetched so callers don't pile up retries;
+	// the empty cache stays until the entry is rebuilt (version bump / clear).
 	{
 		std::lock_guard<std::mutex> lk(stats_cache_.mutex);
 		if (ok) {
@@ -250,22 +224,17 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 	stats_cache_.cv.notify_all();
 }
 
-// Caller must have set stats_cache_.loading = true under the mutex. This
-// runs the deserialize *outside* the mutex (matching FetchColumnStatistics)
-// because Arrow→DuckDB conversion can re-enter logging / catalog paths,
-// and is responsible for clearing the loading flag and notifying waiters
-// on every exit path.
+// Same contract as FetchColumnStatistics; the decode runs unlocked because
+// Arrow-to-DuckDB conversion can re-enter logging / catalog paths.
 void VgiTableEntry::PopulateStatsCacheFromInline(ClientContext &context) const {
 	std::unordered_map<std::string, unique_ptr<BaseStatistics>> parsed_entries;
 	bool ok = false;
 
 	try {
 		auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
-		(void)vgi_catalog; // (referenced below in error path)
+		(void)vgi_catalog;
 
-		// Build column name/type vectors from the table's schema — same
-		// derivation as the on-demand fetch path so the two routes produce
-		// identical BaseStatistics shapes.
+		// Same derivation as FetchColumnStatistics, so both yield identical shapes.
 		auto &columns = GetColumns();
 		std::vector<LogicalType> col_types;
 		std::vector<std::string> col_names;
@@ -297,12 +266,8 @@ void VgiTableEntry::PopulateStatsCacheFromInline(ClientContext &context) const {
 		// unknown — likewise, must reach publish-and-clear below
 	}
 
-	// Publish results. Mark `fetched=true` even on parse failure so callers
-	// don't pile up retries; max_age_seconds = -1 means "never expires within
-	// this catalog_version" — cache invalidation evicts on version bump.
-	// This is the right TTL for inlined stats: the worker built them at some
-	// past instant we don't know, but the version-bump path is what reliably
-	// signals freshness, not steady_clock since attach.
+	// Fetched even on parse failure (no retry pile-up). Inlined stats never
+	// expire: their age is unknown, and a catalog version bump rebuilds the entry.
 	{
 		std::lock_guard<std::mutex> lk(stats_cache_.mutex);
 		if (ok) {
@@ -335,31 +300,23 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 }
 
 bool VgiTableEntry::IsKnownSingleBranchNoAT() const {
-	// Inlined scan_function on table_info_ means the worker pre-shipped
-	// the legacy single-function path — definitely single-branch, no
-	// RPC ever needed for this table.
+	// An inlined scan_function is always single-branch.
 	if (table_info_.scan_function.has_value()) {
 		return true;
 	}
-	// Otherwise consult the atomic hint populated by a prior
-	// FetchScanBranches call.
 	return multi_branch_hint_no_at_.load(std::memory_order_acquire) == 0;
 }
 
 void VgiTableEntry::RecordMultiBranchHintNoAT(bool is_multi_branch) const {
 	int target = is_multi_branch ? 1 : 0;
 	int expected = -1;
-	// First-writer-wins. Subsequent calls leave the existing value alone.
+	// First writer wins.
 	multi_branch_hint_no_at_.compare_exchange_strong(expected, target, std::memory_order_acq_rel);
 }
 
 vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &context, const std::string &at_unit,
                                                             const std::string &at_value,
                                                             const std::optional<std::vector<uint8_t>> &pushdown_filters) {
-	// Fresh RPC per call. branches[] can vary with AT(...) — e.g.,
-	// versioned_data tables return different function args per version.
-	// Capability cache on VgiAttachParameters (A8) avoids the doomed-RPC
-	// round-trip on workers that don't implement the new method.
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -371,11 +328,8 @@ vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &conte
 	auto result = vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name.GetIdentifierName(),
 	                                                     name.GetIdentifierName(), context, at_unit, at_value,
 	                                                     pushdown_filters);
-	// Populate the multi-branch hint for the no-AT case so subsequent
-	// write-refusal helpers can short-circuit without an RPC. AT-carrying
-	// fetches don't populate the hint because the count COULD differ
-	// per version in principle (writes always use empty AT, so the no-AT
-	// snapshot is authoritative for them).
+	// Only no-AT fetches set the hint: the branch count may differ per version,
+	// and writes always use the no-AT view.
 	if (at_unit.empty() && at_value.empty()) {
 		RecordMultiBranchHintNoAT(result.branches.size() > 1);
 	}
@@ -399,22 +353,14 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		return physical;
 	};
 
-	// Resolve the scan-function shape. Three paths in priority order:
-	//   1. Inlined ``table_info_.scan_function`` (legacy single-branch
-	//      pre-shipped path) — saves the per-bind RPC on HTTP transports.
-	//   2. Already-loaded ``branches_`` cache from a prior call (lazy load).
-	//   3. RPC: InvokeCatalogTableScanBranchesGet (protocol 3.3: the only
-	//      scan-discovery RPC; there is no fallback).
+	// Scan shape, in priority order: filtered scan planning (deferred marker),
+	// the inlined ``table_info_.scan_function`` (saves the per-bind RPC), else
+	// catalog_table_scan_branches_get. Multi-branch results become a marker
+	// that VgiMultiScanRewriter expands into a UNION ALL of arms.
 	//
-	// Multi-branch tables (branches.size() > 1) require the optimizer
-	// rewriter to stitch arms together via LogicalSetOperation(UNION_ALL,
-	// ...). That rewriter ships in Phase C — until then, multi-branch
-	// returns surface a NotImplementedException loud-fail so the design
-	// is observable without the rewriter shipping.
-	// Protocol 3.2 filtered scan planning: make no RPC at bind time. Return the
-	// multi-branch marker in deferred mode; the pre-optimizer rewrite collects
-	// the query's predicates on this scan, calls catalog_table_scan_branches_get
-	// with them, prunes, and emits the arms (or an empty result).
+	// Filtered scan planning: no RPC at bind time. The deferred marker lets the
+	// pre-optimizer rewrite fetch branches with the query's predicates, prune,
+	// and emit the arms (or an empty result).
 	if (table_info_.IsFilteredScanPlanning()) {
 		if (generated_columns) {
 			throw NotImplementedException("VGI generated columns require a single worker function scan");
@@ -446,8 +392,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			marker_bd->canonical_column_names.push_back(col.Name().GetIdentifierName());
 			marker_bd->canonical_column_types.push_back(col.Type());
 		}
-		// The catalog entry outlives planning (the rewrite runs right after
-		// bind, inside the same query), so capturing `this` is safe.
+		// Safe to capture `this`: the entry outlives planning, where the rewrite runs.
 		marker_bd->fetch_branches = [this, at_unit, at_value](ClientContext &ctx,
 		                                                      const std::optional<std::vector<uint8_t>> &filters) {
 			return FetchScanBranches(ctx, at_unit, at_value, filters);
@@ -468,14 +413,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		         {"table", name.GetIdentifierName()},
 		         {"function", scan_result.function_name}});
 	} else {
-		// Fetch branches fresh — branches[] varies with AT (e.g. versioned_data
-		// returns different args per VERSION). Capability cache on the attach
-		// params avoids the doomed-RPC round-trip on workers without the new
-		// method.
 		auto branches_result = FetchScanBranches(context, at_unit, at_value);
-		// Zero branches is legal only for scan_planning='filtered' tables
-		// (protocol 3.2), which never reach this bind-time path. For a 'bind'
-		// table it is still a worker bug: fail before a silent zero-row query.
+		// Zero branches is legal only for scan_planning='filtered' tables, which
+		// never reach here; for a 'bind' table fail rather than return no rows.
 		if (branches_result.branches.empty()) {
 			throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kProtocolViolation)
 			                          .Worker(attach_params->worker_path())
@@ -484,11 +424,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			                          "]");
 		}
 
-		// B2 (Phase B): refuse AT (...) on multi-branch tables with a
-		// BinderException at bind time, so the rewriter never sees an AT
-		// clause it can't honour. Single-branch tables still honour AT
-		// (the branches.size() == 1 path threads at_unit/at_value into the
-		// branch's scan-function call exactly as the legacy code did).
+		// Refuse AT (...) at bind for anything that needs the rewriter, which
+		// cannot honour it; a plain single-branch scan threads AT through.
 		if (!at_unit.empty() &&
 		    (branches_result.branches.size() > 1 || !branches_result.branches[0].branch_filter.empty() ||
 		     branches_result.branches[0].IsCatalogTable() || branches_result.branches[0].IsFormatBranch())) {
@@ -503,13 +440,10 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			                                         static_cast<int>(branches_result.branches.size())));
 		}
 
-		// A SINGLE branch still needs the rewriter when it carries anything the
-		// legacy ScanFunctionResult shape cannot express. The collapse below
-		// projects branches[0] back into that shape, which has no home for
-		// branch_filter, writable, or the source_* catalog-table coordinates — so
-		// collapsing a branch that uses them SILENTLY DROPS them. A branch_filter
-		// dropped this way is wrong results, not a missing feature: the arm returns
-		// rows it was supposed to exclude.
+		// A single branch still needs the rewriter when it carries what the
+		// ScanFunctionResult shape below cannot express (branch_filter, writable,
+		// catalog-table or format source); collapsing it would silently drop
+		// them, and a dropped branch_filter returns wrong rows.
 		const bool single_branch_needs_rewriter =
 		    branches_result.branches.size() == 1 &&
 		    (!branches_result.branches[0].branch_filter.empty() || branches_result.branches[0].writable ||
@@ -518,10 +452,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		if (branches_result.branches.size() > 1 || single_branch_needs_rewriter) {
 			if (generated_columns)
 				throw NotImplementedException("VGI generated columns require a single worker function scan");
-			// Multi-branch path. Up-front check of the rollback knob — if
-			// the rewriter is disabled, refuse here with a clear
-			// BinderException rather than returning the marker and reaching
-			// the internal-error safety net at execute time.
+			// Refuse here when the rewriter is disabled rather than reach the
+			// marker's execute-time backstop.
 			Value mb_enabled;
 			if (!context.TryGetCurrentSetting("vgi_multi_branch_scans", mb_enabled) || mb_enabled.IsNull() ||
 			    !mb_enabled.GetValue<bool>()) {
@@ -542,12 +474,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			                                                               ParentSchema().name.GetIdentifierName(),
 			                                                               name.GetIdentifierName()));
 
-			// Return the marker placeholder TableFunction. VgiMultiScanRewriter
-			// (pre_optimize_function in vgi_extension.cpp) detects the marker
-			// bind_data and rewrites the LogicalGet into a LogicalSetOperation
-			// (UNION_ALL, ...) with one arm per branch. The marker's execute
-			// callback throws InternalException — if execution reaches it,
-			// the rewriter failed to fire despite being enabled, which IS a bug.
+			// VgiMultiScanRewriter (a pre-optimize extension) rewrites the
+			// marker's LogicalGet into a UNION ALL with one arm per branch.
 			auto marker_bd = make_uniq<vgi::VgiMultiBranchMarkerBindData>();
 			marker_bd->branches = std::move(branches_result.branches);
 			marker_bd->required_extensions = std::move(branches_result.required_extensions);
@@ -555,10 +483,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			marker_bd->table_schema_name = ParentSchema().name.GetIdentifierName();
 			marker_bd->table_name = name.GetIdentifierName();
 			marker_bd->default_schema = attach_result->default_schema.value_or("");
-			// Canonical column list comes from the table's declared columns
-			// (GetColumns() inherited from TableCatalogEntry). The rewriter's
-			// per-arm projection layer reorders each branch's raw output to
-			// match this order (by name) and NULL-fills missing canonicals.
+			// Canonical columns: the rewriter reorders each arm's output to them
+			// by name and NULL-fills missing ones.
 			const auto &cols = GetColumns();
 			marker_bd->canonical_column_names.reserve(cols.LogicalColumnCount());
 			marker_bd->canonical_column_types.reserve(cols.LogicalColumnCount());
@@ -576,77 +502,45 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			return vgi::MakeMultiBranchMarkerFunction();
 		}
 
-		// Single-branch path: project branches[0] back into the legacy
-		// ScanFunctionResult shape so the rest of this function (extension
-		// auto-load, function-catalog lookup, pushdown capability discovery,
-		// bind-data construction) keeps working unchanged.
+		// Single branch: project branches[0] into the ScanFunctionResult shape.
 		auto &branch = branches_result.branches[0];
 		scan_result.function_name = std::move(branch.function_name);
 		scan_result.positional_arguments = std::move(branch.positional_arguments);
 		scan_result.named_arguments = std::move(branch.named_arguments);
-		// required_extensions hoisted to the top-level ScanBranchesResult;
-		// thread it back into scan_result so the auto-load loop below works.
+		// required_extensions lives on the ScanBranchesResult, not the branch.
 		scan_result.required_extensions = std::move(branches_result.required_extensions);
 	}
-	(void)used_inline; // tag for future per-path metrics
+	(void)used_inline;
 
-	// Load any required extensions before scanning
 	for (auto &ext : scan_result.required_extensions) {
 		ExtensionHelper::TryAutoLoadExtension(context, ext);
 	}
 
-	// Convert scan function arguments to Arrow
 	vector<std::pair<string, Value>> named_args_vec;
 	for (auto &[k, v] : scan_result.named_arguments) {
 		named_args_vec.emplace_back(k, v);
 	}
 
-	// Look up the scan function's catalog entry to get its capabilities
-	// (e.g., filter_pushdown, projection_pushdown)
+	// Capabilities of the resolved scan function's catalog entry.
 	bool has_projection_pushdown = false;
 	bool has_filter_pushdown = false;
 	bool has_sampling_pushdown = false;
 	bool has_late_materialization = false;
-	// PartitionColumns opt-in, read off the worker metadata like
-	// late_materialization below — the synthetic vgi_table_scan is built fresh,
-	// so nothing carries over from the function-set registration path.
+	// Read off worker metadata, like late_materialization below.
 	auto scan_partition_kind = vgi::VgiPartitionKind::NotPartitioned;
-	// Default to INSERTION_ORDER (same as DuckDB's TableFunction default).
-	// Overridden below to the resolved function's declared preservation when
-	// at least one overload of the bound function pins it — required so the
-	// virtual-table form (e.g. ``SELECT … FROM k.topics.<topic>``) honours
-	// ``preserves_order = NO_ORDER_GUARANTEE`` declared by the worker.
-	// Without this the planner kept seeing INSERTION_ORDER and forced
-	// CTAS / parallel-friendly insertion paths to serialise.
+	// DuckDB's default, replaced below by the resolved function's declared
+	// preservation, so a worker's NO_ORDER_GUARANTEE reaches table scans.
 	OrderPreservationType resolved_order_preservation = OrderPreservationType::INSERTION_ORDER;
 	bool order_preservation_set = false;
 	std::vector<std::string> scan_filter_semantic_profiles;
 	std::vector<vgi::VgiFilterFunctionCapability> scan_additional_filter_functions;
 	std::vector<vgi::VgiSecretRequirement> scan_required_secrets;
-	// Which schema the scan function actually resolved in. The worker registers
-	// function names per schema and may reuse one name across schemas, so the
-	// bind request has to name the schema we found it in — not just the table's.
+	// Schema the scan function resolved in; the bind request must name it, as
+	// one function name may exist in several schemas.
 	std::string scan_function_schema;
-	// `default_schema` is read regardless of which branch below needs it: the
-	// worker-provided path also checks against it.
 	const auto default_schema = vgi_catalog.attach_result()->default_schema.value_or("");
-	// The shared resolver (vgi_table_function_resolver.hpp): visible entries in
-	// the worker-claimed third schema, the table's own schema and the catalog's
-	// default schema; then those schemas' hidden (protocol 3.3 table_only) sets;
-	// then the system catalog for native delegation (read_parquet, iceberg_scan).
-	// A function that resolves nowhere is a BinderException naming the worker:
-	// before 3.3 it silently scanned with every capability off.
-	//
-	// A worker-claimed schema equal to one we already have a stable, live
-	// reference to (the table's own schema, or the catalog's default) is
-	// resolved through the EXACT SAME lookup as the table/default cascade —
-	// empirically, routing that case through a separate lookup (even when
-	// passing the identical schema-name string) was observed to silently
-	// disable filter/projection pushdown on a later bind within the same
-	// session (see cache/filter_pushdown_keys.test) — a pre-existing fragility
-	// in the underlying catalog-entry cache that a byte-identical call
-	// shouldn't trigger, but reliably did. The resolver keeps that rule: only a
-	// schema that names neither of those two gets its own lookup.
+	// Resolution order and rules: ResolveVgiTableFunction. allow_system_catalog
+	// enables native delegation (read_parquet, iceberg_scan).
 	vgi::VgiTableFunctionRequest scan_request;
 	scan_request.catalog = &catalog_;
 	scan_request.table_schema = ParentSchema().name.GetIdentifierName();
@@ -668,14 +562,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		                                   StringUtil::Format("VGI table %s.%s (native delegation to '%s')",
 		                                                      ParentSchema().name.GetIdentifierName(),
 		                                                      name.GetIdentifierName(), scan_result.function_name));
-		// Native delegation: bind the system function eagerly here, then return
-		// a marker carrying the bound function + bind_data + return shapes.
-		// VgiRequiredFiltersOptimizer (vgi_extension.cpp) enforces this table's
-		// `required_filters` against the LogicalGet's table_filters,
-		// then swaps `function` / `bind_data` / `returned_types` / `names` in
-		// place to the stashed native ones. Subsequent passes see a vanilla
-		// native scan. Matches VgiMultiScanRewriter's per-arm binding shape
-		// (vgi_multi_scan_rewriter.cpp:219-247) but for the single-branch path.
+		// Native delegation: bind the system function eagerly and return the
+		// marker (VgiNativeDelegationMarkerBindData). Same binding as
+		// VgiMultiScanRewriter's BindBranchArm, for the single-branch path.
 		vector<unique_ptr<Expression>> positional_arguments;
 		for (const auto &value : scan_result.positional_arguments)
 			positional_arguments.push_back(make_uniq<BoundConstantExpression>(value));
@@ -708,19 +597,11 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			native_virtual_columns = native_tf.get_virtual_columns(context, native_bind.get());
 		}
 
-		// Validate the catalog's declared columns match the native bind's
-		// output by position+name. The LogicalGet that DuckDB constructs uses
-		// the catalog's column list for FilterPushdown's column_ids /
-		// table_filters keys; if the native function emits a different shape,
-		// those indices mis-resolve once VgiRequiredFiltersOptimizer rewrites
-		// the marker. Two common causes:
-		//   - The worker's pa.Schema source omits Hive-partition columns that
-		//     the native bind appends (read_parquet on `theme=…/type=…/*`).
-		//   - The worker introspected against a different release than what
-		//     the URL points at.
-		// Either way the right move is to fail loudly here so the worker
-		// author sees the mismatch immediately instead of silent column
-		// misrouting at scan time.
+		// The declared columns must match the native bind's output by position
+		// and name: the LogicalGet's column_ids / table_filters keys come from
+		// the catalog columns and would misroute after the rewrite. (Typical
+		// cause: the worker's schema omits Hive-partition columns read_parquet
+		// appends.)
 		{
 			const auto &decl_columns = GetColumns();
 			const auto decl_count = decl_columns.LogicalColumnCount();
@@ -782,23 +663,18 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			has_projection_pushdown = has_projection_pushdown || tf->projection_pushdown;
 			has_filter_pushdown = has_filter_pushdown || tf->filter_pushdown;
 			has_sampling_pushdown = has_sampling_pushdown || tf->sampling_pushdown;
-			// First overload's order_preservation_type wins. Different overloads
-			// of one function name share the same row-ordering semantics in
-			// practice — the field is per-FunctionInfo, not per-overload.
+			// First overload wins: order preservation is per-FunctionInfo.
 			if (!order_preservation_set) {
 				resolved_order_preservation = tf->order_preservation_type;
 				order_preservation_set = true;
 			}
-			// Extract required_secrets from the VgiTableFunctionInfo
 			if (tf->function_info) {
 				auto &vgi_tf_info = tf->function_info->Cast<vgi::VgiTableFunctionInfo>();
 				scan_required_secrets = vgi_tf_info.function_info().required_secrets;
 				scan_filter_semantic_profiles = vgi_tf_info.function_info().filter_semantic_profiles;
 				scan_additional_filter_functions = vgi_tf_info.function_info().additional_filter_functions;
-				// late_materialization is advertised on the parsed worker metadata
-				// (VgiFunctionInfo), not on DuckDB's TableFunction — the synthetic
-				// vgi_table_scan below is constructed fresh, so read the capability
-				// here and gate func.late_materialization on it.
+				// Worker metadata only (not on DuckDB's TableFunction): the
+				// synthetic vgi_table_scan below is built fresh.
 				has_late_materialization =
 				    has_late_materialization || vgi_tf_info.function_info().late_materialization.value_or(false);
 				if (vgi_tf_info.function_info().partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
@@ -808,7 +684,6 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		}
 	}
 
-	// Build shared bind data
 	auto scan_bind_data = make_uniq<vgi::VgiTableFunctionBindData>();
 	scan_bind_data->attach_params = attach_params;
 	scan_bind_data->attach_opaque_data = attach_result->attach_opaque_data;
@@ -825,28 +700,17 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	scan_bind_data->additional_filter_functions = scan_additional_filter_functions;
 	scan_bind_data->required_secrets = scan_required_secrets;
 
-	// Store table entry reference for get_bind_info callback
+	// For get_bind_info and the (de)serialize callbacks.
 	scan_bind_data->table_entry = this;
 
-	// Retain the AT (...) clause (empty for the no-AT case) so the
-	// vgi_table_scan (de)serialize callbacks can rebuild the same branch
-	// resolution after a logical-plan deep copy.
+	// Kept so (de)serialize rebuilds the same branch resolution.
 	scan_bind_data->at_unit = at_unit;
 	scan_bind_data->at_value = at_value;
 
-	// PartitionColumns: carry the declared kind and resolve the partition
-	// column indices, exactly as ``VgiCatalogTableFunctionBind`` does for the
-	// function-call path. Both are read by ``VgiGetPartitionInfo`` (planning)
-	// and ``VgiGetPartitionData`` (execution); leaving them unset is why a
-	// catalog table never got PhysicalPartitionedAggregate even when the
-	// worker declared SINGLE_VALUE_PARTITIONS.
-	//
-	// Resolved from the TABLE's own arrow schema rather than a bind result:
-	// it is always available here, it is the same schema the bind returns for
-	// a function-backed table, and per-field metadata survives the catalog's
-	// Arrow IPC round-trip (``row_id_column`` above is detected the same way).
-	// Indices are worker-schema positions — the rowid column included — which
-	// is the space ``VgiGetPartitionData`` maps the sink's request into.
+	// PartitionColumns: the kind and column indices read by VgiGetPartitionInfo
+	// and VgiGetPartitionData, as VgiCatalogTableFunctionBind sets them for the
+	// function-call path. Indices come from the table's own arrow schema and are
+	// worker-schema positions (rowid included), the space VgiGetPartitionData uses.
 	if (generated_columns && scan_partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
 		throw NotImplementedException("VGI partitioned generated-column scans require a qualified adapter");
 	}
@@ -868,43 +732,22 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		}
 	}
 
-	// Pass row_id info to bind data
 	if (table_info_.row_id_column >= 0) {
 		scan_bind_data->rowid_worker_col_index = worker_column(table_info_.row_id_column);
 		scan_bind_data->rowid_type = table_info_.rowid_type;
 	}
 
-	// Perform bind handshake with the worker (discovers output schema)
 	vector<LogicalType> return_types;
 	vector<Identifier> names;
 	vgi::PerformVgiTableFunctionBind(context, *scan_bind_data, return_types, names);
 
-	// Validate the worker's bind output_schema against the catalog's declared
-	// columns. DuckDB plans this catalog table scan from GetColumns() (the
-	// column list advertised via catalog_schema_contents_tables /
-	// catalog_table_get) — that list, not the bind result, fixes the LogicalGet's
-	// column_ids and the output DataChunk shape. The scan then reads worker
-	// batches shaped by the bind output_schema and reconciles them by column id
-	// (ArrowTableFunction::ArrowToDuckDB). If the worker binds *fewer* physical
-	// columns than the catalog exposes, that reconciliation indexes the emitted
-	// batch's children past its end and the client SIGSEGVs on server-supplied
-	// data (arrow_conversion.cpp dereferences arrow_array.children[idx] out of
-	// bounds). Fail closed at bind with a clear error instead.
-	//
-	// Only the *count floor* is an invariant here — the catalog deliberately may
-	// NOT match the bind output one-to-one:
-	//   - Column NAMES may differ: a virtual table renames its scan function's
-	//     output (e.g. ``numbers.value`` backed by ``sequence``'s ``n``).
-	//   - The catalog may expose a SUBSET: it can advertise fewer physical
-	//     columns than the function binds (the extras are simply unused).
-	//   - GENERATED columns inflate LogicalColumnCount but are computed by DuckDB
-	//     from physical columns and never scanned from the worker — so compare
-	//     against PhysicalColumnCount, which excludes them.
-	//   - The ROWID is a virtual column: excluded from GetColumns() (see
-	//     CreateTableInfoFromVgiTable, which filters it out of the ColumnList) and
-	//     already erased from names/return_types in ApplyBindResultToBindData.
-	// So the worker may bind *more* physical columns than the catalog exposes,
-	// but never *fewer* — that's the case that overflows the batch.
+	// DuckDB plans this scan from GetColumns(), not the bind result, and
+	// ArrowToDuckDB indexes worker batch children by those column ids: a bind
+	// with *fewer* physical columns than the catalog would read past the batch's
+	// children (a crash on worker data). Only that floor is enforced: names may
+	// differ (virtual tables rename), extra bound columns go unused, generated
+	// columns are excluded (PhysicalColumnCount), and the rowid is in neither
+	// list (ApplyBindResultToBindData erases it from `names`).
 	{
 		const auto scannable_count = GetColumns().PhysicalColumnCount();
 		if (names.size() < scannable_count) {
@@ -927,13 +770,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		}
 	}
 
-	// Use inlined cardinality from TableInfo when present, skipping the
-	// per-bind table_function_cardinality RPC. Saves 50–80ms RTT on remote
-	// HTTP transports for read-only / slow-changing tables. Workers opt in
-	// by setting Table.cardinality_estimate / cardinality_max.
-	//
-	// MUST run AFTER PerformVgiTableFunctionBind, which resets
-	// ``cardinality_estimate = -1`` on the bind data unconditionally.
+	// Inlined Table.cardinality_estimate / cardinality_max skip the per-bind
+	// table_function_cardinality RPC. Must run after PerformVgiTableFunctionBind,
+	// which resets cardinality_estimate to -1.
 	if (table_info_.cardinality_estimate.has_value() || table_info_.cardinality_max.has_value()) {
 		if (table_info_.cardinality_estimate.has_value()) {
 			scan_bind_data->cardinality_estimate = *table_info_.cardinality_estimate;
@@ -952,7 +791,6 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 
 	bind_data = std::move(scan_bind_data);
 
-	// Wire up the shared table function implementation
 	TableFunction func("vgi_table_scan", {}, vgi::VgiTableFunctionScan, nullptr, vgi::VgiTableFunctionInitGlobal,
 	                   vgi::VgiTableFunctionInitLocal);
 	// DuckDB must project away generated fields even when the worker cannot.
@@ -966,12 +804,6 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.filter_pushdown = !generated_columns && has_filter_pushdown && supports_filter_v2;
 	VgiDisableRuntimeFilterPushdown(func);
 	func.sampling_pushdown = has_sampling_pushdown;
-	// Propagate the worker's declared order preservation to the synthetic
-	// TableFunction so DuckDB's planner sees the right SourceOrder() for
-	// virtual-table scans (e.g. ``k.topics.<topic>``). Without this the
-	// dynamic-catalog path always advertised INSERTION_ORDER and CTAS over
-	// a virtual table forcibly serialised even when the underlying function
-	// is NO_ORDER_GUARANTEE.
 	func.order_preservation_type = resolved_order_preservation;
 	if (func.filter_pushdown) {
 		func.pushdown_expression = vgi::VgiPushdownExpression;
@@ -986,24 +818,12 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		func.set_scan_order = vgi::VgiSetScanOrder;
 		func.statistics = vgi::VgiTableFunctionStatistics;
 	}
-	// Make the synthetic scan function survive LogicalOperator::Copy()'s
-	// serialize/deserialize round-trip (WindowSelfJoin et al.). See the
-	// callback definitions below and the catalog registration in
-	// vgi_extension.cpp (RegisterVgiTableScanFunction).
+	// See VgiTableScanSerialize (header).
 	func.serialize = VgiTableScanSerialize;
 	func.deserialize = VgiTableScanDeserialize;
-	// INITIALIZE_ON_SCHEDULE would move init_global into
-	// Executor::ScheduleEvents' eager-init loop, collapsing N sequential
-	// metadata RTTs into one parallel batch — but it fires init_global
-	// before any sibling build pipeline has populated
-	// PhysicalTableScan::dynamic_filters via JoinFilterPushdownInfo::PushInFilter.
-	// A VGI catalog table on the probe side of a hash join would never
-	// see the build-side InFilter, breaking join key pushdown for the
-	// `SELECT … FROM catalog.schema.table` form. The same fix already lives
-	// in vgi_table_function_set.cpp for the function-call form; mirror it
-	// here. See that file's comment block for the full rationale and the
-	// TODO about a deferred-filter-capture refactor that could restore the
-	// eager flag without sacrificing join pushdown.
+	// Deliberately not INITIALIZE_ON_SCHEDULE: it would run init_global before a
+	// hash join's build side fills dynamic_filters, losing join-key pushdown
+	// (same rule as VgiTableFunctionSet).
 
 	// Generated tables expose an empty virtual for COUNT/constant scans so the
 	// engine never selects an unexpanded generated field merely to count rows.
@@ -1013,24 +833,15 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	if (table_info_.row_id_column >= 0) {
 		func.get_row_id_columns = vgi::VgiTableScanGetRowIdColumns;
 
-		// Opt into DuckDB's late-materialization optimizer only when the worker
-		// advertises the capability AND the surviving rowids can be pushed back
-		// to the wide re-scan (filter_pushdown) over a pruned projection
-		// (projection_pushdown). Without filter_pushdown the RHS scan returns the
-		// whole table — a net loss (extra scan + semi-join, no pruning). The
-		// rowid virtual column required by the optimizer is registered just
-		// above (row_id_column >= 0), so this branch is the only place the flag
-		// can be safely set; any path that registers no rowid callbacks must
-		// stay false.
+		// Late materialization needs the capability plus filter and projection
+		// pushdown (else the re-scan reads the whole table), and the rowid
+		// callbacks registered just above: never set it without them.
 		func.late_materialization =
 		    !generated_columns && has_late_materialization && has_filter_pushdown && has_projection_pushdown;
 	}
 
-	// PartitionColumns: without ``get_partition_info`` the planner skips the
-	// source outright ("this source does not expose partition information",
-	// plan_aggregate.cpp), so a catalog table could never plan a partitioned
-	// aggregate however it was declared. ``get_partition_data`` supplies the
-	// per-column (min, max) the sink then reads.
+	// Without get_partition_info the planner never considers a partitioned
+	// aggregate; get_partition_data supplies the per-column (min, max).
 	if (scan_partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
 		func.get_partition_info = vgi::VgiGetPartitionInfo;
 		func.get_partition_data = vgi::VgiGetPartitionData;
@@ -1041,14 +852,13 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 
 void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                           const BoundTableFunction &function) {
-	// Rebuild the scan from its catalog identity and AT clause. Accepted
-	// projections and query-scoped snapshots additionally retain their exact
-	// bind identity, so a copy cannot silently switch provider state.
+	// Catalog identity and AT clause; accepted projections and query-scoped
+	// snapshots also keep their exact bind state, so a copy cannot silently
+	// switch provider state.
 	auto &bind_data = bind_data_p->Cast<vgi::VgiTableFunctionBindData>();
 	if (!bind_data.table_entry) {
-		// Only the catalog-scan path installs these callbacks, and it always
-		// sets table_entry. A null here means foreign bind data reached this
-		// callback — a wiring bug, not a user error.
+		// Only the catalog-scan path installs these callbacks and it always
+		// sets table_entry: a wiring bug.
 		throw SerializationException("vgi_table_scan cannot be serialized without an originating table entry");
 	}
 	auto &table = *bind_data.table_entry;
@@ -1095,12 +905,9 @@ unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &de
 	    Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema), Identifier(table));
 	auto &vgi_entry = catalog_entry.Cast<VgiTableEntry>();
 
-	// Re-run the bind to produce a fully-configured TableFunction (pushdown
-	// flags, order preservation, virtual columns, cardinality, statistics —
-	// all recomputed for *this* table) plus its bind data. Overwriting
-	// `function` is intentional and supported: LogicalGet::Deserialize reads
-	// `function.get_virtual_columns` from the reassigned function after this
-	// callback returns, so the copy ends up identical to a fresh bind.
+	// Re-bind and overwrite `function`: LogicalGet::Deserialize reads
+	// get_virtual_columns from the reassigned function afterwards, so the copy
+	// matches a fresh bind.
 	unique_ptr<FunctionData> bind_data;
 	function = BoundTableFunction(vgi_entry.GetScanFunctionImpl(context, bind_data, at_unit, at_value));
 	if (!projection_request.empty() || !projection_response.empty()) {
@@ -1127,27 +934,14 @@ TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 	TableStorageInfo info;
 	info.cardinality = 0; // Unknown
 
-	// Expose PK and UNIQUE constraints as virtual index_info entries.
+	// PK / UNIQUE constraints as index_info entries: the ON CONFLICT binder
+	// requires a matching UNIQUE index. They are not real indexes; the worker
+	// does conflict detection.
 	//
-	// DuckDB's binder requires matching index_info when validating ON CONFLICT clauses
-	// (see bind_insert.cpp — it iterates storage_info.index_info looking for UNIQUE indexes
-	// that match the conflict target columns). Without these entries, the binder rejects
-	// ON CONFLICT with "no UNIQUE/PRIMARY KEY constraints that refer to this table".
-	//
-	// These are NOT real indexes — VGI tables have no local storage or ART indexes.
-	// They exist solely to satisfy the binder's validation. Actual conflict detection
-	// is delegated to the worker, which owns the data and its constraints.
-	//
-	// Constraint indices from the worker are in Arrow schema space (which includes
-	// the row_id column). DuckDB's physical column space excludes virtual columns
-	// like row_id. Adjust by shifting indices down when they're after row_id.
-	//
-	// The constraint lists are worker metadata, so a row_id column inside one is
-	// bad input, not an invariant: it is skipped, exactly as the CREATE-side
-	// conversion in vgi_catalog_api.cpp does, and a key left with no columns is
-	// dropped. (This used to throw InternalException, and since duckdb_tables()
-	// calls GetStorageInfo for every table, one worker could invalidate the
-	// database for anyone listing tables.)
+	// Worker indices are Arrow-schema positions (rowid included); shift down
+	// past the rowid. A rowid inside a key is bad worker input: skip it (and
+	// drop an emptied key) rather than throw, since duckdb_tables() calls this
+	// for every table.
 	auto add_index = [&](const std::vector<int> &cols, bool is_primary) {
 		IndexInfo idx_info;
 		idx_info.is_unique = true;
@@ -1191,9 +985,8 @@ virtual_column_map_t VgiTableEntry::GetVirtualColumns() const {
 
 #if VGI_ENGINE_HAS_DELETE_RETURNING_VIRTUAL_COLUMNS
 virtual_column_map_t VgiTableEntry::GetDeleteReturningVirtualColumns() const {
-	// The provider returns user columns for DELETE. Its transport row identifier
-	// is available to scans but is absent from the returned row schema; response
-	// order is not an identity mapping back to the input identifiers.
+	// DELETE RETURNING rows carry only user columns: the rowid is absent and
+	// response order does not map back to the input identifiers.
 	return {};
 }
 #endif

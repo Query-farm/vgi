@@ -40,22 +40,16 @@ class QueryFarmTelemetryWorker;
 
 // Process-wide set of workers whose thread may still be running.
 //
-// The database join below covers every orderly shutdown, but a process can also
-// call exit() with the database still alive: the DuckDB shell does so on any
-// non-zero exit (a failing statement in `duckdb -f`, `.exit 1`, Ctrl-C x3), and
-// embedders may hold a global DuckDB object. exit() then runs the atexit
-// handlers -- including OpenSSL's OPENSSL_cleanup, registered by httpfs -- while
-// the worker is still inside the request, which is the crash from issue #4.
+// The per-database join below covers orderly shutdown, but a process can call
+// exit() with the database alive (the DuckDB shell on any non-zero exit,
+// embedders holding a global DuckDB). exit() then runs OpenSSL's
+// OPENSSL_cleanup (registered by httpfs) while a worker is mid-request and
+// crashes. So the registry installs an atexit handler that joins live workers.
+// atexit runs in reverse registration order, so ours must be registered after
+// OpenSSL's: SendEvent constructs the HTTP client (which initialises OpenSSL)
+// before calling EnsureAtExitHandler().
 //
-// So the registry also installs an atexit handler that joins every live worker.
-// atexit handlers run in reverse registration order, so ours must be registered
-// AFTER OpenSSL's to run BEFORE OPENSSL_cleanup. httpfs initialises OpenSSL
-// lazily when an HTTP client is first constructed; SendEvent therefore
-// constructs the client on the calling thread first and only then calls
-// EnsureAtExitHandler().
-//
-// The registry is heap-allocated and never freed on purpose: it has to outlive
-// every static destructor in the process.
+// Heap-allocated and never freed: it must outlive every static destructor.
 class QueryFarmTelemetryRegistry {
 public:
 	static QueryFarmTelemetryRegistry &Get() {
@@ -141,18 +135,12 @@ void QueryFarmTelemetryRegistry::JoinAllAtExit() {
 	}
 }
 
-// One extension's telemetry workers for one database.
-//
-// A plain detached thread could outlive the DuckDB instance that created it and
-// race the process teardown (issue #4). Storing the workers in the database's
-// ObjectCache ties them to the database instead: ~DatabaseInstance destroys the
-// cache before the scheduler, buffer manager, and log manager, so the join
-// happens while everything the request touches is still intact. The registry
-// above covers the remaining case where the process exits without ever
-// destroying the database.
-//
-// An extension may send several events per database (one per ATTACH, say), so
-// finished workers are reaped whenever a new one is added.
+// One extension's telemetry workers for one database. Living in the
+// database's ObjectCache ties them to the database: ~DatabaseInstance destroys
+// the cache before the scheduler, buffer manager and log manager, so the join
+// happens while everything the request touches is intact. The registry above
+// covers exit without destroying the database. Finished workers are reaped
+// whenever a new one is added (one event per ATTACH, say).
 class QueryFarmTelemetryWorkers : public ObjectCacheEntry {
 public:
 	void Add(unique_ptr<QueryFarmTelemetryWorker> worker) {
@@ -170,9 +158,8 @@ public:
 		workers.back()->Start();
 	}
 
-	// Each extension compiles its own copy of this class, so the cache key is
-	// scoped by extension name: an entry is only ever read back by the copy that
-	// created it.
+	// Each extension compiles its own copy of this class, so the key is scoped
+	// by extension name: only the copy that created an entry reads it back.
 	static string CacheKey(const string &extension_name) {
 		return "query_farm_telemetry-" + extension_name;
 	}
@@ -223,22 +210,19 @@ void SendEvent(DatabaseInstance &db, const string &extension_name, const string 
 	// (for example, HTTPParams::Initialize rejects an http_proxy value it cannot
 	// parse); none of that may fail the caller.
 	try {
-		// Resolve settings, proxy, and secrets on the calling thread, so the worker
-		// touches nothing but the HTTP client. Bound the request so a stalled
-		// connection cannot hold up database shutdown (or process exit) for long,
-		// and never retry -- a dropped ping is not worth one. Note that the httplib
-		// client applies this separately to connect, write and read, so the real
-		// bound is a small multiple of it; curl applies it as a total.
+		// Resolve settings, proxy and secrets on the calling thread so the worker
+		// touches only the HTTP client. Bound the request so a stalled connection
+		// cannot hold up shutdown, and never retry. httplib applies the timeout
+		// separately to connect, write and read (curl as a total).
 		auto &http_util = HTTPUtil::Get(db);
 		unique_ptr<HTTPParams> params = http_util.InitializeParameters(db, target_url);
 		params->timeout = 3;
 		params->timeout_usec = 0;
 		params->retries = 0;
 
-		// Construct the client on the calling thread as well. Besides keeping the
-		// worker minimal, this is what initialises curl/OpenSSL (and registers
-		// OpenSSL's atexit cleanup) before we register our own exit handler below,
-		// which is what guarantees ours runs first. No network I/O happens here.
+		// Constructing the client here initialises curl/OpenSSL (registering its
+		// atexit cleanup) before EnsureAtExitHandler below, so ours runs first.
+		// No network I/O happens here.
 		string path, proto_host_port;
 		HTTPUtil::DecomposeURL(target_url, path, proto_host_port);
 		auto client = http_util.InitializeClient(*params, proto_host_port);
@@ -307,8 +291,6 @@ INTERNAL_FUNC void QueryFarmSendTelemetry(ExtensionLoader &loader, const string 
 	} catch (...) {
 		return;
 	}
-	// ALLOW: extension load is already an initialization path, so a one-time
-	// synchronous httpfs auto-load is acceptable here.
 	SendEvent(loader.GetDatabaseInstance(), extension_name, TELEMETRY_URL, body, QueryFarmHttpfsAutoload::ALLOW);
 }
 

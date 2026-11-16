@@ -1,29 +1,11 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
-// =============================================================================
-// VgiMultiScanRewriter implementation.
+// VgiMultiScanRewriter (see the header). Arms reconcile columns by NAME with
+// NULL-fill (UNION ALL BY NAME semantics); a ColumnBindingReplacer pass rewrites
+// parent expressions that referenced the marker's bindings.
 //
-// Phase C of the multi-branch design. Detects LogicalGet nodes whose bind
-// data is a VgiMultiBranchMarkerBindData (placed there by
-// VgiTableEntry::GetScanFunctionImpl when branches_.size() > 1) and rewrites
-// them into LogicalSetOperation(UNION_ALL, [LogicalProjection(
-// LogicalFilter(branch_filter, LogicalGet(branch_fn))), ...]).
-//
-// Design constraints honoured here:
-//   - Pre-pushdown phase: DuckDB's filter pushdown runs AFTER this rewriter
-//     and distributes parent filters into each arm naturally.
-//   - Column reconciliation by NAME with NULL-fill for missing columns
-//     (matches SQL UNION ALL BY NAME semantics — validated by U1 spike).
-//   - column_ids on each arm mirror the marker's narrowed column_ids
-//     (S2 spike finding — silent ColumnBindingResolver failure otherwise).
-//   - ColumnBindingReplacer pass on the root plan to rewrite parent
-//     expressions referencing the old marker bindings.
-//
-// Known limitations:
-//   - branch_filter binding supports only the subset
-//     "col OP const [AND col OP const ...]" — no function calls, no
-//     subqueries, no nested expressions. Richer filters would require
-//     full ExpressionBinder integration.
-// =============================================================================
+// Known limitation: branch_filter binding supports only
+// "col OP const [AND col OP const ...]" — no function calls, subqueries or
+// nested expressions.
 
 #include "vgi_multi_scan_rewriter.hpp"
 #include "storage/vgi_table_function_resolver.hpp"
@@ -107,8 +89,6 @@ void RequireVgiOptimizerExtensions(ClientContext &context, const std::string &wh
 
 TableFunction MakeMultiBranchMarkerFunction() {
 	TableFunction fn("vgi_multi_branch_marker", {}, MultiBranchMarkerExecute);
-	// No bind callback — bind_data is supplied externally by GetScanFunctionImpl.
-	// No init_global / init_local — the marker should never be executed.
 	return fn;
 }
 
@@ -116,16 +96,13 @@ TableFunction MakeMultiBranchMarkerFunction() {
 // Minimal branch_filter binder (scope: col OP const [AND ...])
 // ---------------------------------------------------------------------------
 
-// Map column name → ColumnBinding for the arm. Built from the arm's return_names
-// and the arm's GetColumnBindings(). The binder uses this to resolve
-// column references in the branch_filter expression.
+// Column name → the arm's ColumnBinding, for resolving branch_filter references.
 struct ArmColumnLookup {
 	const std::vector<std::string> &names;
 	const std::vector<LogicalType> &types;
 	const std::vector<ColumnBinding> &bindings;
 };
 
-// Forward declarations.
 static unique_ptr<Expression> BindBranchFilterExpr(ClientContext &context, const ParsedExpression &expr,
                                                     const ArmColumnLookup &cols);
 
@@ -230,34 +207,19 @@ static unique_ptr<Expression> BindBranchFilterExpr(ClientContext &context, const
 }
 
 // ---------------------------------------------------------------------------
-// Per-arm LogicalGet construction (mirrors the S2+S3 spike pattern)
+// Per-arm LogicalGet construction
 // ---------------------------------------------------------------------------
-
-// Build a LogicalGet for a single branch. Resolves function_name through the
-// catalog, invokes its bind callback with the branch's args, propagates
-// column_ids from the marker so the arm's output column count matches.
 struct ArmBindResult {
 	unique_ptr<LogicalGet> get;
 	std::vector<std::string> raw_names;   // column names as the branch returned them
-	std::vector<LogicalType> raw_types;   // ditto
+	std::vector<LogicalType> raw_types;   // as the branch returned them
 	std::vector<ColumnBinding> bindings;  // matching ColumnBinding list
 };
 
-// Build a LogicalGet for a catalog-table branch that scans an attached-catalog
-// BASE TABLE (source_catalog.source_schema.source_table) rather than a table
-// function. Mirrors DuckDB's own base-table binding in bind_basetableref.cpp
-// (CatalogType::TABLE_ENTRY case): resolve the TableCatalogEntry, ask it for its
-// scan function + bind_data, and construct the LogicalGet from the table's
-// logical columns. The companion catalog is attached at VGI-attach time (via the
-// attach_catalogs manifest), so this is a pure lookup — no attach here.
-//! Map a declared format name to the DuckDB table function that reads it.
-//!
-//! The convention (``read_<format>``) covers parquet/csv/json and anything an
-//! extension registers the same way, so the table only needs the exceptions.
-//! Unknown formats fall through to the convention rather than erroring here — if
-//! the resulting function does not exist, the ordinary "unknown function" path
-//! reports it with the extension-load hint already attached, which is a better
-//! message than anything this function could produce.
+//! Map a declared format name to the DuckDB table function that reads it:
+//! ``read_<format>`` except for the listed exceptions. An unknown format falls
+//! through to the convention, so the ordinary "unknown function" path reports
+//! it (with its extension-load hint).
 static std::string VgiFormatReaderFunction(const std::string &format_name) {
 	static const std::map<std::string, std::string> kExceptions = {
 	    {"iceberg", "iceberg_scan"},
@@ -272,6 +234,10 @@ static std::string VgiFormatReaderFunction(const std::string &format_name) {
 	return "read_" + format_name;
 }
 
+// A catalog-table branch scans an attached-catalog BASE TABLE
+// (source_catalog.source_schema.source_table), bound like DuckDB's own
+// base-table binding (Binder::Bind(BaseTableRef), TABLE_ENTRY case). The
+// companion catalog was attached at VGI-attach time, so this is a pure lookup.
 static ArmBindResult BindCatalogTableArm(const VgiScanBranch &branch, ClientContext &context, Binder &binder) {
 	// The companion catalog must already be attached. If it isn't (e.g.
 	// `attach_companions false`, or an optional companion that failed/conflicted),
@@ -336,24 +302,16 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
                                     const std::string &table_schema_name, const std::string &table_name,
                                     const std::string &default_schema,
                                     const std::vector<ColumnIndex> &marker_column_ids) {
-	// SPIKE A: catalog-table branches take a completely different bind path
-	// (base table entry, not a table function).
 	if (branch.IsCatalogTable()) {
 		(void)marker_column_ids;
 		return BindCatalogTableArm(branch, context, binder);
 	}
 
-	// P4: a FORMAT branch names a format plus locations instead of a function.
-	// It is bound by resolving the format to its reader and then taking the
-	// ordinary function path — resolved here rather than given its own bind so it
-	// inherits overload selection, extension auto-load and pushdown discovery
-	// unchanged. A worker gets to say "these 40 parquet files" without knowing the
-	// reader's argument spelling.
-	//
-	// Only the three fields the function path actually reads are overridden.
-	// VgiScanBranch holds a unique_ptr (parsed_branch_filter) so it is not
-	// copy-assignable, and copying the whole record would be wrong anyway — the
-	// filter belongs to the original branch.
+	// A FORMAT branch (a format plus locations) resolves the format to its reader
+	// and takes the ordinary function path, inheriting overload selection,
+	// extension auto-load and pushdown discovery. Only the three fields that path
+	// reads are overridden: VgiScanBranch is not copy-assignable (it owns
+	// parsed_branch_filter), and the filter belongs to the original branch.
 	std::string eff_function_name = branch.function_name;
 	vector<Value> eff_positional(branch.positional_arguments.begin(), branch.positional_arguments.end());
 	std::map<std::string, Value> eff_named = branch.named_arguments;
@@ -375,19 +333,10 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 		}
 		eff_named = branch.format_options;
 	}
-	// Look up the branch's function through the shared resolver
-	// (vgi_table_function_resolver.hpp), the same one the single-branch scan and
-	// the write path use: a worker-provided schema_name (protocol 1.5.0,
-	// function branches only) naming a third schema first, then the table's
-	// schema and the catalog's default schema, then the hidden (protocol 3.3
-	// table_only) sets of those schemas, then the system catalog (read_parquet,
-	// iceberg_scan, ...). A format branch's reader skips the hidden sets and
-	// goes to the system catalog right after the visible entries.
-	// Catalog::GetEntry alone would never see a table_only function:
-	// LookupEntry() deliberately does not return them. A worker-claimed
-	// schema equal to the table's or the default is resolved by that cascade
-	// itself, never by a separate call (see cache/filter_pushdown_keys.test and
-	// the comment in vgi_table_entry.cpp).
+	// Resolve through the shared resolver (vgi_table_function_resolver.hpp) used
+	// by the single-branch scan and the write path, not Catalog::GetEntry, which
+	// never returns table_only functions. A format branch's reader skips the
+	// hidden sets.
 	auto &table_catalog = Catalog::GetCatalog(context, Identifier(table_catalog_name));
 	vgi::VgiTableFunctionRequest request;
 	request.catalog = &table_catalog;
@@ -451,24 +400,11 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	get->input_table_types = std::move(input_table_types);
 	get->input_table_names = std::move(input_table_names);
 
-	// Each arm produces ALL of its natural return columns. We deliberately
-	// do NOT mirror the marker's narrowed column_ids onto the arm because:
-	//
-	//   1. Marker column_ids may contain virtual rowid placeholders (when
-	//      DuckDB optimised `count(*)` to "I just need any column"). Those
-	//      don't exist on every arm — e.g., sequence() and read_parquet
-	//      both have rowid but with different types, and the union ends
-	//      up with mismatched arm types (BIGINT vs BOOLEAN seen in
-	//      multi_branch_heterogeneous.test).
-	//
-	//   2. The per-arm LogicalProjection (BuildArmProjection) explicitly
-	//      maps each arm's raw output to the canonical column list, so the
-	//      union's column shape is always the canonical shape regardless
-	//      of which columns the underlying arm "needs". DuckDB's filter +
-	//      projection pushdown handles per-arm narrowing AFTER the rewrite.
-	//
-	// Populate column_ids with the full set of bound return columns so
-	// ResolveOperatorTypes() doesn't fall back to GetAnyColumn().
+	// Each arm produces ALL of its return columns rather than mirroring the
+	// marker's narrowed column_ids: those may hold virtual rowid placeholders
+	// (count(*)) whose types differ between arms, and BuildArmProjection maps
+	// each arm to the wanted columns anyway; pushdown narrows arms afterwards.
+	// The full set also keeps ResolveOperatorTypes() off GetAnyColumn().
 	{
 		vector<ColumnIndex> all_cols;
 		all_cols.reserve(return_types.size());
@@ -492,17 +428,11 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 // Per-arm projection (column reconciliation by NAME with NULL-fill + cast)
 // ---------------------------------------------------------------------------
 
-// Build a LogicalProjection above the arm's LogicalGet (and the optional
-// branch_filter LogicalFilter) that maps raw_names → wanted_canonical_names.
-//
-// `wanted_canonical_names` is a SUBSET of the table's full canonical column
-// list, in the order the parent expects. When the marker's column_ids has
-// been narrowed by the binder (e.g. `count(*)` only needs one column), the
-// projection produces just those columns, so the union's column count
-// matches the parent's bindings.
-//
-// Match by NAME; emit NULL::canonical_type for missing canonicals; reject
-// extra (non-canonical) columns with a loud error.
+// A LogicalProjection above the arm (and its optional branch_filter) mapping
+// raw_names to `wanted_canonical_names`: the subset of canonical columns the
+// parent references (the marker's narrowed column_ids), in its order, so the
+// union's column count matches the parent's bindings. Matches by NAME, casts
+// on type mismatch, NULL-fills missing columns and rejects non-canonical ones.
 static unique_ptr<LogicalProjection> BuildArmProjection(
     ClientContext &context, unique_ptr<LogicalOperator> arm_child, Binder &binder, const ArmBindResult &arm,
     const std::vector<std::string> &wanted_canonical_names,
@@ -512,7 +442,6 @@ static unique_ptr<LogicalProjection> BuildArmProjection(
 	vector<unique_ptr<Expression>> proj_exprs;
 	proj_exprs.reserve(wanted_canonical_names.size());
 
-	// Build a name→index lookup for the branch's raw output.
 	case_insensitive_map_t<size_t> raw_lookup;
 	for (size_t i = 0; i < arm.raw_names.size(); i++) {
 		raw_lookup.emplace(arm.raw_names[i], i);
@@ -527,23 +456,17 @@ static unique_ptr<LogicalProjection> BuildArmProjection(
 			auto colref = make_uniq<BoundColumnRefExpression>(arm.raw_types[raw_idx], arm.bindings[raw_idx]);
 			unique_ptr<Expression> expr = std::move(colref);
 			if (arm.raw_types[raw_idx] != canonical_type) {
-				// Same-named column with different type — cast it. Let DuckDB's
-				// cast machinery throw with its own error if the cast isn't
-				// defined.
+				// DuckDB's cast machinery reports an undefined cast.
 				expr = BoundCastExpression::AddCastToType(context, std::move(expr), canonical_type);
 			}
 			proj_exprs.push_back(std::move(expr));
 		} else {
-			// Branch doesn't return this canonical column — NULL-fill.
 			proj_exprs.push_back(make_uniq<BoundConstantExpression>(Value(canonical_type)));
 		}
 	}
 
-	// Reject branch columns that AREN'T in the FULL canonical list. Catches
-	// "worker added a column nobody knows about" at rewrite time. (Note: we
-	// reject against the full canonical list, not the narrowed wanted-list,
-	// because a column that's canonical-but-not-needed is fine — it just
-	// won't surface in the union.)
+	// Reject against the FULL canonical list, not the wanted subset: a canonical
+	// but unreferenced column is fine.
 	for (size_t i = 0; i < arm.raw_names.size(); i++) {
 		bool found = false;
 		for (const auto &cname : all_canonical_names) {
@@ -581,7 +504,7 @@ static bool IsMultiBranchMarker(const LogicalGet &get) {
 
 // ---------------------------------------------------------------------------
 // Protocol 3.2 scan planning: predicate collection, filtered fetch, pruning
-// (docs/protocol/scan-planning.md in vgi-python)
+// (docs/multi_branch.md)
 // ---------------------------------------------------------------------------
 
 using ConjunctList = vector<const Expression *>;
@@ -856,8 +779,7 @@ static bool BranchIsPruned(ClientContext &context, const VgiScanBranch &branch,
 
 static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, Binder &binder,
                         LogicalOperator &root, const ConjunctList &applicable) {
-	// Recurse children first (bottom-up). Mirrors the spike implementation.
-	// Each child receives the WHERE conjuncts that apply to it (protocol 3.2).
+	// Bottom-up; each child receives the WHERE conjuncts that apply to it.
 	{
 		auto child_conjuncts = ChildConjuncts(*op, applicable);
 		for (idx_t i = 0; i < op->children.size(); i++) {
@@ -935,36 +857,28 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 		return;
 	}
 
-	// Auto-load required extensions before binding any branch.
 	for (const auto &ext : marker.required_extensions) {
 		ExtensionHelper::TryAutoLoadExtension(context, ext);
 	}
 
-	// Capture old column bindings (parent operators reference these).
+	// Parent operators reference these.
 	auto old_bindings = get.GetColumnBindings();
 	const auto &marker_column_ids = get.GetColumnIds();
 
-	// The marker's column_ids (positional in the canonical schema) tells
-	// the rewriter which canonical columns the parent operators actually
-	// reference. The union's output schema is the narrowed subset, not the
-	// full canonical schema — keeps binding-count consistent with the
-	// marker's GetColumnBindings() output.
+	// The union outputs only the canonical columns the marker's column_ids
+	// reference, so its binding count matches the marker's GetColumnBindings().
 	std::vector<std::string> wanted_names;
 	std::vector<LogicalType> wanted_types;
 	if (marker_column_ids.empty()) {
-		// No narrowing — emit the full canonical schema. Matches what
-		// GetColumnBindings() returns when column_ids is empty (one
-		// binding via GetAnyColumn for the first canonical column).
+		// Empty column_ids: GetColumnBindings() returns one binding (GetAnyColumn),
+		// so emit just the first canonical column.
 		wanted_names.push_back(marker.canonical_column_names[0]);
 		wanted_types.push_back(marker.canonical_column_types[0]);
 	} else {
 		for (const auto &idx : marker_column_ids) {
 			if (idx.IsVirtualColumn()) {
-				// Virtual columns (rowid) aren't supported on multi-branch
-				// unions because each arm may have different rowid semantics.
-				// Fall back to the first canonical column — gives the parent
-				// a real column to count over, which is what `count(*)`
-				// actually needs.
+				// Arms may disagree on rowid semantics, so a virtual column becomes the
+				// first canonical column — a real column for count(*) to count.
 				wanted_names.push_back(marker.canonical_column_names[0]);
 				wanted_types.push_back(marker.canonical_column_types[0]);
 			} else {
@@ -981,7 +895,6 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 		}
 	}
 
-	// Build each arm.
 	vector<unique_ptr<LogicalOperator>> arms;
 	arms.reserve(marker.branches.size());
 	for (const auto &branch : marker.branches) {
@@ -990,7 +903,6 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 
 		unique_ptr<LogicalOperator> arm_top = std::move(arm.get);
 
-		// Optional branch_filter LogicalFilter (uses the minimal binder above).
 		if (branch.parsed_branch_filter) {
 			ArmColumnLookup cols{arm.raw_names, arm.raw_types, arm.bindings};
 			auto bound = BindBranchFilterExpr(context, *branch.parsed_branch_filter, cols);
@@ -1001,14 +913,12 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 			arm_top = std::move(filter);
 		}
 
-		// Column reconciliation: each arm contributes wanted-shaped rows.
 		auto projection = BuildArmProjection(context, std::move(arm_top), binder, arm,
 		                                      wanted_names, wanted_types,
 		                                      marker.canonical_column_names);
 		arms.push_back(std::move(projection));
 	}
 
-	// Assemble the union. column_count = narrowed wanted column count.
 	const idx_t column_count = wanted_names.size();
 	auto setop_idx = binder.GenerateTableIndex();
 	auto union_op = make_uniq<LogicalSetOperation>(setop_idx, column_count, std::move(arms),
@@ -1032,8 +942,8 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 	auto *union_ptr = union_op.get();
 	op = std::move(union_op);
 
-	// Rewrite parent expressions referencing the old marker bindings. Stop
-	// descent at the union itself so we don't trash the arms' bindings.
+	// Rewrite parent references to the marker bindings; stop at the union so the
+	// arms' bindings are untouched.
 	ColumnBindingReplacer replacer;
 	replacer.replacement_bindings.reserve(old_bindings.size());
 	for (idx_t i = 0; i < old_bindings.size(); i++) {
@@ -1050,16 +960,13 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 class VgiMultiScanRewriter : public OptimizerExtension {
 public:
 	VgiMultiScanRewriter() {
-		// Pre-pushdown phase: rewriting INTO standard DuckDB operators that
-		// benefit from filter pushdown. Different from VgiTableBufferingRewriter
-		// which is post-pushdown (its LogicalExtensionOperator is opaque to
-		// pushdown). See the phase-split comment in vgi_extension.cpp.
+		// Pre-pushdown (see the header); VgiTableBufferingRewriter is post-pushdown
+		// because its LogicalExtensionOperator is opaque to pushdown.
 		pre_optimize_function = Optimize;
 	}
 
 private:
 	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-		// Gate on the emergency-rollback session setting.
 		Value enabled_val;
 		if (!input.context.TryGetCurrentSetting("vgi_multi_branch_scans", enabled_val) ||
 		    enabled_val.IsNull() || !enabled_val.GetValue<bool>()) {

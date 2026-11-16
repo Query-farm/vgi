@@ -16,12 +16,9 @@
 namespace duckdb {
 
 // Whether sending an event may auto-load httpfs on the calling thread.
-// TryAutoLoadExtension is synchronous and, with autoinstall on, can download an
-// extension, so it only belongs on a path that can afford to block.
-//
-//   ALLOW    - extension load, already an initialization path.
-//   DISALLOW - a per-query path such as ATTACH. If httpfs is not already
-//              loaded, the event is dropped.
+// TryAutoLoadExtension is synchronous and can download an extension, so only
+// a path that can afford to block (extension load) passes ALLOW. With DISALLOW
+// (per-query paths such as ATTACH) the event is dropped unless httpfs is loaded.
 enum class QueryFarmHttpfsAutoload { ALLOW, DISALLOW };
 
 // Extension-load ping: the 7 base fields, sent once per load.

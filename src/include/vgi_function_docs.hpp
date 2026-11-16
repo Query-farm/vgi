@@ -30,11 +30,8 @@ inline void AddVgiFunctionOption(SimpleFunction &function, Identifier name, Logi
 	}
 }
 
-// Build a FunctionDescription so the extension's built-in functions carry
-// compiled-in documentation surfaced through duckdb_functions()
-// (description, parameter names/types, examples). Worker/catalog-loaded
-// functions populate this from worker metadata; these helpers do the same
-// for the extension's own diagnostic / entry-point functions.
+// duckdb_functions() documentation for the extension's built-in functions
+// (worker functions get theirs from worker metadata).
 inline FunctionDescription MakeFunctionDescription(string description, vector<string> parameter_names = {},
                                                    vector<LogicalType> parameter_types = {},
                                                    vector<string> examples = {}) {

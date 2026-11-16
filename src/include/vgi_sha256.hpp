@@ -1,15 +1,11 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #pragma once
 //
-// SHA-256 for the extension that works on WASM. On native it delegates to the
-// engine's mbedtls (`MbedTlsWrapper::ComputeSha256Hash`, proven + possibly hardware
-// accelerated). On emscripten that symbol is NOT resolvable from the dlopen'd
-// extension side-module (it isn't in the main module's dynamic export table), so a
-// direct call throws "_ is not a function" at runtime — instead we call the engine's
-// **exported** `duckdb_wasm_sha256` primitive (which runs mbedtls inside the main
-// module, where it IS available; the same primitive vgi_oauth already uses). Keep the
-// heavy mbedtls include out of this header (header-hygiene): the impl lives in
-// vgi_sha256.cpp.
+// SHA-256 that also works on WASM. Native builds use the engine's
+// `MbedTlsWrapper::ComputeSha256Hash`. On emscripten that symbol is not exported
+// to the dlopen'd extension side-module (a direct call fails at runtime), so the
+// engine-exported `duckdb_wasm_sha256` is called instead. Keep the mbedtls
+// include out of this header.
 #include <string>
 
 namespace duckdb {

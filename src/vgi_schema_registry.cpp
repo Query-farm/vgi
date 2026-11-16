@@ -13,23 +13,14 @@ namespace vgi {
 
 namespace {
 
-// All schemas this registry references live in
-// `src/generated/vgi_protocol_schemas.hpp`, emitted by vgi-python's
-// `vgi-gen-cpp-schemas`. This file owns **policy** (void vs dynamic vs strict
-// classification, per-method `dynamic_reason` strings, which methods share a
-// `List<Binary>` outer + inner-item schema) — not contract.
+// The contract (every method's request schema, and its result schema when the
+// result is a record) is generated: generated::AllMethodSchemas() and
+// src/generated/vgi_protocol_schemas.hpp. Only the policy below is hand-written:
+// which methods return `{items: List<Binary>}` and what each item is, which
+// return raw bytes of a known record, and which are genuinely dynamic (and why).
 
 using namespace generated;
 
-// ============================================================================
-// Registry
-// ============================================================================
-//
-// Every VgiProtocol method's request schema, and its result schema when the
-// result is a record, come from the generated method table
-// (generated::AllMethodSchemas()). Only the policy below is hand-written: which
-// methods return `{items: List<Binary>}` and what each item is, which return raw
-// bytes of a known record, and which are genuinely dynamic (and why).
 
 struct DynamicMethod {
 	const char *name;
@@ -47,7 +38,6 @@ struct BlobMethod {
 };
 
 const std::unordered_map<std::string, ResponseSchema> &Registry() {
-	// Meyers singleton: thread-safe static init, no heap, no destructor ordering.
 	static const std::unordered_map<std::string, ResponseSchema> kRegistry = []() {
 		// Catalog discovery wraps IPC-serialized info batches in {items: List<Binary>}.
 		static const ItemsMethod kItemsResponses[] = {
@@ -132,9 +122,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 	return kRegistry;
 }
 
-// ============================================================================
 // Diff rendering
-// ============================================================================
 
 std::string DescribeField(const VgiSchema &schema, int i) {
 	std::ostringstream s;

@@ -25,8 +25,7 @@
 namespace duckdb {
 namespace vgi {
 
-// Convert binary bytes to hex string for logging/exceptions
-// Uses lookup table for efficiency instead of snprintf per byte
+// Lowercase hex of `bytes`, for logging/exceptions.
 inline std::string BytesToHex(const std::vector<uint8_t> &bytes) {
 	static constexpr char hex_chars[] = "0123456789abcdef";
 	if (bytes.empty()) {
@@ -53,7 +52,7 @@ inline std::string OpaqueDigest(const std::vector<uint8_t> &bytes) {
 	return VgiSha256Hex(std::string(bytes.begin(), bytes.end())).substr(0, 12);
 }
 
-// Build the standard extra_info map for VGI exceptions
+// The standard extra_info map for VGI exceptions.
 inline std::unordered_map<std::string, std::string> BuildExtraInfo(const std::string &worker_path,
                                                                     pid_t worker_pid = -1,
                                                                     const std::string &execution_id_hex = "");
@@ -214,7 +213,7 @@ inline constexpr const char *kCompanionAttachFailed = "COMPANION_ATTACH_FAILED";
 inline constexpr const char *kLocalResource = "LOCAL_RESOURCE";
 } // namespace error_subtype
 
-// The HTTP client predates the transport-neutral names.
+// Alias used by the HTTP client.
 namespace http_error = error_subtype;
 
 // Remove credentials from a URL or connection string before it is reported:
@@ -377,8 +376,7 @@ inline ErrorInfo ExtraInfoOf(const std::exception &e) {
 	}
 }
 
-// Build message with worker path context for CLI visibility
-// The worker_path is included in the message since DuckDB CLI doesn't display extra_info
+// Appends " [worker: <path>]": the DuckDB CLI does not display extra_info.
 inline std::string BuildMessageWithContext(const std::string &msg, const std::string &worker_path) {
 	if (worker_path.empty()) {
 		return msg;
@@ -386,9 +384,8 @@ inline std::string BuildMessageWithContext(const std::string &msg, const std::st
 	return msg + " [worker: " + worker_path + "]";
 }
 
-// Throw an IOException with worker context
-// Usage: ThrowVgiIOException("Failed to do X: %s", worker_path, pid, execution_id_hex, error_msg);
-// Note: worker_path is included in the message for CLI visibility, plus stored in extra_info
+// IOException with worker context in both the message and extra_info, e.g.
+//   ThrowVgiIOException("Failed to do X: %s", worker_path, pid, execution_id_hex, error_msg);
 template <typename... ARGS>
 [[noreturn]] void ThrowVgiIOException(const std::string &msg, const std::string &worker_path, pid_t worker_pid,
                                       const std::string &execution_id_hex, ARGS... params) {
@@ -397,7 +394,7 @@ template <typename... ARGS>
 	throw IOException(extra_info, full_msg, params...);
 }
 
-// Throw an IOException with worker context (no format args)
+// As above, without format args.
 [[noreturn]] inline void ThrowVgiIOException(const std::string &msg, const std::string &worker_path,
                                              pid_t worker_pid, const std::string &execution_id_hex = "") {
 	auto extra_info = BuildExtraInfo(worker_path, worker_pid, execution_id_hex);
@@ -405,19 +402,10 @@ template <typename... ARGS>
 	throw IOException(extra_info, full_msg);
 }
 
-// Typed VGI RPC exception subclass — adds an `error_kind` field that callers
-// can inspect at catch time without parsing the message text.
-//
-// `error_kind` is an open-enum string token mirrored from the
-// `vgi_rpc.error_kind` metadata key on EXCEPTION-level batches (see
-// vgi-rpc Python's metadata.ERROR_KIND_KEY). Empty string when the worker
-// did not advertise a kind.
-//
-// Subclass of InvalidInputException so:
-//   1. Existing `catch (const InvalidInputException &)` callers in the
-//      retry-suppression path keep working unchanged.
-//   2. Callers that DO want to pattern-match (e.g. capability-detection
-//      fallback) catch `const VgiRpcException &` and read `GetErrorKind()`.
+// A worker RPC error carrying `error_kind` (the open-enum `vgi_rpc.error_kind`
+// token from an EXCEPTION batch; empty when not advertised) and `error_code`.
+// An InvalidInputException, so `catch (const InvalidInputException &)` in the
+// retry-suppression path still catches it.
 class VgiRpcException : public InvalidInputException {
 public:
 	VgiRpcException(const std::unordered_map<std::string, std::string> &extra_info,
@@ -441,13 +429,10 @@ private:
 	std::string error_code_;
 };
 
-// Throw an InvalidInputException (or VgiRpcException if `error_kind` is set)
-// for user-code exceptions bubbling out of worker Python code. This is distinct
-// from IOException (transport failures) so that retry logic in
-// InvokePooledUnaryRpc does NOT retry user-code errors — retrying them on a
-// fresh worker is unsafe for stateful operations (the fresh worker has no
-// state populated by previous update/combine calls) and also masks the real
-// user-code error behind a silent NULL result.
+// Throw an InvalidInputException (VgiRpcException when error_kind/error_code is
+// set) for an exception raised by worker code. Deliberately not an IOException:
+// pool retry logic (InvokePooledUnaryRpc) retries IOExceptions on a fresh
+// worker, which is unsafe for stateful calls and would mask the real error.
 [[noreturn]] inline void ThrowVgiUserException(const std::string &msg, const std::string &worker_path,
                                                 pid_t worker_pid, const std::string &execution_id_hex = "",
                                                 const std::string &error_kind = "",
@@ -464,8 +449,7 @@ private:
 	throw InvalidInputException(extra_info, full_msg);
 }
 
-// Well-known `error_kind` token values. Open enum — new tokens may appear
-// at any time, callers should treat unknown values as "kind not recognised".
+// Well-known `error_kind` tokens. Open enum: treat unknown values as unrecognised.
 namespace error_kind {
 inline constexpr const char *kMethodNotImplemented = "method_not_implemented";
 // The worker does not host the protocol the request named (vgi-rpc WIRE_PROTOCOL
@@ -473,15 +457,9 @@ inline constexpr const char *kMethodNotImplemented = "method_not_implemented";
 inline constexpr const char *kProtocolNotSupported = "protocol_not_supported";
 } // namespace error_kind
 
-// Format captured worker stderr into a suffix appended to worker-failure
-// messages, so the user sees *why* the worker died (Python traceback, missing
-// module, "command not found", etc.). Returns "" when there is no stderr.
-//
-// Tail-capped: a worker can spew arbitrarily much before dying, but the useful
-// part of a traceback is the bottom (the exception type/message), so we keep the
-// last ~kMaxLines lines / ~kMaxBytes bytes and prepend an omitted-lines marker
-// if we dropped anything. Each retained line is indented two spaces under a
-// "worker stderr:" header.
+// Captured worker stderr as a "worker stderr:" suffix for worker-failure
+// messages ("" when empty). Keeps the tail (kMaxLines / kMaxBytes), where a
+// traceback's exception is, with an omitted-lines marker.
 inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 	if (worker_stderr.empty()) {
 		return "";
@@ -489,7 +467,6 @@ inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 	static constexpr size_t kMaxLines = 40;
 	static constexpr size_t kMaxBytes = 4096;
 
-	// Split into lines (no trailing-empty padding beyond what the input has).
 	std::vector<std::string> lines;
 	size_t start = 0;
 	while (start <= worker_stderr.size()) {
@@ -502,7 +479,7 @@ inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 		start = nl + 1;
 	}
 
-	// Keep the tail by line count, then trim further by byte budget from the top.
+	// Tail by line count, then trim from the top to the byte budget.
 	size_t first = lines.size() > kMaxLines ? lines.size() - kMaxLines : 0;
 	size_t total_bytes = 0;
 	for (size_t i = lines.size(); i > first; i--) {
@@ -523,9 +500,7 @@ inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 	return suffix;
 }
 
-// Throw an IOException for a worker that exited with an error. The captured
-// worker stderr (tail-capped) is appended *after* the "[worker: …]" context tag
-// so the message reads:
+// IOException for a worker that exited with an error. Message layout:
 //   VGI worker <ctx> (exit code N) [worker: <path>]
 //   worker stderr:
 //     <captured stderr tail>
@@ -544,27 +519,17 @@ inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 	throw IOException(extra_info, full_msg);
 }
 
-// Check if a worker process exited with an error and throw appropriate exception.
-// Returns true if the process has exited, false if still running.
-// Throws VgiIOException for exit codes 127 (not found), 126 (permission denied), or other non-zero.
-// The error_context parameter customizes the message for non-special exit codes:
-// - "failed to start" for errors during read attempts
-// - "exited with status" for EOF/null batch cases
-// worker_stderr (typically StderrDrainer::CaptureStderrSnapshot()) is appended to
-// the message tail-capped so the user sees the worker's own error output.
+// Returns false if the worker is still running, true if it exited cleanly;
+// otherwise throws an IOException (127 not found, 126 permission denied, signal,
+// other non-zero) with `error_context` (e.g. "failed to start") in the message
+// and `worker_stderr` (typically StderrDrainer::CaptureStderrSnapshot()) appended.
 inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_path, const std::string &error_context,
                                   const std::string &execution_id_hex = "", const std::string &worker_stderr = "") {
 	int exit_status = 0;
-	// Every caller reaches here from a *transport* failure (EPIPE on write, EOF /
-	// error on read), i.e. the worker's pipe end is already closed. A dying child
-	// closes its fds during process teardown, so the parent routinely observes
-	// that EOF a few scheduler slices BEFORE the child becomes reapable — a bare
-	// waitpid(WNOHANG) then reports "still running", the caller rethrows the raw
-	// "RPC response stream EOF" and the user loses both the exit code and the
-	// captured stderr that explains the crash. Give the child a bounded grace
-	// window to be reaped instead. This costs nothing when it has already exited
-	// (first TryWait wins) and is only ever paid on an error path that is about
-	// to throw anyway.
+	// Callers arrive from a transport failure (EPIPE / EOF), which a dying child
+	// produces slightly before it becomes reapable; a bare WNOHANG wait would
+	// report "still running" and lose the exit code and stderr. Allow a bounded
+	// grace window (error path only).
 	if (!proc.TryWait(&exit_status)) {
 		constexpr int kExitGraceMs = 500;
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kExitGraceMs);
@@ -583,12 +548,9 @@ inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_pa
 		}
 	}
 
-	// Build the messages by concatenation (no printf) so the stderr block lands
-	// *after* the "[worker: …]" context tag that ThrowVgiWorkerExitException
-	// appends, and so worker stderr containing '%' is never format-interpreted.
-	//
-	// A program the worker needs may be missing (`uv`, `java`, a shebang's
-	// interpreter): name it, and say where to get it.
+	// Messages are concatenated, never printf-formatted: worker stderr may hold '%'.
+	// A missing program the worker needs (`uv`, `java`, a shebang interpreter) is
+	// named, with where to get it.
 	std::string missing_program;
 	const std::string hint = WorkerStartupHint(worker_stderr, worker_path, exit_status, &missing_program);
 	auto with_program = [&](ErrorInfo info) {

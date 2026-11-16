@@ -12,9 +12,7 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// vgi_result_cache_flush() - clear the in-memory result cache
-// ============================================================================
+// ---- vgi_result_cache_flush(): clear the memory, disk and per-value tiers ----
 
 struct VgiResultCacheFlushData : public TableFunctionData {
 	bool finished = false;
@@ -34,14 +32,11 @@ static void VgiResultCacheFlushScan(ClientContext &context, TableFunctionInput &
 		return;
 	}
 	// Attach the per-value disk backend from vgi_result_cache_dir first, so a flush clears
-	// the disk tier even in a process that set the dir but has not yet called a per-value
-	// function (which is normally what attaches the backend). Idempotent.
+	// it even before any per-value function has run. Idempotent.
 	SyncResultCacheSettings(context);
-	// The per-value memo arena is a separate registry; flush it too so a flush gives a
-	// genuinely cold per-value tier (tests rely on this). Release its SQLite backend BEFORE
-	// VgiResultCache::FlushAll() removes the cache directory — on Windows the open
-	// vgi_per_value.sqlite handle would otherwise block the delete ("used by another
-	// process"). The next per-value call re-opens the backend.
+	// The per-value memo arena is a separate registry; flush it too. Release its SQLite
+	// backend BEFORE FlushAll() removes the cache directory — on Windows the open
+	// vgi_per_value.sqlite handle would block the delete. The next per-value call re-opens it.
 	vgi::GetMemoArenaRegistry(context).ReleaseBackend();
 	auto count = GetResultCache(context).FlushAll();
 	output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(count)));
@@ -59,13 +54,7 @@ void RegisterVgiResultCacheFlushFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(std::move(info));
 }
 
-// ============================================================================
-// vgi_result_cache_reap([advance_seconds]) - synchronous cache cleanup
-// ============================================================================
-// Runs ONE reap pass over both tiers on the calling thread — the same work the
-// background thread does each tick, but synchronous and clock-injectable via the
-// `advance_seconds` argument (simulate elapsed time). Makes TTL/disk cleanup
-// testable reproducibly without sleeping or racing the 1s reaper tick.
+// ---- vgi_result_cache_reap([advance_seconds]): see VgiResultCache::ReapNow ----
 
 struct VgiResultCacheReapData : public TableFunctionData {
 	int64_t advance_seconds = 0;
@@ -92,9 +81,8 @@ static void VgiResultCacheReapScan(ClientContext &context, TableFunctionInput &d
 	if (data.finished) {
 		return;
 	}
-	// Honor a bare `SET vgi_result_cache_*` issued before the reap (disk dir/caps, the
-	// exchange ref-count cap): push the current settings into the database cache so ReapNow
-	// sees them — otherwise settings only reach the cache when a scan runs.
+	// Push current settings so a bare `SET vgi_result_cache_*` before the reap is
+	// honored — otherwise settings only reach the cache when a scan runs.
 	SyncResultCacheSettings(context);
 	auto stats = GetResultCache(context).ReapNow(data.advance_seconds);
 	output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(stats.memory_reaped)));
@@ -116,9 +104,7 @@ void RegisterVgiResultCacheReapFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(std::move(info));
 }
 
-// ============================================================================
-// vgi_result_cache() - list cached table-function results
-// ============================================================================
+// ---- vgi_result_cache(): list cached table-function results ----
 
 struct VgiResultCacheListData : public TableFunctionData {
 	std::vector<VgiResultCache::EntryInfo> entries;

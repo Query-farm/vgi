@@ -3,16 +3,11 @@
 
 #include "vgi_ipc.hpp"
 
-// Validation of Arrow batches received from a worker.
-//
-// Arrow's IPC reader verifies only the message framing: the flatbuffer
-// metadata, and that each buffer's offset is aligned and inside the message
-// body. It does not check buffer *contents* -- offsets that run past their data,
-// buffers too short for the array's length, invalid UTF-8, dictionary indices
-// out of range. DuckDB's Arrow conversion trusts those values, so a malformed
-// batch from a worker reads out of bounds: wrong results, a crash, or process
-// memory returned as query data. Every batch that enters from a worker is
-// therefore validated at the level `vgi_validate_worker_batches` selects.
+// Validation of Arrow batches received from a worker. IPC decoding checks only
+// framing, not buffer contents (offsets past data, short buffers, invalid UTF-8,
+// dictionary indices out of range). DuckDB's Arrow conversion trusts those, so a
+// malformed batch reads out of bounds. Every worker batch is therefore validated
+// at the level `vgi_validate_worker_batches` selects.
 
 #include <memory>
 #include <string>
@@ -26,8 +21,8 @@ namespace vgi {
 
 enum class WorkerBatchValidation : unsigned char {
 	NONE,       // no checks
-	STRUCTURAL, // RecordBatch::Validate(): buffer sizes, lengths, offsets bounds (per column)
-	FULL,       // RecordBatch::ValidateFull(): also every offset, UTF-8, dictionary index (per value)
+	STRUCTURAL, // nanoarrow DEFAULT: buffer sizes vs lengths and offsets (per column)
+	FULL,       // nanoarrow FULL plus UTF-8: every offset, union id, dictionary index, string (per value)
 };
 
 constexpr const char *kWorkerBatchValidationSetting = "vgi_validate_worker_batches";
@@ -47,30 +42,23 @@ WorkerBatchValidation GetWorkerBatchValidation(ClientContext *context);
 // malformed. A null batch is ignored.
 void ValidateWorkerBatch(const VgiBatch *batch, WorkerBatchValidation level, const std::string &worker);
 
-// Throw IOException if `batch`'s column types do not match `expected` (one entry
-// per wire column; type structure only -- nullability and field metadata are
-// ignored, matching what ArrowToDuckDB actually reads). A column-count mismatch
-// is an error too. This catches a worker whose scan-time batch type disagrees
-// with the type it declared at bind: ArrowToDuckDB reads each buffer using the
-// BIND-TIME type (arrow_conversion.cpp), so a mismatch is a type-confusion
-// misread, not a clean cast. Cheap (O(columns), no data scan).
+// Throw IOException if `batch`'s column count or type structure (ignoring
+// names, nullability, metadata) differs from `expected` (one per wire column).
+// DuckDB's arrow_conversion.cpp reads buffers using the bind-time type, so a
+// scan-time mismatch would be a type-confusion misread. O(columns).
 void ValidateWireBatchTypes(const VgiBatch &batch,
                             const std::vector<const ArrowSchema *> &expected,
                             const std::string &worker, const std::string &function);
 
-// Validate a worker OUTPUT batch against a declared output schema projected by
-// `projection_ids` (worker-original column indices; empty = the full schema,
-// all columns in order). Builds the expected per-wire-column types and defers
-// to ValidateWireBatchTypes. A no-op when `context`'s level is NONE or
-// `declared` is null. This is the shared form for every path whose wire batch
-// is the worker's (possibly projection-narrowed) output: the producer table
-// scan and the exchange table-in-out / buffered / lateral operators.
+// ValidateWireBatchTypes against `declared` narrowed by `projection_ids`
+// (worker-original column indices; empty = all columns). No-op when the level
+// is NONE or `declared` is null. Used by every path whose wire batch is the
+// worker's output (table scan, table-in-out, buffered, lateral).
 void ValidateProjectedWireBatch(ClientContext *context, const VgiBatch &batch,
                                 const VgiSchemaPtr &declared,
                                 const std::vector<int32_t> &projection_ids, const std::string &worker,
                                 const std::string &function);
 
-// Convenience: validate at the level configured for `context`.
 inline void ValidateWorkerBatch(ClientContext *context, const VgiBatch *batch, const std::string &worker) {
 	ValidateWorkerBatch(batch, GetWorkerBatchValidation(context), worker);
 }

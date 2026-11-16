@@ -56,9 +56,8 @@ bool ViewHasOffset(const ArrowArrayView *view) {
 
 // IPC permits a zero-length offsets buffer for an empty variable-size array (nanoarrow's
 // encoder writes one), but the C data interface carries no buffer sizes and consumers
-// (DuckDB) read offsets[0] unconditionally. nanoarrow only materializes that offset when
-// it finalizes buffers at DEFAULT validation or above, and arrays are decoded at MINIMAL,
-// so point every empty decoded array's offsets at a zero.
+// (DuckDB) read offsets[0] unconditionally. A decoded array can carry a null offsets
+// buffer there, so point every empty decoded array's offsets at a zero.
 alignas(8) const int64_t kZeroOffsets[2] = {0, 0};
 
 void ZeroEmptyOffsets(ArrowArray *array, const ArrowSchema *schema) {
@@ -140,9 +139,7 @@ ArrowIpcCompressionType CodecOf(const std::string &codec) {
 
 } // namespace
 
-// ============================================================================
-// Streams
-// ============================================================================
+// --- Streams ---
 
 VgiBufferPtr VgiInputStream::ReadBuffer(int64_t nbytes) {
 	uint8_t *data = nullptr;
@@ -170,9 +167,7 @@ VgiBufferPtr VgiBufferReader::ReadBuffer(int64_t nbytes) {
 	return out;
 }
 
-// ============================================================================
-// Reader
-// ============================================================================
+// --- Reader ---
 
 struct VgiIpcReader::Impl {
 	nanoarrow::ipc::UniqueDecoder decoder;
@@ -355,9 +350,7 @@ VgiBatchPtr VgiIpcReader::ReadNext() {
 	return nullptr;
 }
 
-// ============================================================================
-// Writer
-// ============================================================================
+// --- Writer ---
 
 struct VgiIpcWriter::Impl {
 	nanoarrow::ipc::UniqueWriter writer;
@@ -456,8 +449,7 @@ namespace {
 // Make the (writer-owned) view encode the way Arrow C++ writers do: an empty
 // variable-size node still has one zero offset. nanoarrow would write a 0-byte
 // offsets buffer, which strict readers (arrow-go, Apache.Arrow for .NET) index at
-// offsets[0]. (nanoarrow's encoder writes real null counts itself since
-// apache/arrow-nanoarrow#974.)
+// offsets[0].
 alignas(8) const int64_t kWriterZeroOffsets[1] = {0};
 
 void PrepareViewForWrite(ArrowArrayView *view) {
@@ -551,9 +543,7 @@ void VgiIpcWriter::Close() {
 	closed_ = true;
 }
 
-// ============================================================================
-// One-shot helpers
-// ============================================================================
+// --- One-shot helpers ---
 
 VgiBufferPtr SerializeSchema(const VgiSchema &schema) {
 	ArrowError error;

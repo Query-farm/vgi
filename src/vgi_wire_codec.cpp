@@ -15,9 +15,7 @@ namespace duckdb {
 namespace vgi {
 namespace wire {
 
-// ============================================================================
 // Errors
-// ============================================================================
 
 static const std::string kNoWorker;
 
@@ -68,9 +66,7 @@ void ThrowDuplicateKey(const Ctx &ctx) {
 	                       ctx.field, ctx.record, WorkerOf(ctx)));
 }
 
-// ============================================================================
 // Decoding
-// ============================================================================
 
 namespace {
 
@@ -325,9 +321,7 @@ CurrentBatchScope::~CurrentBatchScope() {
 	current_batch = previous_;
 }
 
-// ============================================================================
 // Encoding
-// ============================================================================
 
 void WriteValue(ArrowArray *array, bool value) {
 	append::Bool(array, value);
@@ -424,9 +418,7 @@ void WriteEnum(ArrowArray *array, int16_t index, const char *const *wire_names, 
 	append::Int(array, index);
 }
 
-// ============================================================================
 // Equality
-// ============================================================================
 
 bool Equal(const VgiBufferPtr &a, const VgiBufferPtr &b) {
 	int64_t sa = a ? a->size() : 0;

@@ -14,9 +14,9 @@ inline constexpr const char *VGI_COLUMN_DEFAULT = "vgi.column.default.v1";
 inline constexpr const char *VGI_COLUMN_GENERATED = "vgi.column.generated.v1";
 inline constexpr const char *VGI_COLUMN_GENERATION = "vgi.column.generation.v1";
 
-// The initial native adapter supports the default explicit context and a closed
-// deterministic scalar grammar. Generated expressions use its bounded row subset.
-// Keep engine-generated literals and validated built-in casts independent of caller search paths.
+// Defaults use a closed deterministic scalar grammar under the default evaluation
+// context; generated columns use a bounded row-level subset. Engine-generated literals
+// and validated built-in casts are qualified to system.main, independent of search paths.
 void QualifyNativeBuiltinType(TypeExpression &type);
 unique_ptr<ParsedExpression> NativeLiteralExpression(const Value &value);
 // The session's evaluation context, when it equals the default context a worker

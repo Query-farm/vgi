@@ -33,8 +33,8 @@ void VgiTableSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 		return;
 	}
 
-	// Call catalog_schema_contents_tables via RPC — entry_lock_ is NOT held
-	// here. load_lock_ (held by caller) serializes concurrent loaders.
+	// entry_lock_ is NOT held during the RPC; the caller's load_lock_
+	// serializes concurrent loaders.
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
 	                                vgi_tx_load.GetTransactionOpaqueData()};
@@ -42,8 +42,7 @@ void VgiTableSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 	rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 	auto tables = schema_.TakeTables(rpc_ctx, context);
 
-	// Publish each entry under entry_lock_ briefly (per-entry, not whole loop).
-	// Mirrors UnityCatalog UCTableSet::LoadEntries.
+	// Take entry_lock_ per entry, not across the loop.
 	for (auto &table_info : tables) {
 		vgi::RequireNativeConstraintRead(*attach_result, table_info);
 		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name.GetIdentifierName());
@@ -55,22 +54,18 @@ void VgiTableSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 	}
 }
 
-// Override GetEntry to do on-demand loading for individual tables.
-//
-// Pattern (mirrors VgiTableEntry::GetStatistics' two-phase fetch): hold the
-// mutex only for state inspection, drop it during the worker RPC, then
-// re-acquire to publish. The generation counter on VgiCatalogSet is bumped
-// by every mutation; a concurrent DropEntry / ClearEntries / HarvestEntries
-// during our RPC moves it forward, and we re-check on the way out so a
-// dropped table can't be silently resurrected as a "ghost" entry.
+// On-demand load of one table. entry_lock_ is held only to inspect and to
+// publish, never across the worker RPC. Every VgiCatalogSet mutation bumps
+// generation_; publishing only if it is unchanged keeps a table dropped during
+// the RPC from being resurrected.
 optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const std::string &name) {
 	auto rpc_start = std::chrono::steady_clock::now();
 	uint64_t pre_gen;
 	std::string qualifier = schema_.name.GetIdentifierName() + "." + name;
 	bool eager_path = false;
-	// Pre-read settings OUTSIDE entry_lock_ — DuckDB's setting registry +
-	// log manager both have their own mutexes; holding entry_lock_ across
-	// calls into them risks lock-order inversion (WASM hang trace evidence).
+	// Read settings OUTSIDE entry_lock_: DuckDB's setting registry and log
+	// manager have their own mutexes, so calling them under it risks lock-order
+	// inversion.
 	const bool trust_empty_kinds = ReadTrustEmptyKinds(context);
 
 	optional_ptr<CatalogEntry> cached_result = nullptr;
@@ -102,11 +97,8 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	}
 
 	if (eager_path) {
-		// Bulk fetch outside the lock. LoadEntries() is implemented to do
-		// the RPC + CreateEntryLocked() under the assumption it's already
-		// holding entry_lock_; here we re-implement that with explicit
-		// generation-check publish so multi-thread DDL doesn't resurrect
-		// a dropped table.
+		// Same bulk fetch as LoadEntries(), but publishing only if generation_
+		// is unchanged, so concurrent DDL cannot resurrect a dropped table.
 		auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 		auto &attach_params = vgi_catalog.attach_parameters();
 		auto &attach_result = vgi_catalog.attach_result();
@@ -118,9 +110,8 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 			rpc_ctx.entity_qualifier = schema_.name.GetIdentifierName();
 			auto tables = schema_.TakeTables(rpc_ctx, context);
 
-			// Build entries OUTSIDE entry_lock_ (CreateTableInfoFromVgiTable
-			// may resolve types that re-enter the catalog). Publish each
-			// under entry_lock_ briefly. Mirrors UnityCatalog UCTableSet.
+			// Build entries OUTSIDE entry_lock_: CreateTableInfoFromVgiTable
+			// may resolve types that re-enter the catalog.
 			std::vector<unique_ptr<CatalogEntry>> built_entries;
 			built_entries.reserve(tables.size());
 			for (auto &table_info : tables) {
@@ -145,8 +136,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 				if (it != GetEntries().end()) {
 					eager_result = it->second.get();
 				} else {
-					// Bulk listing didn't include this name — fall through
-					// to a per-name single-entry RPC.
+					// Not in the bulk listing: fall through to a per-name RPC.
 					pre_gen = generation_.load(std::memory_order_acquire);
 				}
 			}
@@ -163,7 +153,6 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 		}
 	}
 
-	// Load this specific table from the worker (no lock held — long RPC).
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -203,7 +192,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name.GetIdentifierName());
 	auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 
-	// Publish under entry_lock_ briefly; log AFTER releasing.
+	// Log only after releasing entry_lock_ (see settings note above).
 	optional_ptr<CatalogEntry> pub_result = nullptr;
 	const char *pub_outcome = nullptr;
 	{
@@ -237,15 +226,12 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	auto at = lookup_info.GetAtClause();
 	auto &entry_name = lookup_info.GetEntryName();
 
-	// If no AT clause, delegate to the existing name-based GetEntry (which holds its own lock)
 	if (!at) {
 		return GetEntry(context, entry_name);
 	}
 
-	// AT clause path: no entry_lock_ needed because point_in_time_entries
-	// lives on the per-context VgiTransaction, not the shared table set.
-
-	// AT clause present: fetch version-specific table info from worker
+	// No entry_lock_: AT-clause entries live on the per-context
+	// VgiTransaction (point_in_time_entries), not in the shared set.
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -257,15 +243,11 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	auto at_unit = at->Unit().GetIdentifierName();
 	auto at_raw = at->GetValue();
 	if (at_raw.IsNull()) {
-		// AT (... => NULL) cannot reach the worker as a meaningful version
-		// string — Value::ToString() on a NULL Value emits the literal text
-		// "NULL", which the worker then tries to parse as a version and
-		// fails with "invalid literal for int(): 'NULL'". Reject at bind.
+		// Value::ToString() would send the literal text "NULL" as the version.
 		throw BinderException("Time travel AT clause (%s) value must not be NULL", at_unit);
 	}
 	auto at_value = at_raw.ToString();
 
-	// Call catalog_table_get with AT params via RPC
 	auto rpc_start = std::chrono::steady_clock::now();
 	auto &vgi_tx_at = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
@@ -294,8 +276,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name.GetIdentifierName());
 	auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 
-	// Store on the transaction so it stays alive for the query lifetime
-	// and gets cleaned up when the transaction ends.
+	// Owned by the transaction: lives for the query, freed at transaction end.
 	auto &transaction = VgiTransaction::Get(context, catalog_);
 	auto &result = transaction.point_in_time_entries.emplace_back(std::move(table_entry));
 	VGI_LOG(context, "catalog.entry_cache",

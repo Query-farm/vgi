@@ -15,39 +15,26 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// Streaming-partitioned aggregate protocol
-// ============================================================================
-// Three unary RPCs: aggregate_streaming_open, _chunk, _close.
-//
-// Used by the streaming-window physical operator that bypasses DuckDB's
-// PhysicalWindow entirely — the operator pipes input chunks straight to the
-// worker (no partition materialisation), and the worker maintains per-
-// partition state in-process for the duration of the session, dispatching
-// each row to its partition's state and returning a same-length output array
-// of cumulative snapshots per chunk.
+// Streaming-partitioned aggregate protocol: unary RPCs aggregate_streaming_open,
+// _chunk and _close, used by the streaming-window operator that bypasses
+// PhysicalWindow. Input chunks go straight to the worker (no partition
+// materialisation); the worker keeps per-partition state for the session and
+// returns one cumulative snapshot per input row.
 
-// Session token for an open streaming-partitioned aggregate. Returned by
-// VgiAggregateStreamingOpen, threaded through every subsequent _chunk call,
-// and surrendered by _close. Carries the worker-issued execution_id plus
-// the attach/function identity needed to dispatch follow-up RPCs.
+// Session token from VgiAggregateStreamingOpen: the worker-issued execution_id
+// plus the identity every follow-up _chunk / _close RPC must repeat.
 struct VgiStreamingSession {
 	std::vector<uint8_t> execution_id;
 	std::string function_name;
-	// Owning catalog schema, snapshotted alongside function_name so the
-	// _chunk / _close RPCs identify the same (schema, name) pair the _open
-	// resolved. Empty = none named; serialises as null.
+	// Owning catalog schema, so _chunk / _close name the same (schema, name)
+	// pair _open resolved. Empty serialises as null.
 	std::string schema_name;
 	std::vector<uint8_t> attach_opaque_data;
 };
 
-// Open a streaming-partitioned session. Sends AggregateStreamingOpenRequest
-// and returns the worker's session token.
-//
-// input_schema describes the chunks that subsequent _chunk calls will ship.
-// Column layout: [partition_key_cols..., order_key_cols..., value_cols...].
-// partition_key_count and order_key_count tell the worker how to split the
-// columns; remaining columns are the function's positional arguments.
+// input_schema describes the chunks later _chunk calls ship:
+// [partition_key_cols..., order_key_cols..., value_cols...]; the counts tell the
+// worker how to split them, and the remaining columns are positional arguments.
 VgiStreamingSession VgiAggregateStreamingOpen(
     ClientContext &context,
     const VgiAggregateBindData &bind_data,
@@ -55,21 +42,16 @@ VgiStreamingSession VgiAggregateStreamingOpen(
     int64_t partition_key_count,
     int64_t order_key_count);
 
-// Process one chunk through the streaming session. Sends
-// AggregateStreamingChunkRequest with input_batch (Arrow IPC bytes) and
-// returns the deserialised one-column RecordBatch with one row per input row.
+// Returns a one-column batch with exactly one row per input row (enforced).
 VgiBatchPtr VgiAggregateStreamingChunk(
     ClientContext &context,
     const VgiAggregateBindData &bind_data,
     const VgiStreamingSession &session,
     const VgiBatchPtr &input_batch);
 
-// End the session and free the worker-side state. Idempotent — calling
-// against a closed/unknown execution_id is a no-op on the worker side.
-//
-// enable_logging mirrors InvokeAggregateRpc's flag — destructor-flavored
-// callers running on task-scheduler threads during pipeline teardown
-// should pass false.
+// Free the worker-side state; a closed/unknown execution_id is a worker no-op.
+// Callers on task-scheduler threads during pipeline teardown (destructors)
+// should pass enable_logging=false (see InvokeAggregateRpc).
 void VgiAggregateStreamingClose(
     ClientContext &context,
     const VgiAggregateBindData &bind_data,

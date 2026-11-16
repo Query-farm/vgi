@@ -2,12 +2,9 @@
 //
 // github:// and github-auto:// LOCATION schemes. See vgi_github.hpp.
 //
-// File I/O goes through DuckDB's cross-platform FileSystem (LocalFileSystem) so
-// the cache/extract layer is portable; only the genuine platform-specifics —
-// the executable bit, archive symlinks, and the macOS ad-hoc codesign — remain
-// POSIX, gated below. The whole module stays VGI_POSIX_TRANSPORT-gated for now
-// (those few bits + .zip support + .exe entrypoint selection are the remaining
-// Windows-port work); the FileSystem refactor keeps that delta small.
+// File I/O goes through DuckDB's LocalFileSystem; only the executable bit,
+// archive symlinks and the macOS ad-hoc codesign are POSIX-gated. The module
+// needs VGI_SUBPROCESS_TRANSPORT; other builds get throwing stubs at the end.
 
 #include "vgi_settings_defaults.hpp"
 #include "vgi_github.hpp"
@@ -52,8 +49,7 @@
 #include <unordered_set>
 
 #if VGI_POSIX_TRANSPORT
-// Platform remainder (no portable API): the executable bit, archive symlinks,
-// and the macOS codesign subprocess. On Windows these are no-ops / unsupported.
+// Executable bit, archive symlinks, codesign subprocess.
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -75,8 +71,7 @@ std::string ResolveWorkerPath(const std::string &location, ClientContext &contex
 
 namespace {
 
-// extra_info for a github:// / github-auto:// failure, keyed to the release
-// coordinates.
+// extra_info for a github:// / github-auto:// failure.
 ErrorInfo GithubInfo(const char *subtype, const GithubCoords &c) {
 	ErrorInfo info(subtype);
 	info.Set(error_key::kTransport, "github")
@@ -86,8 +81,8 @@ ErrorInfo GithubInfo(const char *subtype, const GithubCoords &c) {
 	return info;
 }
 
-// Always the real local filesystem — the cached binary must be a real path we can
-// hand to the child-process spawn; never an overridable virtual FS.
+// Always the real local filesystem: the cached binary must be a real path for
+// the child-process spawn, never a virtual FS.
 FileSystem &LocalFs() {
 	static unique_ptr<FileSystem> fs = FileSystem::CreateLocal();
 	return *fs;
@@ -151,7 +146,6 @@ std::string CacheDir(ClientContext &context) {
 	return base + "/vgi/releases";
 }
 
-// Recursive directory create via FileSystem (cross-platform).
 void MkdirP(const std::string &path) {
 	auto &fs = LocalFs();
 	std::string cur;
@@ -228,7 +222,7 @@ std::string ReadFileBytes(const std::string &path) {
 	return out;
 }
 
-// Platform remainder: the executable bit. FileSystem has no portable chmod.
+// FileSystem has no portable chmod.
 void MakeExecutable(const std::string &path) {
 #if VGI_POSIX_TRANSPORT
 	::chmod(path.c_str(), 0755);
@@ -270,10 +264,10 @@ int RunArgvSilent(const std::vector<std::string> &argv) {
 }
 #endif // VGI_POSIX_TRANSPORT
 
-// Authenticated GitHub *API* GET via DuckDB's HTTPUtil. Adds a bearer token from
-// $GITHUB_TOKEN/$GH_TOKEN when set (avoids the 60-req/hr limit; reaches private
-// repos). Asset/sidecar *downloads* use HttpGetBytes() — they come from a
-// pre-signed CDN URL that breaks if an Authorization header is attached.
+// GitHub *API* GET with a bearer token from $GITHUB_TOKEN/$GH_TOKEN when set
+// (raises the 60 req/hr limit; reaches private repos). Asset/sidecar downloads
+// use HttpGetBytes() instead: their pre-signed CDN URLs break if an
+// Authorization header is attached.
 std::string GithubApiGet(ClientContext &context, const std::string &url) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
@@ -409,9 +403,7 @@ uint64_t ReadTarNumeric(const char *p, size_t n) {
 }
 
 // Extract a USTAR/GNU tar into `dest`, returning the absolute path of the chosen
-// entrypoint (single executable-bit regular file, or `member_hint` override).
-// File/dir writes go through FileSystem; symlinks + the exec bit are the platform
-// remainder.
+// entrypoint (`member_hint`, else the single executable-bit regular file).
 std::string WalkTar(const std::string &tar, const std::string &dest, const std::string &member_hint,
                     uint64_t max_entries, bool allow_symlinks) {
 	auto &fs = LocalFs();
@@ -489,7 +481,7 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 			if (!allow_symlinks) {
 				throw IOException("vgi: database worker archives cannot contain symlinks (%s)", rel.c_str());
 			}
-			// Symlink: platform remainder (no FileSystem API). Reject escapes.
+			// Symlink (no FileSystem API). Reject escapes.
 			std::string target(h + 157, ::strnlen(h + 157, 100));
 			if (target.empty() || target[0] == '/' || target.find("..") != std::string::npos) {
 				throw IOException("github: unsafe symlink %s -> %s", rel.c_str(), target.c_str());
@@ -642,8 +634,8 @@ std::string WalkZip(const std::string &zipbytes, const std::string &dest, const 
 	return ep;
 }
 
-// Decompress+extract `bytes` (the downloaded asset) into `dest`; return the
-// absolute entrypoint path. `asset` drives format + single-file naming.
+// Extract the downloaded asset into `dest` and return the absolute entrypoint
+// path. The asset's extension picks the format and the single-file name.
 std::string ExtractFullTree(const std::string &bytes, const std::string &asset, const std::string &dest,
                             const std::string &member_hint,
                             uint64_t max_extracted_bytes = kDefaultMaxDecompressedBytes,
@@ -700,9 +692,9 @@ void CodesignAdHoc(const std::string &entrypoint) {
 #endif
 }
 
-// Cross-process lock via FileSystem's write lock. DuckDB's lock is fail-fast
-// (throws on contention), so we poll into blocking behavior — a second process
-// waits for the first to finish downloading rather than racing it.
+// Cross-process lock via FileSystem's write lock. DuckDB's lock throws on
+// contention, so poll (100ms, ~60s) so a second process waits for the first
+// download instead of racing it.
 struct FsLockGuard {
 	unique_ptr<FileHandle> handle;
 	explicit FsLockGuard(const std::string &path) {
@@ -779,9 +771,7 @@ std::map<std::string, std::string> ReadMeta(const std::string &meta_path) {
 std::mutex g_resolved_mu;
 std::unordered_map<std::string, std::string> g_resolved; // location -> entrypoint
 
-// ---------------------------------------------------------------------------
-// @latest resolution I/O
-// ---------------------------------------------------------------------------
+// ---- @latest resolution I/O ----
 
 ErrorInfo GithubLatestInfo(const char *subtype, const std::string &owner, const std::string &repo) {
 	ErrorInfo info(subtype);
@@ -1102,7 +1092,6 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 		return ResolveGithubWorker(ResolveGithubLatest(location, context).pinned_location, context);
 	}
 
-	// In-process fast path.
 	{
 		std::lock_guard<std::mutex> lk(g_resolved_mu);
 		auto it = g_resolved.find(location);
@@ -1142,7 +1131,6 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 		}
 	}
 
-	// Resolve the asset's download URL from the release metadata.
 	std::string api =
 	    "https://api.github.com/repos/" + c.owner + "/" + c.repo + "/releases/tags/" + c.tag;
 	std::string json = GithubApiGet(context, api);
@@ -1192,7 +1180,8 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 		expected = token;
 	}
 
-	// Download + verify BEFORE extracting (so the tar parser only sees trusted bytes).
+	// Verify BEFORE extracting so the archive parser only sees trusted bytes
+	// (unverified when a github:// location carries no #sha256= pin).
 	std::string bytes = HttpGetBytes(context, dl, nullptr, HttpSecrets::LOOKUP);
 	if (bytes.empty()) {
 		throw IOException(GithubInfo(error_subtype::kProtocolViolation, c),
@@ -1338,9 +1327,8 @@ std::string ExtractWorkerPackage(const std::string &, const std::string &, const
 }
 
 std::string ResolveGithubWorker(const std::string &location, ClientContext &) {
-	// Parse the coordinates first so malformed-LOCATION errors are identical on every
-	// platform (e.g. "missing owner/repo"); only a well-formed github location hits the
-	// no-subprocess wall below. The constructed asset name is discarded — we only validate.
+	// Parse first so malformed-LOCATION errors are identical on every platform;
+	// only a well-formed location reaches the unsupported-transport error.
 	if (IsGithubAutoLocation(location)) {
 		(void)ParseGithubAutoLocation(location, DuckDB::Platform());
 	} else {

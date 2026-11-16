@@ -121,9 +121,7 @@ VgiAttachTicket InvokeSealAttach(const CatalogRpcContext &ctx, ClientContext &co
 	return ticket;
 }
 
-// ============================================================================
-// vgi_export_session(aliases := NULL, ttl_seconds := NULL)
-// ============================================================================
+// --- vgi_export_session(aliases := NULL, ttl_seconds := NULL) ---
 
 namespace {
 

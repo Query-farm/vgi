@@ -12,36 +12,18 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// Buffered-table RPC inner-request builders + outer-response decoder
-// ============================================================================
-// Shared between FunctionConnection (subprocess) and HttpFunctionConnection.
-// Each Build*Inner function constructs the inner RecordBatch matching the
-// worker's expected schema, serializes it to IPC bytes, and wraps the bytes
-// in the outer RPC envelope (BuildTableBuffering*Params from the generated
-// header). Callers serialize the resulting outer batch with WriteRpcRequest
-// (subprocess) or HttpInvokeUnary (HTTP).
-
-// ----------------------------------------------------------------------------
-// Table sink+source builders.
+// Buffered-table (table_buffering_*) RPC request builders, shared by the
+// subprocess, HTTP and web-worker connections. Each builds the inner request
+// record, serializes it, and wraps it in the outer RPC params batch
+// (generated BuildTableBuffering*Params).
 //
-// Wire-shape differences from table_buffering_*:
-//   * process() is UNARY; the worker-chosen state_id is on the *response*,
-//     not the request. There is no state_id field in the request.
-//   * state_ids / finalize_state_ids are opaque bytes, not int64.
-//   * No transaction_id field today, but the schema reserves it (nullable
-//     binary) so future routing can attach without a wire bump.
-//
-//   * schema_name names the catalog schema that declares the function. A
-//     function name is unique only within a schema, so without it a worker
-//     re-resolving these unary calls by bare name can run a *different*
-//     schema's implementation than the bind picked. Empty string serialises
-//     as null — the legitimate "caller names no schema" form (COPY TO, and
-//     any path with no schema to name), which the worker treats as a
-//     cross-schema lookup.
-//
-// Inner schemas match TableBuffering{Process,Combine,Destructor}Request in
-// vgi-python/vgi/protocol.py.
+//   * process() is unary; the worker-chosen state_id is on the response, not
+//     the request. state_ids are opaque bytes.
+//   * schema_name names the catalog schema declaring the function: a function
+//     name is unique only within a schema, so without it a worker re-resolving
+//     by bare name can run a different schema's implementation than the bind
+//     picked. Empty serializes as null ("no schema", e.g. COPY TO), which the
+//     worker treats as a cross-schema lookup.
 VgiBatchPtr
 BuildTableBufferingProcessInner(const std::string &function_name,
                                   const std::string &schema_name,

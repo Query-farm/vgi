@@ -23,18 +23,12 @@ namespace vgi {
 
 struct VgiAttachParameters;
 
-// ============================================================================
-// Where a batch of VGI functions is being registered, plus the connection state
-// its binds should use.
-//
-// Two registration targets exist:
+// Where a batch of VGI functions is registered, plus the state their binds use:
 //   * per-catalog — entries live in the VGI catalog's own schema and die with
-//     it, so they can hold a Catalog& captured at registration.
-//   * global (system.main) — entries published by
-//     `CatalogAttachResult.global_functions`. DuckDB has no API to unregister a
-//     function, so these outlive DETACH; they hold only the attach *alias* and
-//     re-resolve the live catalog at every bind (see ResolveVgiGlobalBinding).
-// ============================================================================
+//     it, so they may hold a Catalog& captured at registration.
+//   * global (system.main, from CatalogAttachResult.global_functions) — DuckDB
+//     cannot unregister a function, so these outlive DETACH; they hold only the
+//     attach alias and re-resolve the catalog at every bind.
 struct VgiFunctionRegistrationTarget {
 	//! Owning VGI catalog. Null ⇒ this is a global registration.
 	optional_ptr<Catalog> catalog;
@@ -67,12 +61,10 @@ struct VgiGlobalBinding {
 	std::vector<std::string> setting_names;
 };
 
-// Resolve the live state behind a global registration. Because a global entry
-// persists for the process lifetime, re-ATTACHing the alias transparently
-// refreshes the connection (fresh attach_opaque_data / auth), and calling one
-// after DETACH throws an InvalidInputException that names the function and
-// tells the user to re-ATTACH — rather than silently reconnecting to a catalog
-// the user detached.
+// Resolve the live state behind a global registration: a re-ATTACH of the
+// alias refreshes the connection, and a call after DETACH (or with the alias
+// now a non-VGI catalog) throws InvalidInputException telling the user to
+// re-ATTACH, rather than reconnecting to a catalog the user detached.
 VgiGlobalBinding ResolveVgiGlobalBinding(ClientContext &context, const std::string &catalog_name,
                                          const std::string &function_name);
 
@@ -82,13 +74,9 @@ VgiGlobalBinding ResolveVgiGlobalBinding(ClientContext &context, const std::stri
 VgiGlobalBinding ResolveVgiFunctionBinding(ClientContext &context, const VgiFunctionRegistrationTarget &target,
                                            const std::string &function_name);
 
-// ============================================================================
-// Function-set builders, shared by the per-catalog registration
-// (storage/vgi_*_function_set.cpp) and the global registration in
-// vgi_extension.cpp. `registered_name` is the name users type — the bare
-// function name for a catalog entry, `<prefix>_<name>` for a global one — while
-// dispatch always uses func_info.name + the target's dispatch schema.
-// ============================================================================
+// Function-set builders shared by per-catalog and global registration.
+// `registered_name` is what users type (bare name, or `<prefix>_<name>` when
+// global); dispatch always uses func_info.name + the target's DispatchSchema.
 ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::string &registered_name,
                                             const std::vector<VgiFunctionInfo> &overloads,
                                             const VgiFunctionRegistrationTarget &target,
@@ -104,9 +92,7 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
                                           const VgiFunctionRegistrationTarget &target,
                                           vector<FunctionDescription> &descriptions);
 
-// Apply a catalog's `global_function_prefix` to a worker-declared function
-// name, yielding the globally visible (lowercased) name. An empty prefix
-// publishes the bare name.
+// Lower-cased `<prefix>_<name>`, or the bare name when the prefix is empty.
 std::string VgiGlobalFunctionName(const std::string &prefix, const std::string &function_name);
 
 } // namespace vgi

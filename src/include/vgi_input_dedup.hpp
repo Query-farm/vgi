@@ -1,12 +1,10 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
-// Input dedup for exchange-mode MAP operators (scalar / streaming table-in-out /
-// batched correlated LATERAL). Given an input chunk and which of its columns are the
-// worker-input columns (the args passed to the function — NOT correlated/outer
-// columns), group the rows by distinct worker-input tuple so the operator can ship
-// only the distinct tuples to the worker and scatter/expand the results back. Pure
-// compute optimization; no cache, no Arrow. See docs/exchange_dedup_pervalue.md.
+// Input dedup for exchange-mode map operators (scalar / streaming table-in-out /
+// batched correlated LATERAL): group rows by distinct worker-input tuple (the
+// function's args, not outer columns) so only distinct tuples are shipped and the
+// results scattered/expanded back. See docs/exchange_dedup_pervalue.md.
 
 #include <cstdint>
 #include <vector>
@@ -71,15 +69,12 @@ struct InputDedupOptions {
 	idx_t max_comparisons = 65536;
 };
 
-// VARCHAR/BLOB and plain fixed-width columns (integers, dates, timestamps, decimals,
-// UUIDs, enums) are hashed and compared in their input buffers without copies. Large
-// string inputs are sampled before full-batch hashing. Exact equality is always
-// required after hash matches. Other types (floats, intervals, nested) retain the
-// canonical-key semantics.
-// Poor sampled reduction or exhausted work budgets return an identity mapping.
-// Only `key_cols` (indices into `chunk`) participate. NULLs group together; nested
-// and numeric types use CreateSortKey. An identity result may contain duplicates:
-// callers must preserve all original rows when the optimization is bypassed.
+// Groups by `key_cols` (indices into `chunk`); NULLs group together. VARCHAR/BLOB
+// and bitwise-comparable fixed-width columns (integers, dates, timestamps,
+// decimals, UUIDs, enums) are hashed and compared in place; other types (floats,
+// intervals, nested) use CreateSortKey. Hash matches are always confirmed exactly.
+// Large string inputs are sampled first; poor sampled reduction or an exhausted
+// work budget returns an identity mapping, which may contain duplicates.
 InputDedup BuildInputDedup(DataChunk &chunk, const std::vector<column_t> &key_cols,
                            const InputDedupOptions &options = InputDedupOptions());
 

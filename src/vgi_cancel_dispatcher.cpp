@@ -55,10 +55,7 @@ bool VgiCancelDispatcher::Enqueue(CancelRequest req) noexcept {
 		return false;
 	}
 
-	// Spawn the worker on first use. try_enqueue on a ConcurrentQueue
-	// is noexcept; EnsureWorkerStarted is the only work that could
-	// plausibly throw — wrap in try/catch so Enqueue stays noexcept
-	// as promised.
+	// EnsureWorkerStarted is the only call here that can throw.
 	try {
 		if (!EnsureWorkerStarted()) {
 			return false;
@@ -108,20 +105,14 @@ bool VgiCancelDispatcher::EnsureWorkerStarted() {
 		return true;
 	}
 	if (start_ == VgiCancelWorkerStart::kExplicitOnly) {
-		// On WASM the worker is started once, at extension load (StartWorker), and
-		// never here. Enqueue runs from destructors, often on a pthread: a table
-		// scan's local state is destroyed on whichever thread ran its task. There,
-		// pthread_create is a synchronous call proxied to the main runtime thread,
-		// and when a query is interrupted that thread is spinning in
-		// Executor::CancelTasks, waiting for this very task to unregister. It never
-		// services the proxied call, so the two wait on each other forever: in
-		// Cupola, the first cancel of a VGI scan after a page load hung the engine
-		// in 6 of 10 runs at threads > 1, and in 0 of 10 with cancel disabled.
-		// Creating a thread after side modules are dlopen'd is also unreliable on
-		// WASM (see vgi_wasm_async_pool.hpp). Until the worker is running the
-		// caller drops the request; the server-side stream then expires by TTL.
-		// "Running", not "started": a created pthread that never starts would
-		// otherwise accept requests nothing drains.
+		// On WASM the worker starts only at extension load (StartWorker), never
+		// here. Enqueue runs from destructors on arbitrary pthreads, where
+		// pthread_create is proxied to the main runtime thread — which, during a
+		// cancel, spins in Executor::CancelTasks waiting for this task: deadlock.
+		// Thread creation after side modules are dlopen'd is also unreliable (see
+		// vgi_wasm_async_pool.hpp). Until the worker is *running* (a created
+		// pthread may never start) requests are dropped; the server-side stream
+		// then expires by TTL.
 		return false;
 	}
 	// A request queued before the new thread runs is drained once it does.
@@ -181,10 +172,8 @@ void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
 		if (!req.connection) {
 			return;
 		}
-		// Pass the dispatcher's long-lived bot context: the connection's own
-		// context_ references the originating query's ClientContext, which is
-		// typically destroyed by the time we run here (off-thread). Using it
-		// would use-after-free its Logger inside CancelStream's VGI_LOG.
+		// Use the bot context: the originating query's ClientContext is usually
+		// gone by now, and CancelStream's VGI_LOG would use-after-free its Logger.
 		auto context = BotContext();
 		if (context) {
 			req.connection->CancelStream(req.state_token, *context);
@@ -213,10 +202,7 @@ void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noex
 		if (!context) {
 			return;
 		}
-		// Synthesise the minimum bind data InvokeAggregateRpc needs:
-		// attach_params (worker_path / debug / pool / version / auth /
-		// cookies), function_name, attach_opaque_data. Other fields are unused
-		// by the streaming_close path.
+		// Only these bind-data fields are used by the streaming_close path.
 		VgiAggregateBindData synth_bind;
 		synth_bind.attach_params = req.attach_params;
 		synth_bind.attach_opaque_data = req.attach_opaque_data;

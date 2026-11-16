@@ -3,14 +3,9 @@
 
 #include "vgi_ipc.hpp"
 
-// Typed catalog RPC surface: every InvokeCatalog*/InvokeTableFunction* call,
-// the DDL operations, statistics, and the SecretManager / CreateTableInfo
-// helpers. Split out of vgi_catalog_api.hpp so that editing an RPC signature
-// (the part that churns most) doesn't recompile pure-metadata consumers.
-//
-// This header legitimately carries the Arrow IPC umbrella (via vgi_rpc_types.hpp
-// for TableFunctionCardinalityResult / InsertionOrderPreservingMap), so include
-// it only from .cpp files that actually issue catalog RPCs.
+// Typed catalog RPC surface: InvokeCatalog* / InvokeTableFunction*, DDL,
+// statistics, and the SecretManager / CreateTableInfo helpers. It pulls in
+// vgi_rpc_types.hpp, so include it only from .cpp files that issue catalog RPCs.
 
 #include <cstdint>
 #include <map>
@@ -35,12 +30,9 @@ struct CreateTableInfo;
 
 namespace vgi {
 
-// Forward declaration — full definition in vgi_oauth.hpp
-class CatalogAuth;
-// Forward declaration — full definition in vgi_cookie_jar.hpp
-class SessionCookieJar;
+class CatalogAuth;      // vgi_oauth.hpp
+class SessionCookieJar; // vgi_cookie_jar.hpp
 
-// Convert DuckDB OnCreateConflict enum to the string expected by VGI RPC protocol.
 inline std::string MapOnConflict(OnCreateConflict conflict) {
 	switch (conflict) {
 	case OnCreateConflict::ERROR_ON_CONFLICT:
@@ -54,21 +46,13 @@ inline std::string MapOnConflict(OnCreateConflict conflict) {
 	}
 }
 
-// ============================================================================
-// Typed Catalog RPC Functions (vgi_rpc protocol)
-// ============================================================================
-
-// Invoke catalog_attach: attach to a catalog and get configuration
-// Called BEFORE a catalog exists — takes individual parameters, not CatalogRpcContext.
-//
-// ``data_version_spec`` and ``implementation_version`` are pass-through semver
-// strings the user supplied at ATTACH time (empty = unconstrained); the worker
-// validates them and returns the resolved concrete versions in the result.
-// ``cookie_jar`` is the per-catalog HTTP session cookie store (null for
-// subprocess transport); if present, Set-Cookie response headers are captured
-// into it and Cookie request headers are read from it on subsequent RPCs.
-// Optionally return the temporary connection's capability snapshot for reuse
-// by the attached catalog; capabilities remain scoped to this attachment.
+// catalog_attach. Runs before the catalog exists, so it takes individual
+// parameters rather than a CatalogRpcContext. data_version_spec /
+// implementation_version are the user's ATTACH semver constraints (empty =
+// unconstrained); the worker returns the resolved versions. cookie_jar (HTTP
+// only) captures Set-Cookie and supplies Cookie on later RPCs.
+// discovered_capabilities, when non-null, receives the temporary connection's
+// capability snapshot for reuse by this attachment only.
 CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const std::string &catalog_name,
                                         ClientContext &context, bool worker_debug = false, bool use_pool = true,
                                         const std::shared_ptr<CatalogAuth> &auth = nullptr,
@@ -83,19 +67,13 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         std::shared_ptr<IrohClientConfig> iroh = nullptr,
                                         ServerCapabilities *discovered_capabilities = nullptr);
 
-// Notify the worker that an attachment has been detached and may be released.
+// Tell the worker the attachment was detached and may be released.
 void InvokeCatalogDetach(const CatalogRpcContext &ctx, ClientContext &context);
 
-// List catalogs exposed by a worker. Returns per-catalog discovery records
-// carrying implementation_version and data_version_spec metadata alongside the
-// catalog name.
-//
-// The two launcher_* trailing parameters mirror InvokeCatalogAttach: when an
-// ATTACH carries `launcher_idle_timeout` / `launcher_state_dir`, those values
-// must flow into the discovery RPC so the launcher cache is primed with the
-// user's overrides — otherwise this RPC pins the cache with [defaults] and
-// the subsequent real ATTACH (which does carry the overrides) trips the
-// cache-conflict BinderException.
+// List the worker's catalogs (with implementation_version / data_version_spec).
+// The launcher_* parameters MUST carry the ATTACH's overrides: this RPC primes
+// the launcher cache, and priming it with defaults makes the real ATTACH fail
+// with the cache-conflict BinderException.
 std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, ClientContext &context,
                                            bool worker_debug = false, bool use_pool = true,
                                            const std::shared_ptr<CatalogAuth> &auth = nullptr,
@@ -105,30 +83,25 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
                                            const std::string &tcp_proxy = "",
                                            std::shared_ptr<IrohClientConfig> iroh = nullptr);
 
-// One vgi_rpc.Reflection.v1/list_protocols call through the catalog's
-// connection and auth, returning the decoded ProtocolList payload batch (one
-// row). Uncached and undecoded: callers use GetHostedProtocols /
-// HostsProtocol / InvokeListProtocols in vgi_reflection.hpp. A worker that
-// does not host reflection throws (VgiRpcException protocol_not_supported, or
+// One uncached vgi_rpc.Reflection.v1/list_protocols call, returning the one-row
+// ProtocolList payload; use the vgi_reflection.hpp helpers instead. A worker
+// without reflection throws VgiRpcException (protocol_not_supported, or
 // method_not_implemented from a server that predates routing keys).
 VgiBatchPtr InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
                                                                   ClientContext &context);
 
-// One unary call to a non-vgi.v3 protocol through the catalog's connection and
-// auth (routing key and, when non-empty, version from `protocol`). Returns the
-// decoded one-row payload of the binary `result` envelope; decode it by name.
-// Worker errors surface as VgiRpcException carrying error_kind / error_code.
+// One unary call to a non-vgi.v3 protocol (routing key and, when non-empty,
+// version from `protocol`). Returns the one-row payload of the `result`
+// envelope. Worker errors throw VgiRpcException with error_kind / error_code.
 VgiBatchPtr InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
                                                         const VgiProtocolId &protocol, const std::string &method_name,
                                                         const VgiBatchPtr &params);
 
-// Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);
 
-// Invoke catalog_contents: every schema and all of its contents in one RPC.
-// Only call when the attach result sets supports_catalog_contents. With
-// `if_none_match` (an etag from an earlier response) the worker may answer
-// not_modified with no schemas instead.
+// catalog_contents: every schema and its contents in one RPC. Only when the
+// attach result sets supports_catalog_contents. With `if_none_match` (an earlier
+// etag) the worker may answer not_modified with no schemas.
 VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context,
                                          const std::optional<std::string> &if_none_match = std::nullopt);
 
@@ -137,32 +110,26 @@ VgiCatalogContents ParseCatalogContents(const VgiBatchPtr &batch,
                                        const std::string &worker_path,
                                        const std::optional<std::string> &if_none_match = std::nullopt);
 
-// The `vgi_catalog_contents` setting (default true). False means the client
-// never calls catalog_contents: neither to load nor to revalidate.
+// The `vgi_catalog_contents` setting (default true); false disables
+// catalog_contents for both load and revalidation.
 bool UseCatalogContents(ClientContext &context);
 
-// Decode a catalog_contents schema's SchemaInfo (lazily, on first use).
-// Its row was associated with this raw path when the snapshot was indexed.
+// Lazy decoders for a catalog_contents schema. function_type / macro_type use the
+// RPC spellings (SCALAR_FUNCTION, TABLE_MACRO, ...).
 VgiSchemaInfo DecodeContentsSchemaInfo(const VgiSchemaContents &contents);
 
-// Decode one kind of a catalog_contents schema entry (done lazily, on a set's
-// first load). function_type / macro_type use the RPC spellings
-// (SCALAR_FUNCTION, TABLE_MACRO, ...).
 std::vector<VgiTableInfo> DecodeContentsTables(const VgiSchemaContents &contents, ClientContext &context);
 std::vector<VgiViewInfo> DecodeContentsViews(const VgiSchemaContents &contents);
 std::vector<VgiFunctionInfo> DecodeContentsFunctions(const VgiSchemaContents &contents,
                                                      const std::string &function_type);
 std::vector<VgiMacroInfo> DecodeContentsMacros(const VgiSchemaContents &contents, const std::string &macro_type);
 
-// Invoke catalog_schema_contents_tables: list tables in a schema
 std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const CatalogRpcContext &ctx,
                                                             const std::string &schema_name, ClientContext &context);
 
-// Invoke catalog_schema_contents_views: list views in a schema
 std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const CatalogRpcContext &ctx,
                                                           const std::string &schema_name, ClientContext &context);
 
-// Invoke catalog_schema_contents_macros: list macros in a schema
 // macro_type: "SCALAR_MACRO" or "TABLE_MACRO"
 std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
     const CatalogRpcContext &ctx, const std::string &schema_name,
@@ -181,26 +148,21 @@ void InvokeCatalogIndexDrop(const CatalogRpcContext &ctx, const std::string &sch
 void RequireCatalogIndexAlgorithm(const CatalogRpcContext &ctx, const std::string &schema,
     const std::string &table, const std::string &algorithm, ClientContext &context);
 
-// Invoke catalog_schema_contents_functions: list functions in a schema
 // function_type: "SCALAR_FUNCTION" or "TABLE_FUNCTION"
 std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &function_type, ClientContext &context);
 
-// Invoke catalog_copy_from_formats: list custom COPY ... FROM formats this
-// catalog advertises (catalog-level, not schema-scoped). Returns an empty
-// vector when the worker advertises none. Callers must treat a
-// MethodNotImplementedError / ProtocolVersionError from an old worker as "no
-// formats" (handled at the ATTACH call site, not here).
+// Catalog-level custom COPY ... FROM formats (empty when none). Does not catch
+// method_not_implemented: the ATTACH call site treats that as "no formats".
 std::vector<VgiCopyFromFormatInfo> InvokeCatalogCopyFromFormats(const CatalogRpcContext &ctx, ClientContext &context);
 
-// Invoke catalog_table_get: get a specific table's metadata
-// Returns nullopt if table not found (empty response)
+// nullopt when the table is not found (empty response).
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
                                                    const std::string &schema_name, const std::string &table_name,
                                                    ClientContext &context);
 
-// Invoke catalog_table_get with time-travel AT clause
+// With a time-travel AT clause.
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
                                                    const std::string &schema_name,
                                                    const std::string &table_name,
@@ -208,39 +170,30 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
                                                    const std::string &at_unit,
                                                    const std::string &at_value);
 
-// Invoke catalog_view_get: get a specific view's metadata
 std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
                                                  const std::string &schema_name, const std::string &view_name,
                                                  ClientContext &context);
 
-// Invoke catalog_table_scan_branches_get, the only scan-discovery RPC since
-// protocol 3.3 (catalog_table_scan_function_get was removed). A worker that
-// answers MethodNotImplemented fails with a protocol-violation IOException.
-// `pushdown_filters` (protocol 3.2): a VGI Filter Encoding v2 snapshot over the
-// table's declared columns, sent for scan_planning='filtered' tables. Advisory.
+// The only scan-discovery RPC (protocol 3.3); a MethodNotImplemented answer is a
+// protocol-violation IOException. `pushdown_filters`: an advisory VGI Filter
+// Encoding v2 snapshot over the declared columns, sent for
+// scan_planning='filtered' tables.
 VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit,
     const std::string &at_value, const std::optional<std::vector<uint8_t>> &pushdown_filters = std::nullopt);
 
-// Parse a ScanBranchesResult RecordBatch into the in-memory C++ struct.
-// Loud-rejects empty branches lists and surfaces parse errors on
-// branch_filter expressions as BinderException.
+// Rejects an empty branches list; branch_filter parse errors throw
+// BinderException.
 VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
                                                 const VgiBatchPtr &batch,
                                                 const std::string &worker_path);
 
-// Write function discovery uses the same result type as scan function discovery.
 using VgiWriteFunctionResult = VgiScanFunctionResult;
 
-// Invoke catalog_table_{insert,update,delete}_function_get: get write function for a table
-// `writable_branch_function_name` is set ONLY when the C++ side is
-// dispatching an INSERT against a multi-branch VGI table that has a
-// writable arm — in which case it carries the writable arm's
-// `ScanBranch.function_name`, so the worker can dispatch without
-// re-resolving which branch is writable. Empty string means single-branch
-// (or worker-decided routing); workers serving single-branch tables can
-// ignore the field.
+// catalog_table_{insert,update,delete}_function_get. writable_branch_function_name
+// is set only for an INSERT into a multi-branch table with a writable arm: that
+// arm's ScanBranch.function_name, so the worker need not re-resolve it.
 VgiWriteFunctionResult InvokeCatalogTableInsertFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context,
@@ -254,32 +207,23 @@ VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context);
 
-// ============================================================================
-// Transaction Lifecycle
-// ============================================================================
+// Transaction lifecycle.
 
-// Invoke catalog_version: query the current catalog version from the worker.
-// Returns the version number (int64). Returns 0 if the RPC is not implemented
-// or fails (graceful fallback for older workers).
+// 0 ("unknown version") when the worker returns no row or answers
+// method_not_implemented; every other failure throws.
 int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &context);
 
-// Invoke catalog_transaction_begin: begin a new transaction.
-// Returns the transaction_opaque_data bytes from the worker (empty if not supported).
+// Returns transaction_opaque_data (empty when the worker returns none).
 std::vector<uint8_t> InvokeCatalogTransactionBegin(const CatalogRpcContext &ctx, ClientContext &context);
 
-// Invoke catalog_transaction_commit: commit a transaction.
 void InvokeCatalogTransactionCommit(const CatalogRpcContext &ctx, ClientContext &context);
 
-// Invoke catalog_transaction_rollback: rollback a transaction.
 void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContext &context);
 
-// ============================================================================
-// DDL Operations
-// ============================================================================
+// DDL.
 
-// Invoke catalog_table_create: create a new table in the catalog. Returns the
-// reply's `created` (protocol 3.3): true when this call created the table,
-// false when on_conflict IGNORE (IF NOT EXISTS) found an existing one.
+// Returns the reply's `created`: false when on_conflict IGNORE (IF NOT EXISTS)
+// found an existing table.
 bool InvokeCatalogTableCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
@@ -288,7 +232,6 @@ bool InvokeCatalogTableCreate(
     const std::vector<std::vector<uint8_t>> &constraint_definitions,
     ClientContext &context);
 
-// Invoke catalog_table_drop: drop a table from the catalog.
 void InvokeCatalogTableConstraintsApply(const CatalogRpcContext &ctx, const VgiTableInfo &table,
                                       const std::vector<uint8_t> &change, ClientContext &context);
 
@@ -298,14 +241,12 @@ void InvokeCatalogTableDrop(
     bool ignore_not_found, bool cascade,
     ClientContext &context);
 
-// Invoke catalog_table_rename: rename a table in the catalog.
 void InvokeCatalogTableRename(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
     const std::string &new_name, bool ignore_not_found,
     ClientContext &context);
 
-// Invoke catalog_table_column_add: add a column to a table.
 void InvokeCatalogTableColumnAdd(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
@@ -313,21 +254,18 @@ void InvokeCatalogTableColumnAdd(
     bool if_column_not_exists,
     ClientContext &context);
 
-// Invoke catalog_table_column_drop: drop a column from a table.
 void InvokeCatalogTableColumnDrop(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name, bool if_column_exists, bool cascade,
     ClientContext &context);
 
-// Invoke catalog_table_column_rename: rename a column in a table.
 void InvokeCatalogTableColumnRename(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
     const std::string &old_column_name, const std::string &new_column_name,
     ClientContext &context);
 
-// Set or clear the comment on a table
 void InvokeCatalogTableCommentSet(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
@@ -335,7 +273,6 @@ void InvokeCatalogTableCommentSet(
     bool ignore_not_found,
     ClientContext &context);
 
-// Set or clear the comment on a table column
 void InvokeCatalogTableColumnCommentSet(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
@@ -344,43 +281,34 @@ void InvokeCatalogTableColumnCommentSet(
     bool ignore_not_found,
     ClientContext &context);
 
-// Invoke catalog_table_column_type_change: change a column's type in a table.
 void InvokeCatalogTableColumnTypeChange(const CatalogRpcContext &ctx, const std::string &schema_name,
                                         const std::string &table_name,
                                         const VgiSchemaPtr &column_definition,
                                         const std::optional<std::vector<uint8_t>> &expression, ClientContext &context);
 
-// Invoke catalog_table_column_default_set: set a column's default expression.
 void InvokeCatalogTableColumnDefaultSet(const CatalogRpcContext &ctx, const std::string &schema_name,
                                         const std::string &table_name, const std::string &column_name,
                                         const std::vector<uint8_t> &expression, ClientContext &context);
 
-// Invoke catalog_table_column_default_drop: drop a column's default expression.
 void InvokeCatalogTableColumnDefaultDrop(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name,
     ClientContext &context);
 
-// Invoke catalog_table_not_null_set: set NOT NULL constraint on a column.
 void InvokeCatalogTableNotNullSet(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name,
     ClientContext &context);
 
-// Invoke catalog_table_not_null_drop: drop NOT NULL constraint from a column.
 void InvokeCatalogTableNotNullDrop(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name,
     ClientContext &context);
 
-// ============================================================================
-// View DDL Operations
-// ============================================================================
-
-// Invoke catalog_view_create: create a new view in the catalog.
+// View and schema DDL.
 void InvokeCatalogViewCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name,
@@ -389,21 +317,18 @@ void InvokeCatalogViewCreate(
     const std::map<std::string, std::string> &column_comments,
     ClientContext &context);
 
-// Invoke catalog_view_drop: drop a view from the catalog.
 void InvokeCatalogViewDrop(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name,
     bool ignore_not_found, bool cascade,
     ClientContext &context);
 
-// Invoke catalog_view_rename: rename a view in the catalog.
 void InvokeCatalogViewRename(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name,
     const std::string &new_name, bool ignore_not_found,
     ClientContext &context);
 
-// Set or clear the comment on a view
 void InvokeCatalogViewColumnCommentSet(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &view_name, const std::string &column_name,
@@ -417,26 +342,21 @@ void InvokeCatalogViewCommentSet(
     bool ignore_not_found,
     ClientContext &context);
 
-// Invoke catalog_schema_create: create a new schema in the catalog.
 void InvokeCatalogSchemaCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &on_conflict,
     const std::optional<std::string> &comment, const std::map<std::string, std::string> &tags,
     ClientContext &context);
 
-// Invoke catalog_schema_drop: drop a schema from the catalog.
 void InvokeCatalogSchemaDrop(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, bool ignore_not_found, bool cascade,
     ClientContext &context);
 
-// ============================================================================
-// Column Statistics
-// ============================================================================
+// Column statistics.
 
-// Invoke catalog_table_column_statistics_get: fetch column statistics for a table.
-// Returns a map from column_name to BaseStatistics, empty map on failure.
-// Also returns the cache_max_age_seconds via the output parameter (-1 = cache forever).
+// column_name -> BaseStatistics (empty when the worker has none), plus the
+// cache_max_age_seconds from the batch's custom metadata.
 struct ColumnStatisticsRpcResult {
 	std::unordered_map<std::string, unique_ptr<BaseStatistics>> stats;
 	int64_t cache_max_age_seconds = -1;  // -1 = cache forever, 0 = don't cache
@@ -449,16 +369,10 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
     const std::vector<std::string> &column_names,
     ClientContext &context);
 
-// Deserialize a column-statistics IPC RecordBatch into a per-column
-// `BaseStatistics` map. Reused on three paths:
-//   - the on-demand `catalog_table_column_statistics_get` RPC response
-//     (`vgi_table_entry.cpp`)
-//   - the per-bind `table_function_statistics` RPC response
-//     (`vgi_table_function_impl.cpp`)
-//   - inlined `column_statistics` bytes carried on `VgiTableInfo`, parsed at
-//     first `GetStatistics` call by `VgiTableEntry`
-// Throws on malformed input; callers wrap in try/catch when fail-soft is
-// desired (the inline-blob path leaves the cache empty + marks fetched).
+// Shared decoder for catalog_table_column_statistics_get, table_function_statistics
+// and the inlined VgiTableInfo column_statistics. Returns an empty map when a
+// required field is missing and skips (logs) rows that fail to parse; Arrow
+// conversion errors throw, so fail-soft callers wrap it.
 std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
     const VgiBatchPtr &result_batch,
     const std::vector<LogicalType> &column_types,
@@ -466,13 +380,9 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatistic
     const std::string &worker_path, const std::string &log_source_key,
     const std::string &log_source_value, ClientContext &context);
 
-// ============================================================================
-// Table Function Cardinality
-// ============================================================================
+// Table-function plan / cardinality / statistics / dynamic_to_string, all keyed
+// on the serialized BindRequest bytes of a completed bind.
 
-// Invoke table_function_cardinality RPC: get cardinality estimate for a table function.
-// Uses the serialized BindRequest bytes from a completed bind phase.
-// Returns TableFunctionCardinalityResult with estimate and max (-1 = unknown).
 //! Plan a table-function scan into named, independently redeemable splits.
 //! Bounded by a page cap, a total split cap and a per-page cancellation check;
 //! a breach throws rather than scanning a partial enumeration.
@@ -486,15 +396,14 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx, const std::vec
 //! Parse one PlanResponse batch into a page.
 VgiScanPlanPage ParseVgiScanPlanPage(const VgiBatchPtr &batch, const std::string &worker_path);
 
+// Estimate and max (-1 = unknown).
 TableFunctionCardinalityResult InvokeTableFunctionCardinality(
     const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
     const std::vector<uint8_t> &bind_opaque_data, ClientContext &context);
 
-// Invoke table_function_statistics RPC: get per-output-column statistics for a table function.
-// Wire shape mirrors table_function_cardinality — the worker receives a full copy of the
-// BindRequest (with parsed user arguments) and returns per-column stats in the same shape
-// as catalog_table_column_statistics_get. Returns an empty map if the worker returns null
-// (stats unknown) or on parse errors; no cache_max_age_seconds — bind-lifetime cache only.
+// Per-output-column stats in the catalog_table_column_statistics_get shape. Empty
+// when the worker returns null (see ParseColumnStatisticsBatch for malformed
+// input). No cache_max_age_seconds: cached for the bind's lifetime only.
 std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionStatistics(
     const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
     const std::vector<uint8_t> &bind_opaque_data,
@@ -502,34 +411,21 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
     const std::vector<std::string> &column_names,
     const std::string &function_name, ClientContext &context);
 
-// Invoke table_function_dynamic_to_string RPC: ask the worker for diagnostics that should
-// surface as Extra Info under EXPLAIN ANALYZE. Fired once per parallel scan thread at
-// end-of-stream; the user implementation is responsible for persisting whatever metrics
-// it cares about and retrieving them by ``global_execution_id``. Catches and logs any
-// exception; returns an empty map so EXPLAIN ANALYZE never aborts the query.
+// EXPLAIN ANALYZE Extra Info from the worker, which must look up its own metrics
+// by global_execution_id. Catches and logs every exception (returning an empty
+// map) so EXPLAIN ANALYZE never aborts the query.
 InsertionOrderPreservingMap<std::string> InvokeTableFunctionDynamicToString(
     const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
     const std::vector<uint8_t> &bind_opaque_data,
     const std::vector<uint8_t> &global_execution_id,
     ClientContext &context);
 
-// ============================================================================
-// Secret Extraction from DuckDB SecretManager
-// ============================================================================
-
-// Extract secrets from DuckDB's SecretManager based on function requirements.
-// For each VgiSecretRequirement, looks up the secret by type (required),
-// optionally filtered by name and/or scope.
-// Returns map of secret_type → {key → Value}. Missing secrets are skipped.
+// Resolve each requirement from DuckDB's SecretManager: by name (type must
+// match) when named, else by scope + type. Returns secret name (the type for an
+// unnamed secret) -> {key -> Value}; missing secrets are skipped.
 std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
     ClientContext &context, const std::vector<VgiSecretRequirement> &requirements);
 
-// ============================================================================
-// DuckDB Type Conversion
-// ============================================================================
-
-// Convert VgiTableInfo to DuckDB CreateTableInfo.
-// This handles converting the Arrow schema to DuckDB column definitions.
 CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo &table_info,
                                             const std::string &schema_name);
 

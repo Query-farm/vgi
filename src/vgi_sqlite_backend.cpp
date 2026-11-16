@@ -1,15 +1,9 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// SQLite-backed PerValueDiskBackend: same-host multi-process + cross-restart warm
-// reuse for the per-value memo arena. WAL mode gives concurrent readers + one writer
-// across processes on one host. Disk is off the hot path (touched only on a cold-arena
-// hydrate and on a store), so one connection guarded by a mutex is ample.
-//
-// Selected over LMDB by the Step-8 bake-off: reference-grade embedded multi-process DB,
-// single-file amalgamation to vendor, TTL reaping as a DELETE, no hand-rolled reaper or
-// flock, and it sidesteps the DuckDB-reentrancy trap by being a separate engine. LMDB
-// remains a drop-in alternative behind this same interface if write throughput ever
-// proves insufficient (it did not — see the commit).
+// SQLite-backed PerValueDiskBackend: same-host multi-process and cross-restart reuse
+// for the per-value memo arena. Disk is touched only on a cold-arena hydrate and on a
+// store, so one mutex-guarded connection suffices. A separate engine (not DuckDB)
+// avoids re-entering DuckDB from inside a query.
 
 #include "vgi_memo_arena.hpp"
 
@@ -34,10 +28,8 @@ namespace vgi {
 
 namespace {
 
-// Error logging for the disk tier. Failures are rare and operationally important (a
-// silent disk cache is worse than no cache), so these go to stderr UNCONDITIONALLY —
-// not gated behind VGI_STDERR_LOG. A fatal error disables the backend (see disabled_)
-// so it logs once and degrades to memory-only rather than spamming.
+// Disk-tier errors go to stderr UNCONDITIONALLY (not gated by VGI_STDERR_LOG): a
+// silently broken disk cache is worse than none. HandleErrLocked throttles them.
 void LogDiskErr(const char *what, sqlite3 *db) {
 	std::fprintf(stderr, "[vgi] per-value disk cache: %s%s%s\n", what, db ? ": " : "",
 	             db ? sqlite3_errmsg(db) : "");
@@ -45,8 +37,8 @@ void LogDiskErr(const char *what, sqlite3 *db) {
 }
 
 bool IsFatalSqlite(int rc) {
-	// Errors that will keep failing → stop trying (disable). Transient ones (BUSY after
-	// the busy_timeout, FULL when the disk clears) are logged but not disabling.
+	// Errors that will keep failing disable the backend. Transient ones (BUSY after
+	// busy_timeout, FULL) are logged only.
 	return rc == SQLITE_CORRUPT || rc == SQLITE_NOTADB || rc == SQLITE_CANTOPEN || rc == SQLITE_READONLY;
 }
 
@@ -108,8 +100,7 @@ public:
 			HandleErrLocked("persist write failed", first_err);
 			return; // skip reap/evict on a failed write
 		}
-		// Reap expired rows and evict LRU to stay under the byte cap (bounded, off the hot
-		// path — this runs only on a store, i.e. a cache miss).
+		// Runs only on a store (a cache miss), so it stays off the hot path.
 		ReapAndEvictLocked(now_unix);
 	}
 
@@ -171,15 +162,14 @@ public:
 		std::lock_guard<std::mutex> lg(mu_);
 		if (db_) {
 			sqlite3_exec(db_, "DELETE FROM slots", nullptr, nullptr, nullptr);
-			// Reclaim the WAL immediately (TRUNCATE checkpoints then shrinks the -wal file
-			// to zero), so a flush leaves no on-disk residue.
+			// TRUNCATE checkpoints and shrinks the -wal file to zero: no residue.
 			sqlite3_exec(db_, "PRAGMA wal_checkpoint(TRUNCATE)", nullptr, nullptr, nullptr);
 		}
 	}
 
 private:
-	// Log a disk error (throttled so a full/busy disk can't spam) and disable the backend
-	// on a fatal error so it degrades to memory-only instead of failing on every store.
+	// Throttled logging (first 3, then every 1000th); a fatal error disables the
+	// backend so it degrades to memory-only.
 	void HandleErrLocked(const char *what, int rc) {
 		err_count_++;
 		if (err_count_ <= 3 || (err_count_ % 1000) == 0) {
@@ -207,15 +197,13 @@ private:
 		}
 		return v;
 	}
-	// Live data size = (total pages - freelist pages) * page size. O(1) pragmas, and it
-	// SHRINKS as rows are deleted (freed pages join the freelist, reused by later inserts),
-	// so evict-to-fit terminates without a VACUUM.
+	// Live data size, excluding freelist pages: it SHRINKS as rows are deleted, so
+	// evict-to-fit terminates without a VACUUM.
 	int64_t UsedBytesLocked() {
 		const int64_t page = PragmaIntLocked("PRAGMA page_size");
 		return (PragmaIntLocked("PRAGMA page_count") - PragmaIntLocked("PRAGMA freelist_count")) * page;
 	}
 	void ReapAndEvictLocked(int64_t now_unix) {
-		// Reap expired rows first.
 		sqlite3_stmt *rp = nullptr;
 		if (sqlite3_prepare_v2(db_, "DELETE FROM slots WHERE expires_unix>=0 AND expires_unix<=?", -1, &rp,
 		                       nullptr) == SQLITE_OK) {
@@ -226,7 +214,7 @@ private:
 		if (max_bytes_ <= 0) {
 			return;
 		}
-		// Evict least-recently-used rows in batches until under the cap. Bounded loop.
+		// Evict LRU rows in batches until under the cap (bounded loop).
 		for (int guard = 0; guard < 100000 && UsedBytesLocked() > max_bytes_; guard++) {
 			const int before = sqlite3_total_changes(db_);
 			sqlite3_exec(db_, "DELETE FROM slots WHERE rowid IN (SELECT rowid FROM slots ORDER BY last_used ASC LIMIT 512)",
@@ -248,11 +236,9 @@ private:
 
 namespace {
 
-// SQLite's sqlite3_open() creates the database file but NOT its parent directories
-// ("unable to open database file" otherwise). The per-value cache dir is user-set and
-// may not exist yet — and per-value opens it at settings-sync time, before any other
-// tier has had a chance to create it — so create the tree ourselves. Recursive, and
-// tolerant of both '/' and '\\' separators (a Windows cache dir arrives mixed).
+// sqlite3_open() does not create parent directories, and the user-set cache dir may
+// not exist yet when the per-value tier opens it at settings-sync time. Accepts both
+// '/' and '\\' separators (a Windows cache dir arrives mixed).
 void EnsureDirTree(const std::string &dir) {
 	if (dir.empty()) {
 		return;
@@ -269,7 +255,6 @@ void EnsureDirTree(const std::string &dir) {
 		const bool sep = (c == '/' || c == '\\');
 		const bool last = (i + 1 == dir.size());
 		if ((sep || last) && !acc.empty()) {
-			// Build a candidate without the trailing separator and create it if missing.
 			std::string cand = sep ? acc.substr(0, acc.size() - 1) : acc;
 			// Skip empties (leading separator, "C:" drive prefix ending in ':').
 			if (!cand.empty() && cand.back() != ':' && !fs.DirectoryExists(cand)) {
@@ -297,17 +282,15 @@ std::shared_ptr<PerValueDiskBackend> MakeSqliteDiskBackend(const std::string &di
 		return nullptr;
 	}
 	// WAL: concurrent readers + one writer across same-host processes; NORMAL sync is
-	// crash-safe under WAL. busy_timeout so a concurrent writer waits rather than errors.
+	// crash-safe under WAL. busy_timeout makes a concurrent writer wait, not fail.
 	sqlite3_exec(db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
 	sqlite3_exec(db, "PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr);
 	sqlite3_exec(db, "PRAGMA busy_timeout=5000", nullptr, nullptr, nullptr);
-	// Auto-checkpoint the WAL every ~1000 pages (~4 MB) — the default, set explicitly so
-	// the -wal file stays bounded even though the connection is a leaked process-lifetime
-	// singleton (never cleanly closed). Verified: 1M stores through one connection leaves
-	// the WAL at ~0.3 MB while the main DB holds the data. NORMAL sync keeps this crash-safe.
+	// The default, set explicitly: keeps the -wal file bounded for a connection that
+	// may live for the whole process without a clean close.
 	sqlite3_exec(db, "PRAGMA wal_autocheckpoint=1000", nullptr, nullptr, nullptr);
-	// Schema version 2 adds the last_used column (LRU eviction). On a pre-v2 file, drop and
-	// recreate — the per-value tier is a cache, so invalidating it on upgrade is fine.
+	// Schema v2 added last_used (LRU). A pre-v2 file is dropped and recreated — it is
+	// only a cache.
 	{
 		sqlite3_stmt *st = nullptr;
 		int64_t ver = 0;

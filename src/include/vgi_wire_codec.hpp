@@ -9,8 +9,6 @@
 // a null in a non-nullable list/map, a null item in a list of non-optional values, an
 // unknown enum value and a repeated map key are protocol errors. Encoding appends to arrays
 // built from the record's declared schema, so the result has exactly the protocol schema.
-//
-// Only the generated .cpp and tests include this header.
 
 #include "vgi_arrow.hpp"
 
@@ -44,9 +42,7 @@ struct Ctx {
 [[noreturn]] void ThrowBadEnum(const Ctx &ctx, const char *enum_name, const std::string &value);
 [[noreturn]] void ThrowDuplicateKey(const Ctx &ctx);
 
-// ============================================================================
 // Decoding
-// ============================================================================
 
 //! Logical null, including a valid dictionary index referring to a null value.
 bool IsNullValue(const VgiColumn &col, int64_t i, const Ctx &ctx);
@@ -237,9 +233,7 @@ private:
 	const VgiBatch *previous_;
 };
 
-// ============================================================================
 // Encoding: append one value to an array being built from the declared schema
-// ============================================================================
 
 void WriteValue(ArrowArray *array, bool value);
 void WriteValue(ArrowArray *array, int8_t value);
@@ -297,9 +291,7 @@ void WriteValue(ArrowArray *array, const std::map<K, V> &value) {
 //! so an index IS the enumerator.
 void WriteEnum(ArrowArray *array, int16_t index, const char *const *wire_names, int16_t count);
 
-// ============================================================================
 // Equality (records compare member-wise; large_binary by content)
-// ============================================================================
 
 bool Equal(const VgiBufferPtr &a, const VgiBufferPtr &b);
 template <class T>

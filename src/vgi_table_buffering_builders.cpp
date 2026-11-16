@@ -9,11 +9,6 @@
 namespace duckdb {
 namespace vgi {
 
-
-// ----------------------------------------------------------------------------
-// Table sink+source inner builders (new buffered API).
-// ----------------------------------------------------------------------------
-
 VgiBatchPtr
 BuildTableBufferingProcessInner(const std::string &function_name,
                                   const std::string &schema_name,
@@ -21,8 +16,8 @@ BuildTableBufferingProcessInner(const std::string &function_name,
                                   const std::vector<uint8_t> &input_batch_bytes,
                                   const std::vector<uint8_t> &attach_opaque_data,
                                   std::optional<int64_t> batch_index) {
-	// No state_id field — the worker chooses it and ships it on the response.
-	// transaction_id is reserved and not populated yet.
+	// No state_id: the worker chooses it and returns it on the response.
+	// transaction_id is not populated.
 	generated::TableBufferingProcessRequest request;
 	request.function_name = function_name;
 	request.execution_id = execution_id;

@@ -22,40 +22,29 @@
 namespace duckdb {
 namespace vgi {
 
-// Forward declaration — full definition in vgi_oauth.hpp
-class CatalogAuth;
-// Forward declaration — full definition in vgi_cookie_jar.hpp
-class SessionCookieJar;
+class CatalogAuth;      // vgi_oauth.hpp
+class SessionCookieJar; // vgi_cookie_jar.hpp
 struct IrohClientConfig;
 
-// Content type for Arrow IPC streams over HTTP
 constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
-// Invoke a unary RPC method over HTTP.
-// worker_path includes the prefix, e.g. "http://localhost:8000/vgi".
-// Posts to {worker_path}/{method_name}.
-// auth: per-catalog auth state for bearer token injection and 401 handling.
-// cookie_jar: per-catalog HTTP cookie store. Null skips Cookie / Set-Cookie
-// handling entirely. Non-null means request carries a Cookie header built
-// from the jar, and any Set-Cookie response headers update the jar.
-// cached_http_params: optional per-catalog HTTPParams cache. When non-null,
-// HttpPostArrowIpcInternal will reuse it instead of calling
-// HTTPUtil::InitializeParameters, which would otherwise re-enter the secret
-// manager on every RPC (deadlock hazard under the MetaTransaction mutex — see
-// https://github.com/duckdb/duckdb/issues/22258). Callers that have a
-// VgiAttachParameters should pass params->GetOrInitHttpParams(context, url).
-// client_holder: optional caller-owned keep-alive HTTP client (see
-// HttpPostArrowIpc). Same contract: one base URL per holder, never shared
-// across threads. Null = fresh connection per call (previous behavior).
-// caps: optional IN/OUT ServerCapabilities snapshot, forwarded verbatim to
-// HttpPostArrowIpc — see its contract. Callers with a per-catalog
-// ServerCapabilitiesCache should load into a local, pass it, and store it back,
-// so the codec choice (in particular "this server takes identity bodies only")
-// is learned once per catalog instead of once per RPC.
-// protocol: which application protocol the call addresses. Selects the URL's
-// protocol path segment AND the request's vgi_rpc.protocol routing key — the
-// server requires the two to agree. Reserved server-level methods (``__x__``)
-// are mounted flat and carry neither.
+// Invoke a unary RPC over HTTP. worker_path is the base URL (e.g.
+// "http://localhost:8000/vgi"); the request posts to
+// {worker_path}/{protocol}/{method_name}. Discovers capabilities first when
+// `caps` is missing or expired.
+// auth: per-catalog bearer token / 401 handling.
+// cookie_jar: null skips Cookie / Set-Cookie handling; otherwise the request
+// carries the jar's cookies and Set-Cookie responses update it.
+// cached_http_params: per-catalog HTTPParams (pass
+// VgiAttachParameters::GetOrInitHttpParams). Without it every RPC re-enters the
+// secret manager, which deadlocks under the MetaTransaction mutex
+// (duckdb/duckdb#22258).
+// client_holder, caps: as for HttpPostArrowIpc. Callers with a per-catalog
+// ServerCapabilitiesCache should load, pass and store back `caps` so the codec
+// choice is learned once per catalog, not per RPC.
+// protocol: selects both the URL's protocol segment and the vgi_rpc.protocol
+// routing key (the server requires them to agree). Reserved methods (`__x__`)
+// are mounted flat at {worker_path}/{method_name} and carry neither.
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
@@ -73,15 +62,11 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
                                      const std::unordered_map<std::string, std::string> *error_fields = nullptr);
 
-// Small thread-safe pool of keep-alive HTTPClients for unary RPCs against ONE
-// base URL (a pool instance lives on a catalog's VgiAttachParameters, whose
-// worker_path is fixed). HTTPClient itself is not thread-safe and catalog RPCs
-// arrive from many threads, so callers CHECK OUT a client into a thread-local
-// holder (null on a cold pool — HttpPostArrowIpc lazily creates one), pass the
-// holder through the request, and RETURN it only on success. A client whose
-// request threw may hold a wedged TCP connection and is dropped instead
-// (DuckDB's retry loop already refreshes the client on transport errors, but
-// an exception that escapes means we can't trust its state).
+// Thread-safe pool of keep-alive HTTPClients for ONE base URL (one per
+// catalog, VgiAttachParameters::GetOrInitHttpClientPool). HTTPClient is not
+// thread-safe, so callers check a client out into a local holder (null on a
+// cold pool; HttpPostArrowIpc creates one lazily) and Return it only on
+// success: a client whose request threw may hold a wedged connection.
 class VgiHttpClientPool {
 public:
 	duckdb::unique_ptr<HTTPClient> Checkout() {
@@ -104,47 +89,29 @@ public:
 	}
 
 private:
-	// Bounds idle keep-alive connections per catalog; excess returns are
-	// simply dropped (closing the connection). 8 covers DuckDB's typical
-	// catalog-RPC concurrency without holding sockets open needlessly.
+	// Idle keep-alive connections kept per catalog; excess returns are closed.
 	static constexpr size_t kMaxPooled = 8;
 	std::mutex mu_;
 	std::vector<duckdb::unique_ptr<HTTPClient>> clients_;
 };
 
-// POST Arrow IPC bytes to a URL, return raw response body bytes.
-// Used for catalog, stream init, and exchange operations.
-// Timeout is controlled by the vgi_http_timeout_seconds setting (default 300s).
-// The decoded response budget is controlled by
-// vgi_http_accepted_max_response_bytes (256 MiB native, 64 MiB WASM) and is
-// advertised on every request after mandatory capability discovery.
-// auth: per-catalog auth state for bearer token injection and 401 handling.
-// cookie_jar: per-catalog HTTP cookie store (see HttpInvokeUnary).
-// client_holder: optional caller-owned HTTP client cache. When non-null, the
-// underlying DuckDB HTTPClient (and thus its keep-alive TCP connection) is
-// created on first use and REUSED across calls instead of a fresh connection
-// per request — the win on the chatty per-batch exchange path, where a 500k
-// scan otherwise opens ~one TCP connection per 2048-row vector. The client is
-// keyed by host:port, so a single holder is only valid for one host: pass a
-// holder that is used exclusively for one base_url (e.g. a per-connection
-// member), and NEVER share it across threads (HTTPClient is not thread-safe).
-// Null (the default) preserves the previous fresh-connection-per-call behavior.
-// harvested_caps: when non-null, an IN/OUT snapshot of what this server can do.
-// On the way in, a discovered snapshot selects the request body's
-// Content-Encoding — notably, a server that advertised an EMPTY
-// VGI-Supported-Encodings (it speaks no compression) gets identity bodies. On
-// the way out it is refreshed from the capability headers the server middleware
-// stamps on every response, whatever its status, so callers discover
-// ServerCapabilities from traffic they already generate instead of paying a
-// separate HEAD /health round trip per connection. Pass the same per-catalog
-// snapshot (see ServerCapabilitiesCache) on every call to keep the codec
-// choice warm.
-// cancellation: the query's client context for a request
-// that belongs to that query's scan. The backend aborts the transfer when it
-// flips, and the call throws InterruptException rather than a transport error.
-// Opt-in, never defaulted to the calling context: unary RPCs (rollback,
-// table_buffering_destructor) and the cancel dispatcher's server-side cancel all
-// run while the user's query is still marked interrupted, and must go out.
+// POST Arrow IPC bytes and return the decoded response body. Timeout is
+// vgi_http_timeout_seconds; the decoded-response budget is
+// vgi_http_accepted_max_response_bytes, advertised on every request and
+// tightened by the server's VGI-Max-Response-Bytes. Handles one 401 retry via
+// `auth` and one codec renegotiation.
+// client_holder: when non-null, the HTTPClient (and its keep-alive connection)
+// is created on first use and reused across calls — a big win on the per-batch
+// exchange path. The client is bound to one host: use a holder for a single
+// base URL only and never share it across threads. Null = fresh connection.
+// harvested_caps: IN/OUT. On the way in, a discovered snapshot picks the
+// request Content-Encoding (an EMPTY VGI-Supported-Encodings means identity
+// bodies). On the way out it is refreshed from the capability headers the
+// server stamps on every response, whatever its status.
+// cancellation: opt-in query context whose interrupt aborts the transfer and
+// throws InterruptException. Never defaulted to `context`: rollback,
+// table_buffering_destructor and the cancel dispatcher's server-side cancel
+// run while the query is marked interrupted and must still go out.
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
@@ -159,23 +126,20 @@ std::string HttpPostArrowIpc(ClientContext &context,
 
 // Whether HttpGetBytes resolves DuckDB "http" secrets for the URL.
 enum class HttpSecrets {
-	NONE,   // pre-signed URL; safe inside VgiTransaction::Start (vgi_http_params.hpp)
+	NONE,   // pre-signed URL; safe inside VgiTransaction::Start (see vgi_http_params.hpp)
 	LOOKUP, // secret-scoped proxy etc. apply; never from VgiTransaction::Start
 };
 
-// HTTP GET raw bytes from a URL. Used for fetching externalized batches.
-// Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth
-// headers sent. cancellation: as for HttpPostArrowIpc.
+// GET a URL (externalized batches), decoding X-VGI-Content-Encoding /
+// Content-Encoding. Sends no auth headers (pre-signed URLs reject them).
+// cancellation: as for HttpPostArrowIpc.
 std::string HttpGetBytes(ClientContext &context, const std::string &url,
                          ClientContext *cancellation = nullptr, HttpSecrets secrets = HttpSecrets::NONE);
 
-// Resolve an external location pointer batch by fetching and parsing the URL.
-// Returns the resolved data batch. Throws on redirect loops or fetch failures.
-// worker_path, execution_id_hex, attach_opaque_data_digest, conn_id_hex and
-// transaction_opaque_data_digest are passed to HandleBatchLogMessage for any
-// log batches embedded in the externalized IPC stream.
-// If pointer_metadata is provided and contains RPC_LOCATION_SHA256_KEY,
-// the fetched bytes are verified against the expected SHA-256 checksum.
+// Fetch and parse an external location. Throws on fetch failure, an empty
+// body, a SHA-256 mismatch (when pointer_metadata carries
+// RPC_LOCATION_SHA256_KEY) or a pointer to another location. The worker/id
+// arguments are log context for log batches embedded in the fetched stream.
 UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &location_url,
                                              const std::string &worker_path = "",
@@ -186,9 +150,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &conn_id_hex = "",
                                              const std::string &transaction_opaque_data_digest = "");
 
-// Check if a batch result is a pointer batch and resolve it if so.
-// Returns the original result if not a pointer batch, or the resolved result.
-// worker_path and the ids are forwarded to ResolveExternalLocation for log context.
+// Resolve `result` if it carries vgi_rpc.location metadata; otherwise return it.
 UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
                                                    UnaryResponseResult &result,
                                                    const std::string &worker_path = "",
@@ -197,47 +159,37 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
                                                    const std::string &transaction_opaque_data_digest = "",
                                                    const std::string &conn_id_hex = "");
 
-// ServerCapabilities moved to vgi_server_capabilities.hpp (arrow-free) so the
-// per-catalog cache on VgiAttachParameters can include it without Arrow.
-
-// Upload URL returned by __upload_url__/init
+// One entry returned by __upload_url__/init.
 struct UploadUrl {
 	std::string upload_url;
 	std::string download_url;
 };
 
-// Discover server capabilities before method dispatch. Native DuckDB uses
-// HEAD {base_url}/health because its HTTP abstraction has no OPTIONS request
-// type; HTTPI sends OPTIONS through the Iroh envelope.
-// Capability headers are returned on every response; /health is the
-// canonical mandatory, auth-exempt target. Honours Cache-Control:
-// max-age=N to schedule a future re-probe via cache_expires_at.
-// Pass the catalog's cached HTTPParams when available: a probe can run inside
-// VgiTransaction::Start (a capability snapshot that is missing or expired), where
-// initializing parameters with a secret lookup deadlocks.
+// Probe {base_url}/health (mandatory and auth-exempt): HEAD natively, since
+// DuckDB's HTTP layer has no OPTIONS; OPTIONS over httpi://. Cache-Control
+// max-age=N sets cache_expires_at for a re-probe. Pass the catalog's cached
+// HTTPParams: a probe can run inside VgiTransaction::Start, where a secret
+// lookup deadlocks.
 ServerCapabilities HttpDiscoverCapabilities(
     ClientContext &context, const std::string &base_url,
     const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
     const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
 
-// Request upload URLs from the server. Posts to {base_url}/__upload_url__/init.
+// Posts to {base_url}/__upload_url__/init.
 std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
                                                const std::string &base_url,
                                                int count,
                                                const std::shared_ptr<CatalogAuth> &auth = nullptr,
                                                const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
 
-// HTTP PUT raw bytes to a URL with optional compression.  ``encoding`` ==
-// ``HttpEncoding::NONE`` (the default) writes the body verbatim; any other
-// codec is applied before PUT and stamped on Content-Encoding /
-// X-VGI-Content-Encoding so the receiving side knows how to decode.
+// PUT to a pre-signed URL. A non-NONE encoding compresses the body and stamps
+// both Content-Encoding and X-VGI-Content-Encoding.
 void HttpPutBytes(ClientContext &context, const std::string &url,
                    const std::vector<uint8_t> &data, HttpEncoding encoding = HttpEncoding::NONE);
 
-// Serialize a pointer batch: zero-row batch with schema + vgi_rpc.location metadata.
-// Optionally includes the stream_state (cursor) and call_state tokens; both
-// have to ride the pointer batch, since the worker reads them off the request
-// metadata and a token omitted here is simply absent from the request.
+// Zero-row batch with vgi_rpc.location metadata. The stream_state / call_state
+// tokens must ride the pointer batch: the worker reads them off the request
+// metadata, so a token omitted here is absent from the request.
 std::vector<uint8_t> SerializePointerBatch(const VgiSchemaPtr &schema,
                                              const std::string &location_url,
                                              const std::string &stream_state_token = "",

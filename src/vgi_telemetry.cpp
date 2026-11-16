@@ -21,9 +21,8 @@ namespace vgi {
 
 namespace {
 
-// Endpoint for the dedicated VGI attach-telemetry worker (its own repo /
-// subdomain — see docs/telemetry.md). Distinct from the shared extension-load
-// ping endpoint; the load ping is untouched.
+// Dedicated VGI attach-telemetry endpoint (see docs/telemetry.md), distinct from
+// the shared extension-load ping endpoint.
 const char *const kVgiAttachEndpoint = "https://vgi-in.query-farm.services/";
 
 // Per-process random session id — minted once, in memory, never persisted.

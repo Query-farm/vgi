@@ -36,9 +36,8 @@ struct ResponseSchema {
 	VgiSchemaPtr request_schema = nullptr;
 };
 
-// Look up a method's registered response contract. Returns nullptr when the
-// method has no entry. Callers should treat "no entry" as a programmer error;
-// `ValidateResponseSchema` will throw in that case.
+// A method's registered response contract, or nullptr when unregistered (a
+// programmer error; `ValidateResponseSchema` throws for it).
 const ResponseSchema *LookupResponseSchema(const std::string &method_name);
 
 // Validate a deserialized response batch against the registered contract for
@@ -49,24 +48,17 @@ void ValidateResponseSchema(const VgiBatchPtr &batch,
                             const std::string &method_name,
                             const std::string &worker_path);
 
-// Validate a single deserialized item from a {items: List<Binary>} response.
-// The item is itself an IPC-serialized RecordBatch whose schema must match the
-// registered `item_schema` for `method_name`. No-op if the method has no
-// item_schema registered (e.g. method isn't a list-of-items response, or the
-// registry deliberately leaves inner items unvalidated).
+// Validate one deserialized item of a {items: List<Binary>} response against
+// the method's registered `item_schema`; no-op when none is registered.
 void ValidateItemSchema(const VgiBatchPtr &item_batch,
                         const std::string &method_name,
                         const std::string &worker_path,
                         size_t item_index);
 
-// Validate an outgoing request batch against the registered per-method params
-// schema before it's written to the wire. Catches encoder drift (wrong field
-// order, wrong nullability, missing fields) in C++ BuildXxxParams functions at
-// the boundary where it happens — before the worker has to diagnose it.
-//
-// `batch` may be null for methods that take no params (e.g. catalog_catalogs,
-// whose request has an empty schema). If `method_name` has no registered
-// params schema, throws — every invoked method must be registered.
+// Validate an outgoing request batch against the method's registered params
+// schema, catching encoder drift (field order, nullability, missing fields)
+// before the worker has to diagnose it. `batch` may be null for parameter-less
+// methods (e.g. catalog_catalogs). Throws for an unregistered method.
 void ValidateRequestSchema(const VgiBatchPtr &batch,
                            const std::string &method_name,
                            const std::string &worker_path);

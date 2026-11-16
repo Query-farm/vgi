@@ -12,9 +12,8 @@
 
 namespace duckdb {
 
-// Register the vgi_catalogs table function
-// Usage: SELECT * FROM vgi_catalogs('/path/to/vgi-worker')
-// Returns a table with a single column "catalog" containing catalog names from the VGI worker
+// vgi_catalogs(worker_path): one row per catalog the worker advertises (name,
+// versions, attach options, releases, source_url).
 void RegisterVgiCatalogsFunction(ExtensionLoader &loader);
 
 namespace vgi {

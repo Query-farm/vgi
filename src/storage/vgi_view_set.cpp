@@ -16,9 +16,9 @@
 
 namespace duckdb {
 
-// DuckDB 1.5's BindView stores SELECT-derived names until a SELECT binds the
-// view as a table reference. Column comments must use the exposed names even
-// when discovery or COMMENT is the first operation after loading the view.
+// DuckDB's BindView stores the SELECT-derived names until a SELECT binds the
+// view as a table reference. Column comments must see the exposed (aliased)
+// names even when discovery or COMMENT is the first operation on the view.
 class VgiViewCatalogEntry final : public ViewCatalogEntry {
 public:
 	using ViewCatalogEntry::ViewCatalogEntry;
@@ -50,10 +50,9 @@ public:
 	}
 };
 
-// Returns nullptr if the view's SQL fails to parse or is not a SELECT.
-// ViewCatalogEntry derefs info.query in DuckDB's binder, so registering an
-// entry whose query is null crashes any subsequent SELECT * FROM v. Skipping
-// the entry instead surfaces a clean "view not found" error to the user.
+// Returns nullptr if the view's SQL fails to parse or is not a SELECT: the
+// binder derefs info.query, so a null-query entry would crash on use; skipping
+// it yields "view not found" instead.
 static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, SchemaCatalogEntry &schema,
                                                             const vgi::VgiViewInfo &view_info) {
 	CreateViewInfo info(schema, Identifier(view_info.name));
@@ -65,12 +64,10 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 	for (auto &[key, val] : view_info.tags) {
 		info.tags[key] = val;
 	}
-	// Per-column comments — DuckDB aligns these by name against the columns it
-	// binds from the view's SQL and exposes them via duckdb_columns().
+	// DuckDB aligns column comments by name with the view's bound columns.
 	for (auto &[col, comment] : view_info.column_comments) {
 		info.column_comments_map[Identifier(col)] = Value(comment);
 	}
-	// Parse SQL to get SelectStatement
 	try {
 		Parser parser {ParserOptions::Builtin()};
 		parser.ParseQuery(view_info.definition);
@@ -126,8 +123,8 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 		return nullptr;
 	}
 
-	// Eager-load gate: when count is below threshold, bulk LoadEntries
-	// via EnsureLoaded (single-flight via load_lock_, RPC NOT under entry_lock_).
+	// Below the eager threshold, bulk-load via EnsureLoaded (single-flight via
+	// load_lock_; the RPC is not under entry_lock_).
 	if (eager) {
 		EnsureLoaded(context);
 		{
@@ -148,7 +145,6 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 			         {"loaded_reason", "below_threshold"}});
 			return cached_result;
 		}
-		// fall through to single-entry RPC
 	}
 
 	// Load this specific view from the worker — no lock held during RPC.
@@ -203,7 +199,6 @@ void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::
 		return;
 	}
 
-	// Call catalog_schema_contents_views via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
 	                                vgi_tx_load.GetTransactionOpaqueData()};

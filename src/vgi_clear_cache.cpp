@@ -41,9 +41,8 @@ static void VgiClearCacheScan(ClientContext &context, TableFunctionInput &data_p
 		if (catalog.GetCatalogType() != "vgi") {
 			continue;
 		}
-		// User-initiated; force-purge the deferred-drop graveyard too.
-		// Documented to invalidate any in-flight bound queries against
-		// VGI catalogs.
+		// User-initiated: also force-purge the deferred-drop graveyard, which
+		// invalidates in-flight bound queries against VGI catalogs.
 		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 		if (auto transaction = MetaTransaction::Get(context).TryGetTransaction(*db)) {
 			transaction->Cast<VgiTransaction>().ClearSchemaCache();

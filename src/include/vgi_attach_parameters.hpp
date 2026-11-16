@@ -1,10 +1,9 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
-// Connection-level catalog state: the per-catalog ATTACH parameters and the
-// RPC call context bundle. Split out of vgi_catalog_api.hpp so consumers that
-// only need to identify a catalog/worker don't recompile when metadata structs
-// or RPC signatures change. Deliberately light — no Arrow, no vgi_rpc_types.
+// Per-catalog ATTACH parameters and the RPC call context bundle. Kept light
+// (no Arrow, no vgi_rpc_types) so catalog/worker identity consumers don't
+// recompile when metadata structs or RPC signatures change.
 
 #include <atomic>
 #include <cstdint>
@@ -19,30 +18,20 @@
 
 namespace duckdb {
 
-// Forward declarations — full definitions live in their owning headers; only
-// shared_ptr members / declared-only methods reference these here, so the
-// completeness is needed in the .cpp, not this header.
 struct HTTPParams;       // duckdb/common/http_util.hpp
 class ClientContext;
 
 namespace vgi {
 
-// Forward declaration — full definition in vgi_oauth.hpp
-class CatalogAuth;
-// Forward declaration — full definition in vgi_cookie_jar.hpp
-class SessionCookieJar;
-// Forward declaration — full definition in vgi_http_client.hpp
-class VgiHttpClientPool;
+class CatalogAuth;        // vgi_oauth.hpp
+class SessionCookieJar;   // vgi_cookie_jar.hpp
+class VgiHttpClientPool;  // vgi_http_client.hpp
 struct IrohClientConfig;
-// Full definition in vgi_attach_tickets.hpp
-struct VgiRetainedAttach;
+struct VgiRetainedAttach; // vgi_attach_tickets.hpp
 
-// POD constructor argument for ``VgiAttachParameters``.  Replaces the
-// 8-positional-default-param constructor that previous versions of this
-// struct used — adding the launcher overrides pushed it into the
-// "constructor smell" zone.  All fields default-construct sensibly so
-// callers only set what they care about.  See ``VgiAttachParameters``
-// below for accessor docs.
+// Constructor argument for ``VgiAttachParameters``; every field has a usable
+// default. The legacy constructor below aggregate-initializes it positionally,
+// so append new fields at the end.
 struct VgiAttachParametersConfig {
 	std::string worker_path;
 	std::string catalog_name;
@@ -58,9 +47,9 @@ struct VgiAttachParametersConfig {
 	// Native Iroh endpoint/identity configuration. Null for non-Iroh transports
 	// and for Emscripten, where the page-owned adapter owns the endpoint.
 	std::shared_ptr<IrohClientConfig> iroh;
-	// Per-LOCATION launcher overrides.  Both nullopt by default; when set,
-	// they're applied to the spawn-time ``LaunchConfig`` for `launch:`
-	// LOCATIONs and rejected at parse time for any other transport.
+	// Per-LOCATION launcher overrides, applied to the spawn-time
+	// ``LaunchConfig`` for `launch:` LOCATIONs; rejected at parse time for any
+	// other transport.
 	std::optional<int64_t> launcher_idle_timeout_seconds;
 	std::optional<std::string> launcher_state_dir;
 	// Canonical (sorted `k=v;`) serialization of the ATTACH options, EXCLUDING
@@ -68,12 +57,11 @@ struct VgiAttachParametersConfig {
 	// result-cache key so two attaches with different options (which may route
 	// to different data/locations) never share a cache entry. Empty = none.
 	std::string attach_options_canonical;
-	// Opaque lifetime pin for a resolved worker artifact. Null for ordinary
-	// transports. Keeping this on the catalog prevents eviction between calls.
+	// Opaque lifetime pin for a resolved worker artifact (prevents eviction
+	// between calls). Null for ordinary transports.
 	std::shared_ptr<void> worker_artifact_anchor;
 	// Explicit userspace-networking proxy for tcp:// only. Consumed by the
-	// transport and never forwarded in catalog_attach worker options. Kept last
-	// so existing aggregate initializers retain their positional meaning.
+	// transport and never forwarded in catalog_attach worker options.
 	std::string tcp_proxy;
 	// What the user attached with (remote catalog name, catalog options
 	// INCLUDING secret ones, version specs as typed), kept in memory only so
@@ -84,8 +72,6 @@ struct VgiAttachParametersConfig {
 
 // Parameters for connecting to a VGI worker
 struct VgiAttachParameters {
-	// Preferred constructor — takes a config struct.  All fields default to
-	// the config's defaults; callers only specify what they care about.
 	explicit VgiAttachParameters(VgiAttachParametersConfig cfg)
 	    : worker_path_(std::move(cfg.worker_path)), catalog_name_(std::move(cfg.catalog_name)),
 	      worker_debug_(cfg.worker_debug), use_pool_(cfg.use_pool), cache_(cfg.cache),
@@ -101,9 +87,7 @@ struct VgiAttachParameters {
 		retained_attach_ = std::move(cfg.retained_attach);
 	}
 
-	// Legacy constructor — thin wrapper for in-tree call sites that haven't
-	// migrated yet.  Forwards to the config-struct constructor.  Will be
-	// removed in a follow-up after every caller is migrated.
+	// Legacy positional constructor, still used by vgi_table_function_impl.cpp.
 	VgiAttachParameters(const std::string &worker_path, const std::string &catalog_name, bool worker_debug = false,
 	                    bool use_pool = true, std::shared_ptr<CatalogAuth> auth = nullptr,
 	                    std::string data_version_spec = "", std::string implementation_version = "",
@@ -117,24 +101,16 @@ struct VgiAttachParameters {
 	                                                     /*attach_options_canonical=*/std::string()}) {
 	}
 
-	// Lazy-initialized, per-catalog HTTPParams cache.
+	// Lazy-initialized, per-catalog HTTPParams cache (ordinary and
+	// single-attempt sets are initialized together).
 	//
-	// TODO(#22258): revisit once the upstream DuckDB issue is resolved. We cache
-	// HTTPParams because HTTPFSUtil::InitializeParameters reaches into the secret
-	// manager, which takes the MetaTransaction mutex. Calling it from inside
-	// VgiTransaction::Start (which already holds that mutex) deadlocks on HTTP
-	// transport — see https://github.com/duckdb/duckdb/issues/22258. Priming the
-	// cache during ATTACH (outside any transaction) avoids the reentrancy.
-	//
-	// Side effect: session settings like vgi_http_timeout_seconds,
-	// http_proxy, bearer_token secrets, extra_http_headers, TLS options etc. are
-	// captured once per catalog and never refreshed. If the user mutates them
-	// mid-session they won't take effect until re-ATTACH. Acceptable short-term;
-	// a proper fix is to make the upstream secret read lock-free, or to move
-	// CheckAndInvalidateCache off the Transaction::Start hot path so HTTP I/O
-	// never happens under the MetaTransaction lock in the first place.
-	// Both ordinary and single-attempt provider parameter sets are initialized
-	// together during ATTACH; BEGIN must not initialize either under the mutex.
+	// TODO(duckdb#22258): HTTPFSUtil::InitializeParameters reads the secret
+	// manager, which takes the MetaTransaction mutex; calling it inside
+	// VgiTransaction::Start (which holds that mutex) deadlocks on HTTP. So the
+	// cache is primed during ATTACH, outside any transaction, and BEGIN must
+	// never initialize it. Consequence: vgi_http_timeout_seconds, http_proxy,
+	// secrets, extra_http_headers, TLS options etc. are captured once per
+	// catalog and only refresh on re-ATTACH.
 	std::shared_ptr<HTTPParams> GetOrInitHttpParams(ClientContext &context, const std::string &url,
 	                                             bool single_attempt = false) const;
 
@@ -171,29 +147,27 @@ struct VgiAttachParameters {
 		return iroh_;
 	}
 
-	// Requested semver constraint for the catalog's data version. Empty string
-	// means the client did not constrain. Pooled worker lookup uses this as
-	// part of the key so mismatched versions never share a process.
+	// Requested semver constraint for the catalog's data version; empty =
+	// unconstrained. Part of the pooled-worker key so mismatched versions never
+	// share a process.
 	const std::string &data_version_spec() const {
 		return data_version_spec_;
 	}
 
-	// Requested semver constraint for the worker's implementation version.
-	// Empty string means unconstrained.
+	// Requested semver constraint for the worker's implementation version;
+	// empty = unconstrained.
 	const std::string &implementation_version() const {
 		return implementation_version_;
 	}
 
-	// HTTP cookie jar for this catalog. Null on subprocess transport.
+	// HTTP cookie jar for this catalog. Null unless http:// or httpi://.
 	const std::shared_ptr<SessionCookieJar> &cookie_jar() const {
 		return cookie_jar_;
 	}
 
-	// Per-LOCATION launcher overrides — only meaningful when
-	// ``IsLaunchLocation(worker_path())`` is true.  Validation (range,
-	// transport-gating) happens at ATTACH parse time; the cache layer
-	// pins these values to the worker's lifetime and throws
-	// ``BinderException`` on a second ATTACH that disagrees.
+	// Only meaningful for ``IsLaunchLocation(worker_path())``. Validated at
+	// ATTACH parse time; the cache layer pins them to the worker's lifetime and
+	// throws ``BinderException`` on a second ATTACH that disagrees.
 	const std::optional<int64_t> &launcher_idle_timeout_seconds() const {
 		return launcher_idle_timeout_seconds_;
 	}
@@ -202,8 +176,7 @@ struct VgiAttachParameters {
 		return launcher_state_dir_;
 	}
 
-	// Canonical ATTACH-options string (secret tokens excluded) folded into the
-	// result-cache key. Empty when no non-secret options were supplied.
+	// See VgiAttachParametersConfig::attach_options_canonical.
 	const std::string &attach_options_canonical() const {
 		return attach_options_canonical_;
 	}
@@ -221,29 +194,26 @@ struct VgiAttachParameters {
 	}
 
 public:
-	// Per-catalog HTTP ServerCapabilities snapshot, harvested from the
-	// capability headers the server middleware stamps on every response.
-	// Shared across all of this catalog's connections so a new connection
-	// starts warm instead of paying a HEAD /health probe. Returns a copy
-	// with discovered=false when nothing has been harvested yet.
+	// Per-catalog HTTP ServerCapabilities snapshot, harvested from response
+	// capability headers and shared by all of this catalog's connections so a
+	// new one skips the HEAD /health probe. Load() returns discovered=false
+	// until something has been harvested.
 	void StoreServerCapabilities(const ServerCapabilities &caps) const {
 		server_caps_->Store(caps);
 	}
 	ServerCapabilities LoadServerCapabilities() const {
 		return server_caps_->Load();
 	}
-	// The same snapshot as a shareable handle, for call paths that don't hold
-	// the VgiAttachParameters itself (the unary catalog RPCs, which take a
-	// plain UnaryRpcOptions). Handing out the holder rather than a copy is what
-	// lets a codec downgrade learned by one path apply to the others.
+	// The same snapshot as a shared holder, for paths that don't hold the
+	// VgiAttachParameters (unary catalog RPCs via UnaryRpcOptions). Sharing the
+	// holder, not a copy, lets a codec downgrade learned by one path apply to
+	// all.
 	const std::shared_ptr<ServerCapabilitiesCache> &server_caps() const {
 		return server_caps_;
 	}
 
-	// Lazy-initialized per-catalog keep-alive HTTP client pool for unary RPCs
-	// (catalog metadata, DDL, stats). See VgiHttpClientPool in
-	// vgi_http_client.hpp. Only meaningful on HTTP transport; defined
-	// out-of-line (vgi_catalog_api.cpp) so this header stays light.
+	// Lazy-initialized per-catalog keep-alive HTTP client pool for unary
+	// catalog RPCs. HTTP transports only.
 	std::shared_ptr<VgiHttpClientPool> GetOrInitHttpClientPool() const;
 
 	// Per-catalog cache of the worker's vgi_rpc.Reflection.v1 listing. Never
@@ -271,34 +241,27 @@ private:
 	std::shared_ptr<void> worker_artifact_anchor_;
 	std::shared_ptr<const VgiRetainedAttach> retained_attach_;
 
-	// See GetOrInitHttpParams above for the rationale behind caching these.
 	mutable std::mutex http_params_mutex_;
 	mutable std::shared_ptr<HTTPParams> cached_http_params_;
 	mutable std::shared_ptr<HTTPParams> cached_single_attempt_http_params_;
 
-	// HTTP ServerCapabilities snapshot. See Store/LoadServerCapabilities above.
-	// Held by shared_ptr (not by value) so the unary catalog-RPC path can share
-	// the very same holder; never null.
+	// Never null; shared_ptr so server_caps() can hand out the same holder.
 	std::shared_ptr<ServerCapabilitiesCache> server_caps_ = std::make_shared<ServerCapabilitiesCache>();
 
-	// Keep-alive HTTP client pool for unary RPCs. Guarded by
-	// http_params_mutex_ for lazy init (same tiny critical section).
+	// Lazy init guarded by http_params_mutex_.
 	mutable std::shared_ptr<VgiHttpClientPool> http_client_pool_;
 
-	// Reflection listing cache. See hosted_protocols() above.
 	std::shared_ptr<HostedProtocolsCache> hosted_protocols_ = std::make_shared<HostedProtocolsCache>();
 };
 
 // Bundles all catalog state needed for an RPC call.
-// Eliminates the 5-6 individual catalog parameters that every InvokeCatalog* function used to take.
 struct CatalogRpcContext {
 	std::shared_ptr<VgiAttachParameters> params;
 	std::vector<uint8_t> attach_opaque_data;       // from CatalogAttachResult
 	std::vector<uint8_t> transaction_opaque_data;  // from VgiTransaction (empty if N/A)
 
-	// Optional entity context for instrumentation. When populated, the RPC
-	// chokepoint logs them on every catalog.rpc event so analyses can group
-	// latency by which entity DuckDB was resolving. Empty values are omitted.
+	// Optional entity context logged on every catalog.rpc event (empty values
+	// omitted), so latency can be grouped by the entity being resolved.
 	std::string entity_kind;       // "table" | "schema" | "view" | "function" | "macro" | ""
 	std::string entity_qualifier;  // e.g. "schema.table" or just "schema"
 };

@@ -1,9 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
-// ServerCapabilities lives in its own light header (no Arrow, no DuckDB) so
-// the Arrow-free hub vgi_attach_parameters.hpp can cache a per-catalog
-// snapshot without dragging vgi_http_client.hpp's <arrow/api.h> along.
+// Kept in its own light header (no Arrow, no DuckDB) so vgi_attach_parameters.hpp
+// can hold a per-catalog snapshot without including vgi_http_client.hpp.
 
 #include <chrono>
 #include <cstdint>
@@ -15,13 +14,12 @@
 namespace duckdb {
 namespace vgi {
 
-// Server capabilities harvested from HTTP response headers.
-// Capability headers (VGI-Accept-Max-Response-Bytes-Support,
-// VGI-Max-Request-Bytes, VGI-Upload-URL-Support,
-// VGI-Max-Upload-Bytes, VGI-Supported-Encodings) are emitted by the
-// server middleware on EVERY response. A positive discovery is mandatory
-// before the first application call; later bind/init/exchange responses
-// refresh that snapshot and avoid unnecessary re-probes.
+// Server capabilities harvested from HTTP response headers
+// (ParseCapabilityHeaders). The server middleware emits the capability headers
+// (VGI-Accept-Max-Response-Bytes-Support, VGI-Max-Request-Bytes,
+// VGI-Max-Response-Bytes, VGI-Upload-URL-Support, VGI-Max-Upload-Bytes,
+// VGI-Supported-Encodings) on every response. A positive discovery is required
+// before the first application call; later responses refresh the snapshot.
 struct ServerCapabilities {
 	bool discovered = false;
 	bool accept_max_response_bytes_support = false;
@@ -29,36 +27,25 @@ struct ServerCapabilities {
 	int64_t max_response_bytes = -1;  // -1 = no limit advertised
 	bool upload_url_support = false;
 	int64_t max_upload_bytes = -1;    // -1 = no limit advertised
-	// Content-encoding codecs the server can decompress on request bodies
-	// and produce on response bodies, in server-advertised preference order.
-	// ALWAYS read together with ``encodings_advertised`` — the empty vector
-	// is ambiguous on its own.
+	// Codecs the server accepts on requests and produces on responses, in its
+	// preference order. Always read with ``encodings_advertised``: empty alone
+	// is ambiguous.
 	std::vector<HttpEncoding> supported_encodings;
-	// Whether the response carried a ``VGI-Supported-Encodings`` header at all.
-	// The header is three-valued and every VGI SDK stamps it deliberately:
+	// Whether the response carried ``VGI-Supported-Encodings`` at all:
 	//   absent (false)            -> legacy server, assume {ZSTD}
-	//   present, empty (true, {}) -> the server states it speaks NO compression;
-	//                                request bodies must go out as identity
+	//   present, empty (true, {}) -> server speaks no compression; send identity
 	//   present, non-empty (true) -> use one of the advertised codecs
-	// Collapsing "present but empty" into "absent" is what made a
-	// compression-disabled server unusable: it kept being sent zstd bodies it
-	// has no decompressor for.
+	// Never collapse "present but empty" into "absent": that server cannot
+	// decompress zstd bodies.
 	bool encodings_advertised = false;
-	// Steady-clock time after which this snapshot should be re-probed.
-	// Populated from the response's Cache-Control: max-age=N header (in
-	// practice only OPTIONS responses carry it; harvested snapshots refresh
-	// on every response anyway). epoch (default-constructed) means "no
-	// expiry hint" -> valid for the lifetime of the connection.
+	// When to re-probe, from Cache-Control: max-age=N (in practice only on
+	// OPTIONS responses). Default-constructed means no expiry hint.
 	std::chrono::steady_clock::time_point cache_expires_at{};
 };
 
-// Can the server decompress a request body encoded with ``enc``?
-//
-// Identity is always acceptable: the VGI HTTP contract treats an absent
-// ``Content-Encoding`` as identity and no server mandates compression. When
-// the server never advertised a codec set (a pre-update server) we keep the
-// historical assumption that it speaks zstd — changing that would silently
-// stop compressing for every deployed server.
+// Can the server decompress a request body encoded with ``enc``? Identity
+// always can (absent Content-Encoding is identity in the VGI HTTP contract).
+// A server that never advertised a codec set is assumed to speak zstd.
 inline bool ServerAcceptsRequestEncoding(const ServerCapabilities &caps, HttpEncoding enc) {
 	if (enc == HttpEncoding::NONE) {
 		return true;
@@ -74,14 +61,10 @@ inline bool ServerAcceptsRequestEncoding(const ServerCapabilities &caps, HttpEnc
 	return false;
 }
 
-// Codec to use for a request body sent to this server.
-//
-// ``NONE`` means "post the body verbatim and stamp no Content-Encoding at all"
-// — deliberately NOT a literal ``identity`` token, which servers 415 as an
-// unknown codec. Returns the first mutually-supported codec in the server's
-// advertised preference order (we can produce both zstd and gzip), ``ZSTD``
-// when nothing has been advertised yet, and ``NONE`` for an empty
-// advertisement.
+// Codec for a request body: the first advertised codec we can produce (zstd,
+// gzip), ZSTD when nothing was advertised, NONE when no advertised codec is
+// usable. NONE means send no Content-Encoding header at all — a literal
+// ``identity`` token gets a 415 from servers.
 inline HttpEncoding ChooseRequestEncoding(const ServerCapabilities &caps) {
 	if (!caps.discovered || !caps.encodings_advertised) {
 		return HttpEncoding::ZSTD;
@@ -94,22 +77,17 @@ inline HttpEncoding ChooseRequestEncoding(const ServerCapabilities &caps) {
 	return HttpEncoding::NONE;
 }
 
-// Thread-safe holder for one server's harvested snapshot.
-//
-// One instance per ATTACH (owned by VgiAttachParameters). Every path that
-// talks to that server shares it — the streaming HttpFunctionConnections and
-// the unary catalog RPCs — so whichever request first learns the server's
-// capabilities warms the codec choice for all the others, instead of each
-// path rediscovering them (and, for a compression-disabled server, each
-// paying its own rejected round trip).
+// Thread-safe holder for one server's harvested snapshot, one per ATTACH
+// (VgiAttachParameters::server_caps). Shared by the streaming
+// HttpFunctionConnections and the unary catalog RPCs so the first request to
+// learn the capabilities sets the codec choice for all.
 class ServerCapabilitiesCache {
 public:
 	ServerCapabilities Load() const {
 		std::lock_guard<std::mutex> lock(mu_);
 		return caps_;
 	}
-	// Undiscovered snapshots are ignored so a caller can unconditionally
-	// store back whatever its request harvested.
+	// Undiscovered snapshots are ignored, so callers can always store back.
 	void Store(const ServerCapabilities &caps) {
 		if (!caps.discovered) {
 			return;

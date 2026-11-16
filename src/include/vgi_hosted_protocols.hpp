@@ -2,15 +2,13 @@
 #pragma once
 
 // What a worker hosts, as `vgi_rpc.Reflection.v1/list_protocols` reports it,
-// and the per-catalog cache of that answer. Deliberately light (std only, no
-// Arrow, no DuckDB) so vgi_attach_parameters.hpp can hold the cache by value.
+// and the per-catalog cache of that answer. std only (no Arrow, no DuckDB) so
+// vgi_attach_parameters.hpp can include it.
 //
-// Every VGI worker hosts `vgi.v3`, and every worker built on vgi-rpc >= 0.46
-// also hosts `vgi_rpc.Reflection.v1` on every transport. Optional features
-// (attach tickets, report services, identity) are separate protocols, so
-// "does this worker support X" is "does its reflection list X". The extension
-// asks once per attached catalog and caches the answer; see HostsProtocol in
-// vgi_reflection.hpp.
+// Every VGI worker hosts `vgi.v3`; workers on vgi-rpc >= 0.46 also host
+// `vgi_rpc.Reflection.v1`. Optional features (attach tickets, report services,
+// identity) are separate protocols, so "does this worker support X" is "does
+// its reflection list X". See HostsProtocol in vgi_reflection.hpp.
 
 #include <cstdint>
 #include <functional>
@@ -68,19 +66,12 @@ struct VgiProtocolListing {
 // The listing a pre-reflection worker is assumed to have.
 VgiProtocolListing PreReflectionListing();
 
-// ---------------------------------------------------------------------------
-// Worker connection generations
-// ---------------------------------------------------------------------------
-//
-// A process-wide counter per LOCATION, bumped whenever the extension
-// re-establishes the connection to that location's worker: a stale pooled
-// subprocess replaced by a fresh spawn, a launcher socket whose worker died and
-// was relaunched, a shared container restarted. The worker behind the
-// location may have been upgraded in between, so anything cached about what
-// it hosts is keyed by the generation it was fetched under.
-//
-// HTTP has no connection to re-establish; an HTTP catalog's cached listing
-// lives until DETACH or vgi_clear_cache().
+// Worker connection generations: a process-wide counter per LOCATION, bumped
+// whenever the connection to its worker is re-established (dead pooled
+// subprocess respawned, launcher worker relaunched, shared container
+// restarted). The worker may have been upgraded meanwhile, so cached listings
+// are keyed by generation. HTTP never bumps; its listing lives until DETACH or
+// vgi_clear_cache().
 uint64_t WorkerConnectionGeneration(const std::string &location);
 void NoteWorkerConnectionReestablished(const std::string &location);
 
@@ -89,13 +80,11 @@ void NoteWorkerConnectionReestablished(const std::string &location);
 // Thread-safe; concurrent first callers fetch once.
 class HostedProtocolsCache {
 public:
-	// The cached listing when it was fetched under `generation`; otherwise
-	// calls `fetch` (holding the cache lock, so concurrent callers wait for
-	// one fetch rather than racing several) and caches its result. A throwing
-	// fetch caches nothing.
+	// The cached listing if fetched under `generation`; otherwise calls `fetch`
+	// under the cache lock (concurrent callers wait for one fetch) and caches
+	// the result. A throwing fetch caches nothing.
 	std::shared_ptr<const VgiProtocolListing> GetOrFetch(uint64_t generation,
 	                                                     const std::function<VgiProtocolListing()> &fetch);
-	// Forget the cached listing; the next GetOrFetch asks the worker again.
 	void Invalidate();
 
 private:

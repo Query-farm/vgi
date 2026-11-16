@@ -13,9 +13,7 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// vgi_github_cache() - list cached release-worker binaries
-// ============================================================================
+// vgi_github_cache()
 
 struct VgiGithubCacheData : public TableFunctionData {
 	std::vector<GithubCacheEntry> entries;
@@ -63,9 +61,7 @@ void RegisterVgiGithubCacheFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(std::move(info));
 }
 
-// ============================================================================
-// vgi_github_cache_flush() - clear the on-disk release cache
-// ============================================================================
+// vgi_github_cache_flush()
 
 struct VgiGithubCacheFlushData : public TableFunctionData {
 	bool finished = false;
@@ -99,9 +95,7 @@ void RegisterVgiGithubCacheFlushFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(std::move(info));
 }
 
-// ============================================================================
-// vgi_github_latest() - list cached github-auto:// latest-release resolutions
-// ============================================================================
+// vgi_github_latest()
 
 struct VgiGithubLatestData : public TableFunctionData {
 	std::vector<GithubLatestCacheEntry> entries;
@@ -146,9 +140,7 @@ void RegisterVgiGithubLatestFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(std::move(info));
 }
 
-// ============================================================================
-// vgi_github_resolve(location) - which release a github-auto:// LOCATION runs
-// ============================================================================
+// vgi_github_resolve(location)
 
 struct VgiGithubResolveData : public TableFunctionData {
 	std::string location;

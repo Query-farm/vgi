@@ -4,11 +4,10 @@
 #include "vgi_ipc.hpp"
 
 // CachedReplayConnection — an IFunctionConnection that replays a cached result
-// instead of talking to a worker. On a cache hit the scan's global state hands
-// each (single, in v1) local state one of these in place of a real connection,
-// so InitLocal / GetNextBatch / InstallBatch run genuinely unchanged: they call
-// ReadDataBatch() and get the cached batches back, with the stored per-batch
-// vgi_meta replayed via GetLastBatchIndex()/GetLastPartitionValuesBytes().
+// instead of talking to a worker. On a cache hit the local state gets one in
+// place of a real connection, so the scan path runs unchanged: ReadDataBatch()
+// returns the cached batches and the stored per-batch vgi_meta is replayed via
+// GetLastBatchIndex()/GetLastPartitionValuesBytes().
 
 #include <cstddef>
 #include <memory>
@@ -31,10 +30,9 @@ public:
 	}
 
 public:
-	// Replays every batch of `entry` in a single ordered stream. When any
-	// cached batch carries a batch_index, batches are replayed in
-	// non-decreasing batch_index order (InstallBatch enforces per-stream
-	// monotonicity); otherwise substream/arrival order is used.
+	// Replays every batch of `entry` as one stream. When any cached batch has a
+	// batch_index, replay is in non-decreasing batch_index order (InstallBatch
+	// enforces per-stream monotonicity); otherwise substream/arrival order.
 	explicit CachedReplayConnection(std::shared_ptr<const VgiResultCacheEntry> entry);
 	// Out-of-line (the .cpp holds a unique_ptr<FileHandle> of an incomplete type).
 	~CachedReplayConnection() override;
@@ -59,9 +57,8 @@ public:
 	int Wait() override {
 		return 0;
 	}
-	// Out-of-line: returns nullptr, but `unique_ptr<PooledWorker>` needs the complete
-	// type to instantiate its deleter (MSVC enforces this even for a null return;
-	// clang defers it). Defined in the .cpp where vgi_worker_pool.hpp is included.
+	// Out-of-line: `unique_ptr<PooledWorker>` needs the complete type for its
+	// deleter even for a null return (MSVC enforces this).
 	std::unique_ptr<PooledWorker> ReleaseForPooling() override;
 	std::vector<uint8_t> GetLastStateToken() const override {
 		return {};
@@ -83,11 +80,9 @@ public:
 	// worker RPC surface). A cache hit skips bind/init entirely.
 	void SetTickFilterState(shared_ptr<TickFilterState>) override {}
 
-	// Unreachable: a cache HIT returns before the plan RPC ever runs and clamps
-	// MaxThreads() to 1, and the split path additionally refuses revalidation. So a
-	// replay connection can never enter the drain loop. Assert rather than no-op —
-	// a future change that routed a replay through here would otherwise silently
-	// replay the WHOLE cached entry once per split.
+	// Unreachable: a cache hit skips the plan RPC and the split path refuses
+	// revalidation, so a replay never enters the split drain loop. Throws rather
+	// than no-ops: otherwise the WHOLE entry would replay once per split.
 	void ResetForNextSplit() override {
 		throw InternalException("CachedReplayConnection::ResetForNextSplit: a cached replay must never "
 		                        "enter the split drain loop");
@@ -132,9 +127,8 @@ private:
 	idx_t last_batch_index_ = DConstants::INVALID_INDEX;
 	std::string last_partition_values_bytes_;
 	std::string conn_id_hex_ = "cachehit";
-	// [S8] For a disk-backed (streaming) entry: the blob file, opened lazily on
-	// the first disk-backed batch and held for the connection's life so each
-	// batch is a positioned read (one batch resident, RAM flat for >RAM results).
+	// Disk-backed entry: the blob file, opened lazily and held for the
+	// connection's life so each batch is a positioned read (one batch resident).
 	std::unique_ptr<FileHandle> disk_handle_;
 };
 

@@ -22,32 +22,25 @@ class VgiCatalog;
 class VgiSchemaEntry;
 class VgiTableEntry;
 
-// VgiNativeDelegationMarkerBindData — single-branch sibling of
-// VgiMultiBranchMarkerBindData. Carried by the placeholder TableFunction
-// returned from VgiTableEntry::GetScanFunctionImpl when the worker's
+// Single-branch sibling of VgiMultiBranchMarkerBindData: bind data of the
+// placeholder TableFunction GetScanFunctionImpl returns when the worker's
 // ScanFunctionResult names a SYSTEM_CATALOG function (read_parquet, etc.).
-// VgiRequiredFiltersOptimizer (vgi_extension.cpp) detects this marker via
-// `dynamic_cast<VgiNativeDelegationMarkerBindData *>(get.bind_data.get())`,
-// enforces `table.required_filters`, and rewrites the LogicalGet
-// in place to point at the bound native TableFunction. See the comment
-// block at the struct definition in vgi_table_entry.cpp for full lifecycle.
+// VgiRequiredFiltersOptimizer (vgi_extension.cpp) finds it by dynamic_cast,
+// enforces `table.required_filters`, and rewrites the LogicalGet in place to
+// the pre-bound native TableFunction.
 struct VgiNativeDelegationMarkerBindData : public duckdb::TableFunctionData {
-	// Owning VgiTableEntry — the rewriter reads
-	// `required_filters` from this to know which paths must appear
-	// in `LogicalGet::table_filters`.
+	// The rewriter reads `required_filters` from it.
 	reference<VgiTableEntry> table;
 
-	// Pre-bound native TableFunction + bind_data. GetScanFunctionImpl binds
-	// eagerly (so we can populate the LogicalGet's returned_types/names
-	// faithfully), and the rewriter just transfers ownership of these into
-	// the LogicalGet during the in-place swap. No re-binding in the optimizer.
+	// Bound eagerly by GetScanFunctionImpl so the LogicalGet's types/names are
+	// exact; the rewriter moves these into the LogicalGet without re-binding.
 	BoundTableFunction native_tf;
 	mutable unique_ptr<duckdb::FunctionData> native_bind;
 	std::vector<LogicalType> native_return_types;
 	vector<Identifier> native_return_names;
 	virtual_column_map_t native_virtual_columns;
 
-	// Originating ScanFunctionResult — kept for diagnostics + logging.
+	// For diagnostics and logging.
 	vgi::VgiScanFunctionResult scan_result;
 	std::string worker_path;
 
@@ -64,9 +57,8 @@ struct VgiNativeDelegationMarkerBindData : public duckdb::TableFunctionData {
 	}
 };
 
-// Construct the native-delegation marker. Its execute callback throws
-// InternalException — reaching it means VgiRequiredFiltersOptimizer didn't
-// run, which IS a bug.
+// The native-delegation placeholder. Executing it throws (an ordinary
+// InvalidInputException): it means VgiRequiredFiltersOptimizer didn't run.
 TableFunction MakeNativeDelegationMarkerFunction();
 
 class VgiTableEntry : public TableCatalogEntry {
@@ -88,13 +80,11 @@ public:
 
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
-	// Virtual columns: return rowid if table has a row_id column
 	virtual_column_map_t GetVirtualColumns() const override;
 #if VGI_ENGINE_HAS_DELETE_RETURNING_VIRTUAL_COLUMNS
 	virtual_column_map_t GetDeleteReturningVirtualColumns() const override;
 #endif
 
-	// Row ID columns: return COLUMN_IDENTIFIER_ROW_ID if table has a row_id column
 	vector<column_t> GetRowIdColumns() const override;
 
 	const vgi::VgiTableInfo &GetTableInfo() const {
@@ -105,44 +95,28 @@ public:
 		return catalog_;
 	}
 
-	// Fetch the scan branches for this table via a fresh RPC. NOT cached
-	// because branches can vary with AT(...) clauses — the same logical
-	// table may resolve to different function names / args at different
-	// versions (see test/sql/integration/table/time_travel.test).
-	// at_unit/at_value are empty strings for non-time-travel binds.
-	// `pushdown_filters` (protocol 3.2) carries the query's predicates for a
+	// Fetch the scan branches via a fresh RPC. Not cached: branches vary with
+	// AT (...) (at_unit/at_value; empty without time travel).
+	// `pushdown_filters` carries the query's predicates for a
 	// scan_planning='filtered' table; nullopt for bind-time fetches.
 	vgi::VgiScanBranchesResult FetchScanBranches(ClientContext &context, const std::string &at_unit,
 	                                             const std::string &at_value,
 	                                             const std::optional<std::vector<uint8_t>> &pushdown_filters = std::nullopt);
 
-	// Cheap pre-RPC check for "is this table multi-branch under the no-AT
-	// view?" Returns true only when we know cheaply that the table is
-	// single-branch (inlined scan_function, or a previously cached hint).
-	// False means "not known cheaply — caller must fetch branches to
-	// decide." Used by the write-refusal helpers to skip an RPC on every
-	// write to a single-branch table.
+	// True only when the table is known, without an RPC, to be single-branch
+	// with no AT (inlined scan_function or a recorded hint); false means the
+	// caller must fetch branches. Lets write-refusal helpers skip an RPC.
 	bool IsKnownSingleBranchNoAT() const;
-	// Record the multi-branch / single-branch determination after a
-	// FetchScanBranches call with empty AT, so subsequent
-	// IsKnownSingleBranchNoAT calls can short-circuit. Safe to call
-	// concurrently (atomic CAS internally).
+	// Record the no-AT branch determination for IsKnownSingleBranchNoAT.
+	// Thread-safe.
 	void RecordMultiBranchHintNoAT(bool is_multi_branch) const;
 
-	// (De)serialization callbacks for the synthetic ``vgi_table_scan``
-	// TableFunction returned by GetScanFunctionImpl. DuckDB's
-	// LogicalOperator::Copy() round-trips a LogicalGet through
-	// serialize/deserialize (e.g. when the WindowSelfJoin optimizer
-	// duplicates a partitioned window-aggregate scan), and
-	// FunctionSerializer resolves the function *by name* from the catalog
-	// on the way back in. Without these — and the matching catalog
-	// registration in vgi_extension.cpp — that lookup throws
-	// "Table Function with name vgi_table_scan does not exist!".
-	//
-	// Mirrors DuckDB's own TableScanSerialize/Deserialize: serialize only
-	// the table identity (catalog/schema/name + AT clause), then re-derive
-	// a fully-configured TableFunction + bind data by re-running the bind
-	// against the looked-up VgiTableEntry.
+	// (De)serialization for the synthetic ``vgi_table_scan`` TableFunction.
+	// LogicalOperator::Copy() round-trips a LogicalGet through serialization
+	// (e.g. WindowSelfJoin) and resolves the function by name from the catalog,
+	// hence these plus the catalog registration in vgi_extension.cpp. Like
+	// DuckDB's TableScanSerialize: only the table identity (catalog/schema/name
+	// + AT clause) is written; deserialize re-binds against the VgiTableEntry.
 	static void VgiTableScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
 	                                  const BoundTableFunction &function);
 	static unique_ptr<FunctionData> VgiTableScanDeserialize(Deserializer &deserializer, BoundTableFunction &function);
@@ -153,11 +127,9 @@ private:
 
 	void FetchColumnStatistics(ClientContext &context) const;
 
-	// Populate stats_cache_ from the inlined `column_statistics` bytes carried
-	// on table_info_. Called from GetStatistics under the same loading-flag
-	// discipline as FetchColumnStatistics — same publish/clear/notify
-	// contract. Used when the worker pre-shipped stats via
-	// catalog_schema_contents_tables, eliminating the per-table RPC.
+	// Populate stats_cache_ from table_info_'s inlined `column_statistics`
+	// (no per-table RPC), under the same loading-flag contract as
+	// FetchColumnStatistics.
 	void PopulateStatsCacheFromInline(ClientContext &context) const;
 
 	ColumnList columns_;
@@ -165,30 +137,15 @@ private:
 	Catalog &catalog_;
 	LogicalType rowid_type_ = LogicalType::INVALID;
 
-	// No persistent branches_ cache — fetched fresh per scan via
-	// FetchScanBranches so AT (...) variants resolve correctly.
-
-	// Cheap multi-branch hint for the no-AT case (used by write-refusal
-	// helpers, which always use empty AT). Writes don't honour time
-	// travel so the no-AT view is stable per table. Atomic tri-state:
-	//   -1 = unknown (initial)
-	//    0 = known single-branch
-	//    1 = known multi-branch
-	// Lifetime is tied to the VgiTableEntry; vgi_clear_cache() or
-	// catalog-version invalidation creates a fresh entry with hint reset.
+	// No-AT multi-branch hint (writes never time-travel, so it is stable per
+	// entry): -1 unknown, 0 single-branch, 1 multi-branch.
 	mutable std::atomic<int> multi_branch_hint_no_at_ {-1};
 
-	// Column statistics cache: lazy-fetched via RPC, TTL-based expiry, thread-safe.
-	// Mutable because GetStatistics() is const in the DuckDB interface but we
-	// need to populate the cache on first access.
-	//
-	// Concurrency: the worker RPC runs *outside* the mutex, gated by a
-	// `loading` flag + condition_variable. Holding the mutex across an RPC
-	// would self-deadlock if any code path on the RPC stack re-enters
-	// GetStatistics on the same table (e.g., logging path that touches
-	// catalog metadata, optimizer fanout that revisits this entry). Other
-	// callers that arrive while a fetch is in flight wait on the cv and
-	// then read the populated entries — no duplicate RPC.
+	// Column statistics cache: fetched lazily, TTL expiry, thread-safe; mutable
+	// because the loaders are const. The RPC runs outside the mutex, gated by
+	// `loading` + cv: holding the mutex across it would self-deadlock if the RPC
+	// path re-entered GetStatistics on this table. Concurrent callers wait on
+	// the cv instead of issuing a duplicate RPC.
 	struct StatsCache {
 		std::mutex mutex;
 		std::condition_variable cv;

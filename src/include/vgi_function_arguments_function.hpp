@@ -13,7 +13,6 @@ namespace vgi {
 //! attached VGI catalog. Surfaces per-argument metadata that
 //! duckdb_functions() flattens away — named-vs-positional, const, varargs,
 //! table-input, any-type — plus the per-argument description (vgi_doc).
-//! See vgi_function_arguments_function.cpp.
 void RegisterVgiFunctionArgumentsFunction(ExtensionLoader &loader);
 
 } // namespace vgi

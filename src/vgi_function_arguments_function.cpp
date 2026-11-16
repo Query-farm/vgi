@@ -1,18 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
-// =============================================================================
-// vgi_function_arguments() — diagnostic table function. One row per
-// (catalog, schema, function, argument) across every attached VGI catalog.
-//
-// Surfaces per-argument metadata that DuckDB's duckdb_functions() flattens
-// away: the named-vs-positional split, const, varargs, table-input, and
-// any-type markers, plus the per-argument description (the vgi_doc field
-// metadata). Lets an agent that discovered a function via the catalog tags
-// learn how to actually call it.
-//
-// Reuses the schema's function/macro inventories, including catalog_contents
-// seeds. The optional catalog parameter limits discovery before any RPCs.
-// Reports each catalog's current/attached data version (no time travel).
-// =============================================================================
+// vgi_function_arguments(): see the header for what it reports. Reuses the
+// schema's function/macro inventories, including catalog_contents seeds. The
+// optional catalog parameter limits discovery before any RPCs. Reports each
+// catalog's current/attached data version (no time travel).
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -170,7 +160,6 @@ static void EmitArgsFromSchema(ClientContext &context, const std::string &catalo
 	}
 }
 
-// Expand one function's arguments_schema into per-argument rows.
 static void EmitFunctionArgs(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
                              const VgiFunctionInfo &func, std::vector<ArgRow> &out) {
 	EmitArgsFromSchema(context, catalog_name, schema_name, func.name, VgiFunctionTypeToString(func.function_type),

@@ -1,14 +1,12 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// Public façade for the Unix-socket worker launcher.  Brings up — or reuses —
-// a long-running worker process that the calling DuckDB extension can then
-// connect to via AF_UNIX.
+// Worker launcher: brings up, or reuses, a long-running shared worker reached
+// over AF_UNIX (POSIX) or a named pipe (Windows).
 //
-// Concurrency contract: at most one worker exists per
-// (worker_argv, cwd, VGI_RPC_*-env) tuple, system-wide and across DuckDB
-// processes.  Coordination is via per-hash flock in a per-user state dir.
-// See vgi_launcher_internal.hpp for the byte-exact wire-protocol contract
-// shared with the Python reference implementation.
+// At most one worker exists per (worker_argv, cwd, VGI_RPC_*-env) tuple,
+// system-wide and across DuckDB processes; spawns are serialised on a per-hash
+// flock (POSIX) or named mutex (Windows). vgi_launcher_internal.hpp holds the
+// hash / discovery-line contract shared with the Python implementation.
 
 #pragma once
 
@@ -27,47 +25,38 @@ namespace duckdb {
 namespace vgi {
 
 struct LaunchConfig {
-	// The worker command and its arguments.  Must be non-empty.  ``--unix
-	// PATH`` and ``--idle-timeout SEC`` are appended automatically; do not
-	// include them yourself.
+	// Worker command and arguments; must be non-empty. ``--unix PATH`` and
+	// ``--idle-timeout SEC`` are appended by Launch().
 	std::vector<std::string> worker_argv;
 
-	// Optional explicit socket path (skips the per-hash machinery — useful
-	// for tests).  When unset, derived from the hash of (argv, cwd, env).
+	// Explicit socket path (skips the per-hash naming; for tests). When unset,
+	// derived from the hash of (argv, cwd, env).
 	std::optional<std::string> socket_path_override;
 
 	// Worker self-shutdown after this many seconds of zero connected clients.
 	std::chrono::milliseconds idle_timeout = std::chrono::seconds(300);
 
-	// Maximum time we'll wait for the per-hash flock to be acquirable.
+	// Maximum wait for the per-hash spawn lock.
 	std::chrono::milliseconds connect_timeout = std::chrono::seconds(30);
 
-	// Maximum time we'll wait for the worker to print its
-	// ``UNIX:<path>`` discovery line on stdout.  JVM cold-start dominates
-	// in practice, so the default is generous.
+	// Maximum wait for the worker's discovery line on stdout. Generous because
+	// JVM cold start dominates.
 	std::chrono::milliseconds worker_startup_timeout = std::chrono::seconds(60);
 
-	// Optional path for capturing worker stderr.  Default: discard (the
-	// fd is dup'd onto /dev/null in the child).
+	// File to append worker stderr to. Default: discarded once the worker is
+	// ready (startup stderr is kept only for launch error messages).
 	std::optional<std::string> worker_stderr_path;
 
-	// Optional override of the per-user state directory (where lockfiles
-	// and sockets live).  Default: resolved from $XDG_RUNTIME_DIR / $TMPDIR
-	// / euid per the Python contract.
+	// Per-user state directory for lockfiles and sockets (POSIX only).
+	// Default: from $XDG_RUNTIME_DIR / $TMPDIR / euid, as the Python launcher.
 	std::optional<std::string> state_dir_override;
 };
 
-// Bring up (or reuse) a worker per ``cfg``; return the absolute AF_UNIX
-// socket path the caller should connect to.
-//
-// Throws ``duckdb::IOException`` on any failure to bring up a worker:
-// flock contention timeout, worker exits before readiness, worker startup
-// timeout, etc.  Always either returns a path or throws — never
-// silent-fails or returns an empty string.
-//
-// Thread-safe: concurrent calls from multiple DuckDB threads with the same
-// ``cfg`` will serialise on the kernel flock, with at most one of them
-// actually performing the spawn.
+// Bring up (or reuse) a worker per ``cfg`` and return the rendezvous path to
+// connect to (AF_UNIX socket path, or named-pipe name on Windows). Never
+// returns empty: throws IOException on lock timeout, early worker exit,
+// startup timeout, etc. Thread-safe: concurrent calls with the same ``cfg``
+// serialise on the spawn lock and at most one spawns.
 std::string Launch(const LaunchConfig &cfg);
 
 } // namespace vgi

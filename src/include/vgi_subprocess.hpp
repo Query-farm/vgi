@@ -19,48 +19,24 @@ namespace vgi {
 
 #if VGI_POSIX_TRANSPORT
 // Restore default signal dispositions and an empty signal mask in a freshly
-// forked child, BEFORE it touches fds or execs.
-//
-// exec() resets *caught* signals to SIG_DFL for free, but the window between
-// fork() and exec() runs with the parent's handlers armed on the child's copy
-// of the parent's address space. A host process that installs its own handlers
-// — a test harness (Catch2 traps SIGTERM/SIGINT/SIGABRT/SIGSEGV/...), a server,
-// an embedder — will therefore run that handler inside the child if a signal
-// lands in the window, producing output attributed to the host and, in
-// Catch2's case, a spurious test failure the parent never sees. The child is
-// descheduled for whole milliseconds on a loaded box, so the window is not
-// theoretical.
-//
-// SIGPIPE is deliberately left alone: the extension ignores it process-wide,
-// ignored dispositions survive exec, and workers depend on that inherited
-// SIG_IGN (broken pipes must surface as EPIPE, not kill the worker).
-//
-// Every call here is async-signal-safe, as required post-fork.
+// forked child, BEFORE it touches fds or execs. exec() resets caught signals,
+// but between fork() and exec() the host's handlers (e.g. Catch2's) are still
+// armed in the child and would run there, writing to the host's stdout.
+// SIGPIPE is left alone: workers rely on the inherited process-wide SIG_IGN so
+// broken pipes surface as EPIPE. Async-signal-safe, as required post-fork.
 void ResetChildSignalDispositions();
 
-// Block every signal on the calling thread for the duration of a fork(),
-// restoring the previous mask on scope exit (RAII; also usable explicitly via
-// Restore()).
-//
-// ResetChildSignalDispositions() disarms the inherited handlers as the child's
-// very first statement, but it necessarily runs *after* fork() returns — a
-// signal delivered in that sliver still runs the parent's handler inside the
-// child. That is not hypothetical: a worker torn down immediately after being
-// spawned gets SIGTERM from ~SubProcess while it may still be pre-exec, and
-// under Catch2 the inherited handler prints a full failure report (with the
-// parent's assertion counters, copied at fork) to the host's stdout — a test
-// failure that never happened.
-//
-// Blocking around the fork closes the window: nothing can be delivered until
-// the child has reset dispositions and unblocked, at which point a pending
-// signal takes its DEFAULT action — which is exactly right for a child that was
-// being killed anyway.
+// Block every signal on the calling thread across a fork(), restoring the
+// previous mask on scope exit or Restore(). This closes the gap before the
+// child's ResetChildSignalDispositions() runs (e.g. a SIGTERM from ~SubProcess
+// on a just-spawned worker): a pending signal is delivered only after the
+// reset, so it takes its default action.
 class ScopedForkSignalBlock {
 public:
 	ScopedForkSignalBlock();
 	~ScopedForkSignalBlock();
-	// Restore the saved mask early (idempotent). The parent uses this once the
-	// fork has returned; the child never runs it (it execs or _exits).
+	// Idempotent. The parent calls it once fork() returns; the child never does
+	// (ResetChildSignalDispositions empties its mask).
 	void Restore() noexcept;
 
 	ScopedForkSignalBlock(const ScopedForkSignalBlock &) = delete;
@@ -72,7 +48,7 @@ private:
 };
 #endif
 
-// Pipe wrapper for RAII cleanup
+// pipe() pair, both ends FD_CLOEXEC; closed on destruction.
 class Pipe {
 public:
 	int read_fd = -1;
@@ -84,7 +60,6 @@ public:
 	void CloseRead();
 	void CloseWrite();
 
-	// Non-copyable
 	Pipe(const Pipe &) = delete;
 	Pipe &operator=(const Pipe &) = delete;
 };
@@ -94,32 +69,21 @@ struct DirectExecutable {
 	std::shared_ptr<void> lifetime_anchor;
 };
 
-// Subprocess wrapper for RAII cleanup.
-//
-// As of the AF_UNIX launcher work, this class is polymorphic: the existing
-// fork()/execl() concrete implementation is the default; a subclass
-// :class:`UnixSocketWorker` (see ``vgi_unix_socket_worker.hpp``) plugs an
-// AF_UNIX-connected socket into the same shape, so ``FunctionConnection``
-// — which talks to ``proc_->GetStdinFd()`` etc. via this interface — works
-// transparently against either transport.
-//
-// Exception safety: If the constructor throws after fork(), the child
-// process will be orphaned.  In practice, the only operations that can fail
-// after fork() are the pipe fd transfers, which cannot fail.  The child
-// calls _exit() if exec fails, so it won't become a zombie.
+// A worker process with piped stdio (fork + exec on POSIX, CreateProcess on
+// Windows). Subclasses such as UnixSocketWorker supply their own fds through
+// the same virtual accessors, so FunctionConnection works over any of them.
+// Nothing after fork() in the constructor can throw, so a child is never
+// orphaned by a failed construction; a failed exec _exits(127).
 class SubProcess {
 public:
-	// Create a subprocess running the given command.
-	// If stderr_passthrough is true, worker stderr goes directly to the terminal
-	// instead of being captured (useful for debugging).
+	// `command` runs via /bin/sh -c (cmd.exe /c on Windows); a DirectExecutable
+	// is exec'd without a shell. stderr_passthrough (also enabled by
+	// VGI_WORKER_STDERR_PASSTHROUGH=1 / VGI_WORKER_DEBUG=1) leaves worker stderr
+	// on the terminal and sets VGI_IPC_DEBUG=1 in the worker.
 	explicit SubProcess(const std::string &command, bool stderr_passthrough = false);
 	explicit SubProcess(DirectExecutable executable, bool stderr_passthrough = false);
 	virtual ~SubProcess();
 
-	// Accessors for process info and file descriptors.  Virtual so a
-	// non-fork-based transport (``UnixSocketWorker``) can substitute its
-	// own fds without re-implementing FunctionConnection's wire-protocol
-	// machinery.
 	virtual pid_t GetPid() const {
 		return pid_;
 	}
@@ -133,65 +97,44 @@ public:
 		return stderr_fd_;
 	}
 
-	// Close stdin to signal EOF to the child process
 	virtual void CloseStdin();
 
-	// Close stderr (typically after transferring ownership to a reader)
 	virtual void CloseStderr();
 
-	// Wait for the process to exit and return the exit status.
-	// Returns 0 on success, positive exit code on normal exit, or negative signal number
-	// (i.e. -WTERMSIG) if killed by a signal. This matches TryWait() convention.
-	// Sets exited_normally to true if the process exited via exit(), false if killed by signal.
+	// Blocking. Returns the exit code, or -WTERMSIG if killed by a signal (same
+	// convention as TryWait); exited_normally is false only for a signal.
 	virtual int Wait(bool *exited_normally = nullptr);
 
-	// Non-blocking check if the process has exited.
-	// Returns true if the process has exited (and populates exit_status if provided).
-	// Returns false if the process is still running.
-	// Useful for detecting early failures (e.g., command not found).
+	// Non-blocking: true (with exit_status) once the process has exited.
 	virtual bool TryWait(int *exit_status = nullptr);
 
-	// Release ownership of stderr fd (caller takes responsibility for closing)
+	// Caller takes ownership of (and must close) the stderr fd.
 	virtual int ReleaseStderrFd() {
 		int fd = stderr_fd_;
 		stderr_fd_ = -1;
 		return fd;
 	}
 
-	// Subprocess workers can be returned to the per-path worker pool after a
-	// query finishes; AF_UNIX-backed workers (where the same long-lived worker
-	// is shared across DuckDB processes via the launcher) cannot — they're
-	// already conceptually pooled by the OS-level socket.  Defaults true for
-	// the fork-based concrete class; ``UnixSocketWorker`` overrides to false.
+	// Whether the worker may return to the per-path subprocess pool. Socket
+	// workers (UnixSocketWorker, named pipes) override to false: the launcher
+	// already shares them at the OS level.
 	virtual bool IsPoolable() const {
 		return true;
 	}
 
-	// Best-effort liveness probe for *connection-oriented* transports.
-	// The base class always returns true: a fork-spawned subprocess's
-	// liveness is authoritatively answered by ``TryWait()`` (kernel-side
-	// process table) rather than by an I/O probe, so this method exists
-	// purely so AF_UNIX-backed workers (``UnixSocketWorker``) can answer
-	// "is the peer still up?" without a full read attempt.  For AF_UNIX
-	// the override does ``poll(POLLIN | POLLERR | POLLHUP)`` with a
-	// 0-ms timeout: if POLLERR or POLLHUP is set, the peer is gone.
-	//
-	// Note: returning ``true`` here does *not* prove the peer will accept
-	// the next byte — only that we have no observable signal it's gone.
-	// Callers should treat this as a hint, not a contract.  Use it to
-	// short-circuit obviously-dead sockets, not as a replacement for
-	// per-call I/O error handling.
+	// Hint for connection-oriented transports (a 0-ms poll for hangup in
+	// UnixSocketWorker); a forked process answers via TryWait(), so the base
+	// returns true. `true` only means no sign the peer is gone — it never
+	// replaces per-call I/O error handling.
 	virtual bool IsLikelyAlive() const {
 		return true;
 	}
 
-	// Non-copyable
 	SubProcess(const SubProcess &) = delete;
 	SubProcess &operator=(const SubProcess &) = delete;
 
 protected:
-	// Default constructor for subclasses that supply their own fds (e.g.
-	// UnixSocketWorker).  Skips the fork+exec path entirely.
+	// For subclasses that supply their own fds; spawns nothing.
 	SubProcess() = default;
 	SubProcess(const std::string &command, bool stderr_passthrough, bool direct_executable,
 	           std::shared_ptr<void> lifetime_anchor);
@@ -202,16 +145,14 @@ protected:
 	int stderr_fd_ = -1;
 	std::shared_ptr<void> lifetime_anchor_;
 #if defined(_WIN32)
-	// Windows: the spawned child's process HANDLE (owned; closed in the dtor /
-	// after Wait). pid_ holds GetProcessId(process_handle_) for diagnostics, but
-	// Wait()/TryWait() need the HANDLE itself. void* avoids dragging <windows.h>
-	// into this widely-included header. The fd members above are CRT fds wrapping
-	// the parent ends of the stdio pipes via _open_osfhandle().
+	// Owned child process HANDLE (Wait/TryWait need it; pid_ is for
+	// diagnostics). void* keeps <windows.h> out of this header. The fds above
+	// are CRT fds wrapping the parent pipe ends (_open_osfhandle).
 	void *process_handle_ = nullptr;
 #endif
 };
 
-// Helper to write all bytes to a file descriptor
+// Writes every byte, retrying EINTR; throws IOException (e.g. worker gone).
 void WriteAll(int fd, const uint8_t *data, size_t len);
 
 } // namespace vgi
@@ -219,40 +160,24 @@ void WriteAll(int fd, const uint8_t *data, size_t len);
 class ClientContext;
 
 namespace vgi {
-// Wait for a file descriptor to become readable, polling the context's
-// `interrupted` flag every 250ms so a user Ctrl-C breaks out of long blocking
-// reads. No deadline — used by data-phase RPCs (table_buffering_*) that can
-// legitimately run for arbitrary durations. Cleanup of an interrupted-mid-RPC
-// connection is the caller's responsibility (route through
-// VgiCancelDispatcher so the worker unblocks).
+// Wait until `fd` is readable, with no deadline (data-phase RPCs can run
+// arbitrarily long), checking RpcInterrupted every 250ms and throwing
+// InterruptException. The caller must cancel-dispatch an interrupted
+// connection (VgiCancelDispatcher) so the worker unblocks.
 void WaitForReadableUntilCancel(int fd, ClientContext *context);
 
 // Marks this thread as running a cleanup RPC that must reach the worker even
-// though the calling query is marked interrupted: the transaction-rollback
-// RPCs (catalog_transaction_rollback, the drop of a failed CTAS's table).
-// DuckDB's Executor::PushError marks the context interrupted when any task of
-// a statement fails, and the rollback runs before that flag is reset, so an
-// interrupt-polling wait would abort the rollback with an InterruptException
-// before the worker answered (HTTP unary RPCs already never pass the query as
-// cancellation for the same reason; see vgi_http_client.hpp). Thread-local:
-// only the RPC issued on the rolling-back thread ignores the flag; scans and
-// other tasks keep polling it.
+// though its query is marked interrupted (catalog_transaction_rollback, the
+// drop of a failed CTAS's table): Executor::PushError marks the context
+// interrupted when any task fails, before the rollback runs. Thread-local, so
+// scans and other tasks keep honouring the flag.
 //
-// Consequence: a cleanup RPC cannot be interrupted by Ctrl-C (or query cancel)
-// on non-HTTP transports: subprocess pipes, the launcher's Unix sockets,
-// shared memory and native Iroh. It waits until the worker answers or the
-// connection fails. The subprocess/launcher wait has no wall-clock deadline,
-// so a worker that never answers its rollback keeps the rollback waiting until
-// the worker exits or is killed; Iroh still applies its io_timeout_seconds.
-// HTTP unary RPCs never take the query as cancellation either, but are bounded
-// by the HTTP client's timeouts.
-//
-// Native Iroh: the cancel check (CheckDuckDBInterrupted, vgi_iroh_native.cpp)
-// runs on the calling thread, so this scope is effective there too.
-// vgi-iroh-cabi's *_cancellable functions drive host_cancellable() with
-// Runtime::block_on, which polls the passed future (and so the check) on the
-// thread that calls block_on; only tasks the future spawns run on the tokio
-// worker threads, and the check is never moved into one.
+// Known limitation: such an RPC cannot be cancelled on subprocess, launcher,
+// shm or native Iroh transports; a worker that never answers blocks it until
+// the worker exits (Iroh still applies io_timeout_seconds). HTTP unary RPCs
+// never take the query as cancellation and are bounded by HTTP timeouts.
+// Native Iroh's CheckDuckDBInterrupted runs on the calling thread (block_on
+// polls it there), so the scope applies to it too.
 class CleanupRpcScope {
 public:
 	CleanupRpcScope();

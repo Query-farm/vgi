@@ -7,12 +7,9 @@
 //     HAYBARN and HAYBARN_ABI_VERSION.
 //   * Upstream DuckDB v2.0.0: no haybarn.h; neither macro is defined.
 //
-// Gate engine-specific code on the VGI_ENGINE_HAS_* feature macros below, not
-// on HAYBARN directly, so each divergence is named once and can be retired
-// individually when the corresponding upstream PR lands.
-//
-// Safe to include from any header: the only DuckDB header it pulls in is
-// duckdb/haybarn.h (macros only), and its one helper is a header-only template.
+// Gate engine-specific code on the VGI_ENGINE_HAS_* macros below, never on
+// HAYBARN directly, so each divergence can be retired when its upstream PR lands.
+// Safe to include from any header: it pulls in only duckdb/haybarn.h (macros).
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -32,11 +29,10 @@
 #define VGI_ENGINE_HAYBARN 0
 #endif
 
-// extension_config.cmake makes the same decision from the engine source tree
-// (and picks the httpfs fork from it) and passes it down as
-// VGI_ENGINE_FLAVOR_HAYBARN. A stray duckdb/haybarn.h on another include path
-// (an installed Haybarn, say) could make __has_include disagree; stop here
-// rather than compile against one engine with the other's httpfs.
+// extension_config.cmake decides the same from the engine tree (and picks the
+// httpfs fork from it) as VGI_ENGINE_FLAVOR_HAYBARN. A stray haybarn.h on
+// another include path could make __has_include disagree; refuse to compile
+// against one engine with the other's httpfs.
 #if defined(VGI_ENGINE_FLAVOR_HAYBARN) && (VGI_ENGINE_FLAVOR_HAYBARN != VGI_ENGINE_HAYBARN)
 #error "duckdb/haybarn.h detection disagrees with extension_config.cmake's engine flavor: a haybarn.h from another include path is shadowing (or missing from) the engine tree"
 #endif
@@ -62,10 +58,10 @@
 #define VGI_ENGINE_HAS_RUNTIME_FILTER_PUSHDOWN_FLAG VGI_ENGINE_HAYBARN
 
 //! Named arguments in a correlated table-function call, e.g.
-//! `FROM t, LATERAL f(t.x, opt := 1)` (duckdb/duckdb#27833, merged after
-//! v2.0.0). A binder behavior, not an API, so VGI code does not branch on it;
-//! it only feeds vgi_engine_features(). Upstream v2.0.0 rejects such calls with
-//! "No function matches"; the literal form `f(1, opt := 1)` works everywhere.
+//! `FROM t, LATERAL f(t.x, opt := 1)` (duckdb/duckdb#27833). Binder behavior,
+//! not an API: VGI code does not branch on it; it only feeds
+//! vgi_engine_features(). Upstream v2.0.0 rejects such calls ("No function
+//! matches"); `f(1, opt := 1)` works everywhere.
 #define VGI_ENGINE_HAS_CORRELATED_NAMED_ARGS VGI_ENGINE_HAYBARN
 
 #ifdef __cplusplus

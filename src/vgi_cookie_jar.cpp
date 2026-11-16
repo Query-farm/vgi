@@ -35,23 +35,18 @@ std::string LowerAscii(const std::string &s) {
 	return out;
 }
 
-// Parse RFC 1123 date (the only format Falcon/Python emit).
-// Returns nullopt on any parse failure — we treat unparseable Expires as
-// "no expiry constraint" so the cookie lives until Max-Age says otherwise or
-// the process restarts.
+// Parse an RFC 1123 date. nullopt on failure; callers then ignore Expires.
 std::optional<std::chrono::system_clock::time_point> ParseHttpDate(const std::string &s) {
 	std::tm tm {};
-	// std::get_time is the portable replacement for POSIX strptime (MSVC has no
-	// strptime). Classic locale so %a/%b parse the English RFC 1123 names
-	// regardless of the process locale.
+	// std::get_time because MSVC has no strptime; classic locale so %a/%b
+	// match English names whatever the process locale.
 	std::istringstream ss(s);
 	ss.imbue(std::locale::classic());
 	ss >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S GMT");
 	if (ss.fail()) {
 		return std::nullopt;
 	}
-	// tm is UTC (GMT-stamped). timegm interprets it as UTC; MSVC's equivalent is
-	// _mkgmtime (mktime would wrongly apply the local-time offset).
+	// tm is UTC: timegm/_mkgmtime, not mktime (which applies the local offset).
 #if defined(_WIN32)
 	time_t epoch = _mkgmtime(&tm);
 #else
@@ -71,9 +66,8 @@ struct ParsedSetCookie {
 	bool secure = false;
 };
 
-// Parse one Set-Cookie header value. Returns nullopt if the header is malformed
-// (no name=value pair) — we drop rather than raise to keep a hostile proxy
-// from crashing the extension.
+// Parse one Set-Cookie value. nullopt (dropped, never thrown) when malformed
+// or over kMaxValueBytes.
 std::optional<ParsedSetCookie> ParseSetCookie(const std::string &header) {
 	auto semi = header.find(';');
 	std::string name_value = header.substr(0, semi);
@@ -141,7 +135,6 @@ std::optional<ParsedSetCookie> ParseSetCookie(const std::string &header) {
 } // namespace
 
 void SessionCookieJar::UpdateFromSetCookie(const std::vector<std::string> &set_cookie_headers, bool origin_is_https) {
-	// Parse outside the lock so we don't hold the mutex longer than necessary.
 	std::vector<ParsedSetCookie> parsed;
 	parsed.reserve(set_cookie_headers.size());
 	for (const auto &header : set_cookie_headers) {
@@ -149,9 +142,7 @@ void SessionCookieJar::UpdateFromSetCookie(const std::vector<std::string> &set_c
 		if (!entry) {
 			continue;
 		}
-		// Refuse to accept a Secure cookie arriving over plaintext: a rogue
-		// downgrade from https → http should not let an attacker set a
-		// cookie that we later echo somewhere else.
+		// A plaintext response must not set a Secure cookie (downgrade attack).
 		if (entry->secure && !origin_is_https) {
 			continue;
 		}
@@ -164,13 +155,10 @@ void SessionCookieJar::UpdateFromSetCookie(const std::vector<std::string> &set_c
 			cookies_.erase(entry.name);
 			continue;
 		}
-		// Bounded capacity: if we're inserting a new cookie and we're at the
-		// cap, drop the oldest-added entry. Updates to an existing cookie
-		// don't count against the cap.
+		// At kMaxCookies a new name evicts an arbitrary entry (unordered_map
+		// has no insertion order); updating an existing name never evicts.
 		auto it = cookies_.find(entry.name);
 		if (it == cookies_.end() && cookies_.size() >= kMaxCookies) {
-			// unordered_map doesn't carry insertion order — "oldest" here is
-			// approximate. Good enough for a defensive cap.
 			cookies_.erase(cookies_.begin());
 		}
 		cookies_[entry.name] = CookieEntry {std::move(entry.value), entry.expires};
@@ -181,7 +169,6 @@ std::string SessionCookieJar::BuildCookieHeader() {
 	const auto now = std::chrono::system_clock::now();
 	std::lock_guard<std::mutex> lock(mutex_);
 
-	// Evict expired entries lazily.
 	for (auto it = cookies_.begin(); it != cookies_.end();) {
 		if (it->second.expires && *it->second.expires <= now) {
 			it = cookies_.erase(it);

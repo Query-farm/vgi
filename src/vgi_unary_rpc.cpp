@@ -22,9 +22,7 @@
 #include "vgi_webworker_function_connection.hpp" // WebWorkerInvokeUnary (worker: unary branch)
 #endif
 #if VGI_POSIX_TRANSPORT
-// Launcher / AF_UNIX transport — POSIX only.  On builds without it (WASM,
-// Windows Phase 1) the dispatch path short-circuits with InvalidInputException;
-// these supporting headers' .cpp counterparts are empty translation units.
+// Launcher / AF_UNIX transport — POSIX only.
 #include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
@@ -42,10 +40,8 @@ namespace vgi {
 namespace {
 
 #if VGI_SUBPROCESS_TRANSPORT
-// One attempt. Throws IOException on any transport error; caller decides whether
-// to retry. `force_fresh` bypasses the pool acquire entirely — used for the
-// retry path so a freshly-spawned worker does the work. Cross-platform: the
-// SubProcess + fd RPC layer it uses works on POSIX and Windows.
+// One attempt; throws IOException on any transport error and the caller decides
+// whether to retry. `force_fresh` skips pool acquisition (the retry path).
 UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
                                      const VgiBatchPtr &params, bool force_fresh) {
 	std::unique_ptr<SubProcess> proc;
@@ -91,7 +87,6 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 		} else {
 			WriteEmptyRpcRequest(proc->GetStdinFd(), method_name, opts.protocol);
 		}
-		// Disable in-band log message forwarding when enable_logging is false —
 		// HandleBatchLogMessage would otherwise call VGI_LOG from this thread.
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		response = ReadUnaryResponse(proc->GetStdoutFd(), log_ctx, opts.worker_path, proc->GetPid());
@@ -114,11 +109,8 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 		throw;
 	}
 
-	// Drain stderr into DuckDB's logger only when the caller guaranteed we're
-	// on a thread where that's safe. Off-main threads (aggregate destructors
-	// during pipeline teardown) skip this; buffered lines either ride along
-	// with the pooled worker to its next use or are dropped with the
-	// subprocess. StderrDrainer itself keeps reading in its own thread.
+	// Only where logging is safe (see UnaryRpcOptions::enable_logging); otherwise
+	// buffered lines ride along with the pooled worker or die with it.
 	if (drainer && opts.enable_logging) {
 		drainer->DrainToLog(opts.context, opts.worker_path, proc->GetPid());
 	}
@@ -156,10 +148,7 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 		if (opts.http_client_pool) {
 			pooled = opts.http_client_pool->Checkout();
 		}
-		// Carry the catalog's capability snapshot in and back out. In: it picks
-		// the request codec, so a server that advertised no compression gets an
-		// identity body on the FIRST try instead of a rejected compressed one.
-		// Out: refreshed from this response's capability headers.
+		// Snapshot in to pick the request codec; refreshed from the response.
 		ServerCapabilities caps;
 		if (opts.server_caps) {
 			caps = opts.server_caps->Load();
@@ -233,13 +222,10 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 		if (!LookupSharedContainer(opts.worker_path, shared_spec, shared_mode)) {
 			throw IOException("vgi: no resolved shared-container info for '%s'", opts.worker_path);
 		}
-		// The connect + RPC IS the readiness check: a fresh shared container may
-		// still be starting (the worker imports before it binds), so retry with
-		// backoff while it (re)starts. Mirrors ResolveAndConnect's invalidate-and-
-		// retry, with a startup deadline so a broken image fails clearly rather
-		// than spinning. The first RPC of an ATTACH (catalog_attach) lands here, so
-		// this is where cold start is absorbed; a successful RPC returns at once,
-		// so a warm container pays nothing.
+		// The connect + RPC is the readiness check: a fresh shared container may
+		// still be starting, so retry with backoff until a 60 s deadline (a broken
+		// image then fails rather than spinning). The first RPC of an ATTACH lands
+		// here, so this absorbs cold start; a warm container returns at once.
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
 		auto backoff = std::chrono::milliseconds(150);
 		for (;;) {
@@ -261,7 +247,7 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 					}
 					return result;
 				}
-				// tcp (and, later, unix): native vgi-rpc over the connected fd.
+				// tcp: native vgi-rpc over the connected fd.
 				auto worker = ConnectSharedContainer(ep);
 				request_dispatched = true;
 				if (params) {
@@ -346,17 +332,9 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 
 	if (IsLaunchLocation(opts.worker_path) || IsUnixLocation(opts.worker_path)) {
 #if VGI_POSIX_TRANSPORT
-		// AF_UNIX path: resolve socket via the launcher cache (which fires
-		// the launcher on first call per process), open a fresh AF_UNIX
-		// connection, drive the same WriteRpcRequest / ReadUnaryResponse
-		// wire-protocol code through a UnixSocketWorker.  No pooling — the
-		// long-lived worker behind the socket is itself the pool.
-		//
-		// ``ResolveAndConnect`` does a single-retry dance through the cache:
-		// if the cached worker has idle-shut-down between calls, the connect
-		// fails, the cache is invalidated, the launcher fires fresh, and we
-		// reconnect.  Without this, every idle-timeout would surface as a
-		// query error.
+		// Fresh AF_UNIX connection per call; no pooling, the long-lived worker
+		// behind the socket is itself the pool. ResolveAndConnect fires the
+		// launcher on first use and retries once if the cached worker idled out.
 		LaunchOverrides overrides;
 		if (opts.launcher_idle_timeout.has_value()) {
 			overrides.idle_timeout = *opts.launcher_idle_timeout;
@@ -432,10 +410,9 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
                                           const VgiBatchPtr &params) {
 	auto result = InvokeUnaryRpcOnTransport(opts, method_name, params);
-	// A worker with external storage configured externalizes a large unary
-	// result on any transport, not only HTTP: resolve the vgi_rpc.location
-	// pointer here, outside the respawn-retry above, so a failed fetch does not
-	// cost a worker. A no-op for HTTP, which resolved it already.
+	// Externalized results can come back on any transport. Resolved outside
+	// the respawn retry so a failed fetch does not cost a worker; HTTP already
+	// resolved it.
 	return MaybeResolveExternalLocation(opts.context, result, opts.worker_path);
 }
 

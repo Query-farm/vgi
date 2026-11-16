@@ -14,25 +14,19 @@ namespace duckdb {
 namespace vgi {
 
 TableFunction MakeVgiCopyFromTableFunction() {
-	// Empty argument list — the copy_from_function is never SQL-callable directly;
-	// its bind data is produced by VgiCopyFromBind. Reuse the producer-mode scan
-	// + init callbacks verbatim so there is no new streaming code.
+	// Never SQL-callable: its bind data comes from VgiCopyFromBind.
 	TableFunction func("vgi_copy_from", {}, vgi::VgiTableFunctionScan, /*bind=*/nullptr,
 	                   vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
-	// Mirror the diagnostic hooks the catalog scan path installs so
-	// EXPLAIN / EXPLAIN ANALYZE / progress annotate the COPY scan.
+	// Same diagnostic hooks as the catalog scan path.
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;
 	func.get_metrics = vgi::VgiTableFunctionGetMetrics;
 	func.statistics = vgi::VgiTableFunctionStatistics;
-	// COPY FROM always projects all target columns (identity), so no projection
-	// pushdown is needed; leave projection_pushdown at its default (false).
+	// COPY FROM reads every target column, so projection_pushdown stays false.
 	return func;
 }
 
-// Resolve the format's option schema into a case-insensitive name -> (orig_name,
-// LogicalType) map for validation + coercion.
 namespace {
 
 struct OptionSpec {
@@ -40,6 +34,7 @@ struct OptionSpec {
 	LogicalType type;
 };
 
+// Lower-cased option name -> declared name and type.
 std::map<std::string, OptionSpec> ResolveOptionSpecs(ClientContext &context,
                                                       const VgiSchemaPtr &options_schema) {
 	std::map<std::string, OptionSpec> specs;
@@ -68,11 +63,8 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 	auto &carrier = table_info->Cast<VgiCopyFromFunctionInfo>();
 	const auto &copy_info = info.info;
 
-	// --- 1. Validate + coerce COPY options against the format's option schema ---
-	// Worker-side validation (required / choices / ranges) still runs when the
-	// worker parses the arguments; here we reject unknown options and coerce each
-	// value to the declared option type. FORMAT itself arrives on copy_info.format,
-	// not in the options map.
+	// Reject unknown options and coerce each to its declared type; the worker
+	// still validates required / choices / ranges when it parses the arguments.
 	auto specs = ResolveOptionSpecs(context, carrier.options_schema);
 	vector<std::pair<string, Value>> named_args;
 	for (auto &entry : copy_info.options) {
@@ -80,7 +72,7 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 		const auto &values = entry.second;
 		auto key_lower = StringUtil::Lower(key.GetIdentifierName());
 		if (key_lower == "format") {
-			continue; // FORMAT is carried separately, never a worker option
+			continue; // carried on copy_info.format, never a worker option
 		}
 		auto spec_it = specs.find(key_lower);
 		if (spec_it == specs.end()) {
@@ -106,17 +98,14 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 		named_args.emplace_back(spec_it->second.name, std::move(*coerced));
 	}
 
-	// --- 2. Build bind data targeting the worker handler ---
 	auto bind_data = make_uniq<VgiTableFunctionBindData>();
 	bind_data->attach_params = carrier.attach_params;
 	bind_data->attach_opaque_data = carrier.attach_opaque_data;
-	// COPY runs outside a catalog read transaction; the catalog scan
-	// path also binds with no transaction_opaque_data.
+	// No transaction_opaque_data, as on the catalog scan path.
 	bind_data->function_name = carrier.handler;
 	bind_data->arguments = vgi::BuildArgumentsFromValues(context, /*positional=*/{}, named_args);
 	bind_data->settings = ExtractVgiSettings(context, carrier.setting_names);
 
-	// --- 3. Attach the COPY FROM context (format + path + target schema) ---
 	auto expected_schema = BuildArrowSchemaFromDuckDB(context, expected_types, expected_names);
 	CopyFromBindContext copy_ctx;
 	copy_ctx.format = carrier.format_name;
@@ -124,13 +113,12 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 	copy_ctx.expected_schema_bytes = SerializeSchemaToIpcBytes(expected_schema);
 	bind_data->copy_from = std::move(copy_ctx);
 
-	// --- 4. Bind against the worker (discovers + validates the output schema) ---
 	vector<LogicalType> worker_types;
 	vector<Identifier> worker_names;
 	vgi::PerformVgiTableFunctionBind(context, *bind_data, worker_types, worker_names);
 
-	// --- 5. Hard-validate: DuckDB inserts NO cast between the scan and the INSERT,
-	// so the worker's output types must match the COPY target exactly. ---
+	// DuckDB inserts NO cast between the COPY FROM scan and the insert, so the
+	// worker's output types must match the target exactly.
 	if (worker_types.size() != expected_types.size()) {
 		throw BinderException(
 		    "COPY ... FROM (FORMAT %s): worker '%s' produces %llu columns but the COPY target expects %llu",
@@ -147,8 +135,8 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 		}
 	}
 
-	// Mirror table-function configuration onto the bound copy_from_function, as
-	// the catalog scan path does (vgi_table_function_set.cpp).
+	// Mirror the bind's configuration onto the bound function, as the catalog
+	// scan path does.
 	info.tf.projection_pushdown = bind_data->projection_pushdown;
 
 	return std::move(bind_data);

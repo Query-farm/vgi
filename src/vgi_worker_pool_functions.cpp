@@ -10,9 +10,7 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// vgi_worker_pool_flush() - Table function to flush the worker pool
-// ============================================================================
+// vgi_worker_pool_flush()
 
 struct VgiWorkerPoolFlushData : public TableFunctionData {
 	bool finished = false;
@@ -47,9 +45,7 @@ void RegisterVgiWorkerPoolFlushFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(std::move(info));
 }
 
-// ============================================================================
-// vgi_worker_pool() - Table function to show pool contents
-// ============================================================================
+// vgi_worker_pool(): pool contents
 
 struct VgiWorkerPoolData : public TableFunctionData {
 	std::vector<VgiWorkerPool::PoolEntry> entries;
@@ -95,9 +91,7 @@ void RegisterVgiWorkerPoolFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(std::move(info));
 }
 
-// ============================================================================
-// vgi_worker_pool_stats() - Table function to show pool hit/miss statistics
-// ============================================================================
+// vgi_worker_pool_stats(): hit/miss statistics
 
 struct VgiWorkerPoolStatsData : public TableFunctionData {
 	std::vector<VgiWorkerPool::PoolStats> stats;

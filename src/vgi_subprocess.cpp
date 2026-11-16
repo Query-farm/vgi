@@ -41,8 +41,7 @@ namespace vgi {
 #if VGI_POSIX_TRANSPORT
 
 void ResetChildSignalDispositions() {
-	// SIGKILL / SIGSTOP cannot be reset; sigaction() on them just fails, so
-	// walking the whole range and ignoring errors is correct and cheapest.
+	// sigaction() fails harmlessly on SIGKILL / SIGSTOP; errors are ignored.
 	for (int sig = 1; sig < NSIG; ++sig) {
 		struct sigaction sa;
 		std::memset(&sa, 0, sizeof(sa));
@@ -54,8 +53,7 @@ void ResetChildSignalDispositions() {
 		}
 		(void)::sigaction(sig, &sa, nullptr);
 	}
-	// The child inherits the forking thread's signal mask, and exec() preserves
-	// it — a blocked signal would otherwise stay blocked in the worker.
+	// exec() preserves the inherited (fully blocked) mask; clear it.
 	sigset_t empty;
 	sigemptyset(&empty);
 	(void)::sigprocmask(SIG_SETMASK, &empty, nullptr);
@@ -64,9 +62,7 @@ void ResetChildSignalDispositions() {
 ScopedForkSignalBlock::ScopedForkSignalBlock() {
 	sigset_t all;
 	sigfillset(&all);
-	// SIGKILL/SIGSTOP are silently not blockable, which is fine — neither can
-	// run a handler. SIGPIPE is blocked here too and restored on scope exit;
-	// the process-wide SIG_IGN disposition it relies on is untouched.
+	// SIGKILL/SIGSTOP are silently unblockable (neither runs a handler).
 	if (::pthread_sigmask(SIG_SETMASK, &all, &saved_) == 0) {
 		active_ = true;
 	}
@@ -83,7 +79,6 @@ ScopedForkSignalBlock::~ScopedForkSignalBlock() {
 	Restore();
 }
 
-// Pipe implementation
 Pipe::Pipe() {
 	int fds[2];
 	if (pipe(fds) != 0) {
@@ -93,20 +88,10 @@ Pipe::Pipe() {
 	}
 	read_fd = fds[0];
 	write_fd = fds[1];
-	// Mark both ends close-on-exec so subsequent fork+execs in the parent
-	// don't leak this pipe into sibling worker processes.
-	//
-	// Why this matters: SubProcess keeps the parent-side FDs (write end of the
-	// child's stdin, read ends of stdout/stderr) for the lifetime of the worker.
-	// When DuckDB's subprocess pool spawns a SECOND worker via fork+execl,
-	// without CLOEXEC the new child inherits the previous worker's pipe FDs.
-	// Then if DuckDB exits abnormally and every worker reparents to init,
-	// none of them ever sees EOF on its stdin — sibling workers are still
-	// holding the write end alive — and the orphaned cohort lives forever.
-	//
-	// In the child, dup2() onto STDIN/STDOUT/STDERR clears the FD_CLOEXEC flag
-	// on the destination FD, so the worker's stdio survives execl normally.
-	// macOS lacks pipe2(), so we set the flag explicitly via fcntl after pipe().
+	// Close-on-exec, or later-spawned workers inherit earlier workers' stdin
+	// write ends; if DuckDB then dies, no orphaned worker ever sees stdin EOF
+	// and they live forever. dup2() onto fds 0-2 clears the flag, so the
+	// worker's own stdio survives exec. (macOS lacks pipe2().)
 	if (::fcntl(read_fd, F_SETFD, FD_CLOEXEC) != 0 || ::fcntl(write_fd, F_SETFD, FD_CLOEXEC) != 0) {
 		int saved = errno;
 		::close(read_fd);
@@ -137,7 +122,6 @@ void Pipe::CloseWrite() {
 	}
 }
 
-// SubProcess implementation
 SubProcess::SubProcess(const std::string &command, bool stderr_passthrough)
     : SubProcess(command, stderr_passthrough, false, nullptr) {
 }
@@ -149,7 +133,6 @@ SubProcess::SubProcess(DirectExecutable executable, bool stderr_passthrough)
 SubProcess::SubProcess(const std::string &command, bool stderr_passthrough, bool direct_executable,
                        std::shared_ptr<void> lifetime_anchor)
     : lifetime_anchor_(std::move(lifetime_anchor)) {
-	// Also check environment variables
 	if (!stderr_passthrough) {
 		const char *passthrough_env = std::getenv("VGI_WORKER_STDERR_PASSTHROUGH");
 		stderr_passthrough = passthrough_env && std::string(passthrough_env) == "1";
@@ -159,22 +142,17 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough, bool
 		stderr_passthrough = debug_env && std::string(debug_env) == "1";
 	}
 
-	// Build the final shell command BEFORE fork(). When passthrough/debug is on
-	// we want VGI_IPC_DEBUG=1 in the worker's environment; do it by prefixing the
-	// shell command with `export` rather than calling setenv() in the child after
-	// fork(). setenv() is not async-signal-safe (it may take the allocator/environ
-	// lock); DuckDB forks workers from query threads, so a peer thread holding that
-	// lock at fork time could deadlock the child. Building the string pre-fork keeps
-	// the child path to only async-signal-safe calls (dup2/close/execl/_exit).
+	// VGI_IPC_DEBUG=1 goes into the command text, not setenv() in the child:
+	// setenv() is not async-signal-safe, and a peer thread holding the environ /
+	// allocator lock at fork time would deadlock the child. The child path must
+	// stay async-signal-safe (dup2/close/execl/_exit).
 	std::string shell_command =
 	    stderr_passthrough ? ("export VGI_IPC_DEBUG=1; " + command) : command;
 
 	Pipe stdin_pipe;
 	Pipe stdout_pipe;
-	Pipe stderr_pipe; // Only used if not passthrough
+	Pipe stderr_pipe; // unused with passthrough
 
-	// Block signals across the fork so nothing can be delivered to the child
-	// before it resets the host's inherited handlers (see ScopedForkSignalBlock).
 	ScopedForkSignalBlock fork_signal_block;
 	pid_ = fork();
 	if (pid_ < 0) {
@@ -184,36 +162,28 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough, bool
 	}
 
 	if (pid_ == 0) {
-		// Child process
-		// Disarm the host's signal handlers before anything else — while stdout
-		// is still the host's, a handler firing here writes to the host's
-		// console under the host's identity. See ResetChildSignalDispositions().
+		// Child: disarm the host's signal handlers before anything else.
 		ResetChildSignalDispositions();
 
-		// Redirect stdin
 		if (dup2(stdin_pipe.read_fd, STDIN_FILENO) < 0) {
-			_exit(126); // dup2 failed
+			_exit(126);
 		}
 		stdin_pipe.CloseRead();
 		stdin_pipe.CloseWrite();
 
-		// Redirect stdout
 		if (dup2(stdout_pipe.write_fd, STDOUT_FILENO) < 0) {
-			_exit(126); // dup2 failed
+			_exit(126);
 		}
 		stdout_pipe.CloseRead();
 		stdout_pipe.CloseWrite();
 
-		// Redirect stderr (only if not passthrough)
 		if (!stderr_passthrough) {
 			if (dup2(stderr_pipe.write_fd, STDERR_FILENO) < 0) {
-				_exit(126); // dup2 failed
+				_exit(126);
 			}
 			stderr_pipe.CloseRead();
 			stderr_pipe.CloseWrite();
 		}
-		// If passthrough, stderr remains connected to parent's stderr and
-		// VGI_IPC_DEBUG was already baked into shell_command above (pre-fork).
 
 		if (direct_executable) {
 			// Archive-controlled paths are data, never shell command text.
@@ -229,23 +199,20 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough, bool
 		_exit(127); // exec failed
 	}
 
-	// Parent process — unblock as soon as the fork has returned; the remaining
-	// setup is ordinary parent-side bookkeeping that must not run masked.
 	fork_signal_block.Restore();
 	stdin_fd_ = stdin_pipe.write_fd;
-	stdin_pipe.write_fd = -1; // Transfer ownership
+	stdin_pipe.write_fd = -1;
 
 	stdout_fd_ = stdout_pipe.read_fd;
-	stdout_pipe.read_fd = -1; // Transfer ownership
+	stdout_pipe.read_fd = -1;
 
 	if (!stderr_passthrough) {
 		stderr_fd_ = stderr_pipe.read_fd;
-		stderr_pipe.read_fd = -1; // Transfer ownership
+		stderr_pipe.read_fd = -1;
 	} else {
-		stderr_fd_ = -1; // No stderr pipe when passthrough
+		stderr_fd_ = -1;
 	}
 
-	// Close unused ends
 	stdin_pipe.CloseRead();
 	stdout_pipe.CloseWrite();
 	if (!stderr_passthrough) {
@@ -264,7 +231,6 @@ SubProcess::~SubProcess() {
 		close(stderr_fd_);
 	}
 	if (pid_ > 0) {
-		// Fast path: process already exited.
 		int status;
 		pid_t result = waitpid(pid_, &status, WNOHANG);
 		if (result != 0) {
@@ -272,12 +238,8 @@ SubProcess::~SubProcess() {
 			return;
 		}
 
-		// Still running — escalate. SIGTERM first, give it ~2 s to exit;
-		// then SIGKILL (uncatchable, so the second wait is bounded). The
-		// previous code did an unbounded blocking waitpid here, so a
-		// worker that ignored SIGTERM could hang the destructor (and any
-		// caller — pool teardown, FunctionConnection cleanup, the host
-		// process exit) indefinitely.
+		// SIGTERM, a 2 s grace, then SIGKILL: the destructor must stay bounded
+		// even for a worker that ignores SIGTERM.
 		kill(pid_, SIGTERM);
 		constexpr auto kSigtermGrace = std::chrono::milliseconds(2000);
 		constexpr auto kPollInterval = std::chrono::milliseconds(50);
@@ -290,9 +252,7 @@ SubProcess::~SubProcess() {
 			std::this_thread::sleep_for(kPollInterval);
 		}
 
-		// SIGTERM grace expired — escalate.
 		kill(pid_, SIGKILL);
-		// SIGKILL cannot be caught/blocked/ignored, so this returns promptly.
 		waitpid(pid_, &status, 0);
 	}
 }
@@ -390,7 +350,6 @@ bool SubProcess::TryWait(int *exit_status) {
 	return true;
 }
 
-// WriteAll implementation
 void WriteAll(int fd, const uint8_t *data, size_t len) {
 	size_t written = 0;
 	while (written < len) {
@@ -415,16 +374,8 @@ void WriteAll(int fd, const uint8_t *data, size_t len) {
 
 #elif defined(_WIN32)
 
-// ---------------------------------------------------------------------------
-// Windows subprocess backend.
-//
-// Realizes the same fd-based seam the POSIX path uses, via the CRT fd layer:
-// CreatePipe gives HANDLEs, _open_osfhandle wraps the parent ends as int fds so
-// the rest of the codebase keeps its `int fd` model unchanged. Readiness waits
-// use PeekNamedPipe polling (Windows anonymous pipes are not selectable). The
-// child is launched with CreateProcess via `cmd.exe /c <command>` (POSIX uses
-// `/bin/sh -c`). UNTESTED on macOS CI — validated on the Windows build machine.
-// ---------------------------------------------------------------------------
+// Windows backend: same int-fd model via the CRT (_open_osfhandle wraps the
+// parent pipe ends); the child runs under `cmd.exe /c <command>`.
 
 // Pipe is fork-oriented (FD_CLOEXEC); the Windows SubProcess manages its pipes
 // inline, so this type is never instantiated here. Throwing stubs keep it linkable.
@@ -507,15 +458,10 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough, bool
 		return IOException("vgi: %s failed (GetLastError=%lu)", what, (unsigned long)e);
 	};
 
-	// Pipe buffer hint for the two DATA pipes (stdin carries exchange-mode input
-	// + producer ticks; stdout carries the worker's Arrow IPC batches). The
-	// default CreatePipe buffer is ~4 KiB, which is far smaller than a typical
-	// Arrow batch — so the worker blocks part-way through every batch write and
-	// ping-pongs with the reader, adding context switches on the hot path. A
-	// larger buffer lets a whole batch flow without blocking. 256 KiB is a
-	// deliberate balance: big enough for typical/large batches, while bounding
-	// nonpaged-pool use across pooled workers (the size is advisory — Windows
-	// caps the actual allocation). stderr stays at the default (low-volume logs).
+	// Buffer hint for the stdin/stdout data pipes: the ~4 KiB default makes
+	// every Arrow batch write ping-pong with the reader. 256 KiB fits typical
+	// batches while bounding nonpaged pool across pooled workers (advisory).
+	// stderr keeps the default.
 	constexpr DWORD kDataPipeBufferBytes = 1u << 18; // 256 KiB
 	if (!CreatePipe(&child_stdin_rd, &parent_stdin_wr, &sa, kDataPipeBufferBytes)) {
 		throw fail("CreatePipe(stdin)");
@@ -737,9 +683,6 @@ bool RpcInterrupted(const ClientContext *context) {
 
 #if VGI_POSIX_TRANSPORT
 void WaitForReadableUntilCancel(int fd, ClientContext *context) {
-	// No wall-clock deadline. Match the streaming data-phase model: block
-	// until the worker speaks. Cancellation comes via the context's
-	// `interrupted` flag (Ctrl-C, query cancel) — we poll it every 250ms.
 	constexpr int kPollIntervalMs = 250;
 
 	while (true) {
@@ -1122,22 +1065,16 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	if (h == INVALID_HANDLE_VALUE) {
 		throw IOException("VGI WaitForReadableUntilCancel: invalid file descriptor");
 	}
-	// A tcp:// worker's fd is a socket, not a pipe — PeekNamedPipe can't probe it.
-	// Sockets ARE selectable, so block in WSAPoll (the Windows poll()): it wakes
-	// the instant data arrives, with a 250ms cap only to re-check cancellation.
-	// getsockopt fails (WSAENOTSOCK / WSANOTINITIALISED) on a pipe handle, so the
-	// subprocess pipe path falls through to the adaptive-backoff peek loop below.
+	// A tcp:// worker's fd is a socket; getsockopt fails (WSAENOTSOCK /
+	// WSANOTINITIALISED) on a pipe handle, which falls through to the pipe path.
 	{
 		SOCKET sock = reinterpret_cast<SOCKET>(h);
 		int sotype = 0;
 		int slen = static_cast<int>(sizeof(sotype));
 		if (::getsockopt(sock, SOL_SOCKET, SO_TYPE, reinterpret_cast<char *>(&sotype), &slen) == 0) {
-			// Same adaptive ladder as the pipe path so a tcp:// worker isn't
-			// penalised vs subprocess: ioctlsocket(FIONREAD) is the non-blocking
-			// peek; spin (YieldProcessor) → yield (SwitchToThread) → WSAPoll(1ms)
-			// backstop. WSAPoll also wakes on EOF/hangup, so a closed peer doesn't
-			// spin forever (recv() then observes the EOF). interrupted re-checked
-			// each iteration → prompt cancel.
+			// Adaptive ladder: FIONREAD peek, then spin (YieldProcessor) ->
+			// SwitchToThread -> WSAPoll(1ms), re-checking the interrupt each
+			// iteration. WSAPoll also wakes on EOF/hangup (recv observes it).
 			for (unsigned attempt = 0;; attempt++) {
 				if (RpcInterrupted(context)) {
 					throw InterruptException(); // not IOException: never retried
@@ -1162,10 +1099,8 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 			}
 		}
 	}
-	// Pipe path: the subprocess stdout pipe is OVERLAPPED, so the actual read
-	// (FdInputStream::Read) blocks at 0% CPU via overlapped ReadFile +
-	// WaitForSingleObject and wakes the instant data arrives -- a real
-	// poll()-equivalent that also handles cancellation. Nothing to poll here.
+	// Pipe path: stdout is an OVERLAPPED pipe, so FdInputStream::Read itself
+	// waits (overlapped ReadFile + wait) and handles cancellation.
 	return;
 }
 #else // Emscripten

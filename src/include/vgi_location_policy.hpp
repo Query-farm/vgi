@@ -58,13 +58,13 @@ enum class LocationEntryPoint { ATTACH, VGI_CATALOGS, VGI_PROTOCOLS };
 // The SQL name of an entry point ("attach", "vgi_catalogs", "vgi_protocols").
 const char *LocationEntryPointName(LocationEntryPoint entry);
 
-// Classify `location` as the transport the dispatch code will ACTUALLY use for
-// it at `entry` on this build. Built from the same predicates, in the same
-// build configurations, as CreateFunctionConnection / InvokePooledUnaryRpc /
-// SpawnWorker; anything that no network branch claims falls through to
-// POLICY_SUBPROCESS, exactly as dispatch does (so native `worker:x` and
-// `IROH://x` are subprocess). Returns 0 and sets `refusal` for locations that
-// are refused regardless of policy (internal tokens, unresolved database://).
+// Classify `location` as the transport dispatch will ACTUALLY use for it at
+// `entry` on this build (same predicates and build configurations as
+// CreateFunctionConnection / InvokePooledUnaryRpc / SpawnWorker). Anything no
+// network branch claims falls through to POLICY_SUBPROCESS, as dispatch does
+// (so native `worker:x` and `IROH://x` are subprocess). Returns 0 and sets
+// `refusal` for locations refused regardless of policy (internal tokens,
+// unresolved database://). Defined in vgi_location_classify.cpp.
 uint32_t ClassifyLocationForPolicy(const std::string &location, LocationEntryPoint entry, std::string &refusal);
 
 // Parse a `vgi_allowed_transports` value (comma-separated, case-insensitive
@@ -103,13 +103,12 @@ private:
 	std::atomic<uint32_t> allowed_ {POLICY_ALL_TRANSPORTS};
 };
 
-// Defined in vgi_extension.cpp next to the storage extension that owns it.
-// nullptr if VGI is not registered on this instance.
+// nullptr if VGI is not registered on this instance (defined in vgi_extension.cpp).
 VgiLocationPolicy *FindVgiLocationPolicy(DatabaseInstance &db);
 
-// Throw PermissionException unless `location` is permitted at `entry`. Call
-// before ANY I/O on the location (container inspection, package resolution,
-// connecting, spawning).
+// Throw (ExceptionType::PERMISSION) unless `location` is permitted at `entry`.
+// Call before ANY I/O on the location (container inspection, package
+// resolution, connecting, spawning).
 void CheckLocationPolicy(ClientContext &context, const std::string &location, LocationEntryPoint entry);
 
 // Register `vgi_allowed_transports` and seed `policy` from its current value.

@@ -14,12 +14,9 @@
 
 namespace duckdb {
 
-// Schemas live directly on the catalog (no parent VgiSchemaEntry), so we pass
-// nullptr for the schema reference. The base class treats that as "no
-// estimated_object_count available" and falls back to the default count of 1.
-// The threshold has no behavioral effect on VgiSchemaSet anyway — schemas
-// have no single-entry override, so first GetEntry always triggers
-// LoadEntries regardless of threshold.
+// Schemas live directly on the catalog, so there is no parent VgiSchemaEntry
+// (and no estimated_object_count). Schemas have no single-entry lookup, so the
+// first GetEntry always runs LoadEntries regardless of the eager-load threshold.
 VgiSchemaSet::VgiSchemaSet(Catalog &catalog) : VgiCatalogSet(catalog, nullptr) {
 }
 
@@ -36,19 +33,16 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 		return;
 	}
 
-	// Call catalog_schemas via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data,
 	                                vgi_tx_load.GetTransactionOpaqueData()};
 
-	// Whole-catalog load: one catalog_contents RPC replaces catalog_schemas plus
-	// a catalog_schema_contents_* call per schema and kind. The contents seed
-	// each schema entry's per-kind caches. The catalog decides whether to use
-	// it (setting, reload and version rules, a snapshot already fetched by
-	// revalidation); null means the per-schema path. See docs/catalog_contents.md.
+	// Whole-catalog load: one catalog_contents RPC seeds every schema entry's
+	// per-kind caches. TakeCatalogContents decides whether it applies (setting,
+	// reload/version rules, a snapshot already fetched by revalidation); null
+	// means the per-schema path. See docs/catalog_contents.md.
 	if (auto snapshot = vgi_catalog.TakeCatalogContents(context, rpc_ctx)) {
-		// Paths and row references were indexed from the catalog-wide streams.
-		// Decode full SchemaInfo on first use and share the response buffers.
+		// Each entry decodes its full SchemaInfo lazily from the shared buffers.
 		for (auto &contents : snapshot->schemas) {
 			CreateSchemaInfo info;
 			info.SetQualifiedName(QualifiedName(catalog_.GetName(), Identifier(contents.name), Identifier()));

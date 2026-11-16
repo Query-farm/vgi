@@ -13,14 +13,9 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// LogicalVgiStreamingWindow
-// ============================================================================
-// Inserted by the optimizer rule in place of a LogicalWindow when every
-// window expression is a VGI aggregate with streaming_partitioned=true and
-// the frame is cumulative. Mirrors LogicalWindow's column-binding shape so
-// downstream operators see the same column references — the rewrite is
-// transparent.
+// Replaces a LogicalWindow (VgiStreamingWindowOptimizer) when every window
+// expression is a streaming_partitioned VGI aggregate over a cumulative frame.
+// Keeps LogicalWindow's column bindings so the rewrite is invisible downstream.
 
 class LogicalVgiStreamingWindow : public LogicalExtensionOperator {
 public:
@@ -38,30 +33,18 @@ public:
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 
-	// Serialization left as an explicit no-op for v1 — plan caching across
-	// processes isn't a v1 requirement.
+	// Throws NotImplementedException: the operator is not serializable.
 	void Serialize(Serializer &serializer) const override;
 
 protected:
 	void ResolveTypes() override;
 };
 
-// ============================================================================
-// PhysicalVgiStreamingWindow
-// ============================================================================
-// Pipeline operator (Execute / FinalExecute, not Sink+Source). Receives
-// input chunks from upstream; lazily opens an aggregate_streaming session
-// on the first chunk; ships each chunk to the worker via streaming_chunk
-// and appends the worker's result column(s) to the passed-through input;
-// closes the session on FinalExecute.
-//
-// v1 constraints:
-//   - One window expression per node. (Multi-expression LogicalWindow nodes
-//     are rejected by the optimizer rule for v1.)
-//   - Single-threaded (ParallelOperator() = false). Future multi-thread
-//     support routes by partition-key hash to disjoint worker connections.
-//   - Streaming session state lives on the worker for the duration of the
-//     query; not spillable.
+// Pipeline operator (Execute / FinalExecute). Opens one aggregate_streaming
+// session per window expression on the first chunk, ships each chunk via
+// streaming_chunk, appends the worker's result columns to the passed-through
+// input, and closes the sessions in FinalExecute. Single-threaded because a
+// session's cross-partition state lives on one worker; that state is not spillable.
 
 class PhysicalVgiStreamingWindow : public PhysicalOperator {
 public:
@@ -71,9 +54,8 @@ public:
 	PhysicalVgiStreamingWindow(PhysicalPlan &physical_plan, vector<LogicalType> types,
 	                            vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
 
-	//! The window expressions (each is a BoundWindowExpression). The
-	//! operator's output schema is [child types..., expr return types...]
-	//! exactly mirroring PhysicalWindow's shape.
+	//! BoundWindowExpressions. Output schema is [child types..., expr return types...],
+	//! as for PhysicalWindow.
 	vector<unique_ptr<Expression>> select_list;
 
 public:
@@ -91,7 +73,7 @@ public:
 	}
 
 	bool ParallelOperator() const override {
-		return false; // v1: single-threaded; cross-partition state lives on one worker.
+		return false; // cross-partition state lives on one worker session.
 	}
 
 	OrderPreservationType OperatorOrder() const override {

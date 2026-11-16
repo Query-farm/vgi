@@ -53,8 +53,8 @@ void VgiWasmAsyncPool::WorkerLoop() {
 		try {
 			task();
 		} catch (...) {
-			// std::packaged_task captures exceptions into the future;
-			// nothing escapes here under normal use, but swallow defensively.
+			// Submitted tasks are packaged_tasks, which capture exceptions;
+			// swallow anything else so the worker thread survives.
 		}
 	}
 }

@@ -2,44 +2,26 @@
 //
 // Derived bounding-box filters for exact spatial predicates.
 //
-// DuckDB offers `ST_Intersects(geom, <constant>)` to a scan as a filter, but a
-// worker can only take the bounding-box test `geom && <constant>`
-// (`duckdb.spatial/intersects_extent@1`), so VGI declines the exact predicate
-// and the worker reads every row. Every predicate below implies that the two
-// bounding boxes intersect, so `geom && <constant>` is a sound pre-filter for
-// it:
+// A worker can take `geom && <constant>` (`duckdb.spatial/intersects_extent@1`)
+// but not exact predicates such as ST_Intersects, which VGI declines. Each
+// predicate in ExtentImplyingPredicates implies the bounding boxes intersect
+// (DuckDB's `&&` is inclusive, as ST_Touches needs), so `geom && <constant>` is
+// a sound pre-filter. Negated forms (ST_Disjoint, NOT ...) are never used.
 //
-//   ST_Intersects, ST_Contains, ST_Within, ST_Covers, ST_CoveredBy,
-//   ST_Touches, ST_Overlaps, ST_Crosses, ST_Equals, ST_ContainsProperly
+// Post-optimize (after FilterPushdown settled what the scan took), for a
+// LogicalFilter over a VGI scan whose worker declared intersects_extent, push
+// `geom && <constant>` as an OPTIONAL (advisory) filter. The exact predicate
+// stays in the LogicalFilter, so results are unchanged.
 //
-// (DuckDB's `&&` is inclusive: boxes that only share an edge or corner
-// intersect, which ST_Touches needs.) Negated forms (ST_Disjoint, NOT ...) are
-// never derived from: they keep rows whose boxes do NOT intersect.
+// Only constants with a real box are used (>= 1 vertex, finite X and Y): an
+// EMPTY constant makes `geom && EMPTY` false for every row yet
+// ST_Equals(EMPTY, EMPTY) is true; a NaN coordinate is empty to GEOS but
+// unbounded to DuckDB's extent code. Every listed predicate is false for an
+// empty constant, so the gate loses nothing.
 //
-// After DuckDB's filter pushdown, this optimizer finds such a predicate in a
-// LogicalFilter directly above a VGI scan whose worker declared
-// intersects_extent, and pushes `geom && <constant>` into the scan as an
-// OPTIONAL filter, which VGI serializes as an advisory predicate. The exact
-// predicate stays in the LogicalFilter, so the result is unchanged: the worker
-// may use the box to read less, and DuckDB still applies the exact test.
-//
-// Only a constant with a real box is used: one with at least one vertex and
-// finite X and Y ranges. An empty constant has no box, so `geom && EMPTY` is
-// false for every row, yet spatial's ST_Equals(EMPTY, EMPTY) is true. A
-// constant with a NaN coordinate is empty to spatial (GEOS) but has an
-// unbounded axis to DuckDB's extent code; such constants, and infinite ones, are
-// skipped too. Every listed predicate is false for an empty constant, so the
-// gate loses nothing.
-//
-// The derived filter is always a plain `col && <constant>` over the bare
-// column, the only form VGI's filter encoding carries: the constant is
-// relabelled to a CRS-typed column's type (a CRS cast is metadata only), a
-// constant with a different CRS derives nothing, and a bind that would put a
-// cast on the column is dropped. (DuckDB 2.0 binds GEOMETRY('EPSG:4326')
-// columns without such a cast today; these are guards.)
-//
-// Phase: optimize_function (post-optimize), after FilterPushdown has settled
-// which predicates the scan took.
+// VGI's filter encoding carries only `col && <constant>` on the bare column:
+// a CRS-less constant is relabelled to the column's CRS type, a different CRS
+// derives nothing, and a bind that would cast the column is dropped.
 
 #include "vgi_spatial_extent_pushdown.hpp"
 #include "vgi_logging.hpp"

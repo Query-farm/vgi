@@ -1,10 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// POSIX-only — depends on vgi_launcher (fork/exec) and vgi_unix_socket
-// (AF_UNIX).  Under emscripten this translation unit is empty; the
-// dispatch sites in vgi_function_connection / vgi_unary_rpc gate on the
-// same macro and surface a clear error if launch:/unix:// LOCATIONs are
-// used in a WASM build.
+// POSIX-only (fork/exec + AF_UNIX); empty under emscripten. The dispatch sites
+// in vgi_function_connection / vgi_unary_rpc gate on the same macro and report
+// launch:/unix:// as unsupported in a WASM build.
 
 #include "vgi_platform.hpp"
 
@@ -27,11 +25,8 @@ namespace vgi {
 
 namespace {
 
-// One cache entry per location.  ``recorded_overrides`` holds whatever
-// LaunchOverrides the *first* successful resolution used; subsequent
-// callers must match these values or the resolver throws BinderException.
-// On cache invalidation the entry is removed entirely, so the next
-// resolution starts fresh and a new caller can install different overrides.
+// One entry per location; ``recorded_overrides`` is the pin described at
+// LaunchOverrides.
 struct CacheEntry {
 	std::string socket_path;
 	LaunchOverrides recorded_overrides;
@@ -50,10 +45,6 @@ LaunchConfig BuildLaunchConfigFromLocation(const std::string &location, const La
 			throw InvalidInputException(e.what());
 		}
 	} else if (IsUnixLocation(location)) {
-		// unix:// is "connect-to-existing"; we model it through the same
-		// resolve-socket-path API so callers don't branch.  No worker_argv,
-		// no launcher invocation: the path is simply the bytes after
-		// ``unix://``.
 		throw InternalException(
 		    "vgi launcher cache: unix:// locations should be handled by "
 		    "StripUnixScheme directly, not through the launcher");
@@ -61,7 +52,6 @@ LaunchConfig BuildLaunchConfigFromLocation(const std::string &location, const La
 		throw InvalidInputException("vgi launcher cache: unsupported location scheme: %s",
 		                             location);
 	}
-	// Apply overrides on top of LaunchConfig defaults.
 	if (overrides.idle_timeout.has_value()) {
 		cfg.idle_timeout = *overrides.idle_timeout;
 	}
@@ -71,10 +61,7 @@ LaunchConfig BuildLaunchConfigFromLocation(const std::string &location, const La
 	return cfg;
 }
 
-// Render LaunchOverrides as a short human-readable string for error
-// messages.  Empty overrides → ``"defaults"``; otherwise comma-separated
-// key=value pairs.  Used only on the BinderException path so allocation
-// cost is irrelevant.
+// LaunchOverrides for error messages: ``"defaults"`` or comma-separated key=value.
 std::string FormatOverrides(const LaunchOverrides &o) {
 	std::string out;
 	if (o.idle_timeout.has_value()) {
@@ -92,9 +79,8 @@ std::string FormatOverrides(const LaunchOverrides &o) {
 } // namespace
 
 std::string ResolveLauncherSocketPath(const std::string &location, const LaunchOverrides &overrides) {
-	// unix:// → trivially the bytes after the scheme.  Overrides are
-	// rejected at parse time for unix://, so they should always be empty
-	// here; we still record them for symmetry.
+	// unix:// is connect-to-existing: the path is the bytes after the scheme.
+	// Overrides are rejected at parse time for unix://, so these are empty.
 	if (IsUnixLocation(location)) {
 		auto path = StripUnixScheme(location);
 		std::lock_guard<std::mutex> lk(g_cache_mutex);
@@ -102,7 +88,6 @@ std::string ResolveLauncherSocketPath(const std::string &location, const LaunchO
 		return path;
 	}
 
-	// launch: → check the cache first.
 	{
 		std::lock_guard<std::mutex> lk(g_cache_mutex);
 		auto it = g_cache.find(location);
@@ -119,19 +104,14 @@ std::string ResolveLauncherSocketPath(const std::string &location, const LaunchO
 		}
 	}
 
-	// Cache miss: invoke the launcher.  Done outside the cache lock so a
-	// long-running launcher invocation doesn't block other locations.
+	// Launch outside the cache lock so a slow launch doesn't block other locations.
 	auto cfg = BuildLaunchConfigFromLocation(location, overrides);
 	auto path = Launch(cfg);
 	std::lock_guard<std::mutex> lk(g_cache_mutex);
-	// A racing caller may have populated the entry while we ran Launch().
-	// If so, prefer their entry (we built ours from the same overrides
-	// since we hold no shared mutable state in BuildLaunchConfigFromLocation).
+	// A racing caller may have populated the entry while we ran Launch(); with
+	// equal overrides, prefer its entry.
 	auto [it, inserted] = g_cache.try_emplace(location, CacheEntry {path, overrides});
 	if (!inserted && it->second.recorded_overrides != overrides) {
-		// Extremely narrow race: another thread spawned with different
-		// overrides between our cache miss and our re-acquire.  Treat
-		// the same as a regular conflict.
 		throw BinderException(
 		    "vgi launcher: concurrent ATTACH installed conflicting launcher overrides "
 		    "[%s] vs [%s]",
@@ -161,11 +141,8 @@ UnixSocket ResolveAndConnect(const std::string &location,
 	try {
 		return UnixSocket::Connect(sock_path, connect_timeout);
 	} catch (const IOException &) {
-		// The cached worker is gone — typically because its idle timeout
-		// expired between the prior call and this one.  Invalidate and
-		// resolve again; the launcher will probe-then-spawn a fresh worker
-		// for ``launch:`` locations or fail loudly for ``unix://`` ones
-		// (which the operator manages out-of-band).
+		// Typically the worker idled out. The retry probe-then-spawns for launch:;
+		// for unix:// (managed out-of-band) it fails again and throws.
 		InvalidateLauncherSocketCache(location);
 		sock_path = ResolveLauncherSocketPath(location, overrides);
 		return UnixSocket::Connect(sock_path, connect_timeout);

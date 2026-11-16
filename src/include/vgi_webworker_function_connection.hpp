@@ -25,54 +25,31 @@ class ClientContext;
 
 namespace vgi {
 
-// Forward declarations
 struct VgiSecretRequirement;
 
-// Standalone unary RPC over the `worker:` SAB transport, for catalog RPCs (ATTACH
-// + discovery) which are request -> single response. Claims a transient slot,
-// writes the request + EOS, reads the one response, releases the slot. Called from
-// InvokePooledUnaryRpc's worker: branch. Definition in the .cpp (guarded on
-// __EMSCRIPTEN__ || VGI_SAB_NATIVE_TEST).
+// One unary RPC (catalog RPCs: ATTACH, discovery) over the `worker:` SAB
+// transport on a transient slot: request + EOS, one response, release. Used by
+// InvokePooledUnaryRpc for worker: and browser iroh: locations.
 UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::string &worker_path,
                                          const std::string &method_name,
                                          const VgiBatchPtr &params,
                                          const VgiProtocolId &protocol);
 
-// ============================================================================
-// WebWorkerFunctionConnection - vgi_rpc Protocol over the `worker:` SAB transport
-// ============================================================================
+// The subprocess FunctionConnection's protocol (bind/init, producer ticks,
+// exchange input, one-ahead tick pipeline) driving an in-browser Web Worker over
+// a SharedArrayBuffer duplex ring slot (vgi_sab_abi.hpp) instead of pipes:
+// requests and the tick/input VgiIpcWriter go to a SabOutputStream, responses
+// are read from a SabInputStream. No worker pool, stderr drainer or shm side
+// channel: the JS bridge owns the worker's lifecycle. The connection owns one
+// slot from EnsureWorkerSpawned to destruction.
 //
-// A focused port of the subprocess FunctionConnection for the in-browser
-// `worker:` transport. Instead of a spawned child process wired over stdin/
-// stdout pipe fds, this connection drives an in-browser Web Worker across a
-// SharedArrayBuffer duplex ring (the SAB slot — see vgi_sab_abi.hpp). The
-// streaming structure is identical to the subprocess path — same bind→init
-// dance, same producer (tick) / exchange (input) modes, same one-ahead tick
-// pipeline in ReadDataBatch — only the byte transport changes:
-//
-//   * Requests: SerializeRpcRequest(method, params) bytes written to a
-//     SabOutputStream (client->worker ring), replacing WriteRpcRequest(fd, …).
-//   * Responses: a RecordBatchStreamReader over a SabInputStream (worker->client
-//     ring), replacing ReadUnaryResponse(fd)/ReadStreamHeader(fd).
-//   * Tick / input streams: MakeStreamWriter over a SabOutputStream, exactly as
-//     the subprocess path opens them over an FdOutputStream.
-//
-// There is no subprocess, no worker pool, no stderr drainer, and no shared-
-// memory side-channel here — the JS bridge owns the worker's lifecycle and the
-// SAB ring is the transfer medium. The connection owns exactly one SAB slot
-// (vgi_wasm_slot_open at first use → vgi_wasm_slot_release at destruction);
-// CloseInputWriter signals ring EOF via vgi_wasm_slot_write_eos.
-//
-// Compiled only for the wasm extension (__EMSCRIPTEN__) and the native SAB unit
-// test (VGI_SAB_NATIVE_TEST) — the guard lives on the .cpp, not this header.
+// Definitions are compiled only for wasm (__EMSCRIPTEN__) and the native SAB
+// unit test (VGI_SAB_NATIVE_TEST); the guard is on the .cpp.
 class WebWorkerFunctionConnection : public IFunctionConnection {
 public:
-	// Create connection parameters (does not open the SAB slot yet).
-	// `location` is the full `worker:<url>` LOCATION; the stripped URL is what
-	// the JS bridge resolves to a Web Worker. arguments: Arrow struct array
-	// with fields named positional_0, positional_1, etc. global_execution_id:
-	// for secondary workers, pass the ID from the primary worker's InitResult.
-	// function_type: "TABLE", "SCALAR", or "AGGREGATE".
+	// Does not open the slot yet. `location` is the `worker:` LOCATION
+	// (canonicalized for the JS bridge). global_execution_id: for secondary
+	// workers, the primary worker's InitResult id.
 	WebWorkerFunctionConnection(const std::string &location, const std::string &function_name,
 	                            const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
 	                            const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
@@ -83,11 +60,8 @@ public:
 
 	~WebWorkerFunctionConnection() override;
 
-	// Set shared state for dynamic filter pushdown via tick batches
-	// Reset per-init stream state, keeping the SAB ring channel.
-	// Defined out-of-line (vgi_webworker_function_connection.cpp), as a sibling
-	// of PerformFinalizeInit — it is the same problem: re-initialize a LIVE
-	// connection for another stream without leaving the rings mid-frame.
+	// Reset per-init stream state, keeping the slot. Like PerformFinalizeInit,
+	// it must leave the rings between frames, not mid-frame.
 	void ResetForNextSplit() override;
 
 
@@ -141,17 +115,11 @@ public:
 
 	void PerformFinalizeInit(const BindResult &bind_result) override;
 
-	// ========================================================================
-	// Input Data (Scalar and Table-In-Out Functions)
-	// ========================================================================
-
 	void OpenInputWriter() override;
 	void WriteInputBatch(const VgiBatchPtr &batch) override;
 
-	// Cancel the current stream by writing a zero-row batch tagged with
-	// VGI_RPC_CANCEL_KEY custom metadata on the input/tick writer. state_token +
-	// live_context unused (the SAB slot is self-addressing; no context-bound
-	// logging/HTTP on this path).
+	// Writes a zero-row VGI_RPC_CANCEL_KEY tick on the producer tick stream
+	// (no-op in exchange mode). state_token and live_context are unused.
 	void CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) override;
 
 	// SAB: no state token (the lockstep ring is self-addressing).
@@ -161,7 +129,7 @@ public:
 
 	void CloseInputWriter() override;
 
-	// ========== Table sink+source (buffered) RPC family ==========
+	// Buffered table functions (table_buffering_*).
 	std::vector<uint8_t>
 	RpcTableBufferingProcess(const std::string &function_name,
 	                           const std::vector<uint8_t> &execution_id,
@@ -207,25 +175,20 @@ public:
 		return 0;
 	}
 
-	// The SAB transport is never pooled (the JS bridge owns worker lifecycle).
-	// Out-of-line: returns nullptr, but `unique_ptr<PooledWorker>` needs the complete
-	// type to instantiate its deleter, and this header only sees the forward
-	// declaration. libstdc++ enforces that even for a null return (clang/libc++
-	// defers it, so macOS and the clang wasm build never noticed). Defined in the
-	// .cpp where vgi_worker_pool.hpp is included — as CachedReplayConnection does.
+	// Never pooled; returns nullptr. Out-of-line because unique_ptr<PooledWorker>
+	// needs the complete type for its deleter (libstdc++ requires it even for a
+	// null return), and only the .cpp includes vgi_worker_pool.hpp.
 	std::unique_ptr<PooledWorker> ReleaseForPooling() override;
 
-	// Non-copyable and non-movable (contains reference)
 	WebWorkerFunctionConnection(const WebWorkerFunctionConnection &) = delete;
 	WebWorkerFunctionConnection &operator=(const WebWorkerFunctionConnection &) = delete;
 	WebWorkerFunctionConnection(WebWorkerFunctionConnection &&) = delete;
 	WebWorkerFunctionConnection &operator=(WebWorkerFunctionConnection &&) = delete;
 
 private:
-	// Per-checkout correlation id (8 hex). Generated at construction.
+	// Per-connection correlation id, generated at construction.
 	std::string conn_id_hex_;
-	// The stripped `worker:` URL the JS bridge resolves. Used as the worker
-	// label in error messages / logging (there is no filesystem path here).
+	// Canonical browser-worker target; also the worker label in errors/logs.
 	std::string location_;
 	std::string function_name_;
 	std::string function_type_; // "TABLE", "SCALAR", "AGGREGATE"
@@ -234,57 +197,50 @@ private:
 	std::vector<uint8_t> attach_opaque_data_;
 	std::vector<uint8_t> transaction_opaque_data_;
 	std::vector<uint8_t> global_execution_id_;
-	// Stable client-minted per-substream id folded onto every InitRequest this
-	// connection builds (INPUT + FINALIZE). Empty = none. Set via SetSubstreamId.
+	// Client-minted per-substream id sent on every InitRequest (INPUT and
+	// FINALIZE). Empty = none.
 	std::vector<uint8_t> substream_id_;
 	ClientContext &context_;
 	std::map<std::string, Value> settings_;
 	std::vector<VgiSecretRequirement> required_secrets_;
 
-	// The owned SAB slot. -1 until EnsureWorkerSpawned opens it; released on
-	// destruction. A non-negative slot_ is the "worker exists" flag (analog of
-	// the subprocess proc_).
+	// -1 until EnsureWorkerSpawned opens it; released on destruction (or by
+	// ReadDataBatch's abandon path). Non-negative means the worker exists.
 	int slot_ = -1;
 	// Byte offset of this canonical target's independent ABI-v1 region. Zero is
 	// the native-test region; wasm regions are nonzero malloc offsets.
 	int region_offset_ = 0;
 
-	// Streaming-state flags. Bind is just an RPC; no state is tracked for it.
 	bool init_done_ = false;
 	bool data_finished_ = false;
 
-	// Execution ID from GlobalInitResponse
 	std::vector<uint8_t> execution_id_;
 
-	// Producer mode (true for table functions - tick-based data exchange)
 	bool is_producer_mode_ = false;
-	VgiSchemaPtr tick_schema_; // Empty schema for tick batches
+	VgiSchemaPtr tick_schema_; // set only in producer mode
 
-	// Data stream reader (opened during PerformInit / lazily, used for ReadDataBatch)
+	// Opened in PerformInit (producer) or lazily by ReadDataBatch (exchange).
 	std::shared_ptr<VgiInputStream> data_stream_;
 	std::shared_ptr<VgiIpcReader> data_reader_;
 
-	// Input schema for table-in-out/scalar functions (nullptr for regular table functions)
+	// Set = exchange mode (scalar / table-in-out).
 	VgiSchemaPtr input_schema_;
 
-	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
+	// Bind-request context (empty = none): time-travel AT clause, owning schema,
+	// argument names, COPY FROM / TO.
 	std::string at_unit_;
 	std::string at_value_;
-	// Catalog schema owning the function (empty = none). See SetSchemaName.
 	std::string schema_name_;
 	std::optional<std::vector<std::optional<std::string>>> argument_names_;
-
-	// COPY ... FROM / TO context for the bind request (empty = none).
 	std::optional<CopyFromBindContext> copy_from_;
 	std::optional<CopyToBindContext> copy_to_;
 
-	// Input data writer for exchange-mode functions (its SabOutputStream sink is
-	// held alive by the writer for the streaming phase's lifetime).
+	// Tick writer (producer) or input writer (exchange); owns its sink.
 	std::shared_ptr<VgiIpcWriter> input_writer_;
 	bool input_writer_opened_ = false;
 	bool input_writer_closed_ = false;
 
-	// Dynamic filter state for tick-based pushdown (shared with the scan operator)
+	// Dynamic filter pushdown via tick metadata (shared with the scan operator).
 	shared_ptr<TickFilterState> tick_filter_state_;
 	// Which delta of tick_filter_state_ the current stream has been sent.
 	TickFilterCursor tick_filter_cursor_;
@@ -317,8 +273,8 @@ public:
 	}
 
 private:
-	// Conditional-revalidation validators (M6) to attach to the next init
-	// request's custom_metadata. Empty = no key emitted.
+	// Conditional-revalidation validators, sent on a producer stream's first
+	// tick. Empty = no key emitted.
 	std::string cond_if_none_match_;
 	std::string cond_if_modified_since_;
 };

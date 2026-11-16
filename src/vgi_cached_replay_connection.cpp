@@ -5,7 +5,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/error_data.hpp"
-#include "duckdb/common/file_system.hpp" // FileHandle / FileSystem positioned reads (S8)
+#include "duckdb/common/file_system.hpp" // FileHandle / FileSystem positioned reads
 #include "vgi_worker_pool.hpp"           // complete PooledWorker for ReleaseForPooling's deleter
 
 namespace duckdb {
@@ -29,7 +29,6 @@ std::unique_ptr<PooledWorker> CachedReplayConnection::ReleaseForPooling() {
 
 CachedReplayConnection::CachedReplayConnection(std::shared_ptr<const VgiResultCacheEntry> entry)
     : entry_(std::move(entry)) {
-	// Flatten substreams into a single replay order.
 	bool any_batch_index = false;
 	for (const auto &stream : entry_->streams) {
 		for (const auto &b : stream.batches) {
@@ -57,15 +56,11 @@ VgiBatchPtr CachedReplayConnection::ReadDataBatch() {
 	}
 	const VgiCachedBatch *cached = order_[cursor_++];
 
-	// [S8] Disk-backed batch: positioned-read just this batch's IPC bytes from the
-	// blob file (open the handle lazily, hold it for the connection's life). Only
-	// one batch is resident at a time, so a result far larger than RAM streams
-	// with flat memory. In-RAM batches (small adopted entries) use `cached->ipc`.
+	// Disk-backed batch: positioned-read just this batch's IPC bytes, so a result
+	// larger than RAM streams with flat memory. In-RAM batches use `cached->ipc`.
 	VgiBufferPtr ipc = cached->ipc;
 	if (!ipc && cached->disk_ipc_offset >= 0) {
 		if (!disk_handle_) {
-			// The blob is opened once and held for the connection's life; the handle
-			// references ReplayLocalFs(), a process-static FS that outlives it.
 			disk_handle_ = ReplayLocalFs().OpenFile(entry_->disk_path, FileFlags::FILE_FLAGS_READ);
 		}
 		uint8_t *dest = nullptr;
@@ -81,8 +76,7 @@ VgiBatchPtr CachedReplayConnection::ReadDataBatch() {
 		ipc = std::move(b);
 	}
 
-	// Deserialize the self-contained per-batch IPC stream blob (zero-copy: the
-	// batch references `ipc`).
+	// Zero-copy: the batch references `ipc`.
 	VgiBatchPtr batch;
 	try {
 		batch = DeserializeBatch(ipc);

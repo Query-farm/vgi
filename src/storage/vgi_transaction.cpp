@@ -14,13 +14,8 @@
 
 namespace duckdb {
 
-// VgiTransaction implementation
-
 VgiTransaction::VgiTransaction(VgiCatalog &vgi_catalog, TransactionManager &manager, ClientContext &context)
     : Transaction(manager, context), access_mode_(vgi_catalog.GetAccessMode()), vgi_catalog_(vgi_catalog) {
-	// The base class stores `context` as a weak_ptr<ClientContext>; we
-	// reach it via that weak_ptr in Rollback() so we never deref a freed
-	// ClientContext during cross-session/shutdown rollback paths.
 }
 
 VgiTransaction::~VgiTransaction() = default;
@@ -28,11 +23,9 @@ VgiTransaction::~VgiTransaction() = default;
 void VgiTransaction::Start(ClientContext &context) {
 	transaction_state = VgiTransactionState::TRANSACTION_STARTED;
 
-	// Check catalog version — clear cache if metadata changed since last query.
-	// This catches DDL changes from other sessions between queries.
+	// Catches DDL committed by other sessions since the last query.
 	vgi_catalog_.CheckAndInvalidateCache(context, /*transaction_opaque_data=*/{});
 
-	// Call the worker's catalog_transaction_begin RPC if transactions are supported
 	auto &attach_result = vgi_catalog_.attach_result();
 	if (attach_result && attach_result->supports_transactions) {
 		auto &params = vgi_catalog_.attach_parameters();
@@ -49,12 +42,11 @@ void VgiTransaction::Start(ClientContext &context) {
 void VgiTransaction::Commit(ClientContext &context) {
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
 
-	// Retain entries referenced by bound statements even if the provider
-	// throws. DuckDB ends this local transaction on either completion outcome.
-	// Do not publish its metadata as the catalog's committed cache.
+	// Runs before the commit RPC so bound statements keep their entries even if
+	// the provider throws (DuckDB ends the transaction either way). Transaction-
+	// local metadata is never published as the catalog's committed cache.
 	ClearSchemaCache();
 
-	// Call the worker's catalog_transaction_commit RPC
 	if (!transaction_opaque_data_.empty()) {
 		auto &params = vgi_catalog_.attach_parameters();
 		auto &attach_result = vgi_catalog_.attach_result();
@@ -71,22 +63,17 @@ void VgiTransaction::Rollback() {
 	// discard them without clearing another connection's snapshot.
 	ClearSchemaCache();
 
-	// Lock the base class's weak_ptr<ClientContext>. If the original session
-	// has gone away (cross-session rollback during shutdown reconciliation,
-	// extension teardown, etc.), we have no context to dispatch on — skip
-	// the worker RPC and the cache-version probe. The cache will be
-	// rechecked on the next Start anyway. Remote transaction cleanup remains
-	// the provider's responsibility; disconnect or pool eviction does not
-	// necessarily reclaim a transaction in a shared transactor.
+	// The session may be gone (shutdown/teardown rollback): then skip the worker
+	// RPCs. Remote transaction cleanup is then the provider's responsibility;
+	// disconnect or pool eviction does not necessarily reclaim it.
 	auto ctx = context.lock();
 	if (!ctx) {
 		return;
 	}
 
-	// The failed statement left the context marked interrupted
-	// (Executor::PushError); the cleanup RPCs below must still reach the worker.
-	// They are therefore not interruptible by Ctrl-C on non-HTTP transports
-	// (see CleanupRpcScope in vgi_subprocess.hpp).
+	// A failed statement leaves the context interrupted (Executor::PushError), but
+	// these cleanup RPCs must still reach the worker, so they are not
+	// Ctrl-C-interruptible on non-HTTP transports (see CleanupRpcScope).
 	vgi::CleanupRpcScope cleanup_scope;
 
 	DropPendingCtasTables(*ctx);
@@ -100,8 +87,6 @@ void VgiTransaction::Rollback() {
 		}
 	}
 
-	// No extra version RPC is needed. Transaction-local cache entries were
-	// discarded above; other-session changes are caught at the next Start.
 }
 
 void VgiTransaction::AddPendingCtasTable(const std::string &schema_name, const std::string &table_name) {
@@ -166,8 +151,6 @@ void VgiTransaction::ClearSchemaCache() {
 VgiTransaction &VgiTransaction::Get(ClientContext &context, Catalog &catalog) {
 	return Transaction::Get(context, catalog).Cast<VgiTransaction>();
 }
-
-// VgiTransactionManager implementation
 
 VgiTransactionManager::VgiTransactionManager(AttachedDatabase &db_p, VgiCatalog &vgi_catalog)
     : TransactionManager(db_p), vgi_catalog_(vgi_catalog) {

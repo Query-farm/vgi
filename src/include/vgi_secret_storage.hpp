@@ -28,16 +28,13 @@ namespace vgi {
 
 class CatalogAuth;
 
-//! Lazy, remote-backed SecretStorage for Orchard.
-//!
-//! Registered as a catch-all (scope `[""]`) so it sees every (path, type)
-//! secret lookup the SecretManager performs. On a cache miss it fetches the
-//! matching credential from Orchard's separately-versioned secret microservice
-//! over HTTP (VgiSecretProtocol `secret_lookup`), reusing the attached catalog's
-//! OAuth/bearer identity (`CatalogAuth`), caches it with a TTL bounded by the
-//! credential's own expiry, and synthesizes a `KeyValueSecret` of the requested
-//! type. Created/owned per attached VGI catalog (see the per-DB registry on
-//! VgiStorageExtension); inert after the catalog detaches.
+//! Lazy, remote-backed SecretStorage for Orchard. While active it takes part in
+//! every SecretManager (path, type) lookup; on a cache miss it calls the secret
+//! service's VgiSecretProtocol `secret_lookup` over HTTP with the catalog's
+//! `CatalogAuth`, caches the result with a TTL bounded by the credential's own
+//! expiry, and synthesizes a `KeyValueSecret` of the requested type. One per
+//! attached catalog; the SecretManager owns it and VgiStorageExtension keeps a
+//! raw pointer in its provider registry. Inert after DETACH (see Deactivate).
 class VgiRemoteSecretStorage : public SecretStorage {
 public:
 	VgiRemoteSecretStorage(DatabaseInstance &db, std::string storage_name, std::string endpoint,
@@ -63,10 +60,8 @@ public:
 		return false;
 	}
 
-	//! Lifecycle + diagnostics (used by the provider registry / SQL functions).
-	//! Detach is best-effort: SecretManager has no unload, so we flip the active
-	//! flag (drops us from lookups) and flush the cache. The object lives for the
-	//! DB's lifetime.
+	//! DETACH hook. SecretManager has no unload, so this only drops us from
+	//! lookups and flushes the cache; the object lives as long as the DB.
 	void Deactivate();
 	//! Clear the TTL caches. Returns the number of cached positive secrets dropped.
 	idx_t FlushCache();
@@ -99,10 +94,8 @@ private:
 		SteadyTime last_access;
 	};
 
-	// The remote service controls the cardinality of scopes and callers control
-	// lookup paths, so both caches need hard entry limits in addition to TTLs.
-	// Positive entries are larger (they own cloned credentials), while negative
-	// entries are cheap but can have much higher path cardinality.
+	// Hard entry limits besides TTLs: the remote controls scope cardinality and
+	// callers control lookup paths. Negative entries are cheap but per path.
 	static constexpr size_t kMaxPositiveCacheEntries = 1024;
 	static constexpr size_t kMaxNegativeCacheEntries = 4096;
 
@@ -120,19 +113,17 @@ private:
 		int64_t expires_at_unix = 0; // credential's own expiry (0 = none)
 	};
 
-	//! Perform the HTTP secret_lookup RPC and decode/validate the response.
-	//! Mints a transient ClientContext when the caller's transaction has none
-	//! (the system-transaction / null-context path httpfs uses). Throws on
-	//! transport / auth / protocol failure (a legitimate "not found" returns
-	//! ``found=false`` without throwing).
+	//! Perform and validate the secret_lookup RPC. Mints a transient connection
+	//! when the transaction has no context (the system-transaction path httpfs
+	//! uses). "Not found" returns ``found=false``; any transport / auth /
+	//! protocol failure throws.
 	FetchResult FetchRemote(const string &path, const string &type, optional_ptr<CatalogTransaction> transaction);
 
-	//! Build a SecretMatch for ``path`` from a cached/decoded secret (clone +
-	//! SelectBestMatch with this storage's tie-break offset).
+	//! SelectBestMatch for ``path`` on a clone of ``secret``.
 	SecretMatch MatchFromSecret(const KeyValueSecret &secret, const string &path);
 
-	//! Single-flight coordination for one in-progress ``(type, path)`` lookup so
-	//! N concurrent scan threads on the same path share one secret_lookup RPC.
+	//! Single-flight state for one in-progress ``(type, path)`` lookup, so
+	//! concurrent scan threads on the same path share one RPC.
 	struct InflightLookup {
 		std::mutex m;
 		std::condition_variable cv;
@@ -144,10 +135,8 @@ private:
 		int64_t expires_at_unix = 0;
 	};
 
-	//! Build a KeyValueSecret of the requested type. ``values_batch`` is the
-	//! one-row RecordBatch decoded from the response (may be null = no values);
-	//! each column becomes a secret_map entry with a fully-typed DuckDB Value
-	//! (string / int64 / bool / struct / list / nested) via the Arrow→DuckDB bridge.
+	//! Build a KeyValueSecret of the requested type. Each column of the one-row
+	//! ``values_batch`` (may be null) becomes a typed secret_map Value.
 	std::unique_ptr<const KeyValueSecret> Synthesize(ClientContext &context, const string &type,
 	                                                 const std::string &provider, const std::string &name,
 	                                                 const std::vector<std::string> &scope,
@@ -161,12 +150,12 @@ private:
 	std::atomic<bool> active_ {true};
 
 	std::mutex cache_mutex_;
-	//! Positive cache keyed by (type, scope-prefix). A lookup iterates entries
-	//! of the requested type and runs SelectBestMatch, so a cached scope covers
+	//! Positive cache keyed by (type, first scope prefix). Lookups run
+	//! SelectBestMatch over all entries of the type, so a cached scope covers
 	//! every path under it.
 	std::map<std::pair<std::string, std::string>, PositiveEntry> positive_cache_;
-	//! Negative cache keyed by (type, exact path). Short-TTL and coarse so it
-	//! cannot shadow a positive scope match.
+	//! Negative cache keyed by (type, exact path), TTL min(default_ttl, 30s).
+	//! Consulted after the positive cache, so it never shadows a cached match.
 	std::map<std::pair<std::string, std::string>, NegativeEntry> negative_cache_;
 	//! In-flight lookups keyed by (type, path); guarded by cache_mutex_.
 	std::map<std::pair<std::string, std::string>, std::shared_ptr<InflightLookup>> inflight_;

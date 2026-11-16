@@ -1,13 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// Pure helpers for the Unix-socket worker launcher.  No I/O, no fork, no
-// socket calls — every function here is a deterministic transformation that
-// can be exhaustively unit-tested without the system under it.
-//
-// The wire-protocol contract (state-dir layout, hash input, file naming)
-// must stay byte-for-byte compatible with the Python reference launcher in
-// vgi-rpc/vgi_rpc/launcher.py so that `vgi-rpc launch …` and the C++
-// launcher can share a warm worker when both are installed.
+// Pure (no I/O) helpers for the Unix-socket worker launcher, unit-testable in
+// isolation. State-dir layout and hash input must stay byte-for-byte compatible
+// with vgi-rpc's vgi_rpc/launcher.py so both launchers share a warm worker.
 
 #pragma once
 
@@ -20,71 +15,34 @@ namespace duckdb {
 namespace vgi {
 namespace launcher {
 
-// ---------------------------------------------------------------------------
-// Hash + canonical JSON
-// ---------------------------------------------------------------------------
-
-// JSON-encode `s` per RFC 8259 with the same escaping rules Python's
-// json.dumps() uses by default: backslash, double-quote, control chars
-// `\x00..\x1f` as `\u00xx` escapes; printable ASCII passes through; UTF-8
-// passes through (Python with ensure_ascii=False would do the same; we use
-// the default encoding which the Python launcher matches by setting
-// ensure_ascii=True implicitly via separators-only configuration).
-//
-// Returns the encoded string *including* the surrounding double quotes.
+// JSON-encode `s` (including the surrounding quotes) exactly as Python's
+// json.dumps (ensure_ascii=True) encodes os.fsdecode(s) on a UTF-8 filesystem
+// encoding: non-ASCII and DEL become \uXXXX (surrogate pairs above the BMP) and
+// each byte of invalid UTF-8 becomes its surrogateescape \udcXX. Non-UTF-8
+// Python locales decode differently and are not matched.
 std::string EncodeJsonString(const std::string &s);
 
-// Build the canonical JSON payload that gets SHA-256-hashed:
-//
+// Canonical hash input, matching Python's
+// json.dumps(..., sort_keys=True, separators=(",", ":")):
 //     {"cmd":["arg0",…],"cwd":"…","env":{"VGI_RPC_FOO":"x",…}}
-//
-// Rules:
-//   - Object keys appear in this exact order: "cmd", "cwd", "env" (matches
-//     Python's `json.dumps(..., sort_keys=True)` which sorts ASCII-lex —
-//     "cmd" < "cwd" < "env").
-//   - The "env" object's keys are themselves sorted ASCII-lex.
-//   - No whitespace; separators are exactly "," and ":".
-//   - Strings JSON-escaped via EncodeJsonString.
+// with "env" keys sorted by decoded code point (Python str order).
 std::string BuildCanonicalJson(const std::vector<std::string> &argv, const std::string &cwd,
                                const std::map<std::string, std::string> &env_subset);
 
-// Compute the 16-hex-char (lowercase) launcher hash for the given inputs.
-// Equivalent to:
-//   sha256(BuildCanonicalJson(argv, cwd, env)).hexdigest()[:16]
+// sha256(BuildCanonicalJson(argv, cwd, env)).hexdigest()[:16]
 std::string ComputeLauncherHash(const std::vector<std::string> &argv, const std::string &cwd,
                                 const std::map<std::string, std::string> &env_subset);
 
-// Filter a flat env map (keys → values) down to entries whose key starts
-// with "VGI_RPC_".  Output is a sorted map so callers can feed it directly
-// to BuildCanonicalJson / ComputeLauncherHash.
+// Keep only entries whose key starts with "VGI_RPC_".
 std::map<std::string, std::string> FilterVgiRpcEnv(const std::vector<std::pair<std::string, std::string>> &env);
 
-// ---------------------------------------------------------------------------
-// State directory resolution
-// ---------------------------------------------------------------------------
-
-// Resolve the per-user state directory for launcher coordination.
-//
-// POSIX rules (matches vgi_rpc/launcher.py:default_state_dir):
-//   - if $XDG_RUNTIME_DIR is set and non-empty:  $XDG_RUNTIME_DIR/vgi-rpc
-//   - else if $TMPDIR is set and non-empty:      $TMPDIR/vgi-rpc-$EUID
-//   - else:                                      /tmp/vgi-rpc-$EUID
-//
-// `xdg_runtime_dir`, `tmpdir`, and `euid` are passed in explicitly so the
-// function is testable without monkeypatching the process environment.
-// Returns the resolved path with no trailing slash.
-//
-// Windows: there is no XDG / euid, so the result is `<tmpdir>\vgi-rpc`
-// (mirrors vgi_rpc/launcher.py's `tempfile.gettempdir()/vgi-rpc`); the
-// `xdg_runtime_dir` and `euid` arguments are ignored.
+// Per-user launcher state directory (mirrors launcher.py default_state_dir):
+//   POSIX:   $XDG_RUNTIME_DIR/vgi-rpc, else ${TMPDIR:-/tmp}/vgi-rpc-$EUID
+//   Windows: <tmpdir>\vgi-rpc (xdg_runtime_dir and euid ignored)
+// Empty arguments count as unset. No trailing slash.
 std::string ResolveStateDir(const std::string &xdg_runtime_dir, const std::string &tmpdir, uint32_t euid);
 
-// ---------------------------------------------------------------------------
-// Rendezvous path-length validation
-// ---------------------------------------------------------------------------
-
-// AF_UNIX path length cap.  104 on macOS, 108 on Linux/FreeBSD.  Returns
-// the platform-appropriate limit at compile time.
+// AF_UNIX sun_path size, including the trailing NUL.
 constexpr std::size_t MaxUnixPathLen() {
 #if defined(__APPLE__)
 	return 104;
@@ -93,36 +51,19 @@ constexpr std::size_t MaxUnixPathLen() {
 #endif
 }
 
-// Throws std::invalid_argument if `path` is too long for the platform's
-// rendezvous address: the AF_UNIX `sun_path` cap (MaxUnixPathLen, counting the
-// trailing NUL) on POSIX, or the Windows named-pipe name cap on Windows.
-// Otherwise returns silently. The launcher orchestration layer translates
-// std::invalid_argument into DuckDB's InvalidInputException at the boundary;
-// helpers here stay DuckDB-free so the unit-test binary doesn't need to link
-// libduckdb_static. (Formerly ValidateUnixPathLength.)
+// Throws std::invalid_argument if `path` exceeds the AF_UNIX sun_path cap
+// (POSIX) or the named-pipe name cap (Windows). Helpers here throw std
+// exceptions, not DuckDB ones, so the unit-test binary need not link libduckdb.
 void ValidateRendezvousPathLength(const std::string &path);
 
-// ---------------------------------------------------------------------------
-// `launch:` location string parsing (POSIX shell-quote semantics)
-// ---------------------------------------------------------------------------
-
-// Parse the argv portion of a `launch:` location.  `payload` is the part
-// *after* the "launch:" prefix.  Supports:
-//   - simple words separated by whitespace
-//   - double-quoted strings ("…") with backslash escapes for \", \\, \$, \`
-//   - single-quoted strings ('…') as raw literals (no escapes)
-//   - bare backslash escapes outside quotes
-// Throws std::invalid_argument on unterminated quotes or empty argv.
+// Split the part after "launch:" into argv with POSIX shell quoting: '…' raw,
+// "…" with \" \\ \$ \` escapes, bare backslash escapes (backslash is literal
+// on Windows). No expansion. Throws std::invalid_argument on unterminated
+// quotes or empty argv.
 std::vector<std::string> ParseLaunchArgv(const std::string &payload);
 
-// ---------------------------------------------------------------------------
-// Discovery-line parsing
-// ---------------------------------------------------------------------------
-
-// The discovery-line scheme prefix the worker prints on stdout to advertise
-// its rendezvous address: "UNIX:" on POSIX (AF_UNIX socket path), "PIPE:" on
-// Windows (named-pipe name). This is a protocol constant — the C++ launcher and
-// the Python reference launcher/worker (vgi-rpc) must agree on it per platform.
+// Prefix of the stdout line a worker prints to advertise its rendezvous
+// address; protocol constant shared with vgi-rpc.
 inline const char *DiscoveryLinePrefix() {
 #if defined(_WIN32)
 	return "PIPE:";
@@ -138,25 +79,13 @@ enum class DiscoveryParseResult {
 	kMismatch,   // A <prefix> line was seen but its path doesn't match expected.
 };
 
-// Stateful line-by-line scanner that skips noise lines until it sees a
-// UNIX:<path> line matching `expected_path`.  The caller owns a `buffer`
-// string into which it appends new bytes from the worker's stdout; this
-// function consumes complete `\n`-terminated lines from the front of the
-// buffer.
-//
-// Returns kFound the first time a `UNIX:<expected_path>` line is fully
-// consumed.  Returns kMismatch if a `UNIX:` line is seen but its path
-// differs from expected (callers should treat this as a fatal worker bug).
-// Returns kNeedMore otherwise (no terminator yet, or only non-UNIX prefix
-// lines have been consumed).
-// `prefix` is the scheme marker to match (default "UNIX:"; pass
-// DiscoveryLinePrefix() for the platform-appropriate one — "PIPE:" on Windows).
+// Consumes complete lines from the front of `buffer` (the caller appends worker
+// stdout to it), skipping lines without `prefix`. kFound when a
+// <prefix><expected_path> line is consumed; kMismatch (a worker bug) when a
+// <prefix> line names another path; else kNeedMore. Pass DiscoveryLinePrefix()
+// for the platform's prefix.
 DiscoveryParseResult ParseDiscoveryLine(std::string &buffer, const std::string &expected_path,
                                          const std::string &prefix = "UNIX:");
-
-// ---------------------------------------------------------------------------
-// Transport detection (location-string scheme dispatching)
-// ---------------------------------------------------------------------------
 
 bool IsUnixLocation(const std::string &location);
 bool IsLaunchLocation(const std::string &location);

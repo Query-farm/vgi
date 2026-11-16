@@ -24,10 +24,7 @@ std::string VgiGlobalFunctionName(const std::string &prefix, const std::string &
 
 VgiGlobalBinding ResolveVgiGlobalBinding(ClientContext &context, const std::string &catalog_name,
                                          const std::string &function_name) {
-	// A global registration is keyed on the attach alias only. DuckDB has no
-	// API to unregister a function, so the entry survives DETACH — resolving
-	// live here is what makes a re-ATTACH refresh the connection and a DETACH
-	// produce a clear error instead of a stale-worker call.
+	// Resolve by alias every time: the entry survives DETACH (see header).
 	auto db = DatabaseManager::Get(context).GetDatabase(context, Identifier(catalog_name));
 	if (!db) {
 		throw InvalidInputException(

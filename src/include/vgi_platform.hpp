@@ -3,17 +3,9 @@
 // Central platform-capability header.
 //
 // VGI_POSIX_TRANSPORT == 1 when the host provides the POSIX process + socket
-// surface the worker transports need (fork/exec/pipe/select, AF_UNIX, shm).
-// The subprocess, unix://, launch:, and shared-memory transports require it.
-//
-// Windows (MSVC) and Emscripten both lack that full surface, so both currently
-// build HTTP-only and route every other LOCATION scheme to a clear runtime
-// error at connect time. NOTE: Windows needs guards in *more* translation units
-// than Emscripten — Emscripten ships a POSIX emulation layer, so files like
-// vgi_subprocess.cpp / vgi_arrow_ipc.cpp / vgi_shm_segment.cpp compile there
-// unguarded; on MSVC they do not. Use VGI_POSIX_TRANSPORT for the low-level
-// guards and `#if !VGI_POSIX_TRANSPORT` for the transport-dispatch throws so a
-// single condition covers both platforms.
+// surface (fork/exec/pipe/select, AF_UNIX, shm_open). 0 on Windows and
+// Emscripten. Emscripten's POSIX emulation lets some POSIX code compile there
+// unguarded that MSVC rejects, so Windows needs guards in more TUs.
 
 #pragma once
 
@@ -25,37 +17,32 @@
 #endif
 
 // VGI_SUBPROCESS_TRANSPORT == 1 where a child-process worker transport exists:
-// POSIX (fork/exec/pipe/select) and Windows (CreateProcess/CreatePipe +
-// _open_osfhandle, PeekNamedPipe-poll). Emscripten has neither, so it stays
-// HTTP-only. Code shared by the POSIX and Windows subprocess paths (the fd I/O
-// layer, the RPC fd functions, FunctionConnection, the worker pool) guards on
-// this; truly POSIX-only facilities (AF_UNIX, flock launcher, shm) keep guarding
-// on VGI_POSIX_TRANSPORT. Within a VGI_SUBPROCESS_TRANSPORT block, platform
-// syscalls split `#if VGI_POSIX_TRANSPORT … #else (Windows) … #endif`.
+// POSIX and Windows (CreateProcess/CreatePipe, PeekNamedPipe polling), not
+// Emscripten. Code shared by both subprocess paths guards on this; POSIX-only
+// facilities (AF_UNIX, the flock launcher) guard on VGI_POSIX_TRANSPORT. Inside
+// a VGI_SUBPROCESS_TRANSPORT block, syscalls split
+// `#if VGI_POSIX_TRANSPORT … #else (Windows) … #endif`.
 #if VGI_POSIX_TRANSPORT || defined(_WIN32)
 #define VGI_SUBPROCESS_TRANSPORT 1
 #else
 #define VGI_SUBPROCESS_TRANSPORT 0
 #endif
 
-// VGI_SHM_TRANSPORT == 1 where the shared-memory side-channel can run: POSIX
-// (shm_open/mmap) and Windows (CreateFileMapping/MapViewOfFile). It rides on the
-// subprocess/launch pipe for control + signalling and is opt-in via
-// VGI_RPC_SHM_SIZE_BYTES. Emscripten has no cross-worker shared memory, so 0.
+// VGI_SHM_TRANSPORT == 1 where the shared-memory side channel can run: POSIX
+// (shm_open/mmap) and Windows (CreateFileMapping/MapViewOfFile), not
+// Emscripten. It rides on the subprocess/launch pipe for control and is opt-in
+// via VGI_RPC_SHM_SIZE_BYTES.
 #if VGI_POSIX_TRANSPORT || defined(_WIN32)
 #define VGI_SHM_TRANSPORT 1
 #else
 #define VGI_SHM_TRANSPORT 0
 #endif
 
-// VGI_ASYNC_INIT_ENABLED == 1 enables background-thread dispatch of the
-// PerformInit RPC in VgiTableFunctionInitGlobal (std::async on native,
-// VgiWasmAsyncPool on emscripten). When 0, init runs synchronously on the
-// main scheduling thread — slower for fan-outs of N independent pipelines
-// (loses concurrent-batch latency hiding), but avoids the WASM pthread
-// reliability issues (emsdk #19425/#19199/#13303) that hit MAIN_MODULE=1 +
-// pthreads builds when pthread_create runs after side modules dlopen.
-// Default off on emscripten, on elsewhere; overridable via -D at build time.
+// VGI_ASYNC_INIT_ENABLED == 1 dispatches the PerformInit RPC in
+// VgiTableFunctionInitGlobal on a background thread (std::async natively,
+// VgiWasmAsyncPool on Emscripten) so independent pipelines init concurrently.
+// Off by default on Emscripten: pthread_create after side-module dlopen is
+// unreliable in MAIN_MODULE=1 builds (emsdk #19425/#19199/#13303). -D overrides.
 #ifndef VGI_ASYNC_INIT_ENABLED
 #  if defined(__EMSCRIPTEN__)
 #    define VGI_ASYNC_INIT_ENABLED 0
@@ -66,16 +53,12 @@
 
 #if defined(_WIN32)
 #if defined(_MSC_VER)
-// MSVC's CRT has no pid_t. Several widely-included headers use pid_t in
-// declarations that must compile on Windows even though no subprocess is ever
-// spawned there. POSIX provides ::pid_t at global scope (via <sys/types.h>), and
-// the codebase uses unqualified `pid_t` from multiple namespaces (duckdb and
-// duckdb::vgi), so the shim is a global-scope alias. (clang-cl also defines
-// _MSC_VER and lacks pid_t, so it gets the shim too.)
+// MSVC's CRT (and clang-cl's) has no pid_t, but widely-included headers use
+// unqualified `pid_t` from several namespaces, so alias it at global scope as
+// POSIX's <sys/types.h> does.
 using pid_t = int;
 #else
-// MinGW/Clang-on-Windows DO define pid_t in <sys/types.h> (typedef _pid_t pid_t),
-// so defining our own conflicts ("conflicting declaration"). Pull theirs in.
+// MinGW defines pid_t in <sys/types.h>; our own alias would conflict.
 #include <sys/types.h>
 #endif
 #endif

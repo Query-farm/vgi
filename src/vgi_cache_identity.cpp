@@ -24,12 +24,9 @@ std::string ComputeCredentialCacheFingerprint(const std::string &kind,
 
 std::string ComputeSecretCacheFingerprint(
     const std::map<std::string, std::map<std::string, Value>> &resolved_secrets) {
-	// Injective: every component is length-prefixed, and each map is prefixed
-	// with its size, so no two distinct secret sets serialize alike. std::map
-	// iterates in key order, which makes the result independent of resolution
-	// order. The type is part of each value so '1' the VARCHAR and 1 the
-	// INTEGER stay distinct. Never empty — the count alone is a component —
-	// so an unresolved declared secret still gets a real fingerprint.
+	// Injective: components are length-prefixed and maps size-prefixed; std::map
+	// order makes it independent of resolution order; the type keeps VARCHAR '1'
+	// and INTEGER 1 apart. The leading count keeps an empty map non-empty.
 	std::string canonical;
 	auto add = [&canonical](const std::string &s) {
 		canonical += std::to_string(s.size());

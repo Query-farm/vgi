@@ -1,7 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// Thin AF_UNIX client wrapper.  Used by both ``unix://`` (operator-managed
-// worker, no spawn) and ``launch:`` (vgi C++ launcher) code paths.
+// AF_UNIX client socket, used by ``unix://`` (operator-managed worker) and
+// ``launch:`` (Launch()-managed worker).
 
 #pragma once
 
@@ -15,16 +15,11 @@
 namespace duckdb {
 namespace vgi {
 
-// Owns an open AF_UNIX SOCK_STREAM file descriptor; closes it on destruction.
-//
-// All errors throw ``duckdb::IOException`` with a message that names the
-// path and the underlying errno so DuckDB users see a clean diagnostic
-// instead of a raw POSIX number.
+// Owns an AF_UNIX SOCK_STREAM fd; closes it on destruction.
 class UnixSocket {
 public:
 	UnixSocket() = default;
 
-	// Non-copyable, movable.
 	UnixSocket(const UnixSocket &) = delete;
 	UnixSocket &operator=(const UnixSocket &) = delete;
 	UnixSocket(UnixSocket &&other) noexcept;
@@ -32,12 +27,11 @@ public:
 
 	~UnixSocket();
 
-	// Open a fresh AF_UNIX SOCK_STREAM socket and connect() to *path*.
-	// Optional connect timeout (default 2s) bounds how long we wait for
-	// the kernel to accept; a hung worker doesn't make us hang forever.
-	// Throws ``IOException`` on path-too-long, socket()/connect() failure,
-	// timeout, or refused connection.  A listener whose accept queue is full
-	// (``IsAcceptQueueFull``) is retried until the timeout, not refused.
+	// Connect a new socket to *path* within ``connect_timeout``; the returned
+	// fd is blocking. Throws InvalidInputException for a too-long path and
+	// IOException (naming path and errno) for socket/connect failure, refusal
+	// or timeout. A full accept queue (IsAcceptQueueFull) is retried until the
+	// timeout rather than treated as refusal.
 	static UnixSocket Connect(const std::string &path,
 	                           std::chrono::milliseconds connect_timeout = std::chrono::seconds(2));
 
@@ -46,13 +40,11 @@ public:
 	// Never throws.
 	static int ProbeOnce(const std::string &path);
 
-	// True for the errno of a connect() that found a listener with a full
-	// accept queue — alive, only busy.  Linux reports it as EAGAIN; macOS
-	// reports ECONNREFUSED, the same as no listener, so it cannot be told
-	// apart there.
+	// True for a connect() errno meaning "listener alive, accept queue full"
+	// (Linux: EAGAIN). macOS reports ECONNREFUSED, indistinguishable from no
+	// listener.
 	static bool IsAcceptQueueFull(int err);
 
-	// True iff a fd is currently held.
 	bool IsOpen() const {
 		return fd_ >= 0;
 	}
@@ -61,7 +53,7 @@ public:
 		return fd_;
 	}
 
-	// Release ownership of the fd; caller becomes responsible for closing.
+	// Release ownership of the fd to the caller.
 	int Release();
 
 	// Close the fd (idempotent).

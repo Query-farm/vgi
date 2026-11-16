@@ -10,41 +10,15 @@
 namespace duckdb {
 namespace vgi {
 
-// The cap on decompressed output travels as a parameter, defaulted to
-// ``kDefaultMaxDecompressedBytes`` in the header.  Every caller takes that
-// default; the parameter exists so a caller with a known-small payload can
-// tighten it, not so anyone can loosen it.
-
 static constexpr int kDefaultZstdLevel = 3;
-// miniz uses MZ_DEFAULT_LEVEL == 6 for deflate; we mirror it explicitly so
-// the constant doesn't drift if the underlying define changes.
+// MZ_DEFAULT_LEVEL, pinned so it doesn't drift with miniz.
 static constexpr int kDefaultGzipLevel = 6;
 
-// ---------------------------------------------------------------------------
-// zstd
-// ---------------------------------------------------------------------------
-
-// Compression and decompression go through the one-shot ZSTD_compress /
-// ZSTD_decompress entry points, which allocate and free their CCtx/DCtx
-// internally on every call.
-//
-// This used to keep a `thread_local` context per thread and reuse it, to skip
-// that allocation on the per-chunk HTTP exchange hot path. Removed 2026-09-22
-// while chasing DuckDB-Wasm request bodies that arrived at the server with a
-// correct Content-Length but unrelated contents.
-//
-// **That cache was NOT the cause** — the corruption reproduced unchanged on a
-// build without it. The real bug was in DuckDB-Wasm's EM_JS XHR glue, where a
-// pointer above 2 GiB arrives negative and `HEAPU8.slice()` then reads from
-// the wrong end of the heap (haybarn-wasm `lib/src/http_wasm.cc`, fixed in
-// `0c3ca4d6`). Nothing in this file was ever at fault; don't re-litigate the
-// zstd path if a similar report appears.
-//
-// Kept one-shot anyway, on its own merits: the per-call context allocation is
-// microseconds against the network round trip it precedes, and it removes any
-// dependence on `thread_local` semantics inside a dynamically loaded
-// SIDE_MODULE. Do not reintroduce a shared context without first proving
-// that side-module TLS isolates it on every supported client.
+// zstd uses the one-shot entry points (a fresh CCtx/DCtx per call): the
+// allocation is negligible next to the network round trip, and it avoids
+// depending on `thread_local` inside a dynamically loaded Wasm SIDE_MODULE. Do
+// not reintroduce a shared/thread_local context without proving side-module TLS
+// isolates it on every supported client.
 
 static std::string ZstdDecompress(const char *data, size_t size, size_t max_bytes) {
 	using namespace duckdb_zstd;
@@ -69,9 +43,7 @@ static std::string ZstdDecompress(const char *data, size_t size, size_t max_byte
 		return decompressed;
 	}
 
-	// Unknown size — streaming decompress with the same cap as the
-	// frame-header path so a small input claiming infinite output can't
-	// OOM us.
+	// Unknown size: stream, enforcing the same cap incrementally.
 	auto *dstream = ZSTD_createDStream();
 	if (!dstream) {
 		throw IOException("VGI zstd decompression failed: could not create stream");
@@ -114,14 +86,9 @@ static std::vector<uint8_t> ZstdCompress(const uint8_t *data, size_t size, int l
 	return compressed;
 }
 
-// ---------------------------------------------------------------------------
-// gzip (miniz)
-// ---------------------------------------------------------------------------
-//
-// miniz's ``deflateInit2(window_bits=-15)`` emits a raw deflate stream with no
-// wrapper; gzip is that stream sandwiched between a 10-byte header and an
-// 8-byte footer (CRC32 of uncompressed + ISIZE mod 2^32).  Build both
-// directly so we don't depend on miniz's gzip helpers being exported.
+// gzip = a raw deflate stream (miniz, window_bits=-15) between a 10-byte header
+// and an 8-byte footer (CRC32 + ISIZE mod 2^32). Both are built here so we don't
+// depend on miniz's gzip helpers being exported.
 
 static constexpr size_t kGzipHeaderSize = 10;
 static constexpr size_t kGzipFooterSize = 8;
@@ -151,7 +118,6 @@ static void WriteGzipFooter(unsigned char *out, uint32_t crc, uint32_t isize) {
 static std::vector<uint8_t> GzipCompress(const uint8_t *data, size_t size, int level) {
 	using namespace duckdb_miniz;
 	auto bound = mz_compressBound(static_cast<mz_ulong>(size));
-	// Reserve enough room for the deflate body plus the gzip header / footer.
 	std::vector<uint8_t> compressed(kGzipHeaderSize + bound + kGzipFooterSize);
 	WriteGzipHeader(compressed.data());
 
@@ -162,7 +128,7 @@ static std::vector<uint8_t> GzipCompress(const uint8_t *data, size_t size, int l
 	stream.next_out = compressed.data() + kGzipHeaderSize;
 	stream.avail_out = static_cast<mz_uint32>(bound);
 
-	// window_bits = -15 → raw deflate stream (no zlib wrapper)
+	// window_bits = -15: raw deflate (no zlib wrapper)
 	auto init = mz_deflateInit2(&stream, level, MZ_DEFLATED, -15, 9, MZ_DEFAULT_STRATEGY);
 	if (init != MZ_OK) {
 		throw IOException("VGI gzip compression failed at init: %s", mz_error(init));
@@ -176,9 +142,6 @@ static std::vector<uint8_t> GzipCompress(const uint8_t *data, size_t size, int l
 	auto deflated_bytes = stream.total_out;
 	mz_deflateEnd(&stream);
 
-	// CRC32 of the original bytes — required for the gzip footer.  ISIZE is
-	// the uncompressed length mod 2^32, which is fine for any payload below
-	// the 1 GiB cap.
 	auto crc = mz_crc32(MZ_CRC32_INIT, data, size);
 	WriteGzipFooter(compressed.data() + kGzipHeaderSize + deflated_bytes,
 	                static_cast<uint32_t>(crc),
@@ -197,10 +160,9 @@ static std::string GzipDecompress(const char *data, size_t size, size_t max_byte
 		throw IOException("VGI gzip decompression failed: invalid gzip header");
 	}
 	auto flg = bytes[3];
-	// We reject the flags we don't parse rather than silently treating
-	// extras as raw deflate input — VGI workers don't emit FEXTRA / FNAME
-	// / FCOMMENT / FHCRC / FTEXT, so a stream that has them is malformed
-	// from our point of view.
+	// Reject FHCRC / FEXTRA / FNAME / FCOMMENT rather than parse them: VGI
+	// workers never emit them, and skipping them wrongly would feed header bytes
+	// to inflate. FTEXT (a hint) is accepted.
 	if (flg & 0xE0) {
 		throw IOException("VGI gzip decompression failed: reserved FLG bits set");
 	}
@@ -219,15 +181,13 @@ static std::string GzipDecompress(const char *data, size_t size, size_t max_byte
 	stream.next_in = bytes + payload_start;
 	stream.avail_in = static_cast<mz_uint32>(payload_end - payload_start);
 
-	// Raw deflate inflate.
 	auto init = mz_inflateInit2(&stream, -15);
 	if (init != MZ_OK) {
 		throw IOException("VGI gzip decompression failed at init: %s", mz_error(init));
 	}
 
-	// 64 KiB output buffer; loop until MZ_STREAM_END or cap breach.  miniz's
-	// ``mz_inflate`` bounds output per call to ``avail_out`` so this is the
-	// same shape as zstd's bounded streaming branch above.
+	// mz_inflate bounds each call's output to avail_out, so the cap is checked
+	// per 64 KiB step.
 	std::string output;
 	std::vector<unsigned char> tmp(65536);
 	while (true) {
@@ -252,8 +212,7 @@ static std::string GzipDecompress(const char *data, size_t size, size_t max_byte
 			throw IOException("VGI gzip decompression failed: %s", mz_error(status));
 		}
 		if (produced == 0 && stream.avail_in == 0) {
-			// Defensive: avoid infinite loop on a malformed stream where
-			// the decoder neither consumes input nor produces output.
+			// Truncated stream: no input left and no progress.
 			mz_inflateEnd(&stream);
 			throw IOException("VGI gzip decompression stalled");
 		}
@@ -261,10 +220,6 @@ static std::string GzipDecompress(const char *data, size_t size, size_t max_byte
 	mz_inflateEnd(&stream);
 	return output;
 }
-
-// ---------------------------------------------------------------------------
-// Public dispatch
-// ---------------------------------------------------------------------------
 
 static bool TokenEqualsCI(const std::string &lhs, const char *rhs) {
 	auto rhs_len = std::strlen(rhs);
@@ -284,7 +239,7 @@ static bool TokenEqualsCI(const std::string &lhs, const char *rhs) {
 }
 
 HttpEncoding ParseEncoding(const std::string &header_value) {
-	// Strip surrounding whitespace and any q= parameters.
+	// Strip surrounding whitespace and any ;q= parameters.
 	size_t start = 0;
 	while (start < header_value.size() && (header_value[start] == ' ' || header_value[start] == '\t')) {
 		++start;
@@ -364,8 +319,7 @@ std::vector<uint8_t> Compress(HttpEncoding encoding, const uint8_t *data, size_t
 }
 
 std::string Decompress(HttpEncoding encoding, const char *data, size_t size, size_t max_bytes) {
-	// A zero cap would reject every body; treat it as "unset" and fall back
-	// to the default rather than failing in a way that looks like corruption.
+	// 0 means unset (it would otherwise reject every body).
 	if (max_bytes == 0) {
 		max_bytes = kDefaultMaxDecompressedBytes;
 	}

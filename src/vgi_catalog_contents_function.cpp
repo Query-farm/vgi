@@ -61,7 +61,6 @@ void VgiCatalogContentsScan(ClientContext &context, TableFunctionInput &data_p, 
 	vector<Value> info_names;
 	for (auto &schema : snapshot.schemas) {
 		schema_names.emplace_back(schema.name);
-		// Decode the indexed SchemaInfo row from the shared metadata batch.
 		info_names.emplace_back(DecodeContentsSchemaInfo(schema).name);
 	}
 	output.SetValue(0, 0, Value::BIGINT(snapshot.catalog_version));

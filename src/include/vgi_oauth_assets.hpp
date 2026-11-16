@@ -5,22 +5,14 @@
 //
 // Logo artwork embedded in the OAuth callback pages (success / failure).
 //
-// The pages are rendered by the short-lived loopback callback server, which
-// shuts down as soon as the browser has the authorization code. Anything the
-// page references over the network would therefore be a race at best -- and in
-// practice the previously-linked external images drifted (the DuckDB logo URL
-// started 404ing, the VGI logo changed aspect ratio). Both marks are inlined
-// here instead so the page is fully self-contained: no external requests, no
-// broken images, and no callback-server routing for asset paths.
+// The pages are served by the short-lived loopback callback server, which shuts
+// down once the browser has the authorization code, so the page must be
+// self-contained: no external requests and no asset routes. Each mark has a
+// light and a dark cut, selected by prefers-color-scheme.
 //
-// Each mark ships a light-background and a dark-background cut, selected by
-// the page against prefers-color-scheme.
-//
-// VGI mark: 260x189 PNG (quantized), base64 data URI. The dark cut is the same
-// artwork with a cream (#f5f0e0, the dark palette's text color) sticker outline
-// so the mark's own dark-green edge doesn't sink into the dark card; brand
-// colors are untouched. There is no official dark cut published upstream -- if
-// one appears, replace VGI_OAUTH_LOGO_DARK_DATA_URI with it. Regenerate from
+// VGI mark: 260x189 quantized PNG data URI. The dark cut adds a cream
+// (#f5f0e0) sticker outline so the dark-green edge shows on the dark card; no
+// official dark cut exists upstream. Regenerate from
 // https://vgi-rpc.query.farm/logo-hero.png with:
 //   magick logo-hero.png -resize 260x src.png
 //   magick src.png -alpha extract -morphology Dilate Disk:3 mask.png
@@ -30,13 +22,10 @@
 //   # then, per cut: -strip -colors 128 -define png:compression-level=9
 //
 // DuckDB mark: inline SVG from duckdb/logo/DuckDB_Logo-horizontal{,-dark-mode}
-// .svg. Note the two upstream cuts are an INVERSION, not a recolor: the light
-// one draws wordmark + roundel in ink with a yellow duck, the dark one draws
-// them in yellow with the duck as negative space. So both cuts are embedded
-// rather than recoloring one with currentColor -- doing the latter yields a
-// cream disc with a yellow blob in it (a fried egg, not a duck). The dark cut's
-// negative space is painted var(--duck-negative), which the page sets to the
-// dark card background.
+// .svg. The upstream cuts are an inversion, not a recolor (the dark one draws
+// the duck as negative space), so both are embedded rather than recoloring one
+// with currentColor. The dark cut's negative space is var(--duck-negative),
+// which the page sets to the dark card background.
 //
 // Each data URI is split across several string literals because MSVC caps a
 // single string literal at 65535 bytes.

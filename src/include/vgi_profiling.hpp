@@ -13,8 +13,7 @@
 namespace duckdb {
 namespace vgi {
 
-// Check if profiling is enabled via VGI_PROFILE environment variable.
-// Result is cached after first call.
+// VGI_PROFILE environment variable, read once.
 inline bool VgiProfilingEnabled() {
 	static bool initialized = false;
 	static bool enabled = false;
@@ -58,7 +57,6 @@ public:
 			return;
 		}
 
-		// Group by name
 		std::unordered_map<std::string, std::vector<TimingEntry>> grouped;
 		for (const auto &entry : entries_) {
 			grouped[entry.name].push_back(entry);
@@ -201,34 +199,29 @@ private:
 	std::chrono::high_resolution_clock::time_point start_;
 };
 
-// Print profile summary on demand
 inline void VgiProfilePrintSummary() {
 	if (VgiProfilingEnabled()) {
 		ProfileStats::Instance().PrintSummary();
 	}
 }
 
-// Print detailed profile on demand
 inline void VgiProfilePrintDetailed() {
 	if (VgiProfilingEnabled()) {
 		ProfileStats::Instance().PrintDetailed();
 	}
 }
 
-// Clear profile stats
 inline void VgiProfileClear() {
 	ProfileStats::Instance().Clear();
 }
 
-// Register atexit handler to print summary when process exits
-// Call this once during extension initialization
+// Print the summary at process exit. Call once at extension load.
 inline void VgiProfileRegisterAtExit() {
 	if (VgiProfilingEnabled()) {
 		static bool registered = false;
 		if (!registered) {
 			std::atexit([]() {
-				// Use a simple print without locking since we're in atexit
-				// and other threads may have been terminated
+				// No locking: other threads may already be gone at atexit.
 				auto &stats = ProfileStats::Instance();
 				stats.PrintSummaryNoLock();
 			});

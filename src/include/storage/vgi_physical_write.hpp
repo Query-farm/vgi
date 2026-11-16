@@ -5,8 +5,8 @@
 // storage/vgi_physical_write.hpp
 //
 // Physical operators for INSERT, UPDATE, and DELETE on VGI catalog tables.
-// These operators use the table-in-out exchange protocol to send batches
-// to a VGI worker function that processes the write operation.
+// They stream batches to the worker's write function over the table-in-out
+// exchange protocol.
 //
 //===----------------------------------------------------------------------===//
 #pragma once
@@ -28,9 +28,7 @@
 
 namespace duckdb {
 
-// ============================================================================
-// Shared State for all write operations
-// ============================================================================
+// Shared state for all write operations
 
 //! The row ids one DELETE write call has sent. DuckDB hands a non-native
 //! table's DELETE a target row once per matching source row (DELETE ...
@@ -78,31 +76,24 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 	}
 
 	std::unique_ptr<vgi::IFunctionConnection> connection;
-	// BindResult from the bind RPC sent at GetWriteConnection time. Held so
-	// the FINALIZE phase (PerformFinalizeInit) can reference the same bind.
+	// The write connection's bind, reused by the FINALIZE phase (PerformFinalizeInit).
 	vgi::BindResult bind_result;
 	mutex write_lock;
 	bool return_chunk;
 	ColumnDataCollection return_collection; // deep-copies RETURNING rows in Sink
 	idx_t changed_count;
 
-	// Arrow schema for converting DuckDB DataChunks → Arrow batches (input to worker)
+	// Schema of the batches sent to the worker (see NullableWriteInputSchema).
 	vgi::VgiSchemaPtr send_schema;
 
-	// Expected schema for RETURNING-mode response batches (table user-column
-	// schema, sans rowid). Sink validates each non-empty worker response against
-	// this before handing it to ArrowToDuckDB — a worker that emits a count
-	// batch instead of the table-row schema would otherwise read past the end
-	// of the conversion column metadata and crash.
-	// Only set when return_chunk is true.
+	// RETURNING only: the table's user-column schema (sans rowid). Sink checks
+	// each non-empty response against it before ArrowToDuckDB, which would read
+	// past its column metadata (and crash) on a wrongly shaped batch.
 	vgi::VgiSchemaPtr expected_returning_schema;
 
-	// True if the write function declared has_finalize=true on its catalog
-	// metadata. When set, ``FinalizeWriteConnection`` invokes
-	// ``PerformFinalizeInit`` so the worker's ``cls.finalize(params)``
-	// runs and gets one statement-final pass to drain async state and
-	// surface partial-failure errors. False: the legacy close-and-drain
-	// path runs (no finalize callback fires on the worker).
+	// The write function declared has_finalize: FinalizeWriteConnection then runs
+	// a FINALIZE phase (PerformFinalizeInit) instead of a plain close-and-drain,
+	// giving the worker one end-of-statement pass to drain state or raise.
 	bool has_finalize = false;
 
 	//! DELETE: the row ids this write call already sent.
@@ -113,8 +104,8 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 	optional_ptr<VgiTableEntry> ctas_table;
 };
 
-// Local sink state for RETURNING — holds persistent ArrowScanLocalState so that
-// ArrowToDuckDB auxiliary data stays alive during ColumnDataCollection::Append.
+// Local sink state for RETURNING: keeps the ArrowScanLocalState alive so
+// ArrowToDuckDB's auxiliary data survives ColumnDataCollection::Append.
 struct VgiWriteLocalSinkState : public LocalSinkState {
 	VgiWriteLocalSinkState(ClientContext &context, const vgi::VgiSchemaPtr &response_schema,
 	                       const vector<LogicalType> &return_types)
@@ -138,16 +129,12 @@ struct VgiWriteSourceState : public GlobalSourceState {
 	ColumnDataScanState scan_state;
 };
 
-// ============================================================================
-// INSERT Physical Operator
-// ============================================================================
-
 class VgiPhysicalInsert : public PhysicalOperator {
 public:
 	//! INSERT, and a MERGE's INSERT action (whose projection supplies the full
 	//! row). ON CONFLICT never reaches here: DuckDB plans it as a MERGE.
 	VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table, bool return_chunk);
-	// CREATE TABLE AS constructor — table is created during execution, not planning
+	// CREATE TABLE AS: the table is created during execution, not planning.
 	VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, SchemaCatalogEntry &schema,
 	                  unique_ptr<BoundCreateTableInfo> create_info);
 
@@ -181,10 +168,6 @@ private:
 	unique_ptr<BoundCreateTableInfo> create_info; // set for CTAS
 	bool return_chunk;
 };
-
-// ============================================================================
-// DELETE Physical Operator
-// ============================================================================
 
 class VgiPhysicalDelete : public PhysicalOperator {
 public:
@@ -223,10 +206,6 @@ private:
 	bool return_chunk;
 	idx_t rowid_index;
 };
-
-// ============================================================================
-// UPDATE Physical Operator
-// ============================================================================
 
 class VgiPhysicalUpdate : public PhysicalOperator {
 public:

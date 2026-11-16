@@ -14,10 +14,10 @@ class VgiTableSet : public VgiCatalogSet {
 public:
 	VgiTableSet(Catalog &catalog, VgiSchemaEntry &schema);
 
-	// Override GetEntry to do on-demand loading
+	// Hides VgiCatalogSet::GetEntry: loads a single table on demand.
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const std::string &name);
 
-	// Override GetEntry with EntryLookupInfo to handle AT clause for time travel
+	// AT clause (time travel): fetched per call, owned by the transaction, not cached.
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const EntryLookupInfo &lookup_info);
 
 protected:

@@ -1,7 +1,4 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
-//
-// POSIX-only — under emscripten this translation unit is empty.  See
-// vgi_launcher.cpp's banner comment for the policy.
 
 #include "vgi_platform.hpp"
 
@@ -28,9 +25,7 @@ namespace vgi {
 
 namespace {
 
-// RAII helper that closes a non-negative fd on scope exit unless `Release()`
-// is called first.  Used inside Connect() to make the early-return error
-// paths leak-free without an explicit close on each branch.
+// Closes a non-negative fd on scope exit unless Release()d.
 class FdGuard {
 public:
 	explicit FdGuard(int fd) : fd_(fd) {}
@@ -111,9 +106,6 @@ ErrorInfo UnixConnectInfo(const char *subtype, const std::string &path, int err)
 } // namespace
 
 UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::milliseconds connect_timeout) {
-	// Cheap, deterministic check before we touch the kernel.  Translates
-	// std::invalid_argument from ValidateUnixPathLength into the DuckDB
-	// exception users expect at the boundary.
 	try {
 		launcher::ValidateRendezvousPathLength(path);
 	} catch (const std::invalid_argument &e) {
@@ -123,7 +115,7 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 	struct sockaddr_un addr;
 	std::memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	// Length already validated above so the strncpy is safe.
+	// Length validated above.
 	std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
 	auto deadline = std::chrono::steady_clock::now() + connect_timeout;
@@ -137,9 +129,8 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 		}
 		FdGuard guard(raw_fd);
 
-		// We use a non-blocking connect + select() to enforce the timeout.
-		// AF_UNIX connect normally returns immediately, but a hung worker
-		// could leave the kernel queue in a state that blocks us.
+		// Non-blocking connect + select() so a hung worker cannot block us
+		// past the timeout.
 		if (!SetNonBlocking(raw_fd, true)) {
 			const int err = errno;
 			throw IOException(UnixConnectInfo(error_subtype::kLocalResource, path, err),
@@ -148,11 +139,9 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 
 		int rc = ::connect(raw_fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
 		if (rc != 0 && IsAcceptQueueFull(errno)) {
-			// The worker is alive but its accept queue is full — a burst of
-			// connections, typically.  Wait for a slot rather than failing:
-			// a failed connect sends ResolveAndConnect to relaunch a worker
-			// that is fine.  (Linux never reports EINPROGRESS for AF_UNIX, so
-			// there is nothing to select() on; retry the connect instead.)
+			// Alive but busy: wait for a slot rather than fail, since a failed
+			// connect makes ResolveAndConnect relaunch a healthy worker. Linux
+			// gives no EINPROGRESS for AF_UNIX here, so retry the connect.
 			auto now = std::chrono::steady_clock::now();
 			if (now >= deadline) {
 				throw IOException(UnixConnectInfo(error_subtype::kConnectFailed, path, 0),
@@ -165,12 +154,9 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 			continue;
 		}
 		if (rc == 0) {
-			// Connected immediately — common case for an alive AF_UNIX worker.
+			// Connected immediately (the common case).
 		} else if (errno == EINPROGRESS) {
-			// Wait for the socket to become writable, signalling that connect
-			// finished.  ``select()`` (rather than poll) keeps the dependency
-			// surface aligned with the rest of vgi, which already uses it (e.g.
-			// the FdOutputStream write-side readiness wait).
+			// Writable means connect finished; SO_ERROR says how.
 			auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
 			    deadline - std::chrono::steady_clock::now());
 			if (remaining.count() < 0) {
@@ -193,7 +179,6 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 				throw IOException(UnixConnectInfo(error_subtype::kConnectFailed, path, err),
 				                  "vgi unix socket: select() failed for %s: %s", path, std::strerror(err));
 			}
-			// select() said writable; check SO_ERROR to confirm connect succeeded.
 			int so_err = 0;
 			socklen_t so_err_len = sizeof(so_err);
 			if (::getsockopt(raw_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len) < 0) {
@@ -212,8 +197,7 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 			                  "vgi unix socket: connect to %s failed: %s", path, std::strerror(err));
 		}
 
-		// Restore blocking mode for downstream read/write — vgi's IPC code
-		// expects classic blocking semantics.
+		// The IPC streams expect a blocking fd.
 		if (!SetNonBlocking(raw_fd, false)) {
 			const int err = errno;
 			throw IOException(UnixConnectInfo(error_subtype::kLocalResource, path, err),

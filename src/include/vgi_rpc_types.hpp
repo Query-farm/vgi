@@ -19,35 +19,25 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// IPC Bytes Serialization (dataclass-as-binary pattern)
-// ============================================================================
+// IPC bytes serialization (the "dataclass-as-binary" pattern).
 
-// Serialize a RecordBatch to a complete IPC stream in memory (schema + batch + EOS).
-// Returns raw bytes suitable for storing in a binary column.
-// custom_metadata (optional) is attached to the record-batch message, exactly
-// as MakeStreamWriter+WriteRecordBatch(batch, metadata) would — but via the
-// single-allocation payload path (payload sizes are computed up front, so the
-// destination vector is allocated once; no BufferOutputStream realloc chain
-// and no final buffer→vector copy).
+// Serialize a batch to a complete in-memory IPC stream (schema + batch + EOS).
+// custom_metadata, if given, is attached to the record-batch message.
 std::vector<uint8_t> SerializeToIpcBytes(const VgiBatchPtr &batch,
                                           const VgiMetadataPtr &custom_metadata = nullptr);
 
-// Deserialize a RecordBatch from IPC bytes.
+// Deserialize a batch from IPC bytes. Nested IPC payloads come from workers, so
+// the decoded batch is validated (vgi_batch_validation.hpp); callers without a
+// query context keep FULL.
 VgiBatchPtr DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes,
                                                              WorkerBatchValidation validation = WorkerBatchValidation::FULL);
-// Nested IPC payloads come from workers, so the decoded batch is validated
-// (vgi_batch_validation.hpp). Callers without a query context keep FULL.
 VgiBatchPtr DeserializeFromIpcBytes(const uint8_t *data, size_t len,
                                                              WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 
-// Zero-copy variant: decode the inner IPC stream stored in cell ``index`` of a
-// BinaryArray (the "dataclass-as-binary" envelope pattern) WITHOUT copying the
-// bytes. The decode reads from a slice of the batch's values
-// buffer, so the returned batch's arrays refcount-share that buffer — the
-// outer response batch can be dropped freely. Use on response-decode hot
-// paths (bind results, table-buffering envelopes, catalog results) where the
-// pointer-based overload would alloc+memcpy the whole inner payload.
+// Zero-copy variant: decodes from `bytes` (typically a slice of an outer
+// batch's values buffer) without copying. The returned batch's arrays share
+// that buffer's refcount, so the outer batch may be dropped. Prefer this on
+// response-decode hot paths; the pointer overload copies the whole payload.
 VgiBatchPtr DeserializeFromIpcBytesZeroCopy(const VgiBufferPtr &bytes,
                                             WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 
@@ -107,13 +97,10 @@ std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string
                                                     const std::string &referenced_table,
                                                     const std::string &referenced_schema);
 
-// ============================================================================
-// Enum Serialization (dictionary(int16, utf8))
-// ============================================================================
+// Enum serialization: dictionary(int16, utf8).
 
-// Build a dictionary-encoded array with a single value for enum serialization.
-// The dictionary_values should be the list of all enum member names.
-// The value should be the name of the selected member.
+// A one-row dictionary array whose dictionary is all of `dictionary_values`
+// (the enum member names) and whose value is `value`; throws if absent.
 ArrowArray BuildEnumArray(const std::string &value,
                                               const std::vector<std::string> &dictionary_values);
 
@@ -122,19 +109,12 @@ ArrowArray BuildEnumArray(const std::string &value,
 ArrowArray BuildOptionalEnumArray(const std::optional<std::string> &value,
                                                       const std::vector<std::string> &dictionary_values);
 
-// ============================================================================
-// Single-row scalar/list/map builders for the codegen'd request builders.
-// ============================================================================
-//
-// These are public-API helpers consumed by ``vgi/src/generated/vgi_request_builders.hpp``
-// (whose generator lives in vgi-python ``vgi/codegen/cpp_request_builders.py``).
-// Every helper appends exactly one element to a new builder and returns a
-// single-row Array. The non-Optional variants always emit a non-null entry
-// (use them for fields the schema declares ``nullable=false``); the Optional
-// variants emit a null entry when the input is std::nullopt.
-//
-// The generator picks helper names from a fixed mapping; if you change a
-// helper signature here, regenerate the header and re-build.
+// Single-row scalar/list/map builders called by the generated
+// ``generated/vgi_request_builders.hpp`` (generator: vgi-python
+// ``vgi/codegen/cpp_request_builders.py``, which maps fields to these names by a
+// fixed table — changing a signature here requires regenerating). Each returns
+// a one-row array; non-Optional variants always emit a non-null entry, Optional
+// variants emit null for std::nullopt.
 
 // Releases completed request columns if a later field fails validation. On
 // success FromColumns moves the vector and takes ownership of every column.
@@ -174,7 +154,9 @@ ArrowArray BuildOptionalInt32Scalar(std::optional<int32_t> value);
 ArrowArray BuildInt64Scalar(int64_t value);
 ArrowArray BuildOptionalInt64Scalar(std::optional<int64_t> value);
 
-// list<utf8>, list<binary>, list<int32>, list<int64> — single-row lists, always non-null.
+// list<utf8>, list<binary>, list<int32>, list<int64> single-row lists. The
+// Optional/Nullable string variants emit a null list for std::nullopt;
+// BuildNullableStringListScalar also allows null elements.
 ArrowArray BuildStringListScalar(const std::vector<std::string> &values);
 ArrowArray BuildOptionalStringListScalar(const std::optional<std::vector<std::string>> &values);
 ArrowArray
@@ -188,52 +170,40 @@ ArrowArray BuildStringMapScalar(const std::vector<std::pair<std::string, std::st
 ArrowArray
 BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::string, std::string>>> &entries);
 
-// DuckDB 1.5 exposes a single schema identifier. These helpers adapt that
-// boundary to VGI 2.0's structural schema paths without ever flattening a
-// multi-component path.
+// DuckDB exposes a single schema identifier; these adapt it to the protocol's
+// structural schema paths. A path of any depth other than one is rejected,
+// never flattened.
 std::vector<std::string> SingleSchemaPath(const std::string &schema_name);
 std::optional<std::vector<std::string>> OptionalSingleSchemaPath(const std::string &schema_name);
 std::string SchemaNameFromPath(const std::vector<std::string> &schema_path, const std::string &field_name);
 std::string OptionalSchemaNameFromPath(const std::optional<std::vector<std::string>> &schema_path,
                                        const std::string &field_name);
 
-// ============================================================================
 // BindRequest / BindResponse
-// ============================================================================
 
-// COPY ... FROM context attached to a BindRequest (and, via the reused
-// bind_request_bytes, to the InitRequest's bind_call). Set only for a COPY-FROM
-// scan; nullptr/empty otherwise. Mirrors Python's CopyFromContext dataclass:
-//   format: utf8, file_path: utf8, expected_schema: binary (IPC schema bytes).
+// COPY ... FROM context attached to a BindRequest (and so to the InitRequest's
+// bind_call). Set only for a COPY-FROM scan. Mirrors generated::CopyFromContext;
+// expected_schema_bytes is an IPC-serialized schema.
 struct CopyFromBindContext {
 	std::string format;
 	std::string file_path;
 	std::vector<uint8_t> expected_schema_bytes;
 };
 
-// COPY ... TO context attached to a BindRequest (and, via the reused
-// bind_request_bytes, to the InitRequest's bind_call). Set only for a COPY-TO
-// sink; nullptr otherwise. Mirrors Python's CopyToContext dataclass:
-//   format: utf8, file_path: utf8. The source columns ride input_schema.
+// COPY ... TO context attached to a BindRequest (and so to the InitRequest's
+// bind_call). Set only for a COPY-TO sink. The source columns ride input_schema.
 struct CopyToBindContext {
 	std::string format;
 	std::string file_path;
 };
 
-// Build a BindRequest as a RecordBatch (for serialization to IPC bytes).
-// Fields match Python BindRequest dataclass:
-//   function_name: utf8
-//   arguments: binary (Arguments serialized as IPC bytes)
-//   function_type: dictionary(int16, utf8) ("SCALAR", "TABLE", "AGGREGATE")
-//   input_schema: binary|null (serialized Arrow schema)
-//   settings: binary|null (settings RecordBatch as IPC bytes)
-//   secrets: binary|null (secrets RecordBatch as IPC bytes, one struct column per secret)
-//   attach_opaque_data: binary|null
-//   transaction_opaque_data: binary|null
-//   resolved_secrets_provided: bool (true when scoped secrets have been resolved)
+// Build a BindRequest batch (wire shape: generated::BindRequest). Empty byte
+// vectors / strings are sent as null. `secrets` is a batch with one struct
+// column per secret; resolved_secrets_provided is true once scoped secrets have
+// been resolved. function_type must be a FunctionType wire name.
 VgiBatchPtr
 BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
-                 const std::string &function_type,                    // "SCALAR", "TABLE", "AGGREGATE"
+                 const std::string &function_type,                    // FunctionType wire name
                  const std::vector<uint8_t> &input_schema_bytes = {}, // Empty = null
                  const std::vector<uint8_t> &settings_bytes = {},     // Empty = null
                  const std::vector<uint8_t> &secrets_bytes = {},      // Empty = null
@@ -260,12 +230,12 @@ struct BindResponseResult {
 	BindRepeatability repeatability = BindRepeatability::UNKNOWN;
 };
 
-// Parse BindResponse from a deserialized RecordBatch (1 row).
-// Fields: output_schema: binary, opaque_data: binary|null
+// Parse a one-row BindResponse; also validates projection_expression_profiles
+// and repeatability.
 BindResponseResult ParseBindResponse(const VgiBatchPtr &batch,
                                      const std::string &worker_path = "");
 
-// Result of trying to parse scoped secret lookup requests from a BindResponse
+// Scoped secret lookup requests carried by a BindResponse.
 struct BindSecretScopeResponseResult {
 	struct Lookup {
 		std::string secret_type;  // Required — C++ enforces type matching
@@ -275,28 +245,15 @@ struct BindSecretScopeResponseResult {
 	std::vector<Lookup> lookups;
 };
 
-// Try to parse scoped secret lookup requests from a BindResponse batch.
-// If the BindResponse contains non-empty lookup_secret_types field, this is a
-// secret scope request and the function returns the parsed lookups.
-// Returns nullopt if this is a normal BindResponse (no lookup fields or all empty).
+// A BindResponse with a non-empty lookup_secret_types is a secret-scope request:
+// returns its lookups. Returns nullopt for a normal BindResponse.
 std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
     const VgiBatchPtr &batch);
 
-// ============================================================================
 // InitRequest
-// ============================================================================
 
-// Build an InitRequest as a RecordBatch (for serialization to IPC bytes).
-// Fields match Python InitRequest dataclass:
-//   bind_call: binary (BindRequest as IPC bytes)
-//   output_schema: binary (serialized Arrow schema)
-//   bind_opaque_data: binary|null
-//   projection_ids: list<int64>|null
-//   pushdown_filters: binary|null
-//   join_keys: list<large_binary>|null
-//   phase: dictionary(int16, utf8)|null ("INPUT", "FINALIZE")
-//   execution_id: binary|null
-//   init_opaque_data: binary|null
+// Build an InitRequest batch (wire shape: generated::InitRequest). Empty
+// vectors/strings and the negative sentinels below are sent as null.
 VgiBatchPtr BuildInitRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &output_schema_bytes,
@@ -304,7 +261,7 @@ VgiBatchPtr BuildInitRequest(
     const std::vector<int64_t> &projection_ids = {},
     VgiBufferPtr pushdown_filters = nullptr,
     std::vector<VgiBufferPtr> join_keys = {},
-    const std::string &phase = "",          // Empty = null, "INPUT", "FINALIZE"
+    const std::string &phase = "",          // Empty = null, else a VgiInitPhase wire name
     const std::vector<uint8_t> &execution_id = {},
     const std::vector<uint8_t> &init_opaque_data = {},
     const std::string &order_by_column_name = {},   // Empty = null
@@ -317,9 +274,7 @@ VgiBatchPtr BuildInitRequest(
     const std::vector<uint8_t> &substream_id = {},           // parallel streaming table-in-out per-substream id
     const std::vector<std::string> &split_tokens = {});  // splits this init redeems (DuckDB sends one)
 
-// ============================================================================
 // GlobalInitResponse
-// ============================================================================
 
 struct GlobalInitResponseResult {
 	std::vector<uint8_t> execution_id;
@@ -327,21 +282,16 @@ struct GlobalInitResponseResult {
 	std::vector<uint8_t> opaque_data;   // Empty if null
 };
 
-// Parse GlobalInitResponse from a header batch (1 row).
-// Fields: execution_id: binary, max_workers: int64, opaque_data: binary|null
+// Parse a one-row GlobalInitResponse; max_workers < 1 is clamped to 1.
 GlobalInitResponseResult ParseGlobalInitResponse(const VgiBatchPtr &batch,
                                                   const std::string &worker_path = "");
 
-// ============================================================================
-// Catalog Response Unwrapping
-// ============================================================================
-
-// Unwrap response items from a catalog response.
-// Catalog responses wrap items in {items: list<binary>} or {items: list<utf8>}.
-// This extracts the binary items from the list column.
+// Catalog response unwrapping: responses wrap items in {items: list<binary>}
+// or {items: list<utf8>}. Null items are skipped; a missing/null `items` yields
+// an empty vector.
 std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const VgiBatchPtr &batch);
 
-// Unwrap string items (for CatalogsResponse which has items: list<str>)
+// The list<utf8> form.
 std::vector<std::string> UnwrapStringResponseItems(const VgiBatchPtr &batch);
 
 // Unwrap items, deserialize each to a RecordBatch, and validate each item's
@@ -353,16 +303,10 @@ UnwrapAndValidateItems(const VgiBatchPtr &batch,
                        const std::string &method_name,
                        const std::string &worker_path);
 
-// ============================================================================
-// TableFunctionCardinalityRequest / TableCardinality
-// ============================================================================
+// Table function planning / cardinality
 
-// Build a TableFunctionCardinalityRequest as a RecordBatch (for serialization to IPC bytes).
-// Fields match Python TableFunctionCardinalityRequest dataclass:
-//   bind_call: binary (BindRequest as IPC bytes)
-//   bind_opaque_data: binary|null
-//! Build the inner ``TableFunctionPlanRequest`` record (see the .cpp for why
-//! row_limit is absent and target_split_bytes is omitted when 0).
+//! Build the inner ``TableFunctionPlanRequest`` record (see the .cpp for which
+//! fields DuckDB leaves null).
 VgiBatchPtr
 BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
                               const std::vector<uint8_t> &bind_opaque_data,
@@ -375,67 +319,39 @@ VgiBatchPtr BuildTableFunctionCardinalityRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &bind_opaque_data = {});
 
-// Parsed TableCardinality result
 struct TableFunctionCardinalityResult {
 	int64_t estimate = -1;  // -1 = unknown (null from worker)
 	int64_t max = -1;       // -1 = unknown (null from worker)
 };
 
-// Parse TableCardinality from a deserialized RecordBatch (1 row).
-// Fields: estimate: int64|null, max: int64|null
+// Parse a one-row TableFunctionCardinalityResult; an empty batch is unknown.
 TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(
     const VgiBatchPtr &batch,
     const std::string &worker_path = "");
 
-// ============================================================================
-// TableFunctionStatisticsRequest
-// ============================================================================
-
-// Build a TableFunctionStatisticsRequest as a RecordBatch (for serialization to IPC bytes).
-// Wire shape matches TableFunctionCardinalityRequest — the Python worker reconstructs
-// BindParams[TArgs] from bind_call and forwards it to the function's statistics() method,
-// so the worker sees the user's original arguments (e.g. count=10000).
-//   bind_call: binary (BindRequest as IPC bytes)
-//   bind_opaque_data: binary|null
+// Same wire shape as the cardinality request: the worker rebuilds the bind
+// parameters from bind_call, so statistics() sees the user's original arguments.
 VgiBatchPtr BuildTableFunctionStatisticsRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &bind_opaque_data = {});
 
-// ============================================================================
-// TableFunctionDynamicToStringRequest / Response
-// ============================================================================
-
-// Build a TableFunctionDynamicToStringRequest inner batch. Caller serialises and
-// wraps with ``generated::BuildTableFunctionDynamicToStringParams`` to produce the
-// wire params. Fields match Python TableFunctionDynamicToStringRequest:
-//   bind_call: binary (BindRequest as IPC bytes)
-//   bind_opaque_data: binary|null
-//   global_execution_id: binary
+// Inner TableFunctionDynamicToStringRequest batch; the caller serialises it and
+// wraps it with ``generated::BuildTableFunctionDynamicToStringParams``.
 VgiBatchPtr BuildTableFunctionDynamicToStringRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &bind_opaque_data,
     const std::vector<uint8_t> &global_execution_id);
 
-// Parse the response into an InsertionOrderPreservingMap<string>. The wire schema
-// is parallel ``keys: list<utf8>`` / ``values: list<utf8>`` — order on the wire is
-// the order the user emitted from their dynamic_to_string hook.
+// Parse the parallel ``keys`` / ``values`` lists, preserving the order the
+// worker's dynamic_to_string hook emitted them in.
 InsertionOrderPreservingMap<std::string> ParseTableFunctionDynamicToStringResult(
     const VgiBatchPtr &batch,
     const std::string &worker_path = "");
 
-// ============================================================================
-// Hand-coded inner request builders
-// ============================================================================
-//
-// Every catalog method's outer ``*Params`` shape is now generated into
-// ``generated/vgi_request_builders.hpp`` from the Python ``VgiProtocol``
-// (see ``vgi.codegen.cpp_request_builders`` in the sibling vgi-python repo).
-// The hand-coded builders below produce the *inner* request batches that some
-// of those generated outer wrappers expect — the caller serialises an inner
-// batch with ``SerializeToIpcBytes`` and passes the bytes through
-// ``generated::BuildXxxParams(bytes)`` to get the wire-shape outer params.
-// Inner shapes carry list<list<int32>>, list<binary>, embedded Arrow schemas,
-// or other fields the generator does not yet emit.
+// Inner request builders. The outer ``*Params`` shapes are generated
+// (``generated/vgi_request_builders.hpp``); some take an inner request batch,
+// which the caller serialises with ``SerializeToIpcBytes`` and passes to
+// ``generated::BuildXxxParams(bytes)``.
 
 // Build the inner CatalogAttachRequest batch. Caller serialises and wraps
 // with ``generated::BuildCatalogAttachParams`` to produce the wire params.
@@ -447,9 +363,8 @@ VgiBatchPtr BuildCatalogAttachRequest(
     bool query_enabled = false);
 
 
-// Build the inner TableCreateRequest batch (catalog_table_create's payload).
-// Fields match Python TableCreateRequest dataclass; serialise + wrap with
-// ``generated::BuildCatalogTableCreateParams`` for the wire params.
+// Build the inner TableCreateRequest batch (catalog_table_create's payload);
+// serialise + wrap with ``generated::BuildCatalogTableCreateParams``.
 VgiBatchPtr BuildTableCreateRequest(
     const std::vector<uint8_t> &attach_opaque_data, const std::vector<std::string> &schema_path,
     const std::string &name, const VgiSchemaPtr &columns_schema, const std::string &on_conflict,

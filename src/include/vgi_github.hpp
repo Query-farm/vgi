@@ -1,16 +1,11 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// github:// and github-auto:// LOCATION schemes — download a worker executable
-// from a GitHub release, verify it (SHA256), extract the full archive into a
-// cross-process cache directory, and return the absolute path of the worker
-// entrypoint so it can run over the ordinary subprocess transport.
-//
-// A developer-experience convenience (overlaps oci://; the one thing it adds is
-// "no container runtime needed"). SHA256 integrity only in v1 — sigstore/cosign
-// provenance is a deferred follow-up. POSIX-only (the cache uses flock/rename);
-// the dispatch throws on non-POSIX builds before reaching here.
-//
-// See docs/github-transport.md and the design plan.
+// github:// and github-auto:// LOCATION schemes: download a worker from a
+// GitHub release, verify its SHA256 (github:// only when #sha256= is pinned;
+// github-auto:// against the .sha256 sidecar), extract it into a cross-process
+// cache, and return the entrypoint path for the ordinary subprocess transport.
+// No signature/provenance check. Builds without VGI_SUBPROCESS_TRANSPORT throw.
+// See docs/github-transport.md.
 
 #pragma once
 
@@ -64,10 +59,8 @@ GithubCoords ParseGithubAutoLocation(const std::string &location, const std::str
 // real parse reports the error).
 bool IsGithubLatestLocation(const std::string &location);
 
-// ---------------------------------------------------------------------------
 // @latest resolution. The pure pieces are exposed for unit tests; network and
 // cache I/O live in ResolveGithubLatest.
-// ---------------------------------------------------------------------------
 
 // One resolved "latest release" of a repo, as cached on disk.
 struct GithubLatestRecord {
@@ -122,12 +115,10 @@ struct GithubLatestDecision {
 GithubLatestDecision DecideGithubLatest(const GithubLatestRecord *cached, int64_t now, int64_t ttl_seconds,
                                         const std::function<GithubLatestRecord()> &fetch);
 
-// Spawn-site helper: returns `location` unchanged unless it is a github:// /
-// github-auto:// scheme, in which case it resolves to the local cached entrypoint
-// (downloading on a cache miss). Cheap for non-github locations (one prefix
-// check). Call this right before SpawnWorker() at every spawn site so the raw
-// scheme string is never handed to fork/exec. POSIX-only for github schemes; a
-// github location on a non-POSIX build throws.
+// Spawn-site helper: `location` unchanged unless it is github:// /
+// github-auto://, which resolves (ResolveGithubWorker) to the cached entrypoint.
+// Call right before SpawnWorker() at every spawn site so the raw scheme string
+// is never handed to fork/exec.
 std::string ResolveWorkerPath(const std::string &location, ClientContext &context);
 
 // Result of resolving a github-auto:// latest location (see ResolveGithubLatest).
@@ -150,11 +141,10 @@ GithubLatestResolution ResolveGithubLatest(const std::string &location, ClientCo
 // for its whole lifetime.
 std::string PinGithubLatestLocation(const std::string &location, ClientContext &context);
 
-// Resolve a github:// / github-auto:// LOCATION to a local, cached, verified,
-// executable worker entrypoint (absolute path). On a cache miss this fetches the
-// release metadata, downloads the asset, verifies its SHA256, and extracts the
-// full archive tree atomically into the per-user cache. Cross-process safe
-// (coordinate-keyed flock). Throws IOException/InvalidInputException on failure.
+// Resolve a github:// / github-auto:// LOCATION to the absolute path of a cached
+// worker entrypoint. On a miss: fetch release metadata, download, verify the
+// SHA256 (see top of file) before extracting, and move the tree atomically into
+// the cache. Cross-process safe via a coordinate-keyed FileSystem write lock.
 std::string ResolveGithubWorker(const std::string &location, ClientContext &context);
 
 // Row of the vgi_github_cache() diagnostic.

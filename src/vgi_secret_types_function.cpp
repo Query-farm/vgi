@@ -1,21 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
-// =============================================================================
-// vgi_secret_types() — discovery table function. One row per secret type each
-// attached VGI catalog declares.
 //
-// A worker's SecretTypeSpec carries a description and an Arrow parameters
-// schema; ATTACH registers the type with DuckDB's SecretManager, whose
-// duckdb_secret_types() exposes only the name. This surfaces the rest so a
-// client (a directory listing, an agent, vgi-lint) can render a CREATE SECRET
-// template and say which functions need it:
-//   description  — the SecretTypeSpec description
-//   doc_url      — vgi_doc_url schema metadata (how to obtain the credentials)
-//   parameters   — per key: type, required (vgi_required), redact, description (vgi_doc)
-//   required_by  — schema-qualified functions declaring a requirement on the type
-//
-// Reads the attach result already held by the catalog; required_by reuses the
-// schemas' cached function inventories (only for catalogs that declare types).
-// =============================================================================
+// vgi_secret_types() (see the header). Reads the attach result the catalog
+// already holds; required_by reuses the schemas' cached function inventories,
+// and only for catalogs that declare secret types.
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -139,7 +126,8 @@ static unique_ptr<FunctionData> VgiSecretTypesBind(ClientContext &context, Table
 		}
 		auto requirements = CollectRequirements(context, vgi_catalog);
 		for (const auto &st : attach_result->secret_types) {
-			// ATTACH refuses extension-reserved names (iroh); don't advertise them.
+			// ATTACH skips extension-reserved names (iroh) without registering
+			// them, so don't advertise them.
 			if (IsReservedSecretTypeName(st.name)) {
 				continue;
 			}

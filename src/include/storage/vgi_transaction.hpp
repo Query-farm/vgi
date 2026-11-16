@@ -22,7 +22,7 @@ public:
 
 	void Start(ClientContext &context);
 	void Commit(ClientContext &context);
-	void Rollback();  // Uses stored context_ from Start
+	void Rollback(); // Reaches the session through the base Transaction::context weak_ptr
 
 	//! Mutable metadata read through a worker transaction must never share another
 	//! transaction's entries. Null for non-transactional or metadata-frozen workers.
@@ -59,8 +59,6 @@ private:
 	VgiTransactionState transaction_state = VgiTransactionState::TRANSACTION_NOT_YET_STARTED;
 	AccessMode access_mode_;
 	VgiCatalog &vgi_catalog_;
-	// (Rollback uses the base class's `Transaction::context` weak_ptr to
-	// safely reach a ClientContext if one is still alive at rollback time.)
 	unique_ptr<VgiSchemaSet> transaction_schemas_;
 	std::vector<uint8_t> transaction_opaque_data_;   // Assigned by worker's catalog_transaction_begin
 	std::mutex pending_ctas_lock_;

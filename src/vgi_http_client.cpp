@@ -32,27 +32,21 @@
 namespace duckdb {
 namespace vgi {
 
-// Header used to advertise / negotiate the set of supported content
-// encodings.  Mirrors the constant in ``vgi_rpc/http/_common.py``.
+// Mirrors vgi_rpc/http/_common.py.
 static constexpr const char *kSupportedEncodingsHeader = "VGI-Supported-Encodings";
 static constexpr const char *kAcceptMaxResponseBytesHeader = "VGI-Accept-Max-Response-Bytes";
 static constexpr const char *kAcceptMaxResponseBytesSupportHeader =
     "VGI-Accept-Max-Response-Bytes-Support";
 static constexpr int64_t kMinAcceptedMaxResponseBytes = 64LL << 10;
 static constexpr int64_t kMaxSafeInteger = 9007199254740991LL;
-// Independent safety ceiling for a buffered HTTP representation. This is not
-// the VGI decoded Arrow budget: a compressed representation can legitimately
-// be larger than the bytes produced after decoding. HTTPI enforces this while
-// streaming chunks into WASM; DuckDB's native POST API currently exposes the
-// completed string only, so its check is necessarily post-read.
+// Ceiling on a buffered (possibly still encoded) HTTP representation, separate
+// from the decoded-response budget. HTTPI enforces it while streaming; DuckDB's
+// native POST returns only the completed body, so there the check is post-read.
 static constexpr size_t kMaxBufferedRepresentationBytes = 1024ULL * 1024ULL * 1024ULL;
 static constexpr int64_t kDefaultAcceptedMaxResponseBytes = defaults::HTTP_ACCEPTED_MAX_RESPONSE_BYTES;
 
-// Comma-joined list of codecs we can produce / decode, in our preference
-// order — sent on every request so the server can pick a codec for its
-// response.  The reverse direction (what the server accepts on REQUEST
-// bodies) is the ``VGI-Supported-Encodings`` header it stamps on every
-// response; see the renegotiation path in HttpPostArrowIpcInternal.
+// Codecs we decode, in preference order, for the server's response. What the
+// server accepts on request bodies comes back as VGI-Supported-Encodings.
 static std::string ClientAcceptEncoding() {
 	return "zstd, gzip";
 }
@@ -67,9 +61,9 @@ static bool HeaderNameEqual(const std::string &left, const std::string &right) {
 	return true;
 }
 
-// Preserve the native HTTPResponse behavior for http(s), while retaining the
-// ordered duplicate header fields and explicit raw representation marker that
-// arrive through the browser HTTPI SAB envelope.
+// One of: a native http(s) HTTPResponse, a browser HTTPI response, or a native
+// Iroh response. The latter two keep ordered duplicate headers and mark a raw
+// (not browser-decoded) representation.
 struct RpcHttpResponse {
 	std::unique_ptr<HTTPResponse> native;
 	std::optional<httpi::Response> browser;
@@ -157,11 +151,8 @@ struct RpcHttpResponse {
 	}
 };
 
-// Resolve the encoding advertised on a response.  Prefer the custom
-// ``X-VGI-Content-Encoding`` header (older servers stamp this on every
-// response — generic proxies don't fold it), falling back to the standard
-// ``Content-Encoding``.  Returns ``NONE`` when no codec is advertised or
-// when the token is unknown.
+// Prefer X-VGI-Content-Encoding (generic proxies and browsers don't fold it),
+// then Content-Encoding; NONE when absent or unknown.
 template <class RESPONSE>
 static HttpEncoding ResolveResponseEncoding(const RESPONSE &response) {
 	if (response.HasHeader("X-VGI-Content-Encoding")) {
@@ -179,7 +170,6 @@ static HttpEncoding ResolveResponseEncoding(const RESPONSE &response) {
 	return HttpEncoding::NONE;
 }
 
-// Helper: strip trailing slash from a URL
 static std::string NormalizeBaseUrl(const std::string &url) {
 	if (!url.empty() && url.back() == '/') {
 		return url.substr(0, url.size() - 1);
@@ -187,7 +177,6 @@ static std::string NormalizeBaseUrl(const std::string &url) {
 	return url;
 }
 
-// Helper: apply the configurable HTTP timeout setting to request params.
 static uint64_t GetHttpTimeoutSeconds(ClientContext &context) {
 	Value timeout_val;
 	if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
@@ -207,9 +196,8 @@ static int64_t GetAcceptedMaxResponseBytes(ClientContext &context) {
 		    "vgi_http_accepted_max_response_bytes must be between 65536 and 9007199254740991");
 	}
 #if defined(__EMSCRIPTEN__)
-	// The current HTTPI bridge materializes one response in wasm32 linear
-	// memory. Advertise the tighter transport cap so the server never relies on
-	// a value the browser envelope cannot honor.
+	// The HTTPI bridge buffers a whole response in wasm32 memory; never
+	// advertise more than it can hold.
 	result = std::min<int64_t>(result, static_cast<int64_t>(httpi::kMaxBufferedBodyBytes));
 #endif
 	return result;
@@ -219,9 +207,8 @@ static void ApplyHttpTimeout(ClientContext &context, HTTPParams &params) {
 	params.timeout = GetHttpTimeoutSeconds(context);
 }
 
-// Check whether ``url`` is an https origin — used to gate Secure cookies.
+// https (case-insensitive) or httpi: gates Secure cookies.
 static bool UrlIsSecure(const std::string &url) {
-	// Case-insensitive prefix match — HTTPUtil accepts both cases.
 	if (url.size() < 8) {
 		return false;
 	}
@@ -231,20 +218,11 @@ static bool UrlIsSecure(const std::string &url) {
 	return https || IsHttpiTransport(url);
 }
 
-// Collect all Set-Cookie response headers.
-//
-// Caveat: DuckDB's HTTPHeaders is a single-value map keyed on header name
-// (case_insensitive_map_t<string>), and the upstream Set-Cookie spec is
-// explicitly non-foldable (RFC 6265 §3). When a server emits N Set-Cookie
-// headers, DuckDB's wire→HTTPHeaders adapter chooses one of:
-//   (a) keep the last (most underlying clients on a plain map[k]=v assignment),
-//   (b) join with "\r\n" or "\n" between values,
-//   (c) join with ", " (the generic header-folding rule, broken for cookies
-//       whose Expires attribute legitimately contains commas).
-// We can't tell which path the underlying client took, but newline-joins are
-// safely splittable. Splitting on commas is unsafe and is intentionally not
-// attempted — at worst we recover one cookie under (a)/(c), which matches the
-// pre-fix behavior, and recover all of them under (b).
+// Native responses: DuckDB's HTTPHeaders holds one value per name, and
+// Set-Cookie must not be comma-folded (RFC 6265 §3; Expires contains commas).
+// Depending on the backend, N Set-Cookie headers arrive as the last one, or
+// joined by newlines, or joined by ", ". Only newline joins are split; comma
+// splitting is deliberately not attempted.
 static std::vector<std::string> CollectSetCookieHeaders(const RpcHttpResponse &response) {
 	std::vector<std::string> out;
 	if (!response.HasHeader("Set-Cookie")) {
@@ -274,12 +252,11 @@ static std::vector<std::string> CollectSetCookieHeaders(const RpcHttpResponse &r
 	return out;
 }
 
-// Whether a request armed with ``cancellation`` ended because the flag flipped.
-// The curl backend marks such a response cancelled; a backend that cannot abort
-// mid-transfer (the in-tree httplib fallback) instead fails it or lets it finish,
-// and a failure with the flag set is still the interrupt, not a transport fault.
-// A response that completed normally is kept: the scan loop reports the
-// interrupt at its next check, and the stream token stays in step meanwhile.
+// Whether a request armed with `cancellation` ended because of the interrupt.
+// A backend that cannot abort mid-transfer fails the request or lets it
+// finish; a failure while interrupted is still the interrupt. A response that
+// completed normally is kept: the scan loop reports the interrupt at its next
+// check, keeping the stream token in step.
 static bool IsInterruptedRequest(ClientContext *cancellation, const HTTPResponse *response) {
 	if (!cancellation || !cancellation->IsInterrupted()) {
 		return false;
@@ -287,13 +264,10 @@ static bool IsInterruptedRequest(ClientContext *cancellation, const HTTPResponse
 #if VGI_ENGINE_HAS_HTTP_CANCELLATION
 	return !response || response->IsCancelled() || response->HasRequestError();
 #else
-	// Without engine HTTP cancellation the request was never aborted; a transport
-	// failure that coincides with the interrupt is still reported as the interrupt.
 	return !response || response->HasRequestError();
 #endif
 }
 
-// Forward declarations — defined below with the capability-header parsing.
 template <class RESPONSE>
 static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response);
 template <class RESPONSE>
@@ -302,19 +276,10 @@ template <class RESPONSE>
 [[noreturn]] static void ThrowNotAVgiServer(const RESPONSE &response, int status, const std::string &body,
                                             const std::string &url);
 
-// Internal: perform a single HTTP POST with optional auth header.
-//
-// cached_http_params: when non-null, use it instead of calling
-// HTTPUtil::InitializeParameters. The cached path avoids re-entering the
-// secret manager (which takes the MetaTransaction mutex) on every request —
-// required for HTTP RPCs invoked from VgiTransaction::Start to not deadlock.
-// TODO(#22258): drop when https://github.com/duckdb/duckdb/issues/22258 is fixed.
-//
-// request_encoding: codec for the body, chosen by the caller from the
-// capabilities harvested so far. When the server turns out not to accept it,
-// the renegotiate-and-retry path below re-encodes once (gated by
-// allow_codec_retry so a retry can't recurse).
-// harvested_caps: in/out — refreshed from this response's capability headers.
+// One POST (plus at most one codec-renegotiation retry, gated by
+// allow_codec_retry). Returns "" on 401; the caller handles auth.
+// cached_http_params: see HttpInvokeUnary.
+// TODO(duckdb/duckdb#22258): drop the cached-params requirement once fixed.
 static std::string HttpPostArrowIpcInternal(
     ClientContext &context, const std::string &url, const std::vector<uint8_t> &body, const std::string &bearer_token,
     const std::shared_ptr<SessionCookieJar> &cookie_jar, std::unique_ptr<RpcHttpResponse> &out_response,
@@ -338,22 +303,14 @@ static std::string HttpPostArrowIpcInternal(
 		    std::min(effective_max_response_bytes, harvested_caps->max_response_bytes);
 	}
 
-	// Skip compression for tiny bodies (producer ticks, small unary
-	// envelopes): zstd adds CPU on the per-request hot path and often GROWS a
-	// sub-KiB payload past its raw size. The server treats an absent
-	// Content-Encoding header as identity (do NOT send a literal "identity"
-	// token — the server 415s unknown codecs).
+	// Tiny bodies (ticks, small unary envelopes) go uncompressed: compression
+	// costs CPU and often grows them. Identity means NO Content-Encoding header
+	// — the server 415s a literal "identity" token.
 	static constexpr size_t kMinCompressBytes = 1024;
 	if (request_encoding != HttpEncoding::NONE && body.size() < kMinCompressBytes) {
 		request_encoding = HttpEncoding::NONE;
 	}
 
-	// Compress the request body with the chosen codec.  The caller picked it
-	// from whatever ``VGI-Supported-Encodings`` we have already harvested for
-	// this server (zstd when nothing is known yet — the pre-update default);
-	// a server that turns out not to accept it is recovered by the
-	// renegotiate-and-retry path below.  The NONE path posts ``body``
-	// directly — no copy.
 	std::vector<uint8_t> compressed_body;
 	const uint8_t *req_body_data = body.data();
 	size_t req_body_size = body.size();
@@ -389,10 +346,8 @@ static std::string HttpPostArrowIpcInternal(
 	out_response = std::make_unique<RpcHttpResponse>();
 	if (is_httpi) {
 #if defined(__EMSCRIPTEN__)
-		// Only the backend changes: the surrounding auth, cookie, capability,
-		// compression, error and continuation state machine remains identical.
-		// BrowserPost never retries a transport failure, because POST dispatch may
-		// be ambiguous once Iroh accepted request bytes.
+		// BrowserPost never retries a transport failure: once Iroh accepted the
+		// request bytes, whether the POST dispatched is ambiguous.
 		out_response->browser = httpi::BrowserPost(context, url, httpi_headers, req_body_data,
 		                                        req_body_size, timeout_seconds,
 		                                        kMaxBufferedRepresentationBytes,
@@ -429,9 +384,9 @@ static std::string HttpPostArrowIpcInternal(
 			params = std::shared_ptr<HTTPParams>(owned.release());
 		}
 #if VGI_ENGINE_HAS_HTTP_PARAMS_CLONE
-		// Provider-specific parameters are cached across queries. Clone polymorphically
-		// before choosing this request's interruption/retry policy; a rollback or cleanup
-		// must still run after its caller was interrupted.
+		// The cached params are shared across queries: clone (polymorphically,
+		// keeping provider fields) before setting this request's interrupt/retry
+		// policy. Clear any interrupt so a rollback or cleanup still runs.
 		std::shared_ptr<HTTPParams> request_params = params->Clone();
 		request_params->interrupt_context.reset();
 		if (cancellation) {
@@ -441,15 +396,11 @@ static std::string HttpPostArrowIpcInternal(
 			request_params->retries = 0;
 		}
 #else
-		// No polymorphic HTTPParams::Clone (and no interrupt hook) on this engine,
-		// and copying the base would drop the provider's TLS/credential fields,
-		// so the shared snapshot is used as-is and never mutated. Every
-		// single-attempt method is a catalog RPC, and the catalog hands those its
-		// dedicated retries=0 snapshot (VgiAttachParameters::GetOrInitHttpParams).
-		// A single-attempt request arriving with a retrying snapshot is a caller
-		// bug: refuse it before dispatch. Building fresh parameters here instead
-		// would re-enter the secret manager, which deadlocks when the RPC runs
-		// inside VgiTransaction::Start (duckdb#22258).
+		// No polymorphic Clone here, and copying the base would drop provider
+		// TLS/credential fields, so the shared snapshot is used unmodified.
+		// Single-attempt methods must arrive with the retries=0 snapshot from
+		// GetOrInitHttpParams; anything else is a caller bug (building fresh
+		// params would hit the duckdb#22258 deadlock).
 		std::shared_ptr<HTTPParams> request_params = params;
 		if (single_attempt && request_params->retries != 0) {
 			throw InternalException("vgi: single-attempt HTTP RPC to %s was given HTTP parameters that retry (%llu); "
@@ -466,9 +417,8 @@ static std::string HttpPostArrowIpcInternal(
 		} else {
 			out_response->native = http_util.Request(post);
 		}
-		// Checked before anything reads the response: an aborted transfer carries
-		// no capability headers either, so it would otherwise surface as a
-		// misleading "does not advertise" or transport error.
+		// Before reading the response: an aborted transfer would otherwise surface
+		// as a misleading "not a VGI server" or transport error.
 		if (IsInterruptedRequest(cancellation, out_response->native.get())) {
 			throw InterruptException();
 		}
@@ -494,24 +444,15 @@ static std::string HttpPostArrowIpcInternal(
 		}
 	}
 
-	// Harvest server capabilities off this response — ANY response, whatever
-	// its status. The server middleware stamps the capability headers on every
-	// one, so callers that pass a harvest slot learn ServerCapabilities from
-	// traffic they were already generating (avoiding later re-probes after the
-	// mandatory initial discovery),
-	// and — the reason this runs before the status handling below — a failure
-	// caused by a codec the server can't decode still tells us which codecs it
-	// can. A response with no VGI capability header at all (a proxy error page,
-	// a non-VGI endpoint) never came from a VGI server, so it is reported as
-	// that rather than parsed as "server advertises nothing".
-	// Transport-level failure (connection refused, timeout, reset): with
-	// try_request set, HTTPUtil hands these back as a response carrying a
-	// request error rather than throwing. There is no HTTP status, body or
-	// header to inspect, so it is reported before anything reads them.
+	// With try_request, HTTPUtil returns transport failures (refused, timeout,
+	// reset) as a response carrying a request error, with no status or headers.
 	if (out_response->HasRequestError()) {
 		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
 		                  "VGI HTTP request failed (transport error): %s [url: %s]", out_response->GetError(), url);
 	}
+	// Harvest capabilities from EVERY response, before status handling: a
+	// failure caused by a codec the server can't decode still says which codecs
+	// it can. No capability header at all means it did not come from a VGI server.
 	if (!HasCapabilityHeaders(*out_response)) {
 		ThrowNotAVgiServer(*out_response, static_cast<int>(out_response->Status()), out_response->FallbackBody(),
 		                   url);
@@ -522,9 +463,8 @@ static std::string HttpPostArrowIpcInternal(
 		    std::min(effective_max_response_bytes, response_caps.max_response_bytes);
 	}
 	if (harvested_caps) {
-		// Optional capability fields refine the discovery snapshot; omission
-		// does not revoke a previously advertised hard bound. Exact support is
-		// intentionally not inherited because every response must prove it.
+		// An omitted optional field keeps the snapshot's value; budget support
+		// is not inherited because every response must prove it.
 		if (response_caps.max_response_bytes < 0) {
 			response_caps.max_response_bytes = harvested_caps->max_response_bytes;
 		}
@@ -551,33 +491,18 @@ static std::string HttpPostArrowIpcInternal(
 	}
 
 	if (out_response->Status() == HTTPStatusCode::Unauthorized_401) {
-		// Return empty — caller handles 401
 		return "";
 	}
 
-	// Codec renegotiation: the request failed and the server just told us which
-	// content encodings it accepts — and ours isn't one of them. Re-encode and
-	// retry once. Covers both directions of the mismatch:
-	//   * a gzip-only server (advertises "gzip", 415s our zstd body), and
-	//   * a compression-disabled server, which advertises the header with an
-	//     EMPTY value. That is a positive "I speak no compression", distinct
-	//     from an absent header (a pre-update server, still assumed zstd), and
-	//     routes us into the same identity path small bodies already take: post
-	//     the bytes verbatim with no Content-Encoding header at all. Such a
-	//     server has no decompressor, so it can't answer 415 — it fails while
-	//     parsing the body (HTTP 500) — which is why this is keyed on the
-	//     capability header rather than on a particular status code.
-	// Only fires when the codec we used is genuinely unacceptable, so a request
-	// the server did decode and then failed on is never re-sent.
-	//
-	// Cost note: recovery here is the fallback, not the steady state. The
-	// harvested snapshot is cached per catalog (ServerCapabilitiesCache), so a
-	// compression-disabled server costs one rejected request for the whole
-	// ATTACH — and, because 500 is retryable, HTTPUtil burns its own retry
-	// budget on that one before handing it back (~0.5 s of backoff, once).
-	// Everything after it goes out as identity on the first try.
-	// A 415 explicitly rejects the request representation before dispatch.
-	// A 500 can follow successful mutation and must never trigger a replay.
+	// Codec renegotiation: the request failed and the server's advertised
+	// encodings exclude ours, so re-encode and retry once. Covers a gzip-only
+	// server (415s zstd) and a compression-disabled one (EMPTY
+	// VGI-Supported-Encodings; an absent header is a pre-update server, assumed
+	// zstd). The latter has no decompressor and fails parsing with HTTP 500, so
+	// this keys on the capability header, not the status. With the snapshot
+	// cached per catalog this costs one rejected request per ATTACH.
+	// Single-attempt methods retry only on 415 (rejected before dispatch): a 500
+	// can follow a successful mutation and must never be replayed.
 	if (allow_codec_retry && (!single_attempt || out_response->Status() == HTTPStatusCode::UnsupportedMediaType_415) &&
 	    !out_response->Success() && response_caps.discovered &&
 	    !ServerAcceptsRequestEncoding(response_caps, request_encoding)) {
@@ -598,9 +523,7 @@ static std::string HttpPostArrowIpcInternal(
 			                  static_cast<unsigned long long>(error_body.size()),
 			                  static_cast<unsigned long long>(kMaxBufferedRepresentationBytes), url);
 		}
-		// Decompress if the server advertised a codec we know — otherwise
-		// Arrow IPC parsing would see compressed-stream magic bytes and
-		// throw "negative continuation token".
+		// Decode first, or the IPC parse below would read compressed bytes.
 		auto error_enc = ResolveResponseEncoding(*out_response);
 		if (!error_body.empty() && error_enc != HttpEncoding::NONE) {
 			error_body = Decompress(error_enc, error_body.data(), error_body.size(),
@@ -616,12 +539,9 @@ static std::string HttpPostArrowIpcInternal(
 		    out_response->HasHeader("Content-Type") ? out_response->GetHeaderValue("Content-Type") : std::string();
 		bool is_arrow_ipc = content_type.find(ARROW_IPC_CONTENT_TYPE) != std::string::npos;
 
-		// If the body looks like Arrow IPC, parse it. Two outcomes:
-		// 1) ReadUnaryResponseFromBuffer dispatches a VGI-protocol error batch and throws
-		//    an IOException with the worker's original message — we re-throw.
-		// 2) It returns a data batch (e.g., a server-specific error representation
-		//    carrying fields like {"exception_type", "exception_message", "traceback"}).
-		//    Extract textual columns as a readable preview.
+		// An Arrow IPC body either holds a VGI error batch (ReadUnaryResponseFromBuffer
+		// throws the worker's message; rethrown) or a data batch, whose textual
+		// columns become the preview.
 		std::string body_preview;
 		if (is_arrow_ipc && !error_body.empty()) {
 			try {
@@ -676,33 +596,18 @@ static std::string HttpPostArrowIpcInternal(
 		    body_preview.empty() ? out_response->GetError() : body_preview, url);
 	}
 
-	// In the browser (WASM), fetch/XHR transparently decompresses any STANDARD
-	// Content-Encoding (gzip/br/zstd) before the bytes reach us, leaving the body
-	// decoded while Content-Length still reports the *compressed* size. The custom
-	// X-VGI-Content-Encoding header is NOT folded by the browser, so it still
-	// routes through our own decompressor. So when the server stamped a standard
-	// Content-Encoding (and not X-VGI-Content-Encoding), treat the body as already
-	// decoded: skip the size check and skip our own decompress below.
 	bool browser_decoded = false;
 #if defined(__EMSCRIPTEN__)
-	// The browser's HTTP stack transparently decompresses any standard
-	// Content-Encoding (gzip/br/zstd) and MAY strip the Content-Encoding header
-	// while leaving a stale, compressed Content-Length. The only encoding we
-	// decompress ourselves in the browser is the custom X-VGI-Content-Encoding,
-	// which the browser never folds. So when X-VGI-Content-Encoding is absent the
-	// body is already final (browser-decoded or uncompressed): skip the
-	// Content-Length check and our own decompress. We deliberately do NOT gate on
-	// HasHeader("Content-Encoding") — that header is unreliable post-decompression.
+	// The browser decodes any standard Content-Encoding itself and may strip that
+	// header while leaving the compressed Content-Length. Only the custom
+	// X-VGI-Content-Encoding is left for us, so without it (and without a raw
+	// representation) the body is final: skip the Content-Length check and our
+	// decompress. Content-Encoding is not a reliable signal here.
 	browser_decoded = !out_response->RawRepresentation() && !out_response->HasHeader("X-VGI-Content-Encoding");
 #endif
 
-	// Defensive: if the server sent a Content-Length header, ensure the
-	// buffered body matches. Truncated responses (mid-stream proxy timeout,
-	// dropped connection on a chunked transfer that the underlying client
-	// silently swallows) would otherwise be parsed as a valid empty result
-	// — silent wrong-result. Arrow IPC tolerates a truncated body by
-	// returning Invalid which we'd previously treat as EOS. Skipped when the
-	// browser transparently decompressed (body no longer matches Content-Length).
+	// A truncated body (proxy timeout, dropped connection the client swallowed)
+	// could parse as a valid short result: enforce Content-Length when present.
 	if (!browser_decoded && out_response->HasHeader("Content-Length")) {
 		const auto content_length_str = out_response->GetHeaderValue("Content-Length");
 		try {
@@ -714,21 +619,13 @@ static std::string HttpPostArrowIpcInternal(
 				                  static_cast<unsigned long long>(response_body.size()), url);
 			}
 		} catch (const std::invalid_argument &) {
-			// Malformed Content-Length — let the caller's Arrow parser
-			// decide whether the body is intelligible.
+			// Malformed Content-Length: leave it to the Arrow parser.
 		} catch (const std::out_of_range &) {
 			// Same.
 		}
 	}
 
-	// Decompress the response if the server stamped a codec we know. On WASM the
-	// browser already decoded a standard Content-Encoding (browser_decoded), so
-	// there's nothing left for us to decompress in that case.
 	auto resp_enc = browser_decoded ? HttpEncoding::NONE : ResolveResponseEncoding(*out_response);
-	// Capture the on-the-wire size before app-level decompression so the log
-	// below reflects what was actually read off the socket. VGI uses the custom
-	// X-VGI-Content-Encoding header (which generic proxies/clients don't fold),
-	// so response_body here is still the compressed application body.
 	const size_t resp_wire_bytes = response_body.size();
 	if (resp_enc != HttpEncoding::NONE && !response_body.empty()) {
 		response_body = Decompress(resp_enc, response_body.data(), response_body.size(),
@@ -742,14 +639,8 @@ static std::string HttpPostArrowIpcInternal(
 		                  static_cast<unsigned long long>(effective_max_response_bytes), url);
 	}
 
-	// Per-response payload accounting for HTTP-transport debugging: how many
-	// bytes were read, whether the response was compressed (and with which
-	// codec), the decompressed size, and the decompression ratio. Both request
-	// directions are included so a slow scan can be attributed to wire volume vs
-	// codec choice. Surfaced via VGI_LOG (duckdb_logs type 'VGI' + stderr when
-	// VGI_STDERR_LOG=1). The matching Content-Length check above guards truncation.
-	// Gated: this fires once per request on the hot path, so skip the ~10-field
-	// string build (snprintf, to_string) when no sink is listening.
+	// Per-response wire/codec accounting. Gated: runs once per request on the
+	// hot path, so skip building the fields when no log sink is listening.
 	if (VgiInfoLogActive(context)) {
 		const bool resp_compressed = resp_enc != HttpEncoding::NONE;
 		char ratio_buf[32];
@@ -769,25 +660,17 @@ static std::string HttpPostArrowIpcInternal(
 		         {"resp_decompress_ratio", ratio_buf}});
 	}
 
-	// Server errors are sent as HTTP 200 with X-VGI-RPC-Error: true header
-	// (so that clients which discard response bodies on 5xx still receive
-	// the Arrow IPC error metadata). Parse the error batch and throw.
+	// Worker errors arrive as HTTP 200 + `X-VGI-RPC-Error: true`, so clients that
+	// discard 5xx bodies still get the Arrow IPC error batch.
 	if (out_response->HasHeader("X-VGI-RPC-Error") && out_response->GetHeaderValue("X-VGI-RPC-Error") == "true") {
 		auto &error_body = response_body;
 		if (!error_body.empty()) {
-			// Walk EVERY concatenated IPC stream in the body, not just the
-			// first. A streaming RPC replies with a header stream plus a data
-			// stream, so a producer that raises on its first next_batch puts
-			// the error in stream two; reading only stream one finds a valid
-			// header, returns without throwing, and loses the message to the
-			// generic throw below. DispatchErrorStreamsFromBuffer dispatches
-			// the error batch, which throws with the worker's own message.
-			//
-			// With a caller-supplied error context the errors name the worker,
-			// the execution and the function, and the worker's own log lines
-			// before the failure reach duckdb_logs, as on a subprocess stream.
-			// Without one (e.g. the cancel dispatcher's request, which runs off
-			// the query thread) nothing is logged, as before.
+			// Walk EVERY concatenated IPC stream: a streaming RPC replies with a
+			// header stream then a data stream, so an error raised on the first
+			// batch lives in stream two. With an error_context, errors name the
+			// worker/execution/function and the worker's log lines reach
+			// duckdb_logs; without one (e.g. the cancel dispatcher, off the query
+			// thread) nothing is logged.
 			DispatchErrorStreamsFromBuffer(reinterpret_cast<const uint8_t *>(error_body.data()), error_body.size(),
 			                               error_context ? &context : nullptr, url, error_context);
 		}
@@ -805,16 +688,11 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
                              duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *harvested_caps,
                              const std::shared_ptr<IrohClientConfig> &iroh_config,
                              ClientContext *cancellation, const RpcErrorContext *error_context) {
-	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
 		token = auth->GetToken();
 	}
 
-	// ``harvested_caps`` is in/out: a discovered snapshot on the way in picks
-	// the request codec (so a server that already told us it speaks no
-	// compression is never sent a compressed body again), and it is refreshed
-	// from this response's capability headers on the way out.
 	const HttpEncoding request_encoding = harvested_caps ? ChooseRequestEncoding(*harvested_caps) : HttpEncoding::ZSTD;
 
 	std::unique_ptr<RpcHttpResponse> response;
@@ -826,7 +704,6 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 		return result;
 	}
 
-	// Got 401 — need auth to handle it
 	if (!auth) {
 		throw IOException(BuildHttpExtraInfo(http_error::kAuthRequired, url, 401),
 		                  "VGI HTTP authentication required (HTTP 401) but no auth configured for this catalog "
@@ -834,18 +711,9 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 		                  url);
 	}
 
-	// Look for an OAuth challenge. Two cases lead to "there is none", and they
-	// must be handled IDENTICALLY: no WWW-Authenticate header at all, and a
-	// header that is a perfectly valid challenge carrying no OAuth
-	// resource_metadata — RFC 6750's `Bearer realm="..."`, which is what a
-	// plain bearer-auth server is supposed to send. Treating the second as a
-	// hard error rejected the more standards-compliant server: the vgi-java
-	// worker sends the RFC-6750 form, so a rejected bearer token surfaced as
-	// "no OAuth resource_metadata in WWW-Authenticate header" instead of
-	// "bearer token was rejected" — and because that text contains "HTTP",
-	// DuckDB's sqllogic runner silently SKIPPED the whole bearer_auth test
-	// file rather than failing it, so the suite reported green with zero
-	// bearer coverage.
+	// No WWW-Authenticate header and a valid challenge without OAuth
+	// resource_metadata (RFC 6750 `Bearer realm="..."`, what a plain bearer
+	// server sends) must be handled IDENTICALLY: neither is an OAuth challenge.
 	const bool has_www_auth = response->HasHeader("WWW-Authenticate");
 	std::optional<OAuthChallenge> challenge;
 	if (has_www_auth) {
@@ -853,16 +721,9 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 	}
 
 	if (!challenge.has_value()) {
-		// The server rejected the credential outright (static bearer auth, or
-		// OAuth without challenge advertising) — let the auth handler decide.
-		//
-		// Special case: the default handler when the user supplied neither
-		// bearer_token nor oauth_refresh_token is an empty OAuthCatalogAuth.
-		// Feeding an empty OAuthChallenge into its HandleUnauthorized would
-		// eventually call FetchResourceMetadata("") and surface "VGI OAuth:
-		// resource metadata URL must use HTTPS:" — a confusing diagnostic for
-		// a non-OAuth situation. Catch it here while the URL is still in
-		// scope and produce an actionable error that names the fix.
+		// With no credentials configured, the default handler is an empty
+		// OAuthCatalogAuth whose HandleUnauthorized would fail confusingly on
+		// FetchResourceMetadata(""); give an actionable error instead.
 		if (!auth->IsExplicitlyConfigured()) {
 			throw IOException(BuildHttpExtraInfo(http_error::kAuthRequired, url, 401),
 			                  "VGI HTTP authentication failed (HTTP 401) [url: %s]. The server requires "
@@ -873,12 +734,11 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 			    has_www_auth ? "its WWW-Authenticate header carries no resource_metadata"
 			                 : "no WWW-Authenticate header");
 		}
-		// User opted into auth (bearer_token or oauth_refresh_token) — let
-		// the handler decide. BearerTokenCatalogAuth throws a token-rejected
-		// error; a seeded OAuthCatalogAuth attempts refresh.
+		// BearerTokenCatalogAuth throws token-rejected; a seeded
+		// OAuthCatalogAuth attempts a refresh.
 		OAuthChallenge empty_challenge;
 		auth->HandleUnauthorized(empty_challenge, context);
-		// If HandleUnauthorized didn't throw (shouldn't happen), surface a generic error
+		// HandleUnauthorized is expected to throw here.
 		throw IOException(BuildHttpExtraInfo(http_error::kAuthFailed, url, 401),
 		                  "VGI HTTP authentication failed (HTTP 401) [url: %s]", url);
 	}
@@ -886,10 +746,9 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 	VGI_STDERR_DEBUG("[VGI] http.401_received url=%s resource_metadata=%s\n", url.c_str(),
 	                 challenge->resource_metadata_url.c_str());
 
-	// Perform or wait for auth flow (OAuth PKCE/device code)
+	// Runs (or waits for) the OAuth flow.
 	auto new_token = auth->HandleUnauthorized(*challenge, context);
 
-	// Retry with new token
 	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
 	                                  harvested_caps ? ChooseRequestEncoding(*harvested_caps) : request_encoding,
 	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps, iroh_config,
@@ -916,12 +775,9 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
                                     const std::shared_ptr<IrohClientConfig> &iroh_config,
                                     const std::unordered_map<std::string, std::string> *error_fields) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
-	// Route shape: {base}/{protocol}/{method}. The protocol segment is the
-	// projection of the vgi_rpc.protocol routing key the body also carries --
-	// present so an edge device can act on the protocol without an Arrow parser,
-	// and checked against the body by the server. Reserved server-level methods
-	// belong to no protocol and stay flat at {base}/{method}; the upload-URL
-	// method is mounted at {base}/__upload_url__/init.
+	// The protocol segment projects the body's vgi_rpc.protocol key so an edge
+	// device can route without an Arrow parser; the server checks they agree.
+	// The upload-URL method is mounted at {base}/__upload_url__/init.
 	std::string url = IsReservedRpcMethod(method_name)
 	                      ? base_url + "/" + method_name + (method_name == UPLOAD_URL_METHOD ? "/init" : "")
 	                      : base_url + "/" + std::string(protocol.name) + "/" + method_name;
@@ -945,8 +801,6 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 		VGI_LOG(context, "http.invoke_unary", {{"url", url}, {"method", method_name}});
 	}
 
-	// Serialize the RPC request to Arrow IPC bytes, stamping the addressed
-	// protocol's routing key and surface version into the request metadata.
 	std::vector<uint8_t> body;
 	if (params) {
 		body = SerializeRpcRequest(method_name, params, protocol);
@@ -954,9 +808,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 		body = SerializeEmptyRpcRequest(method_name, protocol);
 	}
 
-	// POST to the route built above, using the standard HTTP timeout
-	// A worker error answered in the body names the worker and this call, not
-	// just the request URL; the URL rides along as its own field.
+	// Worker errors name the worker and this call; the URL is its own field.
 	RpcErrorContext error_context;
 	error_context.worker_path = base_url;
 	error_context.execution_id_hex = execution_id_hex;
@@ -971,12 +823,10 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder,
 	                     effective_caps, iroh_config, /*cancellation=*/nullptr, &error_context);
 
-	// Parse the Arrow IPC response. Move the body in — the string becomes the
-	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.
+	// Moved in: the string becomes the owning Arrow buffer (no copy).
 	auto result = ReadUnaryResponseFromBuffer(std::move(response_body), &context, url, execution_id_hex,
 	                                          attach_opaque_data_digest, transaction_opaque_data_digest, conn_id_hex);
 
-	// Resolve external location pointer batches
 	result = MaybeResolveExternalLocation(context, result, base_url, execution_id_hex, attach_opaque_data_digest,
 	                                      transaction_opaque_data_digest, conn_id_hex);
 
@@ -988,9 +838,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	return result;
 }
 
-// ============================================================================
-// External Location Support
-// ============================================================================
+// External locations
 
 std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientContext *cancellation,
                          HttpSecrets secrets) {
@@ -1001,18 +849,16 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 	if (secrets == HttpSecrets::LOOKUP) {
 		params = InitHttpParamsWithSecrets(context, url);
 	} else {
-		// Externalized batches are fetched from inside VgiTransaction::Start
-		// (e.g. a catalog_contents revalidation), where a secret lookup
-		// deadlocks; see vgi_http_params.hpp.
+		// May run inside VgiTransaction::Start (e.g. catalog_contents
+		// revalidation), where a secret lookup deadlocks; see vgi_http_params.hpp.
 		params = InitSecretFreeHttpParams(context);
 		headers.Insert("User-Agent", SecretFreeUserAgent(context));
 	}
 	ApplyHttpTimeout(context, *params);
 
 	headers.Insert("X-VGI-Accept-Encoding", ClientAcceptEncoding());
-	// No auth headers — pre-signed URLs break with extra Authorization headers
+	// No auth headers: pre-signed URLs reject an extra Authorization header.
 
-	// Accumulate response body via content handler
 	std::string body;
 	auto response_handler = [](const HTTPResponse &) {
 		return true;
@@ -1044,8 +890,7 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 		                  url);
 	}
 
-	// Browser HTTP already decodes standard Content-Encoding. As with RPC
-	// POSTs, only the custom encoding header still describes encoded bytes.
+	// As for POSTs: in the browser only X-VGI-Content-Encoding is still encoded.
 	auto get_enc = ResolveResponseEncoding(*response);
 #if defined(__EMSCRIPTEN__)
 	if (!response->HasHeader("X-VGI-Content-Encoding")) {
@@ -1078,7 +923,6 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 		                  "https:// pre-signed URL [url: %s]",
 		                  location_url);
 	}
-	// Fetch the external data
 	auto body = HttpGetBytes(context, location_url, cancellation);
 
 	if (body.empty()) {
@@ -1086,13 +930,11 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 		                  "VGI external location returned empty response [url: %s]", location_url);
 	}
 
-	// Verify SHA-256 checksum if present in pointer batch metadata
 	if (pointer_metadata) {
 		int64_t sha_idx = pointer_metadata->FindKey(RPC_LOCATION_SHA256_KEY);
 		if (sha_idx >= 0) {
 			auto expected_hex = pointer_metadata->value(sha_idx);
-			// This wrapper uses the exported engine primitive on WASM; direct
-			// mbedtls calls are unavailable to dynamically loaded side modules.
+			// VgiSha256Hex, not mbedtls: side modules on WASM can't call it directly.
 			auto actual_hex = VgiSha256Hex(body);
 
 			if (actual_hex != expected_hex) {
@@ -1104,12 +946,8 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 		}
 	}
 
-	// Parse the externalized IPC stream with proper log context.
-	// The stream may contain log batches (bundled by maybe_externalize_collector)
-	// followed by a data batch.
-	// Adopt the fetched body as the owning Arrow buffer — this is the
-	// large-batch path, so avoiding a full alloc+memcpy of the payload matters.
-	// The SHA-256 check above already consumed ``body`` by reference.
+	// The stream may hold log batches followed by the data batch. Adopt the
+	// body as the owning buffer (large-batch path; avoid a copy).
 	auto owned = VgiBuffer::FromString(std::move(body));
 
 	// Errors name the fetched URL; log records keep the worker that pointed at it.
@@ -1158,12 +996,9 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context, UnaryRe
 	                               result.metadata, nullptr, conn_id_hex, transaction_opaque_data_digest);
 }
 
-// ============================================================================
-// Capability Discovery and Upload URLs
-// ============================================================================
+// Capability discovery and upload URLs
 
-// Parse "Cache-Control: max-age=N" (seconds) from a response, if present.
-// Returns 0 seconds when no max-age directive is found or it does not parse.
+// "Cache-Control: max-age=N" in seconds; 0 when absent or unparseable.
 template <class RESPONSE>
 static std::chrono::seconds ParseCacheControlMaxAge(const RESPONSE &response) {
 	const char *header_names[] = {"Cache-Control", "cache-control"};
@@ -1172,12 +1007,10 @@ static std::chrono::seconds ParseCacheControlMaxAge(const RESPONSE &response) {
 			continue;
 		}
 		auto value = response.GetHeaderValue(name);
-		// Tokenise on commas, look for "max-age=N" (case-insensitive, trimmed).
 		size_t pos = 0;
 		while (pos < value.size()) {
 			size_t comma = value.find(',', pos);
 			std::string token = value.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-			// trim
 			size_t a = token.find_first_not_of(" \t");
 			size_t b = token.find_last_not_of(" \t");
 			if (a != std::string::npos) {
@@ -1185,7 +1018,6 @@ static std::chrono::seconds ParseCacheControlMaxAge(const RESPONSE &response) {
 			} else {
 				token.clear();
 			}
-			// lowercase prefix check
 			std::string lower;
 			lower.reserve(token.size());
 			for (char c : token) {
@@ -1213,11 +1045,8 @@ static std::chrono::seconds ParseCacheControlMaxAge(const RESPONSE &response) {
 	return std::chrono::seconds(0);
 }
 
-// Did this response come from something that speaks the VGI capability
-// contract at all? Used to gate the harvest-off-every-response path: an error
-// page synthesized by an intermediary carries none of these headers, and
-// caching it as a discovered snapshot would look identical to a server that
-// genuinely advertises nothing.
+// An intermediary's error page carries none of these; caching it as a
+// discovered snapshot would look like a server that advertises nothing.
 template <class RESPONSE>
 static bool HasCapabilityHeaders(const RESPONSE &response) {
 	return response.HasHeader(kAcceptMaxResponseBytesSupportHeader) ||
@@ -1250,11 +1079,9 @@ static std::string BodyPreviewForError(const std::string &body) {
 	return out;
 }
 
-// A response carrying no VGI capability header did not come from a VGI server:
-// the middleware stamps them on every response, whatever its status. It is a
-// proxy or tunnel error page, a load balancer with no healthy backend, or the
-// wrong URL. Say so, and show what the response was, rather than naming a
-// protocol header the user has never heard of.
+// For a response with no VGI capability header (a proxy error page, a load
+// balancer with no backend, the wrong URL): say so and show the response,
+// rather than naming a protocol header the user has never heard of.
 template <class RESPONSE>
 [[noreturn]] static void ThrowNotAVgiServer(const RESPONSE &response, int status, const std::string &body,
                                             const std::string &url) {
@@ -1328,7 +1155,6 @@ static std::optional<int64_t> ParseAdvertisedResponseMaximum(const RpcHttpRespon
 	return ParseCanonicalResponseMaximum(values[0]);
 }
 
-// Parse capability headers from an HTTP response (set by middleware on every response).
 template <class RESPONSE>
 static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 	ServerCapabilities caps;
@@ -1353,10 +1179,8 @@ static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 		} catch (...) {
 		}
 	}
-	// Three-valued, and the empty case matters: an absent header is a
-	// pre-update server (assume zstd), whereas a present-but-empty one is the
-	// server stating it speaks no compression. ParseAcceptList("") yields an
-	// empty vector for both, so record the presence separately.
+	// Absent = pre-update server (assume zstd); present-but-empty = speaks no
+	// compression. Both parse to an empty list, so record presence separately.
 	caps.encodings_advertised = response.HasHeader(kSupportedEncodingsHeader);
 	if (caps.encodings_advertised) {
 		caps.supported_encodings = ParseAcceptList(response.GetHeaderValue(kSupportedEncodingsHeader));
@@ -1373,14 +1197,10 @@ static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url,
                                              const std::shared_ptr<IrohClientConfig> &iroh_config,
                                              const std::shared_ptr<HTTPParams> &cached_http_params) {
-	// Capability headers are emitted by middleware on every response. Probe
-	// {base_url}/health: it is mandatory in every implementation and exempt
-	// from auth, matching the Python reference client.
 	auto url = NormalizeBaseUrl(base_url) + "/health";
 	const auto accepted_max_response_bytes = GetAcceptedMaxResponseBytes(context);
 	if (IsHttpiTransport(url)) {
-		// HTTPI carries an explicit OPTIONS envelope over Iroh. It is safe to
-		// retry because it never dispatches an application method.
+		// OPTIONS never dispatches an application method, so it is safe to retry.
 #if defined(__EMSCRIPTEN__)
 		RpcHttpResponse response;
 		response.browser = httpi::BrowserRequest(
@@ -1419,16 +1239,11 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 #endif
 	}
 
-	// DuckDB's native HTTP abstraction has no OPTIONS request type. HEAD against
-	// the mandatory health route is the native equivalent and reads the same
-	// capability middleware headers before the first application POST.
 	VGI_LOG(context, "http.capability_probe", {{"url", url}});
 
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	// Reuse the catalog's ATTACH-time parameters when the caller has them (they
-	// already carry the timeout): a re-probe can run inside VgiTransaction::Start,
-	// where a fresh secret lookup deadlocks on the MetaTransaction mutex.
+	// Cached params already carry the timeout (see header for why to pass them).
 	std::unique_ptr<HTTPParams> owned_params;
 	HTTPParams *params = cached_http_params.get();
 	if (!params) {
@@ -1440,9 +1255,7 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	HTTPHeaders headers;
 	headers.Insert(kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes));
 	HeadRequestInfo head(url, headers, *params);
-	// Hand transport failures back rather than letting HTTPUtil throw its own
-	// "Could not connect" error, so an unreachable endpoint is reported like
-	// every other VGI HTTP failure, with structured extra_info.
+	// Report transport failures ourselves, with structured extra_info.
 	head.try_request = true;
 	auto response = http_util.Request(head);
 	if (!response) {
@@ -1469,14 +1282,12 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::string &base_url, int count,
                                                const std::shared_ptr<CatalogAuth> &auth,
                                                const std::shared_ptr<IrohClientConfig> &iroh_config) {
-	// Serialize Arrow batch {count: int64}
 	static const VgiSchemaPtr schema = MakeSchema({type::Int64().Named("count")});
 	VgiBatchBuilder builder(schema);
 	append::Int(builder.column(0), count);
 	builder.FinishRow();
 	auto batch = builder.Finish();
 
-	// POST to __upload_url__/init (HttpInvokeUnary normalizes base_url internally)
 	auto result = HttpInvokeUnary(context, base_url, UPLOAD_URL_METHOD, batch, auth, nullptr, nullptr,
 	                              "", "", "", "", VGI_MAIN_PROTOCOL, nullptr, nullptr, iroh_config);
 
@@ -1485,7 +1296,7 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 		                  "VGI server returned no upload URLs [url: %s]", base_url);
 	}
 
-	// Parse response: {upload_url: utf8, download_url: utf8, expires_at: timestamp}
+	// Response columns: upload_url, download_url (expires_at unused).
 	auto upload_col = result.batch->GetColumnByName("upload_url");
 	auto download_col = result.batch->GetColumnByName("download_url");
 
@@ -1542,13 +1353,9 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const std::vec
 std::vector<uint8_t> SerializePointerBatch(const VgiSchemaPtr &schema,
                                            const std::string &location_url, const std::string &stream_state_token,
                                              const std::string &call_state_token) {
-	// Zero-row batch matching the schema
 	auto zero_batch = VgiBatch::MakeEmpty(schema);
 
-	// Build metadata: location key + optional stream_state / call_state.
-	// Both tokens have to ride the pointer batch: the worker strips the
-	// location and reads the request's metadata, so a token left off here is
-	// simply absent from the request.
+	// Tokens must ride the pointer batch (see header).
 	VgiMetadata metadata {{RPC_LOCATION_KEY, location_url}};
 	if (!stream_state_token.empty()) {
 		metadata.Set(RPC_STREAM_STATE_KEY, stream_state_token);
@@ -1557,7 +1364,6 @@ std::vector<uint8_t> SerializePointerBatch(const VgiSchemaPtr &schema,
 		metadata.Set(RPC_CALL_STATE_KEY, call_state_token);
 	}
 
-	// Serialize as IPC stream
 	auto buffer = SerializeBatch(*zero_batch, &metadata);
 	return buffer->ToVector();
 }

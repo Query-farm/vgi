@@ -20,21 +20,9 @@
 namespace duckdb {
 namespace vgi {
 
-// ============================================================================
-// LogicalVgiTableBufferingFunction
-// ============================================================================
-// Replaces a LogicalGet of a VGI table-in-out function when the function's
-// metadata declares Meta.table_buffering = True. The OptimizerExtension
-// performs the rewrite at optimize_function time (post-built-in passes);
-// any LATERAL decorrelation has already happened by then.
-//
-// Carries:
-//   - table_index: the LogicalGet's table_index, threaded through so
-//     downstream column references continue to resolve.
-//   - return_types / return_names: the function's output schema.
-//   - bind_data: the original VgiTableInOutBindData, owned by us. The
-//     PhysicalVgiTableBufferingFunction takes a reference to this for its
-//     execution-time RPC machinery.
+// Replaces the LogicalGet of a buffered (Meta.table_buffering) VGI table-in-out
+// function. The OptimizerExtension rewrites after the built-in passes, so LATERAL
+// decorrelation has already happened.
 
 class LogicalVgiTableBufferingFunction : public LogicalExtensionOperator {
 public:
@@ -42,61 +30,38 @@ public:
 	                                vector<string> return_names_p,
 	                                unique_ptr<FunctionData> bind_data_p);
 
-	// Threaded through for ColumnBinding resolution.
+	// The LogicalGet's, so downstream column references still resolve.
 	TableIndex table_index;
 
-	// The post-projection types that upstream operators bind against. Matches
-	// what ``LogicalGet::ResolveTypes()`` produces for the original Get under
-	// projection pushdown: narrowed via column_ids/projection_ids when those
-	// are non-empty, otherwise the full worker schema. Downstream column refs
-	// resolve to this. NOT the full worker schema — that lives in
-	// all_column_types below.
+	// Post-projection types, as LogicalGet::ResolveTypes() gives for the original
+	// Get; downstream column refs resolve to these. The full worker schema is
+	// all_column_types.
 	vector<LogicalType> return_types;
-	// Output names parallel to return_types (post-projection).
 	vector<string> return_names;
 
-	// The VgiTableInOutBindData from the original bind. CreatePlan reads
-	// fields (worker_path, function_name, attach_params, input_schema,
-	// bind_result, table_buffering, source_order_dependent) to construct
-	// the PhysicalVgiTableBufferingFunction. Stored as the base FunctionData
-	// type to play nice with DuckDB's planner conventions; cast to
-	// VgiTableInOutBindData at use sites.
+	// The original VgiTableInOutBindData; ownership moves to the physical
+	// operator at CreatePlan.
 	unique_ptr<FunctionData> bind_data;
 
-	// ============================================================================
-	// Pushdown — captured by the rewriter from the LogicalGet at optimize time
-	// ============================================================================
-	// True if the worker declared projection_pushdown=True in Meta and DuckDB
-	// pushed a projection. When false, projection_ids is empty and return_types
-	// equals the full worker schema.
+	// Pushdown, captured by the rewriter from the LogicalGet.
+	// Worker declared projection_pushdown and DuckDB pushed a projection; when
+	// false, projection_ids is empty and return_types is the full worker schema.
 	bool projection_pushdown = false;
-	// Worker-schema column indices DuckDB requested. Empty when no projection.
-	// Mirrors the streaming pure-table path's int32_t projection_ids vector.
+	// Worker-schema column indices requested (empty = no projection).
 	std::vector<int32_t> projection_ids;
-	// Projected output-to-worker index mapping from LogicalGet::GetColumnIds().
-	// Table-filter keys are already bind-schema indexes at rewriter time and do
-	// not index this vector. Source-side ArrowScan uses it for ArrowToDuckDB.
+	// LogicalGet::GetColumnIds() (projected output -> worker index). Table-filter
+	// keys are already bind-schema indexes and do not index this.
 	std::vector<int32_t> column_ids;
-	// Serialized table_filters (Arrow IPC bytes with json filter_spec + value
-	// columns) — null if no filters. Reuses VgiSerializeFilters from the
-	// streaming pure-table path.
+	// VgiSerializeFilters output; null if no filters.
 	VgiBufferPtr pushdown_filters;
-	// Per-IN-filter join-keys batches (one single-column Arrow IPC RecordBatch
-	// each). Empty when no IN filters. Mirrors the streaming convention.
+	// One single-column IPC batch per IN filter.
 	std::vector<VgiBufferPtr> join_keys_buffers;
-	// Full worker-output schema (size matches the worker's declared output —
-	// what the worker would emit absent projection). Preserved verbatim from
-	// ``LogicalGet::returned_types`` / ``names`` at rewriter time. Used by
-	// VgiSerializeFilters (filter column-index → original-name lookup) and by
-	// the Source-side ArrowScan to populate its arrow_column_map_t with the
-	// full type signature.
+	// Full worker-output schema (LogicalGet::returned_types / names), for filter
+	// serialization (column index -> name).
 	vector<LogicalType> all_column_types;
 	vector<string> all_column_names;
-	// Pre-built human-readable description of projections + filters for
-	// EXPLAIN output. Built from ``TableFilter::ToString`` at rewriter time;
-	// the C++ side has no symmetric deserializer for the serialized filter
-	// IPC bytes, so we capture the pretty string when we still have the raw
-	// TableFilter objects in scope.
+	// Projections + filters for EXPLAIN, from TableFilter::ToString at rewrite
+	// time: the serialized filter bytes cannot be turned back into text.
 	std::string explain_summary;
 
 public:
@@ -107,60 +72,28 @@ public:
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 
-	// v1: plan caching across processes is out of scope.
+	// Throws: plan serialization is not supported.
 	void Serialize(Serializer &serializer) const override;
 
 protected:
 	void ResolveTypes() override;
 };
 
-// ============================================================================
-// PhysicalVgiTableBufferingFunction
-// ============================================================================
-// Sink+Source operator: ingest all input across all sub-pipelines into the
-// worker, run a single cross-pipeline combine, then emit output via parallel
-// (or single-threaded — see source_order_dependent) source.
+// Sink+Source operator for buffered table functions: process() all input on
+// per-thread workers, one combine, then drain each finalize state.
 //
-// Lifecycle:
-//
-//   Sink(chunk)                   — parallel per DuckDB thread. The first
-//                                   thread to arrive becomes the *init
-//                                   runner*: it acquires its own per-thread
-//                                   worker, runs PerformInit with phase=
-//                                   TABLE_BUFFERING and no global_execution_id
-//                                   (the worker mints one), publishes the
-//                                   resulting execution_id on the gstate
-//                                   under init_mutex/init_cv. Peer Sink
-//                                   threads block on the condvar until init
-//                                   publishes (or fails), then acquire their
-//                                   own workers with the published
-//                                   global_execution_id (secondary init —
-//                                   no cold work) and run process() per
-//                                   chunk. There is no dedicated coordinator
-//                                   role; storage is shared via BoundStorage
-//                                   keyed by execution_id, so any worker that
-//                                   finished init can serve any combine.
-//   Combine(local sink state)     — moves the per-thread worker into the
-//                                   shared gstate.workers/state_ids lists
-//                                   under workers_mutex.
-//   Finalize()                    — single-threaded, exactly once per
-//                                   GlobalSinkState (DuckDB serializes this
-//                                   even under UNION ALL). Pops *one* worker
-//                                   from gstate.workers — any worker, since
-//                                   they're interchangeable — calls
-//                                   RpcTableBufferingCombine on it, pushes
-//                                   it back, populates finalize_queue. On
-//                                   throw the popped worker is cancel-
-//                                   dispatched (see Sink::Finalize comments).
-//   GetData(chunk)                — parallel (or single-threaded when
-//                                   source_order_dependent). Pulls next
-//                                   finalize_state_id from the queue,
-//                                   acquires a fresh worker (Sink-phase
-//                                   workers can't reuse init), opens a
-//                                   producer-mode stream via
-//                                   PerformInit(phase=TABLE_BUFFERING_FINALIZE)
-//                                   and drains batches until EOS, then
-//                                   moves to the next id.
+//   Sink     — parallel. The first thread runs a primary TABLE_BUFFERING init on
+//              its own worker (the worker mints execution_id); peers wait on
+//              init_cv, then run secondary inits with that id. Each chunk is one
+//              process() RPC. No coordinator: workers share state through
+//              BoundStorage keyed by execution_id, so any of them can combine.
+//   Combine  — moves the thread's worker and state_id into the gstate.
+//   Finalize — once per GlobalSinkState. Probes the result cache, then pops one
+//              worker (or, for empty input, inits one) and runs combine, filling
+//              finalize_queue. On throw that worker is cancel-dispatched.
+//   GetData  — parallel unless source_order_dependent. Per finalize_state_id, a
+//              fresh worker (Sink workers reject a second PerformInit) opens a
+//              TABLE_BUFFERING_FINALIZE producer stream and drains it to EOS.
 
 class PhysicalVgiTableBufferingFunction : public PhysicalOperator {
 public:
@@ -172,28 +105,22 @@ public:
 	                                  bool sink_order_dependent_p, bool requires_input_batch_index_p,
 	                                  bool synthesize_batch_index_p, idx_t estimated_cardinality);
 
-	// Owned bind data. The physical operator is the sole long-lived holder
-	// during execution; the LogicalVgiTableBufferingFunction transfers
-	// ownership at CreatePlan time.
+	// Owned (moved from the logical operator at CreatePlan).
 	unique_ptr<FunctionData> bind_data;
 	vector<string> return_names;
 	bool source_order_dependent;
-	// Sink-side ordering knobs (mutually exclusive — see metadata.py
-	// validation). sink_order_dependent → ParallelSink=false (single thread).
-	// requires_input_batch_index → RequiredPartitionInfo()=BatchIndex().
+	// Sink ordering (mutually exclusive as declared by the worker):
+	// sink_order_dependent → single-threaded sink; requires_input_batch_index →
+	// RequiredPartitionInfo()=BatchIndex().
 	bool sink_order_dependent;
 	bool requires_input_batch_index;
-	// Set when the worker asked for input ordering but the pipeline source cannot
-	// supply a batch index (range(), VALUES, and anything else whose
-	// SupportsPartitioning() says no). We then honour the request the other way:
-	// the sink runs single-threaded, so batches arrive in source order, and we
-	// number them ourselves. The worker sees a valid monotonic batch_index either
-	// way and never has to care which route produced it. See CreatePlan.
+	// The worker asked for a batch index but the pipeline source cannot supply
+	// one (range(), VALUES, ...): the sink runs single-threaded, so batches arrive
+	// in source order, and numbers them itself. See CreatePlan.
 	bool synthesize_batch_index;
 
-	// Pushdown data — populated by CreatePlan from the Logical op. Mirrors
-	// the field set on LogicalVgiTableBufferingFunction; see those docstrings.
-	// Read by Sink/Source PerformInit calls and by the Source-side ArrowScan.
+	// Pushdown, moved from LogicalVgiTableBufferingFunction (see there); used by
+	// every Sink and Source PerformInit.
 	bool projection_pushdown = false;
 	std::vector<int32_t> projection_ids;
 	std::vector<int32_t> column_ids;
@@ -204,17 +131,13 @@ public:
 	std::string explain_summary;
 
 public:
-	// ========== Sink Interface ==========
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override;
-	// NextBatch is invoked by DuckDB when batch_index advances. We don't
-	// need to flush anything — workers receive batch_index per process()
-	// call and handle ordering themselves. Required when
-	// RequiredPartitionInfo()=BatchIndex(); no-op otherwise.
+	// No-op: workers get batch_index on every process() call.
 	SinkNextBatchType NextBatch(ExecutionContext &context, OperatorSinkNextBatchInput &input) const override;
 
 	bool IsSink() const override {
@@ -226,11 +149,8 @@ public:
 		return !sink_order_dependent && !synthesize_batch_index;
 	}
 	bool SinkOrderDependent() const override {
-		// Distinct from ParallelSink: SinkOrderDependent affects the
-		// optimizer's right-of-join placement etc., and we want the planner
-		// to know that order matters when sink_order_dependent is set so
-		// it doesn't reorder the input pipeline arbitrarily. A synthesized
-		// batch index depends on source order just as much.
+		// Tells the planner input order matters, so it does not reorder the
+		// input pipeline; a synthesized batch index depends on it too.
 		return sink_order_dependent || synthesize_batch_index;
 	}
 	OperatorPartitionInfo RequiredPartitionInfo() const override {
@@ -239,7 +159,6 @@ public:
 		    : OperatorPartitionInfo::NoPartitionInfo();
 	}
 
-	// ========== Source Interface ==========
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                  GlobalSourceState &gstate) const override;
