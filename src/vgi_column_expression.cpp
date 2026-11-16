@@ -440,7 +440,29 @@ unique_ptr<ParsedExpression> BindNativeColumnDefault(ClientContext &context, con
 	// Cached table entries must not rebind expression functions/collation against
 	// a later INSERT session. Keep the authoritative SQL/context in table metadata
 	// and install the resolved literal for this bounded constant-only profile.
-	return NativeLiteralExpression(ExpressionExecutor::EvaluateScalar(context, *bound));
+	auto value = ExpressionExecutor::EvaluateScalar(context, *bound);
+	auto literal = NativeLiteralExpression(value);
+	// A literal whose SQL spelling infers another type (9 is INTEGER, so a
+	// BIGINT 9 renders as CAST(9 AS "system".main.BIGINT)) comes back wrapped in
+	// a type witness. DuckDB binds a column default against the column type, so
+	// when the bare literal casts back to exactly this value the witness is
+	// redundant: drop it so duckdb_columns() renders the default as a native
+	// table does (DuckDB keeps an ALTER ... TYPE column's default unchanged).
+	if (literal->GetExpressionClass() == ExpressionClass::CAST) {
+		auto &cast = literal->Cast<CastExpression>();
+		if (!cast.IsTryCast() && cast.Child().GetExpressionClass() == ExpressionClass::CONSTANT) {
+			auto bare = cast.Child().Cast<ConstantExpression>().GetLiteral().ToValue();
+			// A string spelling of a non-string value (e.g. '-0.0') stays explicit.
+			if (bare.type().id() != LogicalTypeId::VARCHAR || target_type.id() == LogicalTypeId::VARCHAR) {
+				auto restored = bare.DefaultTryCastAs(target_type, nullptr, true);
+				if (restored && restored->type() == value.type() && Value::NotDistinctFrom(*restored, value) &&
+				    restored->ToString() == value.ToString()) {
+					return cast.Child().Copy();
+				}
+			}
+		}
+	}
+	return literal;
 }
 
 VgiSchemaPtr NativeColumnTypeSchema(const VgiSchemaPtr &schema, const std::string &schema_name) {

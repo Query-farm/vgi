@@ -113,8 +113,9 @@
     }
   ],
   "compatibility": "All listed SDKs and adapters use vgi.v3/3.2.0. Exact major+minor matching rejects 3.1 workers and clients; patch releases remain wire compatible.",
-  "knownIssues": [
-    "test/sql/duckdb2/column_paths.test fails on column_default rendering; pre-existing (reproduced on unmodified v2.0 22140b0 with vgi-python 0.49.5)."
+  "knownIssues": [],
+  "resolvedIssues": [
+    "test/sql/duckdb2/column_paths.test failed on column_default rendering (CAST(9 AS \"system\".main.BIGINT) instead of 9 after ALTER ... TYPE BIGINT); pre-existing since at least v2.0 22140b0 with vgi-python 0.49.5. Fixed in the extension: BindNativeColumnDefault (src/vgi_column_expression.cpp) drops the redundant type witness when the bare literal casts back to the same value, matching native DuckDB, which keeps the default unchanged."
   ],
   "status": "published_artifacts_and_hosted_validation_complete"
 }
