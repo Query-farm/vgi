@@ -1,0 +1,54 @@
+# name: test/sql/integration/visibility/example_table_only.test
+# description: Standard example worker: a table_only scan with a row id, and a table_only scan named range (the worker's function binds, not DuckDB's range()).
+# group: [vgi_integration_visibility]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query IIT
+SELECT rowid, id, label FROM example.contract.good ORDER BY id;
+----
+1	1	a
+2	2	b
+3	3	c
+
+query I
+SELECT count(*) FROM example.contract.good WHERE rowid >= 2;
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name IN ('contract_good_scan', 'range');
+----
+0
+
+statement error
+SELECT * FROM example.contract.contract_good_scan();
+----
+<REGEX>:.*contract_good_scan.*does not exist.*
+
+# ranged's table_only scan is named `range`: the worker's function binds, not range().
+query T
+SELECT who FROM example.contract.ranged;
+----
+vgi example worker
+
+query I
+SELECT count(*) FROM example.contract.ranged;
+----
+1
+
+query I
+SELECT count(*) FROM range(3);
+----
+3
+
+statement ok
+DETACH example;

@@ -1,0 +1,61 @@
+# name: test/sql/integration/write_contract/example_decimal_width.test
+# description: Standard example worker: INSERT into decimal32 / decimal64 / decimal128 columns; the extension re-encodes each value at the declared width.
+# group: [vgi_integration_write_contract]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'contract' AND table_name = 'amounts' ORDER BY column_index;
+----
+id	BIGINT
+d32	DECIMAL(7,2)
+d64	DECIMAL(15,3)
+d128	DECIMAL(9,2)
+
+query ITTT
+SELECT id, d32::VARCHAR, d64::VARCHAR, d128::VARCHAR FROM example.contract.amounts ORDER BY id;
+----
+1	12345.67	-123456789012.345	1234567.89
+2	-99999.99	999999999999.999	-9999999.99
+3	NULL	0.001	NULL
+
+query I
+INSERT INTO example.contract.amounts VALUES
+    (1, 12345.67, -123456789012.345, 1234567.89),
+    (2, -99999.99, 999999999999.999, -9999999.99),
+    (3, NULL, 0.001, NULL);
+----
+3
+
+query ITTT
+INSERT INTO example.contract.amounts VALUES
+    (1, 12345.67, -123456789012.345, 1234567.89),
+    (3, NULL, 0.001, NULL)
+RETURNING id, d32::VARCHAR, d64::VARCHAR, d128::VARCHAR;
+----
+1	12345.67	-123456789012.345	1234567.89
+3	NULL	0.001	NULL
+
+# The session's arrow_output_version must not change what reaches the worker.
+statement ok
+SET arrow_output_version = '1.5';
+
+query ITTT
+INSERT INTO example.contract.amounts VALUES (4, -0.01, -0.001, 0.01)
+RETURNING id, d32::VARCHAR, d64::VARCHAR, d128::VARCHAR;
+----
+4	-0.01	-0.001	0.01
+
+statement ok
+RESET arrow_output_version;
+
+statement ok
+DETACH example;

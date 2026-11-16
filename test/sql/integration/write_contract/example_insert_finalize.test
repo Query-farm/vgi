@@ -1,0 +1,60 @@
+# name: test/sql/integration/write_contract/example_insert_finalize.test
+# description: Standard example worker: an INSERT whose count comes from finalize only, write input with every field nullable, and a NOT NULL the worker enforces.
+# group: [vgi_integration_write_contract]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name IN ('contract_notes_scan', 'contract_notes_insert');
+----
+0
+
+query TT
+SELECT table_name, constraint_column_names::VARCHAR FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'contract' AND constraint_type = 'NOT NULL';
+----
+notes	[id]
+
+# The count comes from finalize only; the input arrives with every field nullable.
+query I
+INSERT INTO example.contract.notes VALUES (1, 'x'), (2, 'y');
+----
+2
+
+# Several batches, one write call: finalize reports the per-call total.
+query I
+INSERT INTO example.contract.notes SELECT i, 'n' || i FROM range(5000) t(i);
+----
+5000
+
+query I
+INSERT INTO example.contract.notes (id) VALUES (3);
+----
+1
+
+# NOT NULL is the worker's to enforce: the NULL reaches it, in a valid batch.
+statement error
+INSERT INTO example.contract.notes VALUES (NULL, 'z');
+----
+<REGEX>:.*contract: notes\.id required.*
+
+statement error
+INSERT INTO example.contract.notes VALUES (4, 'w') RETURNING id;
+----
+<REGEX>:.*does not support result mode 'rows' for INSERT.*
+
+query I
+SELECT count(*) FROM example.contract.notes;
+----
+0
+
+statement ok
+DETACH example;

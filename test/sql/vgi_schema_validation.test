@@ -29,6 +29,7 @@ SELECT catalog_name, schema_name
 FROM information_schema.schemata
 WHERE catalog_name = 'vgi_schema_test';
 ----
+vgi_schema_test	contract
 vgi_schema_test	data
 vgi_schema_test	main
 
