@@ -229,6 +229,12 @@ VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, boo
 				inventory = FetchFunctions(rpc_ctx, function_type, context);
 			}
 			for (const auto &function : *inventory) {
+				// A table_only function cannot be called from SQL, so it must not
+				// capture a macro's bare call either: a hidden scan named `range`
+				// would otherwise shadow DuckDB's range() inside the schema's macros.
+				if (function.visibility == vgi::VgiFunctionVisibility::TableOnly) {
+					continue;
+				}
 				callable_names->insert(function.name);
 			}
 		};

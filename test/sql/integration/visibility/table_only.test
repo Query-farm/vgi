@@ -67,6 +67,13 @@ SELECT count(*) FROM v.main.ranged;
 ----
 1
 
+# A macro in the same schema calling range(n) gets DuckDB's range(), not the
+# hidden no-argument scan (a table_only function is not macro-callable).
+query I
+SELECT count(*) FROM v.main.first_n(4);
+----
+4
+
 # Still hidden: DuckDB's range() is untouched and the worker's is not listed.
 query I
 SELECT count(*) FROM range(3);

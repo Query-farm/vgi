@@ -15,6 +15,8 @@ Serves catalog ``visfix``, schema ``main``:
             ``notes_insert`` also refuses an input batch with a non-nullable field: the
             extension marks every write-input field nullable (``notes.id`` is declared
             NOT NULL), since the worker, not the Arrow schema, enforces NOT NULL.
+    first_n table macro calling ``range(n)``: the hidden ``range`` scan must not
+            capture the call.
     ranged  scan named ``range``, like the DuckDB built-in: it is ``table_only``,
             so the extension must bind the worker's function, not ``range()``.
 
@@ -39,7 +41,7 @@ import pyarrow as pa
 from vgi_rpc import ArrowSerializableDataclass
 from vgi_rpc.rpc import OutputCollector
 
-from vgi.catalog import Catalog, ReadOnlyCatalogInterface, Schema, Table
+from vgi.catalog import Catalog, Macro, MacroType, ReadOnlyCatalogInterface, Schema, Table
 from vgi.invocation import BindResponse
 from vgi.metadata import FunctionStability
 from vgi.table_function import BindParams, ProcessParams, TableFunctionGenerator, init_single_worker
@@ -223,6 +225,16 @@ CATALOG = Catalog(
         Schema(
             path=["main"],
             functions=[],
+            # A macro calling DuckDB's range() in the schema that also holds the
+            # hidden scan named `range`: the table_only scan must not capture it.
+            macros=[
+                Macro(
+                    name="first_n",
+                    macro_type=MacroType.TABLE,
+                    parameters=["n"],
+                    definition="SELECT * FROM range(n)",
+                ),
+            ],
             tables=[
                 Table(name="good", function=GoodScan),
                 Table(name="ghost", function=GhostScan),
