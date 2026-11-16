@@ -96,10 +96,15 @@ VGI_TRANSPORT_PYTHONPATH = $(VGI_RPC_PYTHON_DIR)$${PYTHONPATH:+:$$PYTHONPATH}
 # the multi_branch_* and required_field_filter_paths_native tests). The vgi-python
 # fixture bakes this into its branch definitions and the coupled .test files write
 # their parquet/csv there via ${VGI_TEST_BRANCH_DIR} — both must name the SAME path.
-# Defaults to the OS temp dir so those tests run with no extra setup; exported so
-# both the unittest process and the subprocess worker it spawns see it. (Hardcoded
-# /tmp broke on Windows, which has no /tmp.)
-VGI_TEST_BRANCH_DIR ?= $(shell python3 -c 'import tempfile;print(tempfile.gettempdir())')
+# Defaults to a fresh directory under the OS temp dir, created once per `make`
+# run (simply expanded, so every recipe and sub-make sees the same one), so
+# lanes running side by side on one host never share these fixed-name files.
+# Exported so both the unittest process and the subprocess worker it spawns see
+# it. (Hardcoded /tmp broke on Windows, which has no /tmp.) Files within one run
+# that share names declare a `# serial-group:` (see scripts/run_tests.py).
+ifeq ($(origin VGI_TEST_BRANCH_DIR),undefined)
+VGI_TEST_BRANCH_DIR := $(shell python3 -c 'import tempfile;print(tempfile.mkdtemp(prefix="vgi-branches-"))')
+endif
 export VGI_TEST_BRANCH_DIR
 
 # The vgi-python example worker implements the secret-lookup conformance
@@ -746,14 +751,16 @@ test_python:
 	        "~test/sql/integration/writable/*" \
 	        "~test/sql/vgi_worker_pool.test"
 
+# Pass VGI_DIR: each SDK Makefile defaults it to ../vgi, which is wrong for an SDK
+# checkout that is not a sibling of this one.
 test_go:
-	$(MAKE) -C $(VGI_GO_DIR) test
+	$(MAKE) -C $(VGI_GO_DIR) test VGI_DIR=$(CURDIR)
 
 test_typescript:
-	$(MAKE) -C $(VGI_TS_DIR) test
+	$(MAKE) -C $(VGI_TS_DIR) test VGI_DIR=$(CURDIR)
 
 test_java:
-	$(MAKE) -C $(VGI_JAVA_DIR) test
+	$(MAKE) -C $(VGI_JAVA_DIR) test VGI_DIR=$(CURDIR)
 
 # C# has no Makefile-embedded coverage gate of its own to delegate to bare `test` for (its
 # `test` target is the xUnit unit suite) — its `test_integration_gated` target is the
@@ -761,7 +768,7 @@ test_java:
 # versioned_tables/attach_options/attach_options_required/bad_enum) as of the version-resolution
 # + attach-options + bad-enum work — see that Makefile for the gate detail.
 test_csharp:
-	$(MAKE) -C $(VGI_CSHARP_DIR) test_integration_gated
+	$(MAKE) -C $(VGI_CSHARP_DIR) test_integration_gated VGI_DIR=$(CURDIR)
 
 # Rust has no Makefile of its own — build the example worker and point the
 # suite at it directly. Same .test files, only the worker differs.

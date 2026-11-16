@@ -99,6 +99,25 @@ def discover(patterns: list[str], root: Path) -> list[Path]:
     return sorted(matched)
 
 
+# A test file that writes a fixed-name file other tests also write (fixtures
+# read a fixed path under $VGI_TEST_BRANCH_DIR) declares
+# `# serial-group: <name>` in its header; files in one group never run at the
+# same time. Without it, two files racing on the same COPY ... TO fail on the
+# file lock.
+_SERIAL_GROUP_RE = re.compile(r"^#\s*serial-group:\s*(\S+)", re.MULTILINE)
+
+
+def serial_group(path: Path) -> str | None:
+    """The `# serial-group:` a test file declares in its first lines, if any."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = "".join(fh.readline() for _ in range(40))
+    except OSError:
+        return None
+    m = _SERIAL_GROUP_RE.search(head)
+    return m.group(1) if m else None
+
+
 # --- Execution ---
 
 
@@ -683,11 +702,25 @@ def main(argv: Iterable[str] | None = None) -> int:
     log_dir = Path(tempfile.mkdtemp(prefix="vgi-test-servers-")) if args.server_per_test else None
     if log_dir is not None:
         print(f"a worker server per test file; server logs: {log_dir}", file=sys.stderr)
+    group_locks: dict[str, threading.Lock] = {}
+    test_groups: dict[Path, str | None] = {}
+    for t in tests:
+        test_groups[t] = serial_group(args.root / t)
+        if test_groups[t] is not None:
+            group_locks.setdefault(test_groups[t], threading.Lock())
+
+    def run_grouped(t: Path, *run_args: object) -> dict:
+        group = test_groups[t]
+        if group is None:
+            return run_one(t, *run_args)
+        with group_locks[group]:
+            return run_one(t, *run_args)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         timeout = args.timeout if args.timeout > 0 else None
         futures = {
             pool.submit(
-                run_one, t, unittest, env, extra_args, timeout, args.server_per_test, log_dir,
+                run_grouped, t, unittest, env, extra_args, timeout, args.server_per_test, log_dir,
                 args.isolate_launcher, test_names[t]
             ): t
             for t in tests

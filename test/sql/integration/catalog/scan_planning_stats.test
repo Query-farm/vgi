@@ -5,6 +5,7 @@
 #              statistics exclude the query. The 2026-10-05 file is never created,
 #              so a query that keeps that branch errors.
 # group: [vgi_integration_catalog]
+# serial-group: planned_days (writes fixed-name files under $VGI_TEST_BRANCH_DIR that other files share)
 
 require-env VGI_TEST_WORKER
 

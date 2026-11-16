@@ -5,6 +5,7 @@
 #              function the worker names, without tunneling through the
 #              worker pipe.
 # group: [vgi_integration_catalog]
+# serial-group: hetero_branch (writes fixed-name files under $VGI_TEST_BRANCH_DIR that other files share)
 
 require-env VGI_TEST_WORKER
 

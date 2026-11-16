@@ -2,6 +2,7 @@
 # description: DuckDB's dynamic_or_filter_threshold remains authoritative for
 #              joins involving rewritten multi-branch VGI scans.
 # group: [vgi_integration_catalog]
+# serial-group: hetero_branch (writes fixed-name files under $VGI_TEST_BRANCH_DIR that other files share)
 
 require-env VGI_TEST_WORKER
 
