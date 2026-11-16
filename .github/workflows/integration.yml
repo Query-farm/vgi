@@ -48,7 +48,7 @@ jobs:
       VGI_FIXTURES_DIR: /tmp/vgi-python
       # Pin the coordinated Protocol 3.3 fixture release. Exact major+minor
       # matching deliberately rejects the earlier 3.2 workers.
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.51.0' }}
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.52.1' }}
       GEN: ninja
       BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"

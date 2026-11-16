@@ -1,5 +1,5 @@
 {
-  "date": "2026-11-11",
+  "date": "2026-11-16",
   "protocol": {
     "name": "vgi.v3",
     "version": "3.3.0",
@@ -58,22 +58,50 @@
       "status": "publish_succeeded_registry_pending",
       "releaseUrl": "https://github.com/Query-farm/vgi-csharp/releases/tag/v0.26.0",
       "validation": "Release run 43137938567 pushed QueryFarm.Vgi 0.26.0 (+ snupkg) to nuget.org; not yet indexed on the flat container at recording time."
-    }
-  ],
-  "pendingReleases": [
+    },
     {
       "language": "Rust",
       "repo": "vgi-rust",
-      "status": "not_released",
-      "note": "crates.io vgi max_version is 0.50.2 (protocol 3.2); no 3.3 release published at recording time."
+      "version": "0.51.0",
+      "tagCommit": "d3a76e0c04236b6ea3701b47cb29ec18fc628cc0",
+      "status": "registry_verified",
+      "releaseUrl": "https://github.com/Query-farm/vgi-rust/releases/tag/v0.51.0",
+      "validation": "crates.io vgi / vgi-protocol 0.51.0 (vgi-rpc 0.32.4, Arrow 59). test_rust lane on native v2.0 b559975 (EC2 Linux ARM64, Clang, 2026-11-16): 360 passed, 0 failed, exit 0."
     },
     {
       "language": "C++",
       "repo": "vgi-cpp",
-      "status": "not_released",
-      "note": "Latest release v0.15.0 (protocol 3.2); no 3.3 release at recording time."
+      "version": "0.16.0",
+      "tagCommit": "b4641c1f0cdf818e097705720b876567dcbd575e",
+      "status": "github_release",
+      "releaseUrl": "https://github.com/Query-farm/vgi-cpp/releases/tag/v0.16.0",
+      "validation": "ci/run-integration.sh against native v2.0 b559975 (EC2 Linux ARM64): stdio 350, launch 351, http 347 executed, 0 failed; 114 unit tests pass."
+    },
+    {
+      "language": "C",
+      "repo": "vgi-c",
+      "version": "0.2.0",
+      "tagCommit": "d6d9ee8556db0e8a5a36e2cf78127c4a25118210",
+      "status": "github_release",
+      "releaseUrl": "https://github.com/Query-farm/vgi-c/releases/tag/v0.2.0",
+      "validation": "From protocol 3.1.0 (adds 3.2 filtered scan planning). ci/run-integration.sh against native v2.0 b559975 (EC2 Linux ARM64): stdio 352, launch 353, http 347 executed, 0 failed; ctest 8/8 (also under sanitizers)."
     }
   ],
+  "pendingReleases": [],
   "compatibility": "All listed SDKs use vgi.v3/3.3.0. Exact major+minor matching rejects 3.2 workers and clients; write functions and hidden scans no longer appear in duckdb_functions(). Patch releases remain wire compatible.",
-  "status": "partial_sdk_releases_recorded"
+  "status": "all_sdk_releases_recorded",
+  "patchReleases": [
+    {
+      "date": "2026-11-16",
+      "note": "Cross-SDK example.contract conformance fixtures (visibility/example_table_only.test, write_contract/example_insert_finalize.test, write_contract/example_decimal_width.test); wire unchanged (3.3.0).",
+      "releases": {
+        "vgi-python": "0.52.1",
+        "vgi-rust": "0.51.1 (table functions homed in the table's schema)",
+        "vgi-go": "0.42.1",
+        "vgi-typescript": "0.50.1",
+        "vgi-csharp": "0.26.1",
+        "vgi-java": "0.48.1 (uncommented schema sent as NULL; no decimal32/64 in arrow-java, decimal file excluded)"
+      }
+    }
+  ]
 }
