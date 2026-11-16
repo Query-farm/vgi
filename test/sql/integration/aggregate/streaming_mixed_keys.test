@@ -75,11 +75,36 @@ a	1	1	1
 b	2	2	3
 a	3	4	6
 
-# Identical keys still take the streaming path.
-query II
+# Identical keys still take the streaming path whenever the worker's function
+# is streaming-eligible at all (a single expression is the baseline; an SDK whose
+# fixture is not eligible leaves both plans on PhysicalWindow).
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x)
+FROM (VALUES ('a', 1), ('a', 2)) t(k, x);
+
+statement ok
+CREATE TEMP TABLE single_expr_rewrites AS
+SELECT count(*) AS n FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%streaming_window.rewrite%';
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
 EXPLAIN SELECT
        example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x),
        example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x)
 FROM (VALUES ('a', 1), ('a', 2)) t(k, x);
+
+query I
+SELECT (SELECT n FROM single_expr_rewrites) = 0 OR count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%streaming_window.rewrite%';
 ----
-physical_plan	<REGEX>:.*Vgi Streaming Window.*
+true

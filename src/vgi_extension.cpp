@@ -221,9 +221,9 @@ private:
 		return true;
 	}
 
-	static void Rewrite(unique_ptr<LogicalOperator> &op) {
+	static void Rewrite(unique_ptr<LogicalOperator> &op, ClientContext &context) {
 		for (auto &child : op->children) {
-			Rewrite(child);
+			Rewrite(child, context);
 		}
 		if (op->type != LogicalOperatorType::LOGICAL_WINDOW) {
 			return;
@@ -276,6 +276,10 @@ private:
 		                 "(window_index=%llu, %zu expression(s))\n",
 		                 static_cast<unsigned long long>(window.window_index.index),
 		                 streaming_op->expressions.size());
+		if (VgiInfoLogActive(context)) {
+			VGI_LOG(context, "streaming_window.rewrite",
+			        {{"expressions", std::to_string(streaming_op->expressions.size())}});
+		}
 
 		op = std::move(streaming_op);
 	}
@@ -286,7 +290,7 @@ private:
 		    enabled_val.IsNull() || !enabled_val.GetValue<bool>()) {
 			return;
 		}
-		Rewrite(plan);
+		Rewrite(plan, input.context);
 	}
 };
 

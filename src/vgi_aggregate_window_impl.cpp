@@ -211,6 +211,13 @@ void VgiAggregateWindowInit(AggregateInputData &aggr_input_data, const WindowPar
 	ls->bind_data = &bind_data;
 	ls->partition_id = bind_data.exec_state->partition_id_counter.fetch_add(1);
 
+	if (VgiInfoLogActive(context)) {
+		VGI_LOG(context, "aggregate.window_init",
+		        {{"function", bind_data.function_name},
+		         {"partition_id", std::to_string(ls->partition_id)},
+		         {"rows", std::to_string(partition.count)}});
+	}
+
 	auto partition_batch = PartitionToArrow(context, partition);
 	auto frame_stats_bytes = EncodeFrameStats(partition.stats);
 	auto all_valid_bytes = EncodeAllValid(partition.all_valid);

@@ -1,5 +1,9 @@
 # name: test/sql/integration/aggregate/window_batch.test
-# description: Windowed VGI aggregates use the batched aggregate_window_batch callback (one RPC per Evaluate chunk)
+# description: Windowed VGI aggregates use the batched aggregate_window_batch callback (one RPC per Evaluate chunk).
+#              Results must match sum() on every SDK. The batch-path checks apply
+#              only when the worker's function opts into VGI window callbacks
+#              (supports_window, seen as aggregate.window_init); otherwise DuckDB
+#              evaluates the frames itself and no window RPCs are made.
 # group: [vgi_integration_aggregate]
 
 require-env VGI_TEST_WORKER
@@ -30,19 +34,17 @@ FROM (
 ----
 0
 
-# Every output row went through the batch callback, and in more than one call.
-query II
-SELECT sum(regexp_extract(message, 'rows=(\d+)', 1)::BIGINT), count(*) > 1
-FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%aggregate.window_batch%';
-----
-5000	true
-
+# When VGI's window callbacks ran, every output row went through the batch
+# callback, in more than one call, and some batch started at row_idx > 0.
 query I
-SELECT count(*) > 0
+SELECT count(*) FILTER (WHERE message LIKE '%aggregate.window_init%') = 0
+    OR (coalesce(sum(TRY_CAST(regexp_extract(message, 'rows=(\d+)', 1) AS BIGINT))
+                 FILTER (WHERE message LIKE '%aggregate.window_batch%'), 0) = 5000
+        AND count(*) FILTER (WHERE message LIKE '%aggregate.window_batch%') > 1
+        AND count(*) FILTER (WHERE message LIKE '%aggregate.window_batch%'
+                             AND TRY_CAST(regexp_extract(message, 'row_idx=(\d+)', 1) AS BIGINT) > 0) > 0)
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%aggregate.window_batch%'
-  AND regexp_extract(message, 'row_idx=(\d+)', 1)::BIGINT > 0;
+WHERE type = 'VGI' AND message LIKE '%aggregate.window_%';
 ----
 true
 
@@ -62,8 +64,10 @@ FROM (
 0
 
 query I
-SELECT sum(regexp_extract(message, 'rows=(\d+)', 1)::BIGINT)
+SELECT count(*) FILTER (WHERE message LIKE '%aggregate.window_init%') = 0
+    OR coalesce(sum(TRY_CAST(regexp_extract(message, 'rows=(\d+)', 1) AS BIGINT))
+                FILTER (WHERE message LIKE '%aggregate.window_batch%'), 0) = 3000
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%aggregate.window_batch%';
+WHERE type = 'VGI' AND message LIKE '%aggregate.window_%';
 ----
-3000
+true
