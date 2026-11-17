@@ -1,9 +1,13 @@
 # `orchard://` locations
 
 ```sql
-ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/hosted-python');
+ATTACH 'functions' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/hosted-python');
 SELECT hp.main.pass_claims(1);
 ```
+
+As with every vgi location, the first argument is the catalog to attach (a
+worker may host several) and `LOCATION` names where the worker is. The location
+names the deployment, never a catalog.
 
 `orchard://<workspace>/<deployment>` names a deployment hosted on Query.Farm
 Orchard. ATTACH signs in at the Orchard **Front Desk** and then talks directly to
@@ -17,9 +21,6 @@ Both parts are slugs: 1–63 lowercase letters, digits and dashes, starting and
 ending with a letter or digit (`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`). The
 scheme is case-insensitive. Anything else (a missing or extra part, a query,
 fragment or userinfo) is a binder error before any network I/O.
-
-The bare form works too: `ATTACH 'orchard://acme/tiles' (TYPE vgi)` discovers the
-catalog name from the worker.
 
 Only ATTACH resolves `orchard://`. `vgi_catalogs()` and `vgi_protocols()` refuse
 it. The location policy classifies it as `https`, and the Field Address is
