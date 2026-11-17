@@ -94,6 +94,7 @@
 #include "vgi_global_functions.hpp"
 #include "vgi_iroh_config.hpp"
 #include "vgi_oauth.hpp"
+#include "vgi_orchard.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_secret_storage.hpp"
 #include "vgi_lateral_batch_operator.hpp"
@@ -1814,6 +1815,18 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// the rewrites below.
 	vgi::CheckLocationPolicy(context, worker_path, vgi::LocationEntryPoint::ATTACH);
 
+	// orchard://<workspace>/<deployment>: validated now, before any I/O; the
+	// sign-in below turns it into the deployment's https Field Address.
+	std::optional<vgi::OrchardLocation> orchard_location;
+	if (vgi::IsOrchardLocation(worker_path)) {
+		orchard_location = vgi::ParseOrchardLocation(worker_path);
+		if (!bearer_token.empty()) {
+			throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "bearer_token"),
+			                      "bearer_token cannot be used with an orchard:// LOCATION: Orchard sign-in "
+			                      "happens at the Front Desk (pass oauth_refresh_token, or nothing to sign in)");
+		}
+	}
+
 	if (!tcp_proxy.empty() && !vgi::IsTcpTransport(worker_path)) {
 		throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "tcp_proxy"), "tcp_proxy is only valid for tcp:// LOCATIONs");
 	}
@@ -1978,6 +1991,29 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// user's @latest LOCATION.
 	worker_path = vgi::PinGithubLatestLocation(worker_path, context);
 
+	// Orchard: sign in at the Front Desk before any RPC, then use the Field
+	// Address it names as this catalog's HTTP worker for the life of the attach.
+	// The user's orchard:// string stays the displayed LOCATION.
+	std::shared_ptr<vgi::OrchardCatalogAuth> orchard_auth;
+	if (orchard_location) {
+#ifndef __EMSCRIPTEN__
+		try {
+			ExtensionHelper::TryAutoLoadExtension(db.GetDatabase(), "httpfs");
+		} catch (...) {
+		}
+		if (!db.GetDatabase().ExtensionIsLoaded("httpfs")) {
+			throw BinderException("VGI orchard:// LOCATIONs require the httpfs extension. "
+			                      "Install it with: INSTALL httpfs; LOAD httpfs;");
+		}
+#endif
+		orchard_auth = std::make_shared<vgi::OrchardCatalogAuth>(*orchard_location);
+		auto field_address = orchard_auth->SignIn(context, oauth_refresh_token);
+		vgi::CheckLocationPolicy(context, field_address, vgi::LocationEntryPoint::ATTACH);
+		VGI_STDERR_DEBUG("[VGI] orchard.attach location=%s field_address=%s\n", orchard_location->ToString().c_str(),
+		                 field_address.c_str());
+		worker_path = field_address;
+	}
+
 #ifdef __EMSCRIPTEN__
 	// WASM: HTTP and browser SAB targets only. `worker:` names a legacy worker
 	// script; `iroh://` an EndpointId the page maps to its Iroh adapter Worker.
@@ -2002,7 +2038,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 #endif
 
 	std::shared_ptr<vgi::CatalogAuth> auth;
-	if (!bearer_token.empty()) {
+	if (orchard_auth) {
+		auth = orchard_auth;
+	} else if (!bearer_token.empty()) {
 		if (!vgi::IsHttpTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
 			throw BinderException(vgi::ErrorInfo(vgi::error_subtype::kInvalidAttachOption).Set(vgi::error_key::kAttachOption, "bearer_token"),
 			                      "bearer_token is only valid for HTTP transport "
@@ -2022,7 +2060,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		auth = std::move(oauth_auth);
 	}
 
-	if (!bearer_token.empty()) {
+	if (orchard_auth) {
+		tele.auth_mode = oauth_refresh_token.empty() ? "orchard" : "orchard_refresh_token";
+	} else if (!bearer_token.empty()) {
 		tele.auth_mode = "bearer";
 	} else if (!oauth_refresh_token.empty()) {
 		tele.auth_mode = "oauth_refresh_token";

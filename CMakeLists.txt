@@ -340,6 +340,7 @@ src/vgi_cookie_jar.cpp
 src/vgi_oauth.cpp
 src/vgi_oauth_env.cpp
 src/vgi_oauth_store.cpp
+src/vgi_orchard.cpp
 src/vgi_catalogs.cpp
 src/vgi_protocols.cpp
 src/vgi_engine_features.cpp

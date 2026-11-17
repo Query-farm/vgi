@@ -690,7 +690,7 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
                              ClientContext *cancellation, const RpcErrorContext *error_context) {
 	std::string token;
 	if (auth) {
-		token = auth->GetToken();
+		token = auth->GetTokenForRequest(context);
 	}
 
 	const HttpEncoding request_encoding = harvested_caps ? ChooseRequestEncoding(*harvested_caps) : HttpEncoding::ZSTD;
@@ -709,6 +709,25 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 		                  "VGI HTTP authentication required (HTTP 401) but no auth configured for this catalog "
 		                  "[url: %s]. Use bearer_token or oauth_refresh_token in ATTACH options.",
 		                  url);
+	}
+
+	// Auth that owns its 401 handling (Orchard): any challenge is ignored. One
+	// refresh (deduplicated against the token this request was rejected with),
+	// one retry; a second 401 fails.
+	if (auth->HandlesRejectedTokens()) {
+		VGI_STDERR_DEBUG("[VGI] http.401_received url=%s handler=rejected_token\n", url.c_str());
+		auto retry_token = auth->HandleRejectedToken(token, context);
+		result = HttpPostArrowIpcInternal(context, url, body, retry_token, cookie_jar, response, cached_http_params,
+		                                  harvested_caps ? ChooseRequestEncoding(*harvested_caps) : request_encoding,
+		                                  /*allow_codec_retry=*/true, client_holder, harvested_caps, iroh_config,
+		                                  cancellation, error_context);
+		if (response->Status() == HTTPStatusCode::Unauthorized_401) {
+			throw IOException(BuildHttpExtraInfo(http_error::kAuthFailed, url, 401),
+			                  "VGI HTTP authentication failed (HTTP 401) after refreshing the access token "
+			                  "[url: %s]. The worker rejected the new token as well.",
+			                  url);
+		}
+		return result;
 	}
 
 	// No WWW-Authenticate header and a valid challenge without OAuth

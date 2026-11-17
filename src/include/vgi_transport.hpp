@@ -47,6 +47,12 @@ bool IsContainerSharedLocation(const std::string &worker_path);
 // tcp://host:port or tcp://[IPv6]:port; hostnames resolve at connect time.
 bool IsTcpTransport(const std::string &worker_path);
 
+// orchard://<workspace>/<deployment>: an Orchard deployment. Not a transport
+// of its own: ATTACH signs in at the Orchard Front Desk and rewrites it to the
+// deployment's https Field Address (see vgi_orchard.hpp). Scheme is
+// case-insensitive.
+bool IsOrchardLocation(const std::string &worker_path);
+
 // worker:<url> (DuckDB-WASM only).
 bool IsWebWorkerTransport(const std::string &worker_path);
 

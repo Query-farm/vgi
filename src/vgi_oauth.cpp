@@ -801,6 +801,32 @@ static RawTokenResponse PostTokenRequestRaw(ClientContext &context,
 	return {static_cast<int>(response->status), resp_body};
 }
 
+OAuthFormResponse PostOAuthForm(ClientContext &context, const std::string &endpoint, const std::string &body) {
+	auto raw = PostTokenRequestRaw(context, endpoint, body);
+	OAuthFormResponse out;
+	out.status_code = raw.status_code;
+	out.body = std::move(raw.body);
+	return out;
+}
+
+std::string OAuthErrorCode(const std::string &body) {
+	return OAuthErrorCodeOf(body);
+}
+
+std::string OAuthErrorDescription(const std::string &body) {
+	auto doc = yyjson_read(body.c_str(), body.size(), 0);
+	if (!doc) {
+		return std::string();
+	}
+	YyjsonDocGuard guard(doc);
+	auto root = yyjson_doc_get_root(doc);
+	if (!root || !yyjson_is_obj(root)) {
+		return std::string();
+	}
+	auto val = yyjson_obj_get(root, "error_description");
+	return val && yyjson_is_str(val) ? std::string(yyjson_get_str(val)) : std::string();
+}
+
 static std::string PostTokenRequest(ClientContext &context,
                                      const std::string &token_endpoint,
                                      const std::string &body,
@@ -1493,6 +1519,14 @@ static std::string OAuthErrorPage(const std::string &message, const std::string 
   <span class="footer-text">&copy; 2026 &#x1F69C; <a href="https://query.farm" class="footer-link">Query Farm LLC</a></span>
 </div>
 </body></html>)";
+}
+
+std::string OAuthCallbackSuccessPage(const std::string &resource_display, const std::string &resource_url) {
+	return OAuthSuccessPage(resource_display, resource_url);
+}
+
+std::string OAuthCallbackErrorPage(const std::string &message, const std::string &resource_display) {
+	return OAuthErrorPage(message, resource_display);
 }
 
 // resource_name, else the resource URL's host.

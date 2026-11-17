@@ -117,6 +117,18 @@ uint32_t ClassifyLocationForPolicy(const std::string &location, LocationEntryPoi
 		return 0;
 	}
 	// Order and build guards mirror CreateFunctionConnection / InvokePooledUnaryRpc.
+	// orchard:// is resolved only by ATTACH, which signs in at the Front Desk
+	// and then connects over https to the Field Address (itself re-checked).
+	// Anywhere else the raw string would fall through to the shell.
+	if (IsOrchardLocation(location)) {
+		if (entry != LocationEntryPoint::ATTACH) {
+			refusal = StringUtil::Format("vgi: %s() does not resolve orchard:// LOCATIONs; ATTACH the "
+			                             "orchard:// LOCATION instead",
+			                             LocationEntryPointName(entry));
+			return 0;
+		}
+		return POLICY_HTTPS;
+	}
 	if (IsHttpTransport(location)) {
 		return StringUtil::StartsWith(StringUtil::Lower(location), "https://") ? POLICY_HTTPS : POLICY_HTTP;
 	}

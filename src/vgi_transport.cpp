@@ -46,6 +46,11 @@ bool IsGithubAutoLocation(const std::string &worker_path) {
 	return StringUtil::StartsWith(lower, "github-auto://");
 }
 
+bool IsOrchardLocation(const std::string &worker_path) {
+	auto lower = StringUtil::Lower(worker_path);
+	return StringUtil::StartsWith(lower, "orchard://");
+}
+
 bool IsWebWorkerTransport(const std::string &worker_path) {
 	auto lower = StringUtil::Lower(worker_path);
 	return StringUtil::StartsWith(lower, "worker:");

@@ -119,8 +119,28 @@ public:
 	// Current bearer token ("" if none).
 	virtual std::string GetToken() = 0;
 
+	// The bearer token for an outgoing request. May refresh a token that is
+	// about to expire (it has a context to do so); the default is GetToken().
+	virtual std::string GetTokenForRequest(ClientContext &context) {
+		return GetToken();
+	}
+
 	// Handle a 401: obtain and return a new bearer token, or throw.
 	virtual std::string HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) = 0;
+
+	// True when this auth handles every 401 itself, ignoring any challenge the
+	// server sends (no discovery, no new authorization server): the HTTP client
+	// calls HandleRejectedToken instead of parsing WWW-Authenticate, then
+	// retries the request once.
+	virtual bool HandlesRejectedTokens() const {
+		return false;
+	}
+	// A request sent with `rejected_token` drew a 401. Return a token to retry
+	// with, or throw. If the current token already differs from the rejected
+	// one (another thread refreshed), it is returned without a new refresh.
+	virtual std::string HandleRejectedToken(const std::string &rejected_token, ClientContext &context) {
+		return HandleUnauthorized(OAuthChallenge(), context);
+	}
 
 	virtual void ClearTokens() = 0;
 
@@ -269,6 +289,22 @@ std::string UrlEncode(const std::string &str);
 void OpenBrowser(const std::string &url);
 
 std::string HttpGet(ClientContext &context, const std::string &url);
+
+// POST a form-encoded body to an OAuth endpoint. Returns the status and body
+// without throwing on a non-2xx status; throws on a transport failure.
+struct OAuthFormResponse {
+	int status_code = 0;
+	std::string body;
+};
+OAuthFormResponse PostOAuthForm(ClientContext &context, const std::string &endpoint, const std::string &body);
+
+// The RFC 6749 `error` / `error_description` of a JSON error body ("" if absent).
+std::string OAuthErrorCode(const std::string &body);
+std::string OAuthErrorDescription(const std::string &body);
+
+// The loopback callback pages shown in the browser after a PKCE redirect.
+std::string OAuthCallbackSuccessPage(const std::string &resource_display, const std::string &resource_url);
+std::string OAuthCallbackErrorPage(const std::string &message, const std::string &resource_display);
 
 OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::string &url);
 OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::string &server_url);
