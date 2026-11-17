@@ -1,0 +1,109 @@
+# name: test/sql/orchard/orchard_location.test
+# description: orchard:// LOCATIONs are parsed and policy-checked before any network I/O (offline)
+# group: [vgi_orchard]
+
+require vgi
+
+# --- Malformed locations are binder errors, raised before any sign-in.
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e');
+----
+the deployment is missing
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/');
+----
+the deployment is empty
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard:///hosted-python');
+----
+the workspace is empty
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/hosted-python/extra');
+----
+it has more than two path parts
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://Orchard-E2E/hosted-python');
+----
+'Orchard-E2E' is not a valid workspace slug
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/-hosted');
+----
+'-hosted' is not a valid deployment slug
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/hosted-');
+----
+'hosted-' is not a valid deployment slug
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard_e2e/hosted');
+----
+'orchard_e2e' is not a valid workspace slug
+
+# 64 characters: one too many.
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://a123456789012345678901234567890123456789012345678901234567890123/x');
+----
+is not a valid workspace slug
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/hosted-python?x=1');
+----
+query strings, fragments, userinfo and backslashes are not allowed
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://user@orchard-e2e/hosted-python');
+----
+query strings, fragments, userinfo and backslashes are not allowed
+
+# The scheme is case-insensitive, so this is still an Orchard location.
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'ORCHARD://orchard-e2e/Hosted');
+----
+'Hosted' is not a valid deployment slug
+
+# The bare connection-string form is parsed the same way.
+statement error
+ATTACH 'orchard://orchard-e2e' (TYPE vgi);
+----
+Invalid Orchard LOCATION
+
+# Orchard sign-in happens at the Front Desk; a static bearer token is refused.
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/hosted-python', bearer_token 'abc');
+----
+bearer_token cannot be used with an orchard:// LOCATION
+
+# The location is checked before any refresh token is used.
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://BAD/x', oauth_refresh_token 'ort1.not-a-real-token');
+----
+Binder Error: Invalid Orchard LOCATION 'orchard://BAD/x': 'BAD' is not a valid workspace slug.
+
+# --- Only ATTACH resolves orchard://; elsewhere it would reach the shell.
+
+statement error
+SELECT * FROM vgi_catalogs('orchard://orchard-e2e/hosted-python');
+----
+vgi_catalogs() does not resolve orchard:// LOCATIONs
+
+statement error
+SELECT * FROM vgi_protocols('orchard://orchard-e2e/hosted-python');
+----
+vgi_protocols() does not resolve orchard:// LOCATIONs
+
+# --- The location policy classifies orchard:// as https.
+
+statement ok
+SET vgi_allowed_transports = 'http';
+
+statement error
+ATTACH 'hp' AS hp (TYPE vgi, LOCATION 'orchard://orchard-e2e/hosted-python');
+----
+LOCATION transport 'https' is not permitted by vgi_allowed_transports (allowed: http)

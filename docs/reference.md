@@ -108,7 +108,7 @@ Catalogs may register additional worker-defined settings at ATTACH; those are ou
 | `pool_max` | BIGINT | (global default) | Max pooled workers for this worker path (0 = disabled) |
 | `pool_timeout` | BIGINT | (global default) | Idle timeout in seconds before pooled workers are removed |
 | `worker_debug` | BOOLEAN | false | Enable worker debug output |
-| `oauth_refresh_token` | VARCHAR | (none) | Pre-seed OAuth refresh token for HTTP transport (skips interactive auth) |
+| `oauth_refresh_token` | VARCHAR | (none) | Pre-seed OAuth refresh token for HTTP transport (skips interactive auth); for `orchard://`, an Orchard Renewal Token (`ort1.…`) |
 | `bearer_token` | VARCHAR | (none) | Static bearer token for HTTP transport (reused for the remote secret provider too). Throws on 401 (no recovery), unlike OAuth |
 | `attach_ticket` | VARCHAR | (none) | An attach ticket from `vgi_export_session()`: reattach the catalog with the options it was originally attached with, secret ones included, without supplying them. Pair it with `bearer_token` set to the grant from the same export. A credential: redacted from `duckdb_databases()`, never logged, keyed in the result cache only as a salted hash. Requires a worker hosting `vgi.attach_tickets.v1` (checked by reflection before `catalog_attach`); refuses catalog options, `data_version_spec` and `implementation_version` beside it. See [attach tickets](attach-tickets.md) |
 | `secrets` | BOOLEAN | true | Auto-register the Orchard remote secret provider when the catalog advertises a secret-service URL. Set `false` to opt out for this catalog. See *Remote Secret Provider* |
@@ -125,6 +125,7 @@ Catalogs may register additional worker-defined settings at ATTACH; those are ou
 
 - bare command path → **subprocess** transport (default; pooled per-DuckDB-process)
 - `http://...` / `https://...` → **HTTP** transport
+- `orchard://<workspace>/<deployment>` → an **Orchard** deployment (ATTACH only): sign in at the Orchard Front Desk, then the **HTTP** transport to the deployment's Field Address. See [orchard_locations.md](orchard_locations.md)
 - `unix:///path/to/sock` → **AF_UNIX** transport against a worker started out-of-band
 - `launch:<argv>` → **AF_UNIX** transport with the worker spawned via the launcher
 - `oci://<image>[:tag]` (or `docker://` alias) → **container** transport: the worker runs inside an OCI container via the host runtime (docker/podman/nerdctl/Apple `container`), wired over stdin/stdout like a subprocess and pooled the same way. See [docs/container-transport.md](container-transport.md)

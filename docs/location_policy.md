@@ -34,7 +34,7 @@ Comma-separated and case-insensitive. The default is `all`; `none` refuses every
 | `oci` | `oci://`, `docker://` | yes |
 | `github` | `github://`, `github-auto://` (incl. latest-release `owner/repo` / `@latest`) | yes |
 | `database` | `database://` | yes |
-| `http` / `https` | `http://` / `https://` (separate, so plain http can be forbidden) | no |
+| `http` / `https` | `http://` / `https://` (separate, so plain http can be forbidden); `orchard://` is `https` | no |
 | `tcp` | `tcp://host:port` | no |
 | `httpi` | `httpi://<EndpointId>` | no |
 | `iroh` | `iroh://<EndpointId>` | no |
@@ -75,6 +75,8 @@ Some LOCATIONs are refused whatever the policy says:
   users never type.
 - `database://` given to `vgi_catalogs()` or `vgi_protocols()`, which never resolve it. There the raw string would
   otherwise go to the shell.
+- `orchard://` given to `vgi_catalogs()` or `vgi_protocols()`, for the same reason. ATTACH classifies it as
+  `https`, checks it, signs in, and checks the Field Address it is routed to as well.
 
 ## Limitations
 
