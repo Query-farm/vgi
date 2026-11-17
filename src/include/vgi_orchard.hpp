@@ -56,10 +56,15 @@ static constexpr const char *kOrchardClientId = "vgi-duckdb";
 // once per rejected Pass. Never starts an interactive flow after ATTACH.
 class OrchardCatalogAuth : public CatalogAuth {
 public:
-	explicit OrchardCatalogAuth(OrchardLocation location);
+	// `profile` (default "default") and `cache_mode` (oauth_cache) select the
+	// stored sign-in shared by every catalog of this deployment.
+	OrchardCatalogAuth(OrchardLocation location, std::string profile, std::string cache_mode);
 
-	// Sign in: refresh with `refresh_token` when given, else browser PKCE or
-	// (headless) device code. Returns the validated Field Address.
+	// Sign in. An explicit `refresh_token` is used for this attach only: it is
+	// never read from or written to the credential store. Otherwise the stored
+	// sign-in is refreshed; if there is none, or it is refused (invalid_grant,
+	// which deletes it), browser PKCE or (headless) device code, saved after.
+	// Returns the validated Field Address.
 	std::string SignIn(ClientContext &context, const std::string &refresh_token);
 
 	const OrchardLocation &Location() const {
@@ -88,11 +93,20 @@ private:
 	void RefreshLocked(ClientContext &context, bool initial);
 	// Store a token response; `initial` requires vgi_location.
 	void AcceptTokenResponse(ClientContext &context, const std::string &body, bool initial);
-	std::string SignInInteractive(ClientContext &context);
+	std::string SignInInteractive(ClientContext &context, const std::string &store_note);
+	// Write the current Renewal Token to the store. Caller holds the lease.
+	void PersistCurrentToken(ClientContext &context);
 
 	const OrchardLocation location_;
 	const std::string issuer_;
 	const std::string resource_;
+	const std::string cache_mode_;
+	OAuthRefreshContext binding_; // what a stored record is bound to
+	std::string store_key_;
+
+	// Guarded by refresh_mutex_.
+	bool persist_ = false;      // this sign-in is shared through the credential store
+	bool stored_entry_ = false; // the store held (or was given) our token
 
 	// Serializes refreshes: N parallel 401s cause one refresh.
 	std::mutex refresh_mutex_;

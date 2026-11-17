@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <future>
 #include <thread>
 
@@ -19,6 +20,7 @@
 
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_oauth_store.hpp"
 #include "vgi_settings_defaults.hpp"
 
 #ifndef __EMSCRIPTEN__
@@ -39,6 +41,9 @@ constexpr const char *kDeviceCodeGrant = "urn:ietf:params:oauth:grant-type:devic
 // Refresh ahead of expiry: one thread refreshes once less than this is left,
 // the others keep the still-valid Pass.
 constexpr std::chrono::seconds kProactiveRefreshWindow {300};
+// Once a sign-in is persisted, store errors must surface (an auto-mode store
+// that silently drops a write leaves a stale token for another process).
+constexpr const char *kStoreMode = "persistent";
 
 struct YyjsonDoc {
 	yyjson_doc *doc;
@@ -283,8 +288,19 @@ std::string ValidateOrchardFieldAddress(const std::string &vgi_location) {
 // OrchardCatalogAuth
 //===--------------------------------------------------------------------===//
 
-OrchardCatalogAuth::OrchardCatalogAuth(OrchardLocation location)
-    : location_(std::move(location)), issuer_(OrchardIssuer()), resource_(OrchardResource(location_)) {
+OrchardCatalogAuth::OrchardCatalogAuth(OrchardLocation location, std::string profile, std::string cache_mode)
+    : location_(std::move(location)), issuer_(OrchardIssuer()), resource_(OrchardResource(location_)),
+      cache_mode_(std::move(cache_mode)) {
+	if (profile.empty()) {
+		profile = "default";
+	}
+	binding_.issuer = issuer_;
+	binding_.resource = resource_;
+	binding_.client_id = kOrchardClientId;
+	binding_.token_endpoint = issuer_ + "/token";
+	// One stored sign-in per (profile, issuer, Desk resource, client): every
+	// catalog attaching the same deployment under one profile shares it.
+	store_key_ = "orchard\x1f" + profile + "\x1f" + issuer_ + "\x1f" + resource_ + "\x1f" + kOrchardClientId;
 }
 
 std::string OrchardCatalogAuth::FieldAddress() const {
@@ -340,18 +356,52 @@ void OrchardCatalogAuth::AcceptTokenResponse(ClientContext &context, const std::
 	if (!refresh_token.empty()) {
 		token_.refresh_token = std::move(refresh_token);
 	}
+	// Test hook: a shorter Pass lifetime, so refreshes happen mid-session.
+	if (auto ttl = std::getenv("VGI_TEST_ORCHARD_PASS_TTL_SECONDS")) {
+		auto cap = std::atoll(ttl);
+		if (cap > 0 && (!has_expiry || cap < expires_in)) {
+			expires_in = cap;
+			has_expiry = true;
+		}
+	}
 	token_.expires_at = has_expiry ? std::chrono::steady_clock::now() + std::chrono::seconds(expires_in)
 	                               : std::chrono::steady_clock::time_point();
 	dead_message_.clear();
 }
 
 void OrchardCatalogAuth::RefreshLocked(ClientContext &context, bool initial) {
-	std::string refresh_token;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (!dead_message_.empty()) {
 			throw IOException(ErrorInfo(error_subtype::kAuthFailed), "%s", dead_message_);
 		}
+	}
+	// Rotation is shared with every process using the same stored sign-in:
+	// under the store's cross-process lease, use the newest stored token, and
+	// write the successor back before the lease is released. A rotated token
+	// presented more than 30 s later kills the whole family.
+	std::unique_ptr<OAuthCredentialLease> lease;
+	if (persist_) {
+		lease = AcquireOAuthCredentialLease(store_key_, kStoreMode, /*allow_linux=*/true);
+		std::string stored;
+		if (LoadOAuthRefreshToken(store_key_, binding_, kStoreMode, stored, nullptr, /*allow_linux=*/true)) {
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (stored != token_.refresh_token) {
+				VGI_STDERR_DEBUG("[VGI] orchard.store adopt_newer_token location=%s\n", location_.ToString().c_str());
+				token_.refresh_token = stored;
+			}
+			stored_entry_ = true;
+		} else if (stored_entry_) {
+			// Forgotten elsewhere (vgi_oauth_logout in another process): keep this
+			// session in memory, but never resurrect the stored sign-in.
+			VGI_STDERR_DEBUG("[VGI] orchard.store entry_gone location=%s\n", location_.ToString().c_str());
+			persist_ = false;
+			lease.reset();
+		}
+	}
+	std::string refresh_token;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
 		refresh_token = token_.refresh_token;
 	}
 	const std::string endpoint = issuer_ + "/token";
@@ -378,6 +428,9 @@ void OrchardCatalogAuth::RefreshLocked(ClientContext &context, bool initial) {
 		if (transport_error.empty() && resp.status_code == 200) {
 			AcceptTokenResponse(context, resp.body, initial);
 			VGI_STDERR_DEBUG("[VGI] orchard.refresh ok location=%s\n", location_.ToString().c_str());
+			if (persist_) {
+				PersistCurrentToken(context);
+			}
 			return;
 		}
 		const bool transient = !transport_error.empty() || IsTransient(resp.status_code, resp.body);
@@ -394,6 +447,19 @@ void OrchardCatalogAuth::RefreshLocked(ClientContext &context, bool initial) {
 		auto code = OAuthErrorCode(resp.body);
 		auto detail = DescribeOAuthError(resp.status_code, resp.body);
 		if (code == "invalid_grant") {
+			if (persist_) {
+				// Revoked, signed out, expired or reuse-detected: the stored entry
+				// (which is the token just presented: it was re-read under the lease)
+				// is dead too.
+				try {
+					DeleteOAuthRefreshToken(store_key_, kStoreMode, /*allow_linux=*/true);
+					VGI_STDERR_DEBUG("[VGI] orchard.store deleted_after_invalid_grant location=%s\n",
+					                 location_.ToString().c_str());
+				} catch (const std::exception &e) {
+					DUCKDB_LOG_WARNING(context, "VGI Orchard: could not delete the stored sign-in: " + RawMessageOf(e));
+				}
+				stored_entry_ = false;
+			}
 			std::lock_guard<std::mutex> lock(mutex_);
 			token_ = OAuthTokenSet();
 			dead_message_ = StringUtil::Format(
@@ -411,6 +477,30 @@ void OrchardCatalogAuth::RefreshLocked(ClientContext &context, bool initial) {
 		throw IOException(OrchardInfo(error_subtype::kOAuthFailed, "refresh", endpoint, code),
 		                  "VGI Orchard: refreshing the access token for %s failed (%s)", location_.ToString(),
 		                  detail);
+	}
+}
+
+void OrchardCatalogAuth::PersistCurrentToken(ClientContext &context) {
+	std::string token;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		token = token_.refresh_token;
+	}
+	try {
+		StoreOAuthRefreshToken(store_key_, binding_, kStoreMode, token, /*allow_linux=*/true);
+		stored_entry_ = true;
+		VGI_STDERR_DEBUG("[VGI] orchard.store saved location=%s\n", location_.ToString().c_str());
+	} catch (const std::exception &e) {
+		// A stale stored token would later be presented by another process and
+		// kill the family, so drop the entry and stop persisting.
+		DUCKDB_LOG_WARNING(context, "VGI Orchard: could not save the sign-in, it is kept in memory only: " +
+		                                RawMessageOf(e));
+		try {
+			DeleteOAuthRefreshToken(store_key_, kStoreMode, /*allow_linux=*/true);
+		} catch (...) {
+		}
+		persist_ = false;
+		stored_entry_ = false;
 	}
 }
 
@@ -450,7 +540,104 @@ std::string OrchardCatalogAuth::SignIn(ClientContext &context, const std::string
 		}
 		return field_address_;
 	}
-	SignInInteractive(context);
+	// No explicit token: the stored sign-in, if this build and oauth_cache allow it.
+	persist_ = false;
+	std::string store_note;
+#ifndef __EMSCRIPTEN__
+	std::string store_problem;
+	if (cache_mode_ == "auto" || cache_mode_ == "persistent") {
+		try {
+			// Throws for oauth_cache='persistent' when there is no usable store
+			// (kStoreMode surfaces a lock directory that fails its checks); in
+			// auto mode either means memory only, said in the sign-in prompt.
+			if (AcquireOAuthCredentialLease(store_key_, kStoreMode, /*allow_linux=*/true)) {
+				persist_ = true;
+			}
+		} catch (const std::exception &e) {
+			if (cache_mode_ == "persistent") {
+				throw;
+			}
+			store_problem = RawMessageOf(e);
+		}
+	}
+	store_note = persist_ ? "The sign-in will be saved in " + DescribeOAuthStore(cache_mode_, true) +
+	                            "; SELECT * FROM vgi_oauth_logout() forgets it."
+	                      : "The sign-in will not be saved (it lasts until this process exits): " +
+	                            (store_problem.empty() ? DescribeOAuthStore(cache_mode_, true) : store_problem) +
+	                            ".";
+	if (persist_) {
+		std::string stored;
+		bool have = false;
+		try {
+			have = LoadOAuthRefreshToken(store_key_, binding_, kStoreMode, stored, nullptr, /*allow_linux=*/true);
+		} catch (const std::exception &e) {
+			if (cache_mode_ == "persistent") {
+				throw;
+			}
+			DUCKDB_LOG_WARNING(context, "VGI Orchard: the credential store failed, signing in without it: " +
+			                                RawMessageOf(e));
+			persist_ = false;
+		}
+		if (have) {
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				token_.refresh_token = stored;
+			}
+			stored_entry_ = true;
+			try {
+				RefreshLocked(context, /*initial=*/true);
+				VGI_STDERR_DEBUG("[VGI] orchard.signin source=store location=%s\n", location_.ToString().c_str());
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (!field_address_.empty()) {
+					return field_address_;
+				}
+				throw IOException(OrchardInfo(error_subtype::kOAuthFailed, "refresh", issuer_ + "/token"),
+				                  "VGI Orchard: the Front Desk's token response for %s has no vgi_location (Field "
+				                  "Address); the deployment may not be running",
+				                  location_.ToString());
+			} catch (const std::exception &e) {
+				auto info = ExtraInfoOf(e);
+				auto it = info.find(error_key::kOAuthError);
+				if (it == info.end() || it->second != "invalid_grant") {
+					throw;
+				}
+				// The stored sign-in is dead (and already deleted): sign in again.
+				std::lock_guard<std::mutex> lock(mutex_);
+				dead_message_.clear();
+				token_ = OAuthTokenSet();
+				Prompt(context, "The saved sign-in for " + location_.ToString() +
+				                    " is no longer valid (revoked, signed out or expired); signing in again.");
+			}
+		}
+	}
+	// Test hook: stand in for the interactive sign-in with a Renewal Token read
+	// from a file. Unlike oauth_refresh_token, the result is persisted exactly
+	// as an interactive sign-in's would be.
+	if (auto seed_path = std::getenv("VGI_TEST_ORCHARD_SEED_TOKEN_FILE")) {
+		std::ifstream in(seed_path);
+		std::string seed;
+		std::getline(in, seed);
+		while (!seed.empty() && (seed.back() == '\r' || seed.back() == ' ')) {
+			seed.pop_back();
+		}
+		if (seed.empty()) {
+			throw IOException("VGI Orchard: VGI_TEST_ORCHARD_SEED_TOKEN_FILE names an empty or unreadable file");
+		}
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			token_.refresh_token = seed;
+		}
+		RefreshLocked(context, /*initial=*/true); // persists the successor
+		VGI_STDERR_DEBUG("[VGI] orchard.signin source=seed_file location=%s\n", location_.ToString().c_str());
+		std::lock_guard<std::mutex> lock(mutex_);
+		return field_address_;
+	}
+#endif
+	SignInInteractive(context, store_note);
+	if (persist_) {
+		auto lease = AcquireOAuthCredentialLease(store_key_, kStoreMode, /*allow_linux=*/true);
+		PersistCurrentToken(context);
+	}
 	std::lock_guard<std::mutex> lock(mutex_);
 	interactive_ = true;
 	return field_address_;
@@ -528,6 +715,15 @@ std::string OrchardCatalogAuth::HandleUnauthorized(const OAuthChallenge &, Clien
 }
 
 void OrchardCatalogAuth::ClearTokens() {
+	std::lock_guard<std::mutex> refresh_lock(refresh_mutex_);
+	if (persist_) {
+		// Forget the stored sign-in too; errors propagate so vgi_oauth_logout()
+		// never reports success while a saved token remains.
+		auto lease = AcquireOAuthCredentialLease(store_key_, kStoreMode, /*allow_linux=*/true);
+		DeleteOAuthRefreshToken(store_key_, kStoreMode, /*allow_linux=*/true);
+		persist_ = false;
+		stored_entry_ = false;
+	}
 	std::lock_guard<std::mutex> lock(mutex_);
 	token_ = OAuthTokenSet();
 	dead_message_ = "VGI Orchard: signed out of " + location_.ToString() + ". Sign in again: DETACH and re-run ATTACH.";
@@ -567,7 +763,7 @@ bool OrchardCatalogAuth::WasInteractive() const {
 //===--------------------------------------------------------------------===//
 
 #ifdef __EMSCRIPTEN__
-std::string OrchardCatalogAuth::SignInInteractive(ClientContext &) {
+std::string OrchardCatalogAuth::SignInInteractive(ClientContext &, const std::string &) {
 	throw NotImplementedException("VGI Orchard: interactive sign-in for orchard:// is not available in DuckDB-WASM "
 	                              "yet; pass oauth_refresh_token");
 }
@@ -602,7 +798,7 @@ struct OrchardCallbackBindFailure : public IOException {
 
 } // namespace
 
-std::string OrchardCatalogAuth::SignInInteractive(ClientContext &context) {
+std::string OrchardCatalogAuth::SignInInteractive(ClientContext &context, const std::string &store_note) {
 	const auto flow = OAuthFlowSetting(context);
 	const std::string token_endpoint = issuer_ + "/token";
 	const std::string display = location_.ToString();
@@ -642,6 +838,9 @@ std::string OrchardCatalogAuth::SignInInteractive(ClientContext &context) {
 			msg += "\nOr visit: " + verification_uri_complete;
 		}
 		msg += "\nOnly approve if you started this sign-in.";
+		if (!store_note.empty()) {
+			msg += "\n" + store_note;
+		}
 		Prompt(context, msg);
 
 		const auto budget = std::min(timeout_seconds, expires_in);
@@ -782,7 +981,8 @@ std::string OrchardCatalogAuth::SignInInteractive(ClientContext &context) {
 		                             "&state=" + UrlEncode(state) + "&code_challenge=" + UrlEncode(challenge) +
 		                             "&code_challenge_method=S256&resource=" + UrlEncode(resource_);
 		Prompt(context, "Sign in to " + display +
-		                    " (Query.Farm Orchard). Opening your browser...\nIf it doesn't open, visit:\n" + auth_url);
+		                    " (Query.Farm Orchard). Opening your browser...\nIf it doesn't open, visit:\n" + auth_url +
+		                    (store_note.empty() ? std::string() : "\n" + store_note));
 		OpenBrowser(auth_url);
 
 		std::string code;

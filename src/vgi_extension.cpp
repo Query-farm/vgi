@@ -1778,6 +1778,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
+	// orchard:// shares one stored sign-in per deployment across aliases, so it
+	// only uses a profile the user named.
+	const std::string orchard_profile = oauth_profile.empty() ? std::string("default") : oauth_profile;
 	if (oauth_profile.empty()) {
 		oauth_profile = name;
 	}
@@ -2006,7 +2009,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			                      "Install it with: INSTALL httpfs; LOAD httpfs;");
 		}
 #endif
-		orchard_auth = std::make_shared<vgi::OrchardCatalogAuth>(*orchard_location);
+		orchard_auth = std::make_shared<vgi::OrchardCatalogAuth>(*orchard_location, orchard_profile, oauth_cache_mode);
 		auto field_address = orchard_auth->SignIn(context, oauth_refresh_token);
 		vgi::CheckLocationPolicy(context, field_address, vgi::LocationEntryPoint::ATTACH);
 		VGI_STDERR_DEBUG("[VGI] orchard.attach location=%s field_address=%s\n", orchard_location->ToString().c_str(),
