@@ -45,6 +45,9 @@ struct OAuthServerMetadata {
 	std::string token_endpoint;
 	std::string device_authorization_endpoint; // RFC 8628
 	std::vector<std::string> grant_types_supported;
+	// Orchard: where a token response's vgi_location may point, as published
+	// (unvalidated; see ValidateOrchardFieldPatterns).
+	std::vector<std::string> vgi_field_address_patterns;
 
 	bool SupportsGrantType(const std::string &grant_type) const;
 };

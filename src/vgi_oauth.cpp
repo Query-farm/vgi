@@ -630,6 +630,16 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 		meta.device_authorization_endpoint = yyjson_get_str(device_ep);
 	}
 
+	auto field_patterns = yyjson_obj_get(root, "vgi_field_address_patterns");
+	if (field_patterns && yyjson_is_arr(field_patterns)) {
+		size_t idx, max;
+		yyjson_val *val;
+		yyjson_arr_foreach(field_patterns, idx, max, val) {
+			// A non-string entry is kept as "" so validation rejects the whole list.
+			meta.vgi_field_address_patterns.emplace_back(yyjson_is_str(val) ? yyjson_get_str(val) : "");
+		}
+	}
+
 	auto grant_types = yyjson_obj_get(root, "grant_types_supported");
 	if (grant_types && yyjson_is_arr(grant_types)) {
 		size_t idx, max;

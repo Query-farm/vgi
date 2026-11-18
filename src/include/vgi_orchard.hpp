@@ -10,6 +10,7 @@
 #include <chrono>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "vgi_oauth.hpp"
 
@@ -47,6 +48,18 @@ std::string OrchardResource(const OrchardLocation &location);
 // trailing slash, no :443) or throws IOException. Loopback http is accepted
 // only with VGI_TEST_ALLOW_LOOPBACK_DELEGATION=1 in the environment.
 std::string ValidateOrchardFieldAddress(const std::string &vgi_location);
+// The same, against explicit host patterns: `*.<suffix>` is exactly one DNS
+// label, `**.<suffix>` one or more.
+std::string ValidateOrchardFieldAddress(const std::string &vgi_location, const std::vector<std::string> &patterns);
+
+// The built-in Field Address host patterns, used when the issuer publishes none.
+const std::vector<std::string> &OrchardDefaultFieldPatterns();
+
+// Validate an issuer's published `vgi_field_address_patterns`: 1..16 entries,
+// each `*.` or `**.` plus a fixed suffix of at least two lowercase DNS labels
+// (so `*.com` is refused). Any invalid entry rejects the whole list: returns
+// empty, and the caller falls back to the built-ins.
+std::vector<std::string> ValidateOrchardFieldPatterns(const std::vector<std::string> &published);
 
 // The OAuth client every native Orchard sign-in presents.
 static constexpr const char *kOrchardClientId = "vgi-duckdb";

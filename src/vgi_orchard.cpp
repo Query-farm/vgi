@@ -10,6 +10,10 @@
 #include <fstream>
 #include <future>
 #include <thread>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -20,6 +24,7 @@
 
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_oauth.hpp"
 #include "vgi_oauth_store.hpp"
 #include "vgi_settings_defaults.hpp"
 
@@ -36,14 +41,9 @@ namespace {
 
 constexpr const char *kDefaultIssuer = "https://auth.queryfarm.cloud";
 constexpr const char *kDefaultDeskOrigin = "https://desk.queryfarm.cloud";
-// Field Address hosts the Front Desk may hand out. Orchard's own domain may
-// nest; a Fly.io app host is exactly one label under fly.dev (random app
-// names on Fly's shared wildcard certificate never reach CT logs).
-struct FieldHostRule {
-	const char *suffix;
-	bool single_label;
-};
-constexpr FieldHostRule kFieldHostRules[] = {{".field.queryfarm.cloud", false}, {".fly.dev", true}};
+// How long an issuer's published Field Address patterns are trusted before
+// they are fetched again.
+constexpr std::chrono::seconds kFieldPatternTtl {3600};
 constexpr const char *kDeviceCodeGrant = "urn:ietf:params:oauth:grant-type:device_code";
 // Refresh ahead of expiry: one thread refreshes once less than this is left,
 // the others keep the still-valid Pass.
@@ -230,7 +230,94 @@ std::string OrchardResource(const OrchardLocation &location) {
 	return OrchardDeskOrigin() + "/" + location.workspace + "/" + location.deployment;
 }
 
+namespace {
+
+bool IsDnsLabel(const std::string &label) {
+	if (label.empty() || label.size() > 63 || label.front() == '-' || label.back() == '-') {
+		return false;
+	}
+	return label.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") == std::string::npos;
+}
+
+// `*.<suffix>`: exactly one label before the suffix; `**.<suffix>`: one or more.
+bool FieldHostMatches(const std::string &host, const std::string &pattern) {
+	bool single;
+	std::string suffix;
+	if (StringUtil::StartsWith(pattern, "**.")) {
+		single = false;
+		suffix = pattern.substr(2);
+	} else if (StringUtil::StartsWith(pattern, "*.")) {
+		single = true;
+		suffix = pattern.substr(1);
+	} else {
+		return false;
+	}
+	if (host.size() <= suffix.size() || !StringUtil::EndsWith(host, suffix)) {
+		return false;
+	}
+	auto labels = StringUtil::Split(host.substr(0, host.size() - suffix.size()), '.');
+	if (labels.empty() || (single && labels.size() != 1)) {
+		return false;
+	}
+	// StringUtil::Split drops empty pieces, so check for them directly.
+	const std::string prefix = host.substr(0, host.size() - suffix.size());
+	if (prefix.front() == '.' || prefix.back() == '.' || prefix.find("..") != std::string::npos) {
+		return false;
+	}
+	for (auto &label : labels) {
+		if (!IsDnsLabel(label)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+} // namespace
+
+const std::vector<std::string> &OrchardDefaultFieldPatterns() {
+	// Orchard's own domain may nest; a Fly.io app host is exactly one label
+	// under fly.dev (random names on Fly's shared wildcard stay out of CT).
+	static const std::vector<std::string> defaults {"**.field.queryfarm.cloud", "*.fly.dev"};
+	return defaults;
+}
+
+std::vector<std::string> ValidateOrchardFieldPatterns(const std::vector<std::string> &published) {
+	if (published.empty() || published.size() > 16) {
+		return {};
+	}
+	std::vector<std::string> out;
+	for (auto &pattern : published) {
+		std::string suffix;
+		if (StringUtil::StartsWith(pattern, "**.")) {
+			suffix = pattern.substr(3);
+		} else if (StringUtil::StartsWith(pattern, "*.")) {
+			suffix = pattern.substr(2);
+		} else {
+			return {};
+		}
+		if (pattern.size() > 253 || suffix.empty() || suffix.front() == '.' || suffix.back() == '.' ||
+		    suffix.find("..") != std::string::npos) {
+			return {};
+		}
+		auto labels = StringUtil::Split(suffix, '.');
+		if (labels.size() < 2) {
+			return {};
+		}
+		for (auto &label : labels) {
+			if (!IsDnsLabel(label)) {
+				return {};
+			}
+		}
+		out.push_back(pattern);
+	}
+	return out;
+}
+
 std::string ValidateOrchardFieldAddress(const std::string &vgi_location) {
+	return ValidateOrchardFieldAddress(vgi_location, OrchardDefaultFieldPatterns());
+}
+
+std::string ValidateOrchardFieldAddress(const std::string &vgi_location, const std::vector<std::string> &patterns) {
 	auto refuse = [&](const std::string &why) {
 		return IOException(ErrorInfo(error_subtype::kAuthFailed).Url(vgi_location),
 		                   "VGI Orchard: refusing the Field Address '%s' from the Front Desk: %s", vgi_location, why);
@@ -280,21 +367,18 @@ std::string ValidateOrchardFieldAddress(const std::string &vgi_location) {
 		throw refuse("it must name a host, not an IP literal");
 	}
 	bool allowed = false;
-	for (const auto &rule : kFieldHostRules) {
-		const std::string suffix = rule.suffix;
-		if (host.size() <= suffix.size() || !StringUtil::EndsWith(host, suffix)) {
-			continue;
+	for (const auto &pattern : patterns) {
+		if (FieldHostMatches(host, pattern)) {
+			allowed = true;
+			break;
 		}
-		const std::string label = host.substr(0, host.size() - suffix.size());
-		if (label.front() == '.' || label.back() == '.' || label.find("..") != std::string::npos ||
-		    (rule.single_label && label.find('.') != std::string::npos)) {
-			continue;
-		}
-		allowed = true;
-		break;
 	}
 	if (!allowed) {
-		throw refuse("its host is not under *.field.queryfarm.cloud or <app>.fly.dev");
+		std::string list;
+		for (auto &pattern : patterns) {
+			list += (list.empty() ? "" : ", ") + pattern;
+		}
+		throw refuse("its host is not under an allowed Field Address pattern (" + list + ")");
 	}
 	std::string canonical = "https://" + host;
 	if (!port.empty() && port != "443") {
@@ -302,6 +386,49 @@ std::string ValidateOrchardFieldAddress(const std::string &vgi_location) {
 	}
 	return canonical;
 }
+
+namespace {
+
+// The issuer's published Field Address patterns, fetched from its metadata
+// and cached per process. Any failure falls back to the built-ins, which are
+// the stricter choice.
+std::vector<std::string> OrchardFieldPatterns(ClientContext &context, const std::string &issuer) {
+	struct Entry {
+		std::vector<std::string> patterns;
+		std::chrono::steady_clock::time_point fetched;
+	};
+	static std::mutex cache_mutex;
+	static std::unordered_map<std::string, Entry> cache;
+	const auto now = std::chrono::steady_clock::now();
+	{
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		auto it = cache.find(issuer);
+		if (it != cache.end() && now - it->second.fetched < kFieldPatternTtl) {
+			return it->second.patterns;
+		}
+	}
+	std::vector<std::string> patterns;
+	try {
+		auto meta = FetchAuthServerMetadata(context, issuer);
+		patterns = ValidateOrchardFieldPatterns(meta.vgi_field_address_patterns);
+		if (patterns.empty() && !meta.vgi_field_address_patterns.empty()) {
+			DUCKDB_LOG_WARNING(context, "VGI Orchard: " + issuer +
+			                                " published unusable vgi_field_address_patterns; using the built-in hosts");
+		}
+	} catch (std::exception &ex) {
+		DUCKDB_LOG_WARNING(context, "VGI Orchard: could not read " + issuer +
+		                                " metadata for Field Address patterns (" + ex.what() +
+		                                "); using the built-in hosts");
+	}
+	if (patterns.empty()) {
+		patterns = OrchardDefaultFieldPatterns();
+	}
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	cache[issuer] = Entry {patterns, now};
+	return patterns;
+}
+
+} // namespace
 
 //===--------------------------------------------------------------------===//
 // OrchardCatalogAuth
@@ -347,7 +474,7 @@ void OrchardCatalogAuth::AcceptTokenResponse(ClientContext &context, const std::
 
 	std::string field;
 	if (!vgi_location.empty()) {
-		field = ValidateOrchardFieldAddress(vgi_location);
+		field = ValidateOrchardFieldAddress(vgi_location, OrchardFieldPatterns(context, issuer_));
 	} else if (initial) {
 		throw IOException(OrchardInfo(error_subtype::kOAuthFailed, "token_exchange", issuer_ + "/token"),
 		                  "VGI Orchard: the Front Desk's token response for %s has no vgi_location (Field "
