@@ -36,7 +36,14 @@ namespace {
 
 constexpr const char *kDefaultIssuer = "https://auth.queryfarm.cloud";
 constexpr const char *kDefaultDeskOrigin = "https://desk.queryfarm.cloud";
-constexpr const char *kFieldHostSuffix = ".field.queryfarm.cloud";
+// Field Address hosts the Front Desk may hand out. Orchard's own domain may
+// nest; a Fly.io app host is exactly one label under fly.dev (random app
+// names on Fly's shared wildcard certificate never reach CT logs).
+struct FieldHostRule {
+	const char *suffix;
+	bool single_label;
+};
+constexpr FieldHostRule kFieldHostRules[] = {{".field.queryfarm.cloud", false}, {".fly.dev", true}};
 constexpr const char *kDeviceCodeGrant = "urn:ietf:params:oauth:grant-type:device_code";
 // Refresh ahead of expiry: one thread refreshes once less than this is left,
 // the others keep the still-valid Pass.
@@ -272,10 +279,22 @@ std::string ValidateOrchardFieldAddress(const std::string &vgi_location) {
 	if (host.find_first_not_of("0123456789.") == std::string::npos) {
 		throw refuse("it must name a host, not an IP literal");
 	}
-	const std::string suffix = kFieldHostSuffix;
-	if (host.size() <= suffix.size() || !StringUtil::EndsWith(host, suffix) ||
-	    host[host.size() - suffix.size() - 1] == '.') {
-		throw refuse("its host is not under *" + suffix);
+	bool allowed = false;
+	for (const auto &rule : kFieldHostRules) {
+		const std::string suffix = rule.suffix;
+		if (host.size() <= suffix.size() || !StringUtil::EndsWith(host, suffix)) {
+			continue;
+		}
+		const std::string label = host.substr(0, host.size() - suffix.size());
+		if (label.front() == '.' || label.back() == '.' || label.find("..") != std::string::npos ||
+		    (rule.single_label && label.find('.') != std::string::npos)) {
+			continue;
+		}
+		allowed = true;
+		break;
+	}
+	if (!allowed) {
+		throw refuse("its host is not under *.field.queryfarm.cloud or <app>.fly.dev");
 	}
 	std::string canonical = "https://" + host;
 	if (!port.empty() && port != "443") {

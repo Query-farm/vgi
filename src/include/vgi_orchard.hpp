@@ -43,7 +43,7 @@ std::string OrchardResource(const OrchardLocation &location);
 
 // Validate a token response's `vgi_location`: https, optional port, no path,
 // query, fragment or userinfo, not an IP literal, host under
-// `.field.queryfarm.cloud`. Returns the canonical form (lowercase host, no
+// `.field.queryfarm.cloud` or exactly `<app>.fly.dev`. Returns the canonical form (lowercase host, no
 // trailing slash, no :443) or throws IOException. Loopback http is accepted
 // only with VGI_TEST_ALLOW_LOOPBACK_DELEGATION=1 in the environment.
 std::string ValidateOrchardFieldAddress(const std::string &vgi_location);
