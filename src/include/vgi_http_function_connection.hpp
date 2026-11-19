@@ -215,6 +215,11 @@ private:
 		return capabilities_;
 	}
 
+	// CurrentCapabilities, probing /health when there is no snapshot or its
+	// Cache-Control max-age has passed. For the request-size decision, which
+	// must not act on a stale VGI-Max-Request-Bytes.
+	ServerCapabilities FreshCapabilities();
+
 	// Store harvested capabilities here and in the per-catalog cache.
 	void PublishHarvestedCapabilities(const ServerCapabilities &caps) {
 		if (!caps.discovered) {

@@ -73,6 +73,17 @@
     "description": "Before an exchange-mode MAP call (scalar / streaming table-in-out / batched correlated LATERAL), ship only the DISTINCT worker-input tuples in each chunk to the worker and scatter the results back \u2014 turning e.g. 2048 evals over a low-cardinality column into the distinct count. Compute-only (no cache); sound under the same per-row-purity the cacheability opt-in asserts. Default ON"
   },
   {
+    "name": "vgi_external_location_max_bytes",
+    "type": "UBIGINT",
+    "default": 1073741824,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Max bytes fetched (and, when compressed, decompressed) for one externalized vgi_rpc.location batch; a larger object fails the query instead of being buffered",
+    "minimum": 1,
+    "maximum": 9223372036854775807
+  },
+  {
     "name": "vgi_github_allow_latest",
     "type": "BOOLEAN",
     "default": true,

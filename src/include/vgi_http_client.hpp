@@ -133,10 +133,26 @@ enum class HttpSecrets {
 // GET a URL (externalized batches), decoding X-VGI-Content-Encoding /
 // Content-Encoding. Sends no auth headers (pre-signed URLs reject them).
 // cancellation: as for HttpPostArrowIpc.
+// max_bytes > 0 bounds both the transferred body and its decoded size
+// (IOException RESPONSE_TOO_LARGE); 0 = unbounded.
 std::string HttpGetBytes(ClientContext &context, const std::string &url,
-                         ClientContext *cancellation = nullptr, HttpSecrets secrets = HttpSecrets::NONE);
+                         ClientContext *cancellation = nullptr, HttpSecrets secrets = HttpSecrets::NONE,
+                         uint64_t max_bytes = 0);
 
-// Fetch and parse an external location. Throws on fetch failure, an empty
+// The test hook that admits plain-http loopback external locations
+// (http://127.0.0.1, http://[::1], http://localhost). Production stores are https.
+inline constexpr const char *kAllowLoopbackExternalLocationsEnv = "VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS";
+
+// Whether ResolveExternalLocation may fetch `url`: https://, or loopback http
+// with kAllowLoopbackExternalLocationsEnv=1 (always, in the browser).
+bool ExternalLocationUrlAllowed(const std::string &url);
+
+// vgi_external_location_max_bytes for this session.
+uint64_t GetExternalLocationMaxBytes(ClientContext &context);
+
+// Fetch and parse an external location. Throws on a URL that is not
+// ExternalLocationUrlAllowed, an object over vgi_external_location_max_bytes,
+// fetch failure, an empty
 // body, a SHA-256 mismatch (when pointer_metadata carries
 // RPC_LOCATION_SHA256_KEY) or a pointer to another location. The worker/id
 // arguments are log context for log batches embedded in the fetched stream.
@@ -187,13 +203,16 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
 void HttpPutBytes(ClientContext &context, const std::string &url,
                    const std::vector<uint8_t> &data, HttpEncoding encoding = HttpEncoding::NONE);
 
-// Zero-row batch with vgi_rpc.location metadata. The stream_state / call_state
-// tokens must ride the pointer batch: the worker reads them off the request
-// metadata, so a token omitted here is absent from the request.
-std::vector<uint8_t> SerializePointerBatch(const VgiSchemaPtr &schema,
-                                             const std::string &location_url,
-                                             const std::string &stream_state_token = "",
-                                             const std::string &call_state_token = "");
+// A request body over the server's VGI-Max-Request-Bytes, when the server
+// advertises VGI-Upload-URL-Support: PUT it to an __upload_url__ URL and
+// replace `body` with a zero-row pointer batch (same schema, the request's
+// metadata plus vgi_rpc.location). Returns whether it did. Throws when the
+// body also exceeds VGI-Max-Upload-Bytes or a vended URL is not https (see
+// ExternalLocationUrlAllowed). Without upload support the body is left
+// inline for the server to refuse with 413.
+bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base_url, std::vector<uint8_t> &body,
+                                 const ServerCapabilities &caps, const std::shared_ptr<CatalogAuth> &auth,
+                                 const std::shared_ptr<IrohClientConfig> &iroh_config);
 
 } // namespace vgi
 } // namespace duckdb

@@ -193,6 +193,15 @@ std::string HttpFunctionConnection::GetTransactionOpaqueDataDigest() const {
 	return OpaqueDigest(transaction_opaque_data_);
 }
 
+ServerCapabilities HttpFunctionConnection::FreshCapabilities() {
+	auto caps = CurrentCapabilities();
+	if (!caps.discovered || (caps.cache_expires_at != std::chrono::steady_clock::time_point{} &&
+	                         std::chrono::steady_clock::now() >= caps.cache_expires_at)) {
+		caps = HttpDiscoverCapabilities(context_, base_url_, attach_params_ ? attach_params_->iroh() : nullptr);
+	}
+	return caps;
+}
+
 std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
     const VgiBatchPtr &batch,
     const VgiSchemaPtr &schema) {
@@ -562,8 +571,11 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	    ? attach_params_->GetOrInitHttpParams(context_, init_url) : nullptr;
 #ifdef __EMSCRIPTEN__
 #endif
-	// See CurrentCapabilities.
-	ServerCapabilities harvested = CurrentCapabilities();
+	// See CurrentCapabilities. A large init (e.g. a big table-function
+	// parameter carried in the bind request) goes up via an upload URL.
+	ServerCapabilities harvested = FreshCapabilities();
+	MaybeExternalizeRequestBody(context_, base_url_, body, harvested, auth,
+	                            attach_params_ ? attach_params_->iroh() : nullptr);
 	const auto call_error_context = HttpCallErrorContext(base_url_, init_url, "init", function_name_, function_type_,
 	                                                       GetExecutionIdHex(), GetAttachOpaqueDataDigest(), GetConnIdHex());
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
@@ -911,29 +923,11 @@ VgiBatchPtr HttpFunctionConnection::ReadDataBatch() {
 	auto body = SerializeBatchWithState(input_batch, input_schema_);
 
 	// A body over max_request_bytes goes through a server-vended upload URL.
-	// Capabilities are normally warm from /init; probe only with no snapshot or
-	// an expired Cache-Control max-age.
-	if (!capabilities_.discovered && attach_params_) {
-		capabilities_ = attach_params_->LoadServerCapabilities();
-	}
-	if (!capabilities_.discovered ||
-	    (capabilities_.cache_expires_at != std::chrono::steady_clock::time_point{} &&
-	     std::chrono::steady_clock::now() >= capabilities_.cache_expires_at)) {
-		capabilities_ = HttpDiscoverCapabilities(context_, base_url_,
-		                                            attach_params_ ? attach_params_->iroh() : nullptr);
-	}
-	if (capabilities_.max_request_bytes > 0 &&
-	    static_cast<int64_t>(body.size()) > capabilities_.max_request_bytes &&
-	    capabilities_.upload_url_support) {
-		auto e_auth = attach_params_ ? attach_params_->auth() : nullptr;
-		auto urls = HttpRequestUploadUrls(context_, base_url_, 1, e_auth,
-		                                  attach_params_ ? attach_params_->iroh() : nullptr);
-		if (!urls.empty()) {
-			HttpPutBytes(context_, urls[0].upload_url, body, HttpEncoding::NONE);
-			body = SerializePointerBatch(input_schema_, urls[0].download_url, stream_state_token_,
-			                             call_state_token_);
-		}
-	}
+	// Capabilities are normally warm from /init.
+	capabilities_ = FreshCapabilities();
+	MaybeExternalizeRequestBody(context_, base_url_, body, capabilities_,
+	                            attach_params_ ? attach_params_->auth() : nullptr,
+	                            attach_params_ ? attach_params_->iroh() : nullptr);
 
 	std::string exchange_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/exchange";
 

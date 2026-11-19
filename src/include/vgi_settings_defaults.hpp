@@ -12,6 +12,7 @@ inline constexpr bool CANCEL_ENABLED = true;
 inline constexpr bool CATALOG_CONTENTS = true;
 inline constexpr int64_t EAGER_LOAD_THRESHOLD = 1000LL;
 inline constexpr bool EXCHANGE_INPUT_DEDUP = true;
+inline constexpr uint64_t EXTERNAL_LOCATION_MAX_BYTES = 1073741824ULL;
 inline constexpr bool GITHUB_ALLOW_LATEST = true;
 inline constexpr const char *GITHUB_CACHE_DIR = "";
 inline constexpr int64_t GITHUB_LATEST_TTL_SECONDS = 3600LL;

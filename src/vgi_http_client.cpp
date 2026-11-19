@@ -826,6 +826,11 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	} else {
 		body = SerializeEmptyRpcRequest(method_name, protocol);
 	}
+	// A request over VGI-Max-Request-Bytes goes up through an upload URL
+	// (never the upload-URL request itself).
+	if (method_name != UPLOAD_URL_METHOD) {
+		MaybeExternalizeRequestBody(context, base_url, body, *effective_caps, auth, iroh_config);
+	}
 
 	// Worker errors name the worker and this call; the URL is its own field.
 	RpcErrorContext error_context;
@@ -860,7 +865,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 // External locations
 
 std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientContext *cancellation,
-                         HttpSecrets secrets) {
+                         HttpSecrets secrets, uint64_t max_bytes) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 	HTTPHeaders headers;
@@ -879,12 +884,34 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 	// No auth headers: pre-signed URLs reject an extra Authorization header.
 
 	std::string body;
-	auto response_handler = [](const HTTPResponse &) {
+	// max_bytes bounds the transferred body: a declared Content-Length over it
+	// stops before any body is read, and a body that grows past it (chunked, or
+	// a lying length) stops at the limit.
+	bool over_limit = false;
+	auto response_handler = [&over_limit, max_bytes](const HTTPResponse &response) {
+		if (max_bytes > 0 && response.HasHeader("Content-Length")) {
+			try {
+				if (std::stoull(response.GetHeaderValue("Content-Length")) > max_bytes) {
+					over_limit = true;
+					return false;
+				}
+			} catch (...) {
+			}
+		}
 		return true;
 	};
-	auto content_handler = [&body](const_data_ptr_t data, idx_t data_length) {
+	auto content_handler = [&body, &over_limit, max_bytes](const_data_ptr_t data, idx_t data_length) {
+		if (max_bytes > 0 && body.size() + data_length > max_bytes) {
+			over_limit = true;
+			return false;
+		}
 		body.append(reinterpret_cast<const char *>(data), data_length);
 		return true;
+	};
+	auto throw_too_large = [&]() {
+		throw IOException(BuildHttpExtraInfo(http_error::kResponseTooLarge, url),
+		                  "VGI external location exceeds vgi_external_location_max_bytes (%llu) [url: %s]",
+		                  static_cast<unsigned long long>(max_bytes), RedactCredentials(url));
 	};
 
 	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
@@ -897,6 +924,9 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 	auto response = http_util.Request(get);
 	if (IsInterruptedRequest(cancellation, response.get())) {
 		throw InterruptException();
+	}
+	if (over_limit) {
+		throw_too_large();
 	}
 	if (!response) {
 		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
@@ -917,10 +947,37 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 	}
 #endif
 	if (get_enc != HttpEncoding::NONE && !body.empty()) {
-		return Decompress(get_enc, body.data(), body.size());
+		// The codec's own error names the cap when the decoded size exceeds it.
+		return max_bytes == 0 ? Decompress(get_enc, body.data(), body.size())
+		                      : Decompress(get_enc, body.data(), body.size(), static_cast<size_t>(max_bytes));
 	}
 
 	return body;
+}
+
+uint64_t GetExternalLocationMaxBytes(ClientContext &context) {
+	Value value;
+	if (context.TryGetCurrentSetting("vgi_external_location_max_bytes", value) && !value.IsNull()) {
+		return value.GetValue<uint64_t>();
+	}
+	return defaults::EXTERNAL_LOCATION_MAX_BYTES;
+}
+
+bool ExternalLocationUrlAllowed(const std::string &url) {
+	if (url.size() >= 8 && StringUtil::Lower(url.substr(0, 8)) == "https://") {
+		return true;
+	}
+	if (!IsLoopbackHttpUrl(url)) {
+		return false;
+	}
+#if defined(__EMSCRIPTEN__)
+	// No process environment in the browser, which also blocks mixed content
+	// on its own; a page served from localhost may use a loopback store.
+	return true;
+#else
+	const char *flag = std::getenv(kAllowLoopbackExternalLocationsEnv);
+	return flag && std::string(flag) == "1";
+#endif
 }
 
 UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::string &location_url,
@@ -942,7 +999,14 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 		                  "https:// pre-signed URL [url: %s]",
 		                  location_url);
 	}
-	auto body = HttpGetBytes(context, location_url, cancellation);
+	if (!ExternalLocationUrlAllowed(location_url)) {
+		throw IOException(location_error(http_error::kUnsupported),
+		                  "VGI external location refused: the URL must be https:// (plain http is accepted only for a "
+		                  "loopback host with %s=1) [url: %s]",
+		                  kAllowLoopbackExternalLocationsEnv, RedactCredentials(location_url));
+	}
+	auto body = HttpGetBytes(context, location_url, cancellation, HttpSecrets::NONE,
+	                         GetExternalLocationMaxBytes(context));
 
 	if (body.empty()) {
 		throw IOException(location_error(http_error::kProtocolViolation),
@@ -1369,22 +1433,54 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const std::vec
 	}
 }
 
-std::vector<uint8_t> SerializePointerBatch(const VgiSchemaPtr &schema,
-                                           const std::string &location_url, const std::string &stream_state_token,
-                                             const std::string &call_state_token) {
-	auto zero_batch = VgiBatch::MakeEmpty(schema);
-
-	// Tokens must ride the pointer batch (see header).
-	VgiMetadata metadata {{RPC_LOCATION_KEY, location_url}};
-	if (!stream_state_token.empty()) {
-		metadata.Set(RPC_STREAM_STATE_KEY, stream_state_token);
+bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base_url, std::vector<uint8_t> &body,
+                                 const ServerCapabilities &caps, const std::shared_ptr<CatalogAuth> &auth,
+                                 const std::shared_ptr<IrohClientConfig> &iroh_config) {
+	if (caps.max_request_bytes <= 0 || static_cast<int64_t>(body.size()) <= caps.max_request_bytes) {
+		return false;
 	}
-	if (!call_state_token.empty()) {
-		metadata.Set(RPC_CALL_STATE_KEY, call_state_token);
+	if (!caps.upload_url_support) {
+		// Sent inline: the server's 413 names its cap and the missing upload path.
+		return false;
 	}
+	if (caps.max_upload_bytes > 0 && static_cast<int64_t>(body.size()) > caps.max_upload_bytes) {
+		throw IOException(BuildHttpExtraInfo(http_error::kLimitExceeded, base_url),
+		                  "VGI request of %llu bytes exceeds both the server's VGI-Max-Request-Bytes (%lld) and "
+		                  "VGI-Max-Upload-Bytes (%lld) [url: %s]",
+		                  static_cast<unsigned long long>(body.size()), static_cast<long long>(caps.max_request_bytes),
+		                  static_cast<long long>(caps.max_upload_bytes), base_url);
+	}
+	// The pointer keeps the request's schema and every metadata key (method,
+	// protocol, state tokens, validators): the server routes and reads tokens
+	// from the outer batch, then resolves the pointer for the payload.
+	auto reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(VgiBuffer::Copy(body.data(), body.size())));
+	auto request_batch = reader->ReadNext();
+	if (!request_batch) {
+		throw InternalException("vgi: request body to externalize holds no batch [url: %s]", base_url);
+	}
+	auto urls = HttpRequestUploadUrls(context, base_url, 1, auth, iroh_config);
+	if (urls.empty()) {
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI server returned no upload URLs [url: %s]", base_url);
+	}
+	// The same scheme rule as a fetched location: request bytes never leave
+	// over plaintext to a non-loopback host.
+	for (const auto *vended : {&urls[0].upload_url, &urls[0].download_url}) {
+		if (!ExternalLocationUrlAllowed(*vended)) {
+			throw IOException(BuildHttpExtraInfo(http_error::kUnsupported, base_url),
+			                  "VGI server vended an upload URL that is not https:// (plain http is accepted only for "
+			                  "a loopback host with %s=1) [url: %s]",
+			                  kAllowLoopbackExternalLocationsEnv, RedactCredentials(*vended));
+		}
+	}
+	HttpPutBytes(context, urls[0].upload_url, body, HttpEncoding::NONE);
 
-	auto buffer = SerializeBatch(*zero_batch, &metadata);
-	return buffer->ToVector();
+	VgiMetadata metadata(request_batch->metadata()->pairs());
+	metadata.Set(RPC_LOCATION_KEY, urls[0].download_url);
+	auto pointer = VgiBatch::MakeEmpty(request_batch->schema());
+	body = SerializeBatch(*pointer, &metadata)->ToVector();
+	VGI_STDERR_DEBUG("[VGI] http.request_externalized url=%s\n", base_url.c_str());
+	return true;
 }
 
 } // namespace vgi

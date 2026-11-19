@@ -58,7 +58,7 @@ sent as an empty string.
 | `SCHEMA_MISMATCH` | A batch's columns differ from the schema declared at bind (`column_index`, `expected`, `actual`). |
 | `CHECKSUM_MISMATCH` | Downloaded content did not match its digest (`expected`, `actual`). |
 | `RESPONSE_TOO_LARGE` | A response exceeded a client-side size bound. |
-| `LIMIT_EXCEEDED` | A response exceeded a client-side count bound such as pages or splits (`limit`). |
+| `LIMIT_EXCEEDED` | A response exceeded a client-side count bound such as pages or splits (`limit`), or a request exceeded both the server's `VGI-Max-Request-Bytes` and `VGI-Max-Upload-Bytes`. |
 
 ### Authentication
 
