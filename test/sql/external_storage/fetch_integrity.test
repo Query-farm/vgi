@@ -1,0 +1,126 @@
+# name: test/sql/external_storage/fetch_integrity.test
+# description: Fetched external locations are checked against their digest and size cap
+# group: [vgi_external_storage]
+#
+# ext_probe serves the pointed-at objects itself on 127.0.0.1, so it can lie:
+# a digest of other bytes, an object altered after hashing, a body without
+# Content-Length, a gzip body that inflates past the cap.
+
+require-env VGI_EXTERNAL_PROBE_WORKER
+
+require-env VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS
+
+require vgi
+
+require httpfs
+
+statement ok
+SET http_retries=0;
+
+statement ok
+ATTACH 'ext_probe' AS ep (TYPE vgi, LOCATION '${VGI_EXTERNAL_PROBE_WORKER}');
+
+# --- positive controls: the fetched batch is exactly what was pointed at ----
+
+query IIII
+SELECT count(*), sum(strlen(payload)), bool_and(payload = repeat(chr((97 + i % 26)::INTEGER), 100)),
+       md5(string_agg(payload, '' ORDER BY i)) = md5(string_agg(repeat(chr((97 + i % 26)::INTEGER), 100), '' ORDER BY i))
+FROM ep.ext_probe_ok(500, 100);
+----
+500	50000	true	true
+
+query II
+SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_no_sha(500, 100);
+----
+500	50000
+
+query II
+SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_unsized(500, 100);
+----
+500	50000
+
+query II
+SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_gzip(500, 100);
+----
+500	50000
+
+# --- integrity -----------------------------------------------------------------
+
+statement error
+SELECT * FROM ep.ext_probe_bad_sha(500, 100);
+----
+VGI external location SHA-256 checksum mismatch
+
+statement error
+SELECT * FROM ep.ext_probe_corrupt(500, 100);
+----
+VGI external location SHA-256 checksum mismatch
+
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT * FROM ep.ext_probe_corrupt(500, 100);
+----
+"error_subtype":"CHECKSUM_MISMATCH"
+
+statement ok
+RESET errors_as_json;
+
+# --- size cap ------------------------------------------------------------------
+# The objects are ~50 KB (500 x 100 characters plus IPC framing).
+
+statement ok
+SET vgi_external_location_max_bytes=20000;
+
+# A declared Content-Length over the cap stops before the body is read.
+statement error
+SELECT * FROM ep.ext_probe_ok(500, 100);
+----
+exceeds vgi_external_location_max_bytes (20000)
+
+# A close-delimited body stops when it grows past the cap.
+statement error
+SELECT * FROM ep.ext_probe_unsized(500, 100);
+----
+exceeds vgi_external_location_max_bytes (20000)
+
+# The gzip body is far below the cap on the wire; its decoded size is not.
+statement error
+SELECT * FROM ep.ext_probe_gzip(500, 100);
+----
+20000 byte cap
+
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT * FROM ep.ext_probe_ok(500, 100);
+----
+"error_subtype":"RESPONSE_TOO_LARGE"
+
+statement ok
+RESET errors_as_json;
+
+# Objects under the cap still pass.
+query II
+SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_ok(50, 100);
+----
+50	5000
+
+statement ok
+RESET vgi_external_location_max_bytes;
+
+query II
+SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_gzip(500, 100);
+----
+500	50000
+
+# Zero would refuse every object; the setting's minimum is 1.
+statement error
+SET vgi_external_location_max_bytes=0;
+----
+vgi_external_location_max_bytes
+
+statement ok
+DETACH ep;

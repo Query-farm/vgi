@@ -1,0 +1,54 @@
+# name: test/sql/external_storage/table_in_out.test
+# description: A table-in-out function whose input batches, per-batch state and output are externalized
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor. blob_tio puts each input batch in worker
+# storage, reads it back and emits it with checksums: the exchange request is
+# uploaded (over 16 KiB), the state value lives in the vendor (over 4 KiB),
+# and the output is a vendor pointer (over 4 KiB).
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CREATE TABLE src AS SELECT i, repeat(chr((97 + i % 26)::INTEGER), 300) || i::VARCHAR AS s FROM range(6000) t(i);
+
+foreach threads 1 4
+
+statement ok
+SET threads=${threads};
+
+statement ok
+CREATE OR REPLACE TABLE s0 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query IIII
+SELECT count(*), sum(payload_len) = (SELECT sum(strlen(s)) FROM src),
+       bool_and(payload_sha256 = sha256(s)), count(DISTINCT i) = 6000
+FROM bt.blob_tio((SELECT s, i FROM src));
+----
+6000	true	true	true
+
+statement ok
+CREATE OR REPLACE TABLE s1 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query IIII
+SELECT s1.upload_urls > s0.upload_urls, s1.puts > s0.puts, s1.gets > s0.gets, s1.storage_gets > s0.storage_gets
+FROM s0, s1;
+----
+true	true	true	true
+
+endloop
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH bt;

@@ -1,0 +1,75 @@
+# name: test/sql/external_storage/scalar.test
+# description: Scalar functions with outputs and inputs over the externalization limits
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor (results > 4 KiB are vendor pointers, requests
+# > 16 KiB must go up through __upload_url__). Each case checks the values
+# exactly AND that the fake vendor's counters moved, so a lane that silently
+# stopped externalizing fails here instead of passing inline.
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# --- large output: one 300 KB value, fetched from a vendor pointer -----------
+
+statement ok
+CREATE TABLE s0 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query III
+SELECT strlen(r), r = repeat('abc', 100000), md5(r) = md5(repeat('abc', 100000))
+FROM (SELECT bt.blob_repeat('abc', 100000) AS r);
+----
+300000	true	true
+
+statement ok
+CREATE TABLE s1 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+# The server put the result in the vendor; the client downloaded it.
+query II
+SELECT s1.puts > s0.puts, s1.storage_gets > s0.storage_gets FROM s0, s1;
+----
+true	true
+
+# Many rows whose batches are each far over the threshold.
+query II
+SELECT count(*), bool_and(r = repeat(chr((97 + i % 26)::INTEGER), 2000 + i::INTEGER))
+FROM (SELECT i, bt.blob_repeat(chr((97 + i % 26)::INTEGER), 2000 + i) AS r FROM range(3000) t(i));
+----
+3000	true
+
+# --- large input: VARCHAR batches over the 16 KiB request cap ----------------
+
+statement ok
+CREATE TABLE s2 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query I
+SELECT bt.blob_len(repeat('x', 50000));
+----
+50000
+
+# Distinct values (exchange input dedup would otherwise shrink the batch).
+query III
+SELECT count(*), sum(bt.blob_len(s)) = sum(strlen(s)), bool_and(bt.blob_len(s) = strlen(s))
+FROM (SELECT repeat('y', 200) || i::VARCHAR AS s FROM range(10000) t(i));
+----
+10000	true	true
+
+statement ok
+CREATE TABLE s3 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+# The client asked for upload URLs and PUT the request batches to them.
+query II
+SELECT s3.upload_urls > s2.upload_urls, s3.bytes_uploaded - s2.bytes_uploaded > 2000000 FROM s2, s3;
+----
+true	true
+
+statement ok
+DETACH bt;

@@ -1,0 +1,82 @@
+# name: test/sql/external_storage/buffered.test
+# description: A buffered table function whose input, storage values and output are all externalized
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor. blob_buffer_echo stores every input batch raw
+# in worker storage (process), then replays them (finalize):
+#   * the table_buffering_process request carries a whole input batch, over the
+#     16 KiB request cap -> uploaded (upload_urls);
+#   * each stored batch is over VGI_STORAGE_EXTERNALIZE_BYTES -> kept in the
+#     vendor (puts) and read back on finalize (gets);
+#   * each replayed batch is over the result threshold -> fetched by the client.
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CREATE TABLE src AS SELECT i, repeat(chr((97 + i % 26)::INTEGER), 200) || i::VARCHAR AS s FROM range(6000) t(i);
+
+foreach threads 1 4
+
+statement ok
+SET threads=${threads};
+
+statement ok
+CREATE OR REPLACE TABLE s0 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query IIIII
+SELECT count(*), sum(payload_len) = (SELECT sum(strlen(s)) FROM src),
+       bool_and(payload_len = strlen(s)), bool_and(payload_sha256 = sha256(s)),
+       count(DISTINCT s) = 6000
+FROM bt.blob_buffer_echo((SELECT s, i FROM src));
+----
+6000	true	true	true	true
+
+statement ok
+CREATE OR REPLACE TABLE s1 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query IIII
+SELECT s1.upload_urls > s0.upload_urls, s1.puts > s0.puts, s1.gets > s0.gets, s1.storage_gets > s0.storage_gets
+FROM s0, s1;
+----
+true	true	true	true
+
+# Every row came back with its own partner column intact.
+query I
+SELECT count(*) FROM bt.blob_buffer_echo((SELECT s, i FROM src)) e JOIN src USING (i) WHERE e.s <> src.s;
+----
+0
+
+endloop
+
+statement ok
+RESET threads;
+
+# One wide row: the stored value and the result are over their thresholds,
+# the process request is not over the request cap.
+statement ok
+CREATE OR REPLACE TABLE s2 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query II
+SELECT payload_len, payload_sha256 = sha256(repeat('w', 10000)) FROM bt.blob_buffer_echo((SELECT repeat('w', 10000) AS s));
+----
+10000	true
+
+statement ok
+CREATE OR REPLACE TABLE s3 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query II
+SELECT s3.puts > s2.puts, s3.gets > s2.gets FROM s2, s3;
+----
+true	true
+
+statement ok
+DETACH bt;

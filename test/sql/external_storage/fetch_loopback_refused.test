@@ -1,0 +1,30 @@
+# name: test/sql/external_storage/fetch_loopback_refused.test
+# description: Loopback http external locations need the test hook
+# group: [vgi_external_storage]
+#
+# Without VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1 even a loopback http
+# location is refused: production object stores are https.
+
+require-env VGI_EXTERNAL_PROBE_WORKER
+
+require-env-not VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'ext_probe' AS ep (TYPE vgi, LOCATION '${VGI_EXTERNAL_PROBE_WORKER}');
+
+statement error
+SELECT * FROM ep.ext_probe_ok(3, 10);
+----
+plain http is accepted only for a loopback host with VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1
+
+statement error
+SELECT * FROM ep.ext_probe_url('http://localhost:9/blob');
+----
+VGI external location refused: the URL must be https://
+
+statement ok
+DETACH ep;

@@ -164,6 +164,7 @@ the native CI does not run it.
 | `make test_http` / `_debug` | Integration suite over HTTP (`test/run_http_integration.sh`); a server per test file by default. `VGI_HTTP_SERVER_PER_TEST=0` selects one shared server with a per-run log (`VGI_HTTP_SERVER_LOG` overrides its path). |
 | `make test_http_no_compression` | HTTP against a server advertising an **empty** `VGI-Supported-Encodings` (speaks no compression; an *absent* header means a pre-update server that still speaks zstd) |
 | `make test_http_demo_storage` | HTTP against a server that externalizes every response to its demo object store; the only lane fetching externalized results from inside `VgiTransaction::Start` (duckdb#22258 secret-lookup deadlock). |
+| `make test_http_vendor` / `_debug` | HTTP with everything externalized through a fake blob vendor: results > 4 KiB fetched, requests > 16 KiB uploaded, worker storage values > 4 KiB in the vendor. `test/sql/external_storage/` plus the integration suite; `make test_http_vendor_external` runs only the targeted files. See `docs/external_locations.md` |
 | `make test_launcher_external_storage` | Launcher suite against the fixture worker externalizing every result over the byte transport (`test/support/external_storage_worker.py`) |
 | `make test_unix`, `make test_shm` | AF_UNIX transport; shared-memory side channel |
 | `make test_all` / `_debug` | spawn, shm, unix, http, plus the bearer / versioned-tables / attach-options / no-compression HTTP variants |
@@ -265,6 +266,7 @@ the build-host lane. Updating the distribution/platform matrix remains release w
 | `VGI_WORKER_DEBUG=1` | Passthrough + sets `VGI_IPC_DEBUG=1` in the worker |
 | `VGI_RPC_SHM_SIZE_BYTES=N` | Enable the shared-memory side channel for subprocess workers (see `docs/shm_transport.md`) |
 | `VGI_RPC_SHM_DEBUG=1` | Log each resolved / fallback shm batch |
+| `VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1` | Test hook: fetch/upload `vgi_rpc.location` URLs over plain http to a loopback host (otherwise only https) |
 | `VGI_PROFILE=1` | `ScopedTimer` aggregate summary to stderr at exit, incl. every catalog RPC |
 
 Catalog RPC / cache instrumentation (`catalog.rpc`, `catalog.entry_cache`, …) is queryable via
@@ -435,6 +437,7 @@ remain supported. Preserve this rule when changing pool/connection cleanup.
 | Table-in-out: parallel fan-out, blended, buffered, batched LATERAL | `docs/table_in_out.md` |
 | Table-function result cache (memory/disk, partition, exchange-mode) | `docs/result_cache.md`, `docs/result_cache_compression.md`, `docs/result_cache_packed_store.md`, `docs/exchange_dedup_pervalue.md` |
 | Worker batch validation (`vgi_validate_worker_batches`) | `docs/worker_batch_validation.md` |
+| External locations: fetch hardening, request upload, vendor lane | `docs/external_locations.md` |
 | Shared-memory transport | `docs/shm_transport.md` |
 | Protocol routing | `docs/protocol_routing.md` |
 | Catalog profiling | `docs/catalog_profiling.md` |

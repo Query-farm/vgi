@@ -161,6 +161,9 @@ VGI_VISIBILITY_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/tes
 VGI_WRITE_CONTRACT_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/write_contract_worker.py
 # The fixture worker with every result externalized (test_launcher_external_storage).
 VGI_EXTERNAL_STORAGE_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/external_storage_worker.py
+# Hostile and well-formed vgi_rpc.location pointers for the client's fetch
+# checks (test/sql/external_storage/fetch_*.test).
+VGI_EXTERNAL_PROBE_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/external_location_probe_worker.py
 # The fixture worker without vgi_rpc.Reflection.v1, standing in for a worker
 # that predates reflection (test/sql/integration/reflection/pre_reflection.test).
 VGI_NO_REFLECTION_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/no_reflection_worker.py
@@ -175,6 +178,7 @@ VGI_NO_REFLECTION_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/
 # explicitly via `make test_writable` when that worker is available.
 .PHONY: test_spawn test_spawn_debug test_unix test_unix_debug test_http test_http_debug \
 	test_http_demo_storage test_http_demo_storage_debug test_launcher_external_storage \
+	test_http_vendor test_http_vendor_debug test_http_vendor_external \
 	test_shm test_shm_debug \
 	test_launcher test_launcher_debug \
 	test_http_attach_ticket test_http_attach_ticket_debug \
@@ -344,6 +348,7 @@ test_launcher:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build release --isolate-launcher "test/*" \
@@ -365,6 +370,7 @@ test_launcher_debug:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build debug --isolate-launcher "test/*" \
@@ -405,6 +411,7 @@ test_launcher_cloudflare_do:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
@@ -433,6 +440,7 @@ test_launcher_cloudflare_do_debug:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
@@ -526,8 +534,10 @@ test_http_no_compression_debug:
 # Launcher suite against the fixture worker externalizing every result (unary,
 # stream header, data) over the byte transport -- externalization is a server
 # setting, not an HTTP feature. See test/support/external_storage_worker.py.
+# Its blob store is http://127.0.0.1, admitted only by the loopback test hook.
 test_launcher_external_storage:
-	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" $(MAKE) test_launcher VGI_TEST_WORKER="$(VGI_EXTERNAL_STORAGE_WORKER)"
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1 \
+	    $(MAKE) test_launcher VGI_TEST_WORKER="$(VGI_EXTERNAL_STORAGE_WORKER)"
 
 # HTTP suite against a server that externalizes every response (threshold
 # 1 byte) to its demo object store, so each result -- catalog RPCs included --
@@ -536,18 +546,47 @@ test_launcher_external_storage:
 # lookup self-deadlocks (duckdb#22258); run_tests.py's per-file timeout turns a
 # hang into a failure with thread stacks.
 test_http_demo_storage:
-	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 \
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1 \
 	    ./test/run_http_integration.sh "test/sql/integration/*" \
 	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
 test_http_demo_storage_debug:
-	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 BUILD_DIR=debug \
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_DEMO_STORAGE=1 VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1 BUILD_DIR=debug \
 	    ./test/run_http_integration.sh "test/sql/integration/*" \
 	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
+
+# HTTP suite with everything externalized through a fake blob vendor
+# (test/run_http_vendor_integration.sh): results over 4 KiB are fetched from
+# vgi_rpc.location pointers, requests over 16 KiB (unary, init and exchange)
+# go up through __upload_url__, and worker storage values over 4 KiB live in
+# the vendor. Runs the targeted external_storage/ tests, which assert the vendor's
+# counters moved, plus the integration suite as a regression net.
+# The targeted tests live outside test/sql/integration/ so the SDK repos'
+# lanes (which run that tree with strict skip allowlists) never see them.
+VGI_HTTP_VENDOR_SUITE = "test/sql/external_storage/*" "test/sql/integration/*" \
+	    "test/sql/engine_features/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
+
+test_http_vendor:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" \
+	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)" \
+	    ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)
+
+test_http_vendor_debug:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" BUILD_DIR=debug \
+	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)" \
+	    ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)
+
+# Just the targeted externalization tests, against the vendor.
+test_http_vendor_external:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" \
+	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)" \
+	    ./test/run_http_vendor_integration.sh "test/sql/external_storage/*"
 
 # Container (OCI/Docker) transport tests (uses test/run_docker_integration.sh).
 # Skips cleanly when no container runtime is present, so it's safe to run
@@ -738,6 +777,7 @@ test_python:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	    python3 scripts/run_tests.py -j 6 --isolate-launcher \
@@ -816,6 +856,8 @@ VGI_EXPECTED_SKIPS := \
 	--allow-skip 'require-env VGI_TEST_COMPANION_TARGET' \
 	--allow-skip 'require-env VGI_TEST_BEARER_TOKEN' \
 	--allow-skip 'require-env VGI_HTTP_TRANSPORT' \
+	--allow-skip 'require-env VGI_BLOB_VENDOR_URL' \
+	--allow-skip 'require-env VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS' \
 	--allow-skip 'require-env VGI_HTTP_DISABLE_ZSTD' \
 	--allow-skip 'require-env VGI_HTTP_NO_COMPRESSION' \
 	--allow-skip 'require-env VGI_VERSIONED_HTTP_WORKER' \

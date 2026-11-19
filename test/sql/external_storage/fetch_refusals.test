@@ -1,0 +1,64 @@
+# name: test/sql/external_storage/fetch_refusals.test
+# description: External-location URLs the client refuses before fetching anything
+# group: [vgi_external_storage]
+#
+# A vgi_rpc.location pointer names a URL the client GETs with no credentials.
+# Only https:// is fetched (plus loopback http behind a test hook); every other
+# scheme, and a host that merely looks like loopback, is refused up front, so
+# no request leaves the process. The URLs below would not resolve anyway; the
+# assertion is that the refusal, not a transport error, is what comes back.
+
+require-env VGI_EXTERNAL_PROBE_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+SET http_retries=0;
+
+statement ok
+ATTACH 'ext_probe' AS ep (TYPE vgi, LOCATION '${VGI_EXTERNAL_PROBE_WORKER}');
+
+# Plain http to a real host.
+statement error
+SELECT * FROM ep.ext_probe_url('http://vgi-probe.invalid/blob');
+----
+VGI external location refused: the URL must be https://
+
+# userinfo that looks like loopback; the request would go to evil.invalid.
+statement error
+SELECT * FROM ep.ext_probe_url('http://127.0.0.1@evil.invalid/blob');
+----
+VGI external location refused: the URL must be https://
+
+# A loopback-looking host name under another domain.
+statement error
+SELECT * FROM ep.ext_probe_url('http://127.0.0.1.evil.invalid/blob');
+----
+VGI external location refused: the URL must be https://
+
+statement error
+SELECT * FROM ep.ext_probe_url('file:///etc/passwd');
+----
+VGI external location refused: the URL must be https://
+
+statement error
+SELECT * FROM ep.ext_probe_url('ftp://vgi-probe.invalid/blob');
+----
+VGI external location refused: the URL must be https://
+
+# The refusal is a structured error naming the policy.
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT * FROM ep.ext_probe_url('http://vgi-probe.invalid/blob');
+----
+"error_subtype":"UNSUPPORTED"
+
+statement ok
+RESET errors_as_json;
+
+statement ok
+DETACH ep;

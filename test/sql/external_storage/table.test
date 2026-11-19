@@ -1,0 +1,92 @@
+# name: test/sql/external_storage/table.test
+# description: Table functions with outputs and bind parameters over the externalization limits
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor. A large parameter rides the bind and init
+# requests (unary RPC and the /init POST), which the client must upload when
+# they exceed the server's VGI-Max-Request-Bytes.
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# --- large output -------------------------------------------------------------
+
+statement ok
+CREATE TABLE s0 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query IIII
+SELECT count(*), sum(strlen(payload)), bool_and(payload = repeat(chr((97 + i % 26)::INTEGER), 1000)),
+       count(DISTINCT i) = count(*)
+FROM bt.blob_rows(5000, 1000);
+----
+5000	5000000	true	true
+
+statement ok
+CREATE TABLE s1 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query III
+SELECT s1.puts > s0.puts, s1.storage_gets > s0.storage_gets,
+       s1.bytes_downloaded - s0.bytes_downloaded >= 5000000
+FROM s0, s1;
+----
+true	true	true
+
+# An ordered digest of the whole result, against DuckDB's own construction.
+query I
+SELECT md5(string_agg(payload, '' ORDER BY i)) = (
+    SELECT md5(string_agg(repeat(chr((97 + i % 26)::INTEGER), 300), '' ORDER BY i)) FROM range(2500) t(i))
+FROM bt.blob_rows(2500, 300);
+----
+true
+
+# --- large bind parameter (unary bind + init requests) ----------------------
+
+statement ok
+CREATE TABLE s2 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query II
+SELECT payload_len, payload_sha256 = sha256(repeat('p', 100000)) FROM bt.blob_param_echo(repeat('p', 100000));
+----
+100000	true
+
+statement ok
+CREATE TABLE s3 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query I
+SELECT s3.upload_urls > s2.upload_urls FROM s2, s3;
+----
+true
+
+# Multi-byte text: lengths are UTF-8 bytes on both sides.
+query II
+SELECT payload_len, payload_sha256 = sha256(repeat('é', 40000)) FROM bt.blob_param_echo(repeat('é', 40000));
+----
+80000	true
+
+# Under the cap the parameter stays inline (no new upload URL).
+statement ok
+CREATE TABLE s4 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query II
+SELECT payload_len, payload_sha256 = sha256('small') FROM bt.blob_param_echo('small');
+----
+5	true
+
+statement ok
+CREATE TABLE s5 AS SELECT * FROM bt.vgi_test_blob_stats();
+
+query I
+SELECT s5.upload_urls = s4.upload_urls FROM s4, s5;
+----
+true
+
+statement ok
+DETACH bt;
