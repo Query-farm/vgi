@@ -4,8 +4,9 @@
 #
 # Lane: make test_http_vendor (results > 4 KiB are vendor pointers, requests
 # > 32 KiB must go up through __upload_url__). Each case checks the values
-# exactly AND that the fake vendor's counters moved, so a lane that silently
-# stopped externalizing fails here instead of passing inline.
+# exactly AND that the fake vendor's counters moved (read straight from the
+# vendor, GET $VGI_BLOB_VENDOR_URL/__stats__), so a lane that silently stopped
+# externalizing fails here instead of passing inline.
 
 require-env VGI_BLOB_VENDOR_URL
 
@@ -15,13 +16,21 @@ require vgi
 
 require httpfs
 
+require json
+
+# Faults a previous file left armed (it may have stopped half way) must not reach this one.
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
 statement ok
 ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # --- large output: one 300 KB value, fetched from a vendor pointer -----------
 
 statement ok
-CREATE TABLE s0 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query III
 SELECT strlen(r), r = repeat('abc', 100000), md5(r) = md5(repeat('abc', 100000))
@@ -30,7 +39,7 @@ FROM (SELECT bt.blob_repeat('abc', 100000) AS r);
 300000	true	true
 
 statement ok
-CREATE TABLE s1 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 # The server put the result in the vendor; the client downloaded it.
 query II
@@ -48,7 +57,7 @@ FROM (SELECT i, bt.blob_repeat(chr((97 + i % 26)::INTEGER), 2000 + i) AS r FROM 
 # --- large input: VARCHAR batches over the 32 KiB request cap ----------------
 
 statement ok
-CREATE TABLE s2 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s2 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query I
 SELECT bt.blob_len(repeat('x', 50000));
@@ -63,7 +72,7 @@ FROM (SELECT repeat('y', 200) || i::VARCHAR AS s FROM range(10000) t(i));
 10000	true	true
 
 statement ok
-CREATE TABLE s3 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s3 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 # The client asked for upload URLs and PUT the request batches to them.
 query II

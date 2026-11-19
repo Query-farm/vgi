@@ -56,12 +56,21 @@ a cap below the widest request schema still 413s: echo over the fixture's
 ## Tests
 
 - `make test_http_vendor` runs `test/sql/external_storage/` and the
-  integration suite against the fixture HTTP server and a fake blob vendor
-  (`vgi._test_fixtures.fake_blob_vendor`), with results over 4 KiB
-  externalized, requests over 32 KiB uploaded and worker storage values over
-  4 KiB kept in the vendor (`VGI_STORAGE_EXTERNALIZE=1`). The targeted tests
-  check values exactly and that the vendor's counters
-  (`blob_test.vgi_test_blob_stats()`) moved.
+  integration suite against the fixture HTTP server and a fake blob vendor,
+  with results over 4 KiB externalized, requests over 32 KiB uploaded and
+  worker storage values over 4 KiB kept in the vendor
+  (`VGI_STORAGE_EXTERNALIZE=1`). The vendor is vgi-rpc's
+  `vgi-rpc-fake-vendor --test-routes`, started by
+  `test/start_fake_blob_vendor.sh` with `uvx` from a pinned vgi-rpc-python
+  commit (`VGI_RPC_FAKE_VENDOR_REF`); any SDK lane can source that script.
+  The targeted tests check values exactly, read the vendor's counters straight
+  from it (`read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__')`), and use its
+  fault routes to corrupt or lose storage blobs and result objects
+  (`storage_integrity.test`, `result_integrity.test`), plus threshold, empty
+  and NULL cases (`storage_values.test`). The worker contract (the
+  `blob_test` catalog, environment, storage-error messages, the value
+  envelope and vendor conventions) is `docs/testing/blob-test-catalog.md`;
+  envelope vectors are `test/vectors/storage_envelope_v1.json`.
   `make test_http_vendor_external` runs only the targeted files.
 - `test/sql/external_storage/fetch_*.test` use
   `test/support/external_location_probe_worker.py`

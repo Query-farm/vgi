@@ -1,0 +1,182 @@
+{
+  "format": "vgi.storage_envelope.v1",
+  "description": "Function-storage value envelope: every stored value is 0x00||raw (inline) or 0x01||u64be(size)||sha256(32 bytes)||object_id (pointer to a blob-vendor object, purpose fs). Hex strings are lowercase. See docs/testing/blob-test-catalog.md in the vgi extension.",
+  "tag_inline": 0,
+  "tag_pointer": 1,
+  "pointer_fixed_bytes": 41,
+  "object_id_regex": "[A-Za-z0-9._:-]{1,128}",
+  "default_externalize_bytes": 524288,
+  "externalize_rule": "with a vendor, a value of len >= VGI_STORAGE_EXTERNALIZE_BYTES is a pointer, else inline",
+  "inline": [
+    {
+      "name": "empty value",
+      "value_hex": "",
+      "envelope_hex": "00"
+    },
+    {
+      "name": "ascii text",
+      "value_hex": "68656c6c6f",
+      "envelope_hex": "0068656c6c6f"
+    },
+    {
+      "name": "value starting with the pointer tag byte",
+      "value_hex": "010203",
+      "envelope_hex": "00010203"
+    },
+    {
+      "name": "value starting with the inline tag byte",
+      "value_hex": "0000",
+      "envelope_hex": "000000"
+    },
+    {
+      "name": "all byte values",
+      "value_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "envelope_hex": "00000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+    }
+  ],
+  "pointers": [
+    {
+      "name": "32-hex object id (the vendor's)",
+      "object_id": "0123456789abcdef0123456789abcdef",
+      "size": 4096,
+      "sha256": "a2e659dacb4691e887ac0139f8893d04764ee197d70fb73d3190d56113d18e3e",
+      "envelope_hex": "010000000000001000a2e659dacb4691e887ac0139f8893d04764ee197d70fb73d3190d56113d18e3e3031323334353637383961626364656630313233343536373839616263646566"
+    },
+    {
+      "name": "object id using every allowed punctuation",
+      "object_id": "A-z_0.9:obj",
+      "size": 7,
+      "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+      "envelope_hex": "010000000000000007239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5412d7a5f302e393a6f626a"
+    },
+    {
+      "name": "one-character object id, empty blob",
+      "object_id": "a",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "envelope_hex": "010000000000000000e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85561"
+    },
+    {
+      "name": "128-character object id (the maximum)",
+      "object_id": "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo",
+      "size": 1000000,
+      "sha256": "29db38f631ce8382c4cf5e52db4fc5b4c031f088a069275950ce63a3159a2c92",
+      "envelope_hex": "0100000000000f424029db38f631ce8382c4cf5e52db4fc5b4c031f088a069275950ce63a3159a2c926f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f"
+    }
+  ],
+  "malformed": [
+    {
+      "name": "empty stored value",
+      "envelope_hex": "",
+      "error": "empty"
+    },
+    {
+      "name": "unknown tag 0x02",
+      "envelope_hex": "02616263",
+      "error": "unknown_tag"
+    },
+    {
+      "name": "unknown tag 0xff",
+      "envelope_hex": "ff",
+      "error": "unknown_tag"
+    },
+    {
+      "name": "pointer tag only",
+      "envelope_hex": "01",
+      "error": "malformed_pointer"
+    },
+    {
+      "name": "pointer truncated inside the sha256",
+      "envelope_hex": "0100000000000000050000000000000000000000",
+      "error": "malformed_pointer"
+    },
+    {
+      "name": "pointer with an empty object id",
+      "envelope_hex": "0100000000000000050000000000000000000000000000000000000000000000000000000000000000",
+      "error": "malformed_pointer"
+    },
+    {
+      "name": "pointer object id with a disallowed character (/)",
+      "envelope_hex": "0100000000000000050000000000000000000000000000000000000000000000000000000000000000612f62",
+      "error": "malformed_pointer"
+    },
+    {
+      "name": "pointer object id with a space",
+      "envelope_hex": "0100000000000000050000000000000000000000000000000000000000000000000000000000000000612062",
+      "error": "malformed_pointer"
+    },
+    {
+      "name": "pointer object id of 129 characters",
+      "envelope_hex": "01000000000000000500000000000000000000000000000000000000000000000000000000000000006f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f",
+      "error": "malformed_pointer"
+    }
+  ],
+  "scope_execution_ids": {
+    "rule": "'<kind>.<hex ident>' where kind is q (queue, ident = execution id) or s (state/log, ident = scope id); if longer than 128 characters, '<kind>.h<sha256(ident) hex>'",
+    "cases": [
+      {
+        "kind": "q",
+        "ident_hex": "00000000000000000000000000000000",
+        "execution_id": "q.00000000000000000000000000000000"
+      },
+      {
+        "kind": "s",
+        "ident_hex": "000102030405060708090a0b0c0d0e0f",
+        "execution_id": "s.000102030405060708090a0b0c0d0e0f"
+      },
+      {
+        "kind": "s",
+        "ident_hex": "",
+        "execution_id": "s."
+      },
+      {
+        "kind": "q",
+        "ident_hex": "ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+        "execution_id": "q.ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+      },
+      {
+        "kind": "s",
+        "ident_hex": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+        "execution_id": "s.hec65c8798ecf95902413c40f7b9e6d4b0068885f5f324aba1f9ba1c8e14aea61"
+      }
+    ]
+  },
+  "scope_shards": {
+    "rule": "the storage shard key; empty becomes 'loc-anon'; a key not matching [A-Za-z0-9._-]{1,128} becomes 'h-<sha256(utf8 key) hex>'",
+    "regex": "[A-Za-z0-9._-]{1,128}",
+    "cases": [
+      {
+        "shard_key": "att-abababababababababababababababab",
+        "shard": "att-abababababababababababababababab"
+      },
+      {
+        "shard_key": "",
+        "shard": "loc-anon"
+      },
+      {
+        "shard_key": "loc-anon",
+        "shard": "loc-anon"
+      },
+      {
+        "shard_key": "has space",
+        "shard": "h-47b5c36fc0b017ba576f10f988d0cbcbc78256dab5de0e4689980898e7c715e3"
+      },
+      {
+        "shard_key": "a/b",
+        "shard": "h-c14cddc033f64b9dea80ea675cf280a015e672516090a5626781153dc68fea11"
+      },
+      {
+        "shard_key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "shard": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      {
+        "shard_key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "shard": "h-0ec9eb33e74510bcdd1f2ea55206e82f21649c5c2becbf2b433eb475b34c01bd"
+      },
+      {
+        "shard_key": "colon:not-allowed",
+        "shard": "h-90c9c0f18613abec8676487ef2374594287b5808b55232c0e52f31b8a981b896"
+      }
+    ]
+  }
+}

@@ -1,0 +1,188 @@
+# name: test/sql/external_storage/storage_values.test
+# description: Function-storage values at the externalization threshold, empty and NULL values, and many batches in one execution
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, or any SDK lane that sources
+# test/start_fake_blob_vendor.sh. blob_store_values stores the UTF-8 bytes of
+# each value of its first column as one storage value of exactly that size and
+# reports the length and SHA-256 of the bytes it reads back, so the test
+# controls value sizes to the byte. A value of VGI_STORAGE_EXTERNALIZE_BYTES or
+# more must become a vendor blob (one /v1/blobs/put each, counted in
+# /__stats__ `puts`); a smaller one must stay inline. The outputs here are
+# small (under the 4 KiB result threshold) and so are the requests (under the
+# 32 KiB request cap), so every `puts` counted below is a storage value.
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_STORAGE_EXTERNALIZE_BYTES
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Load the catalog before counting: its catalog_contents response is itself an
+# externalized result (one `put`), fetched by the first query that resolves bt.
+query I
+SELECT count(*) FROM bt.blob_store_values((SELECT 'warm' AS s, 1 AS id));
+----
+1
+
+# --- one byte below, at and one above the threshold ----------------------------
+
+statement ok
+CREATE OR REPLACE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query III
+SELECT id, payload_len - ${VGI_STORAGE_EXTERNALIZE_BYTES},
+       payload_sha256 = sha256(repeat(chr((96 + id)::INTEGER), ${VGI_STORAGE_EXTERNALIZE_BYTES} - 2 + id))
+FROM bt.blob_store_values((
+    SELECT repeat(chr((96 + id)::INTEGER), ${VGI_STORAGE_EXTERNALIZE_BYTES} - 2 + id) AS s, id FROM range(1, 4) t(id)))
+ORDER BY id;
+----
+1	-1	true
+2	0	true
+3	1	true
+
+statement ok
+CREATE OR REPLACE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+# Exactly the at and above values went to the vendor, and were read back from it.
+query III
+SELECT s1.puts - s0.puts, s1.gets - s0.gets, s1.bytes_uploaded - s0.bytes_uploaded - 2 * ${VGI_STORAGE_EXTERNALIZE_BYTES}
+FROM s0, s1;
+----
+2	2	1
+
+# The threshold counts bytes, not characters: 'é' is two UTF-8 bytes.
+statement ok
+CREATE OR REPLACE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query II
+SELECT payload_len - ${VGI_STORAGE_EXTERNALIZE_BYTES},
+       payload_sha256 = sha256(repeat('é', ${VGI_STORAGE_EXTERNALIZE_BYTES} // 2) || repeat('a', ${VGI_STORAGE_EXTERNALIZE_BYTES} % 2))
+FROM bt.blob_store_values((
+    SELECT repeat('é', ${VGI_STORAGE_EXTERNALIZE_BYTES} // 2) || repeat('a', ${VGI_STORAGE_EXTERNALIZE_BYTES} % 2) AS s, 1 AS id));
+----
+0	true
+
+statement ok
+CREATE OR REPLACE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query I
+SELECT s1.puts - s0.puts FROM s0, s1;
+----
+1
+
+# --- empty and NULL values -----------------------------------------------------
+
+statement ok
+CREATE OR REPLACE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+# An empty value round-trips as empty; NULL stores nothing and reports NULLs.
+query III
+SELECT id, payload_len, payload_sha256 IS NOT DISTINCT FROM (CASE WHEN id = 2 THEN NULL ELSE sha256('') END)
+FROM bt.blob_store_values((SELECT * FROM (VALUES ('', 1), (NULL, 2), ('', 3)) t(s, id)))
+ORDER BY id;
+----
+1	0	true
+2	NULL	true
+3	0	true
+
+statement ok
+CREATE OR REPLACE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query I
+SELECT s1.puts - s0.puts FROM s0, s1;
+----
+0
+
+# Empty inputs: no rows in, no rows out, no error.
+query I
+SELECT count(*) FROM bt.blob_tio((SELECT 'x' AS s, 1 AS i WHERE false));
+----
+0
+
+query I
+SELECT count(*) FROM bt.blob_buffer_echo((SELECT 'x' AS s, 1 AS i WHERE false));
+----
+0
+
+query I
+SELECT count(*) FROM bt.blob_store_values((SELECT 'x' AS s, 1 AS i WHERE false));
+----
+0
+
+# NULL and empty values inside externalized batches (each batch is over the threshold).
+query IIII
+SELECT count(*), count(payload_len), sum(payload_len) = sum(strlen(s)),
+       bool_and(payload_sha256 = sha256(s)) FILTER (WHERE s IS NOT NULL)
+FROM bt.blob_buffer_echo((
+    SELECT CASE WHEN i % 3 = 0 THEN NULL WHEN i % 3 = 1 THEN '' ELSE repeat('n', 100) || i::VARCHAR END AS s, i
+    FROM range(3000) t(i)));
+----
+3000	2000	true	true
+
+# --- many batches and many values in one execution -----------------------------
+
+# 50,000 rows reach the worker as ~25 batches of up to 2,048 rows; each batch is
+# one storage blob (well over the threshold), written and read back in turn.
+statement ok
+CREATE OR REPLACE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query III
+SELECT count(*), sum(payload_len) = (SELECT sum(strlen(i::VARCHAR)) FROM range(50000) t(i)),
+       bool_and(payload_sha256 = sha256(s))
+FROM bt.blob_tio((SELECT i::VARCHAR AS s, i FROM range(50000) t(i)));
+----
+50000	true	true
+
+statement ok
+CREATE OR REPLACE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query I
+SELECT s1.gets - s0.gets >= 20 FROM s0, s1;
+----
+true
+
+# 3,000 values, every 30th at the threshold: 100 vendor blobs among 2,900 inline
+# values. (The outputs here are over the result threshold, so `puts` also counts
+# a few result uploads: hence a lower bound, with `gets` exact.)
+statement ok
+CREATE OR REPLACE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query III
+SELECT count(*), bool_and(payload_len = strlen(v)), bool_and(payload_sha256 = sha256(v))
+FROM bt.blob_store_values((
+    SELECT CASE WHEN i % 30 = 0 THEN repeat('m', ${VGI_STORAGE_EXTERNALIZE_BYTES} - 6) || lpad(i::VARCHAR, 6, '0')
+                ELSE i::VARCHAR END AS s,
+           CASE WHEN i % 30 = 0 THEN repeat('m', ${VGI_STORAGE_EXTERNALIZE_BYTES} - 6) || lpad(i::VARCHAR, 6, '0')
+                ELSE i::VARCHAR END AS v
+    FROM range(3000) t(i)));
+----
+3000	true	true
+
+statement ok
+CREATE OR REPLACE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query II
+SELECT s1.puts - s0.puts >= 100, s1.gets - s0.gets FROM s0, s1;
+----
+true	100
+
+statement ok
+DETACH bt;

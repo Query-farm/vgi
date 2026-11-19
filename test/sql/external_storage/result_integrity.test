@@ -1,0 +1,125 @@
+# name: test/sql/external_storage/result_integrity.test
+# description: An externalized result that comes back corrupted or missing fails the query, never returns other rows
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, or any SDK lane that sources
+# test/start_fake_blob_vendor.sh. Results over the 4 KiB result threshold are
+# vendor objects of purpose `rpc` that the extension downloads from the
+# pointer's vgi_rpc.location. GET /__admin__/fault?purpose=rpc damages the next
+# N of them: `corrupt` keeps the length and changes every byte, `missing`
+# answers 404.
+#
+# The worker's pointers must carry vgi_rpc.location.sha256 (the SHA-256 of the
+# stored IPC bytes): with it the extension refuses the corrupted body
+# (CHECKSUM_MISMATCH). Without it the extension can only hope the damaged bytes
+# fail to decode, and this file fails. The requests here stay under the 32 KiB
+# request cap, so no client upload (also purpose `rpc`) takes the fault.
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# --- positive controls: ~100 KB table result, 30 KB scalar result -------------
+
+query II
+SELECT count(*), bool_and(payload = repeat(chr((97 + i % 26)::INTEGER), 100)) FROM bt.blob_rows(1000, 100);
+----
+1000	true
+
+query I
+SELECT bt.blob_repeat('abc', 10000) = repeat('abc', 10000);
+----
+true
+
+# --- corrupted result ------------------------------------------------------------
+# Each faulted query uses arguments no earlier query used: the extension caches
+# results, and a cache hit would never download the damaged object. The faults
+# take count=100, i.e. every `rpc` download until the reset: the first query
+# after an error may re-fetch the catalog (itself an externalized result, whose
+# failure the extension answers by falling back to per-schema calls), and a
+# count of 1 would be spent there instead of on the result.
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=rpc&action=corrupt&count=100');
+----
+true
+
+statement error
+SELECT count(*), bool_and(payload = repeat(chr((97 + i % 26)::INTEGER), 100)) FROM bt.blob_rows(1001, 100);
+----
+VGI external location SHA-256 checksum mismatch
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=rpc&action=corrupt&count=100');
+----
+true
+
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT bt.blob_repeat('abd', 10000) = repeat('abd', 10000);
+----
+"error_subtype":"CHECKSUM_MISMATCH"
+
+statement ok
+RESET errors_as_json;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- missing result --------------------------------------------------------------
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=rpc&action=missing&count=100');
+----
+true
+
+statement error
+SELECT count(*) FROM bt.blob_rows(1002, 100);
+----
+<REGEX>:.*(404|Not Found|NoSuchKey).*
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- the faults were the cause: the same shapes pass again (fresh arguments) ----
+
+query II
+SELECT count(*), bool_and(payload = repeat(chr((97 + i % 26)::INTEGER), 100)) FROM bt.blob_rows(1003, 100);
+----
+1003	true
+
+query I
+SELECT bt.blob_repeat('abe', 10000) = repeat('abe', 10000);
+----
+true
+
+statement ok
+DETACH bt;

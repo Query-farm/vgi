@@ -14,13 +14,21 @@ require vgi
 
 require httpfs
 
+require json
+
+# Faults a previous file left armed (it may have stopped half way) must not reach this one.
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
 statement ok
 ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # --- large output -------------------------------------------------------------
 
 statement ok
-CREATE TABLE s0 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query IIII
 SELECT count(*), sum(strlen(payload)), bool_and(payload = repeat(chr((97 + i % 26)::INTEGER), 1000)),
@@ -30,7 +38,7 @@ FROM bt.blob_rows(5000, 1000);
 5000	5000000	true	true
 
 statement ok
-CREATE TABLE s1 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query III
 SELECT s1.puts > s0.puts, s1.storage_gets > s0.storage_gets,
@@ -50,7 +58,7 @@ true
 # --- large bind parameter (unary bind + init requests) ----------------------
 
 statement ok
-CREATE TABLE s2 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s2 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query II
 SELECT payload_len, payload_sha256 = sha256(repeat('p', 100000)) FROM bt.blob_param_echo(repeat('p', 100000));
@@ -58,7 +66,7 @@ SELECT payload_len, payload_sha256 = sha256(repeat('p', 100000)) FROM bt.blob_pa
 100000	true
 
 statement ok
-CREATE TABLE s3 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s3 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query I
 SELECT s3.upload_urls > s2.upload_urls FROM s2, s3;
@@ -73,7 +81,7 @@ SELECT payload_len, payload_sha256 = sha256(repeat('é', 40000)) FROM bt.blob_pa
 
 # Under the cap the parameter stays inline (no new upload URL).
 statement ok
-CREATE TABLE s4 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s4 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query II
 SELECT payload_len, payload_sha256 = sha256('small') FROM bt.blob_param_echo('small');
@@ -81,7 +89,7 @@ SELECT payload_len, payload_sha256 = sha256('small') FROM bt.blob_param_echo('sm
 5	true
 
 statement ok
-CREATE TABLE s5 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE TABLE s5 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query I
 SELECT s5.upload_urls = s4.upload_urls FROM s4, s5;

@@ -18,6 +18,14 @@ require vgi
 
 require httpfs
 
+require json
+
+# Faults a previous file left armed (it may have stopped half way) must not reach this one.
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
 statement ok
 ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
@@ -30,7 +38,7 @@ statement ok
 SET threads=${threads};
 
 statement ok
-CREATE OR REPLACE TABLE s0 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE OR REPLACE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query IIIII
 SELECT count(*), sum(payload_len) = (SELECT sum(strlen(s)) FROM src),
@@ -41,7 +49,7 @@ FROM bt.blob_buffer_echo((SELECT s, i FROM src));
 6000	true	true	true	true
 
 statement ok
-CREATE OR REPLACE TABLE s1 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE OR REPLACE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query IIII
 SELECT s1.upload_urls > s0.upload_urls, s1.puts > s0.puts, s1.gets > s0.gets, s1.storage_gets > s0.storage_gets
@@ -63,7 +71,7 @@ RESET threads;
 # One wide row: the stored value and the result are over their thresholds,
 # the process request is not over the request cap.
 statement ok
-CREATE OR REPLACE TABLE s2 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE OR REPLACE TABLE s2 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query II
 SELECT payload_len, payload_sha256 = sha256(repeat('w', 10000)) FROM bt.blob_buffer_echo((SELECT repeat('w', 10000) AS s));
@@ -71,7 +79,7 @@ SELECT payload_len, payload_sha256 = sha256(repeat('w', 10000)) FROM bt.blob_buf
 10000	true
 
 statement ok
-CREATE OR REPLACE TABLE s3 AS SELECT * FROM bt.vgi_test_blob_stats();
+CREATE OR REPLACE TABLE s3 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query II
 SELECT s3.puts > s2.puts, s3.gets > s2.gets FROM s2, s3;

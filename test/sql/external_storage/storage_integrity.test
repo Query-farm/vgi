@@ -1,0 +1,153 @@
+# name: test/sql/external_storage/storage_integrity.test
+# description: A function-storage blob that comes back corrupted or missing fails the query, never returns other rows
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, or any SDK lane that sources
+# test/start_fake_blob_vendor.sh. GET /__admin__/fault on the fake vendor
+# damages the next N objects of a purpose that are downloaded: `corrupt` serves
+# every byte XORed with 0xFF (same length), `missing` answers 404 (an expired
+# or deleted blob). Purpose `fs` is function storage, so only the worker's
+# storage reads are hit; result and request transfers (purpose `rpc`) are not.
+#
+# The worker must check each storage blob it reads against the pointer's size
+# and SHA-256, and report a missing one. An SDK that skips the check hands
+# other bytes to the function (wrong rows, or an Arrow decode error), and the
+# error regexes below fail. Error contract (docs/testing/blob-test-catalog.md):
+#   integrity: storage blob ... (sha256|size) mismatch
+#   missing:   storage blob ... (missing|not found)
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+# One thread: the fault counts objects, and each query below must be the one to hit it.
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Each input batch is ~60 KB: one storage blob per batch (over the 4 KiB threshold).
+statement ok
+CREATE TABLE src AS SELECT i, repeat(chr((97 + i % 26)::INTEGER), 300) || i::VARCHAR AS s FROM range(200) t(i);
+
+# --- positive controls -----------------------------------------------------------
+
+query II
+SELECT count(*), bool_and(payload_sha256 = sha256(s)) FROM bt.blob_tio((SELECT s, i FROM src));
+----
+200	true
+
+query II
+SELECT count(*), bool_and(payload_sha256 = sha256(s)) FROM bt.blob_buffer_echo((SELECT s, i FROM src));
+----
+200	true
+
+# --- corrupted: same length, other bytes -> integrity error ---------------------
+
+# table-in-out: blob_tio stores the batch and reads it straight back.
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs&action=corrupt&count=1');
+----
+true
+
+statement error
+SELECT count(*), bool_and(payload_sha256 = sha256(s)) FROM bt.blob_tio((SELECT s, i FROM src));
+----
+<REGEX>:.*storage blob.*(sha256|size) mismatch.*
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# buffered: blob_buffer_echo stores in process and reads back in finalize.
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs&action=corrupt&count=1');
+----
+true
+
+statement error
+SELECT count(*), bool_and(payload_sha256 = sha256(s)) FROM bt.blob_buffer_echo((SELECT s, i FROM src));
+----
+<REGEX>:.*storage blob.*(sha256|size) mismatch.*
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# One exact-size value (blob_store_values stores each value as it is).
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs&action=corrupt&count=1');
+----
+true
+
+statement error
+SELECT * FROM bt.blob_store_values((SELECT repeat('v', 10000) AS s, 1 AS id));
+----
+<REGEX>:.*storage blob.*(sha256|size) mismatch.*
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- missing (expired or deleted): a clear error, not other rows ----------------
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs&action=missing&count=1');
+----
+true
+
+statement error
+SELECT count(*) FROM bt.blob_tio((SELECT s, i FROM src));
+----
+<REGEX>:.*storage blob.*(missing|not found).*
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs&action=missing&count=1');
+----
+true
+
+statement error
+SELECT count(*) FROM bt.blob_buffer_echo((SELECT s, i FROM src));
+----
+<REGEX>:.*storage blob.*(missing|not found).*
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- the faults were the cause: the same queries pass again --------------------
+# (over one row fewer, so no cached result can stand in for a fresh run)
+
+query II
+SELECT count(*), bool_and(payload_sha256 = sha256(s)) FROM bt.blob_tio((SELECT s, i FROM src WHERE i < 199));
+----
+199	true
+
+query II
+SELECT count(*), bool_and(payload_sha256 = sha256(s)) FROM bt.blob_buffer_echo((SELECT s, i FROM src WHERE i < 199));
+----
+199	true
+
+statement ok
+DETACH bt;

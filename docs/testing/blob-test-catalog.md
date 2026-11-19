@@ -1,0 +1,243 @@
+# `blob_test`: the blob-vendor fixture contract
+
+`test/sql/external_storage/` checks blob-vendor externalization end to end:
+results over a threshold fetched from vendor pointers, requests over a cap
+uploaded through vendor URLs, and function-storage values over a threshold
+kept in the vendor. The tests are SQL only. Every SDK's HTTP fixture worker can
+run them if it serves the `blob_test` catalog described here and honours the
+environment below. The Python fixture worker
+(`vgi-python/vgi/_test_fixtures/blob_catalog.py`) is the reference
+implementation.
+
+The fake vendor is vgi-rpc-python's `vgi-rpc-fake-vendor`. Lanes start it with
+`test/start_fake_blob_vendor.sh`, which runs it with `uvx` from a pinned git
+commit, so it needs no SDK checkout. The `fetch_*.test` files are different.
+They test the extension's own download client against
+`test/support/external_location_probe_worker.py` (`VGI_EXTERNAL_PROBE_WORKER`)
+and are not part of this contract.
+
+## Running a lane
+
+```bash
+source test/start_fake_blob_vendor.sh     # starts the vendor, exports the variables below
+trap stop_fake_blob_vendor EXIT
+# start your SDK's HTTP fixture worker with this environment, then:
+VGI_TEST_WORKER=http://127.0.0.1:<port> \
+    python3 scripts/run_tests.py --build release "test/sql/external_storage/*" -j 1
+```
+
+Run the files **one at a time** (`-j 1`). They compare the vendor's lane-wide
+counters before and after each query, and they arm faults that hit the next
+download of a purpose. Concurrent files would disturb both. Each file starts
+with `GET /__admin__/reset`, so a file that stopped half way through cannot
+leave a fault armed for the next. The vendor lives
+for the whole lane, so give each test file its own worker, as the Python lane
+does, or one long-lived worker.
+
+The vendor is started as:
+
+```bash
+uvx --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
+    vgi-rpc-fake-vendor --test-routes --token "${VGI_BLOB_VENDOR_TOKEN}=tenant-a"
+```
+
+It prints `PORT:<n>` and then `URL:<base>`. Set `VGI_RPC_FAKE_VENDOR_FROM` to
+replace the whole `--from` spec, for example with a local checkout or
+`vgi-rpc==X.Y.Z`.
+
+## Environment
+
+`test/start_fake_blob_vendor.sh` exports these. A value the caller already set
+is kept. The worker must honour every variable in the first group.
+
+| Variable | Lane value | Worker obligation |
+|---|---|---|
+| `VGI_BLOB_VENDOR_URL` | `http://127.0.0.1:<port>` | The vendor's base URL. With it set, the HTTP server externalizes results, offers upload URLs and (with `VGI_STORAGE_EXTERNALIZE`) keeps large storage values in the vendor. `http://` is allowed only for loopback. |
+| `VGI_BLOB_VENDOR_TOKEN` | `test-token` | Bearer token for every `/v1` call. Never put it on a signed-URL request. |
+| `VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES` | `4096` | A result batch whose Arrow buffers total at least this many bytes is uploaded (purpose `rpc`) and replaced by a pointer. The pointer **must** carry `vgi_rpc.location.sha256` (`result_integrity.test`). |
+| `VGI_RPC_MAX_REQUEST_BYTES` | `32768` | Advertise `VGI-Max-Request-Bytes` and `VGI-Upload-URL-Support: true`. Serve `__upload_url__/init` from the vendor's `/v1/upload_urls`, and accept requests sent as upload pointers. |
+| `VGI_RPC_MAX_UPLOAD_BYTES` | `268435456` | Advertise `VGI-Max-Upload-Bytes`. |
+| `VGI_STORAGE_EXTERNALIZE` | `1` | Wrap the function-storage backend (e.g. SQLite) in the envelope described below. |
+| `VGI_STORAGE_EXTERNALIZE_BYTES` | `4096` | A storage value of **at least** this many bytes is a vendor blob (purpose `fs`). A smaller one is stored inline. The tests use it as `${VGI_STORAGE_EXTERNALIZE_BYTES}`. |
+
+For the extension only:
+
+| Variable | Lane value | Meaning |
+|---|---|---|
+| `VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS` | `1` | Lets the extension fetch and upload the fake's `http://127.0.0.1` signed URLs. |
+| `VGI_TEST_WORKER` | your worker | Set by the lane, not by the script. |
+| `VGI_RPC_FAKE_VENDOR_REF` / `VGI_RPC_FAKE_VENDOR_FROM` | pinned commit | The vendor build to run (see above). |
+
+## The catalog
+
+`ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}')`.
+`blob_test` is its own catalog, with one schema `main`, so the example
+catalog's function counts do not change. It has exactly these seven functions.
+
+| Function | Kind | Arguments | Output |
+|---|---|---|---|
+| `blob_repeat(s, n)` | scalar | `s VARCHAR`, `n BIGINT` | `VARCHAR` (Arrow `large_utf8` in Python; any string type) |
+| `blob_len(s)` | scalar | `s VARCHAR` | `BIGINT` |
+| `blob_rows(rows, width)` | table | `rows BIGINT >= 0`, `width BIGINT >= 0` (positional) | `i BIGINT, payload VARCHAR` |
+| `blob_param_echo(payload)` | table | `payload VARCHAR` (positional) | `payload_len BIGINT, payload_sha256 VARCHAR` |
+| `blob_buffer_echo(t)` | table-buffering | one table input | every input column, then `payload_len BIGINT, payload_sha256 VARCHAR` |
+| `blob_tio(t)` | table-in-out | one table input | every input column, then `payload_len BIGINT, payload_sha256 VARCHAR` |
+| `blob_store_values(t)` | table-in-out | one table input | input columns **2..n**, then `payload_len BIGINT, payload_sha256 VARCHAR` |
+
+**Checksum columns.** `payload_len` is the UTF-8 byte length and
+`payload_sha256` the lowercase hex SHA-256 of a value as text. They match
+DuckDB's `strlen(x)` and `sha256(x)`. A NULL value gives NULL in both.
+
+Behaviour:
+
+- **`blob_repeat`**: `s` repeated `n` times (`n < 0` counts as 0). NULL in
+  either argument gives NULL. It produces large scalar outputs.
+- **`blob_len`**: `strlen(s)` in UTF-8 bytes. It takes large scalar inputs
+  (the requests exceed the request cap).
+- **`blob_rows`**: row `i` (0-based) is `repeat(chr(97 + i % 26), width)`,
+  for `rows` rows in order of `i`. Emit them in batches (Python uses 2,048
+  rows). Cardinality is exactly `rows`. It produces large table outputs.
+- **`blob_param_echo`**: one row with the checksum columns of `payload`. It
+  takes large bind parameters, which ride the bind and init requests.
+- **`blob_buffer_echo`**: *process* stores each input batch, serialized as an
+  Arrow IPC stream, as **one** storage value appended to the execution's log
+  (`state_append`). *Finalize* scans the log and emits each stored batch with
+  the checksum columns of its **first** column (cast to text), one batch per
+  tick. Every row must come back with its other columns intact.
+- **`blob_tio`**: for each input batch, store it (IPC stream) as **one**
+  storage value under a fresh key, read it back immediately, delete it, and
+  emit the batch **as read back** with the checksum columns of its first
+  column. A value that is missing straight after the write is an error.
+- **`blob_store_values`**: for each input batch, store the UTF-8 bytes of each
+  non-NULL value of the first column (cast to text) as **its own storage value
+  of exactly that size** (an empty string is a zero-byte value; NULL stores
+  nothing). Read all of them back in one call, delete them, and emit input
+  columns 2..n with the checksum columns **of the bytes read back**. Each value
+  at or over the threshold costs exactly one vendor `put` and, on the read,
+  exactly one vendor `get` (`storage_values.test` counts them).
+
+The functions in each storage group (`blob_buffer_echo`, `blob_tio`,
+`blob_store_values`) must compute their outputs from what storage returns, not
+from the input they were given. Otherwise the round trip goes untested.
+
+## Storage-error contract
+
+When a storage blob cannot be read, the query must fail. The error message
+that reaches DuckDB must match these SDK-neutral patterns (RE2,
+`.` matches newline):
+
+| Failure | Pattern | Python message |
+|---|---|---|
+| Downloaded bytes differ from the pointer's SHA-256 or size | `.*storage blob.*(sha256\|size) mismatch.*` | `storage blob <id> failed its integrity check: sha256 mismatch` |
+| Blob gone (vendor `get` 404 `not_found`/`not_uploaded`, or the signed URL 404s) | `.*storage blob.*(missing\|not found).*` | `storage blob <id> is missing: not found in the blob vendor (expired or deleted?)` |
+| Anything else | starts `storage blob <id>` | `storage blob <id> could not be read: <detail>` |
+
+The words are lowercase. Verify against the **pointer's** size and SHA-256,
+not the vendor's own report. An SDK that skips verification feeds other bytes
+to the function. That gives wrong rows or a decode error, never these
+messages, so `storage_integrity.test` fails.
+
+Result downloads are checked by the extension, not the worker. A result
+pointer without `vgi_rpc.location.sha256` cannot be verified, so
+`result_integrity.test` requires one (`CHECKSUM_MISMATCH`, "VGI external
+location SHA-256 checksum mismatch").
+
+## Storage value envelope (v1)
+
+Every value the externalizing wrapper writes is enveloped, including
+work-queue items, `state_*` values and log items:
+
+```
+inline:  0x00 || raw
+pointer: 0x01 || u64be(size) || sha256(raw) (32 bytes) || object_id (ASCII)
+```
+
+- A value with `len(raw) >= VGI_STORAGE_EXTERNALIZE_BYTES` (with a vendor) is
+  uploaded **before** the backend write and stored as a pointer, about 73
+  bytes. Everything else is inline.
+- `object_id` matches `[A-Za-z0-9._:-]{1,128}`. The fixed part is 41 bytes.
+- Decoding is strict, and each of these is an error: an empty value, an
+  unknown tag, a pointer of 41 bytes or fewer, or an object id outside the
+  charset. A pointer read with no vendor configured is an error too. User
+  bytes that begin `0x01` are safe because every value is enveloped.
+- Counters (`state_counter_*`) are not enveloped.
+
+Test vectors: [`test/vectors/storage_envelope_v1.json`](../../test/vectors/storage_envelope_v1.json).
+They contain inline values, pointers, malformed cases, and the scope and
+shard names below. They are generated by
+`vgi-python/scripts/gen_storage_envelope_vectors.py`, and vgi-python's
+`tests/test_storage_envelope_vectors.py` checks this copy byte for byte when
+the two checkouts are siblings.
+
+## Vendor scope and idempotency conventions
+
+Uploads carry `scope = {shard, execution_id}` so clean-up can delete by scope:
+
+- **`shard`**: the storage shard key (`"att-" + hex(attach uuid)`). An empty
+  key becomes `loc-anon`. A key that does not match `[A-Za-z0-9._-]{1,128}`
+  becomes `h-` plus the hex SHA-256 of its UTF-8 bytes. The vendor itself also
+  accepts `:`, but the wrapper's charset does not.
+- **`execution_id`**: `q.<hex execution id>` for queue items and
+  `s.<hex scope id>` for state and log values. If the result is longer than
+  128 characters, use `<kind>.h<hex sha256(ident)>` instead.
+- **`idempotency_key`**: `<per-call uuid hex>.<index of the value in the
+  call>`, so a retried logical write reuses the object.
+- Clean-up runs in the background and is best effort. `queue_clear` and
+  `execution_clear` delete their scope, `state_drain` deletes the blobs it
+  drained, and `queue_pop` deletes the blob it claimed. `state_delete` leaves
+  blobs until the scope is cleared.
+
+## Vendor HTTP API
+
+These are the `/v1` routes, mirroring the staging Worker
+(`blobs.staging.queryfarm.cloud`). Every `/v1` route needs
+`Authorization: Bearer <token>`. Errors are `{error, message, ...}`. Times are
+ISO-8601 UTC. Object ids are 32 lowercase hex characters.
+
+| Route | Request | Response |
+|---|---|---|
+| `POST /v1/blobs/put` | `{size, sha256_b64, purpose: "rpc"\|"fs", scope?: {shard, execution_id}, content_encoding?, idempotency_key?}` | `{object_id, region, upload_url, upload_method: "PUT", required_headers, expires_at}` plus `download_url, download_expires_at` for purpose `rpc`. A repeated idempotency key with the same bytes returns the same object; with other bytes, 409 `idempotency_conflict`. 413 `object_too_large` / `quota_exceeded`. |
+| `POST /v1/blobs/get` | `{object_id}` | `{object_id, download_url, size, sha256_b64, content_encoding, expires_at}`. 404 `not_uploaded` / `not_found`. |
+| `POST /v1/blobs/delete` | `{object_ids: [...]}` (at most 1,000) | `{deleted}` |
+| `POST /v1/blobs/delete_scope` | `{shard, execution_id}` | `{deleted}` |
+| `POST /v1/upload_urls` | `{count: 1..100}` | `{region, urls: [{object_id, upload_url, download_url, expires_at, download_expires_at}]}` (unsized, purpose `rpc`) |
+| `GET /v1/info` | none | `{tenant, region, jurisdiction, upload_hosts, download_hosts, url_prefixes, limits, ttl_seconds}`. Pin signed URLs to these hosts and prefixes. |
+
+Signed URLs behave like R2's. A PUT must send exactly the `required_headers`
+(`content-length`, `x-amz-checksum-sha256`, and `content-encoding` when one was
+declared), and a body that does not hash to the declared digest gets
+`400 BadDigest`. Downloads support `HEAD` and single `Range` requests. A URL
+whose query has been stripped fails `403`.
+
+### Test routes (`--test-routes`)
+
+These are unauthenticated, take `GET` only and have side effects only on
+`GET`. A `HEAD` returns the same headers with no effect. Bodies are JSON padded
+with spaces to exactly 1,024 bytes. They support `Range` and carry
+`Cache-Control: no-store`, so DuckDB's `read_json_auto` can read them over
+httpfs.
+
+| Route | Effect / body |
+|---|---|
+| `GET /__stats__` | `{puts, gets, deletes, delete_scopes, upload_urls, storage_puts, storage_gets, objects, bytes, bytes_uploaded, bytes_downloaded}`. These are calls to the five `/v1` routes in order; signed-URL PUTs and GET/HEADs; live objects and their bytes; and cumulative bytes accepted by signed PUTs and served by signed GETs. All but `objects` and `bytes` only grow, so tests compare deltas. |
+| `GET /__admin__/fault?purpose=fs\|rpc&action=corrupt\|missing&count=N` | Arms a fault for the next `N` **objects** of that purpose that are downloaded. The first signed `GET` of such an object marks it. After that, every `GET` of it is faulted until reset: `corrupt` XORs every byte with `0xFF` (same length) and `missing` answers `404 NoSuchKey`. So a probe `GET`, ranged reads and retries all see the same damage. Arming replaces the fault armed for that purpose, so repeating the request is harmless. `count=0` disarms. Body: `{ok, purpose, action, count}`. |
+| `GET /__admin__/reset` | Clears armed and applied faults. Body: `{ok}`. |
+
+From SQL:
+
+```sql
+SELECT puts FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs&action=corrupt&count=1');
+```
+
+## The tests
+
+| File | What it proves |
+|---|---|
+| `scalar.test` | Large scalar outputs come back exactly from vendor pointers (`puts`, `storage_gets` move). Large scalar inputs are uploaded (`upload_urls`, `bytes_uploaded` move). |
+| `table.test` | Large table outputs come back exactly. Large bind parameters are uploaded, and a small one is not. |
+| `buffered.test` | Buffered input, storage and output are all externalized, with 1 and 4 threads. |
+| `table_in_out.test` | Table-in-out input, per-batch state and output are externalized. |
+| `storage_integrity.test` | A corrupted storage blob fails `blob_tio`, `blob_buffer_echo` and `blob_store_values` with the integrity pattern. A missing one fails `blob_tio` and `blob_buffer_echo` with the missing pattern. The same queries pass after reset. |
+| `storage_values.test` | Values one byte below, at and one byte above the threshold round-trip, and exactly the last two become blobs (`puts` +2, `gets` +2, bytes exact). The threshold counts UTF-8 bytes. Empty values, NULLs and empty inputs work, and store nothing. 25 batches and 100 vendored values out of 3,000 in one execution round-trip exactly. |
+| `result_integrity.test` | A corrupted result (table and scalar) fails with `CHECKSUM_MISMATCH`, and a missing one fails with a 404. Neither ever returns rows. Its faults use `count=100`, which damages every `rpc` download until the reset. The first query after an error may re-fetch the catalog, which is itself an externalized result, and the extension answers that failure by falling back to per-schema calls. Each faulted query uses fresh arguments, so no cached result can stand in. |
