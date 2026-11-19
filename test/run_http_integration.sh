@@ -43,6 +43,11 @@ if [[ "${VGI_DEMO_STORAGE:-}" == "1" ]]; then
     echo "Demo storage mode: threshold=${THRESHOLD} compression=${COMPRESSION}"
     SERVER_CMD+=" --demo-storage --externalize-threshold-bytes $(printf %q "$THRESHOLD")"
     SERVER_CMD+=" --externalize-compression $(printf %q "$COMPRESSION")"
+    # The client refuses a request over the advertised VGI-Max-Upload-Bytes.
+    # The fixture's 4 MiB default (also its request cap in demo mode) is
+    # below the suite's largest exchange batch (dedup_large_strings, ~7.6 MB).
+    MAX_UPLOAD="${VGI_EXTERNALIZE_MAX_UPLOAD_BYTES:-67108864}"
+    SERVER_CMD+=" --max-upload-bytes $(printf %q "$MAX_UPLOAD")"
 else
     SERVER_CMD+=" --log-format json"
 fi
