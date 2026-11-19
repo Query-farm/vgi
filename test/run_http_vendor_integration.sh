@@ -50,13 +50,23 @@ echo "fake blob vendor: $VENDOR_URL (pid $VENDOR_PID)"
 
 export VGI_BLOB_VENDOR_URL="$VENDOR_URL"
 export VGI_BLOB_VENDOR_TOKEN="$VENDOR_TOKEN"
-# Results over 4 KiB are externalized; requests over 16 KiB must be uploaded.
+# Results over 4 KiB are externalized; requests over 32 KiB must be uploaded.
+# Not lower: an uploaded request is replaced by a zero-row pointer that keeps
+# the request's schema, and the widest fixture input (echo over all_types)
+# has a ~20 KiB schema, so its pointer alone would exceed a 32 KiB cap.
 export VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES="${VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES:-4096}"
-export VGI_RPC_MAX_REQUEST_BYTES="${VGI_RPC_MAX_REQUEST_BYTES:-16384}"
+export VGI_RPC_MAX_REQUEST_BYTES="${VGI_RPC_MAX_REQUEST_BYTES:-32768}"
+# The client refuses a request over the advertised upload cap; the suite has
+# multi-MB exchange batches (dedup_large_strings), so keep it well above them.
+export VGI_RPC_MAX_UPLOAD_BYTES="${VGI_RPC_MAX_UPLOAD_BYTES:-268435456}"
 # Worker storage (SQLite here) keeps values over 4 KiB in the vendor.
 export VGI_STORAGE_EXTERNALIZE="${VGI_STORAGE_EXTERNALIZE:-1}"
 export VGI_STORAGE_EXTERNALIZE_BYTES="${VGI_STORAGE_EXTERNALIZE_BYTES:-4096}"
 # The fake vendor's signed URLs are http://127.0.0.1; production stores are https.
 export VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1
 
-exec "$(dirname "$0")/run_http_integration.sh" "$@"
+rc=0
+"$(dirname "$0")/run_http_integration.sh" "$@" || rc=$?
+# Evidence that the lane externalized at all: the vendor's lifetime counters.
+echo "fake blob vendor counters: $(python3 -c 'import sys, urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=10).read().decode())' "$VENDOR_URL/__stats__" 2>&1)"
+exit "$rc"

@@ -48,12 +48,17 @@ true` takes larger requests by reference. For any request body over the cap
 
 Without upload support the body is sent inline and the server's 413 explains.
 
+The pointer keeps the request's schema (as vgi-rpc-python's client does), so
+a cap below the widest request schema still 413s: echo over the fixture's
+`all_types` table has a ~20 KiB schema, which is why the vendor lane uses a
+32 KiB cap rather than 16 KiB.
+
 ## Tests
 
 - `make test_http_vendor` runs `test/sql/external_storage/` and the
   integration suite against the fixture HTTP server and a fake blob vendor
   (`vgi._test_fixtures.fake_blob_vendor`), with results over 4 KiB
-  externalized, requests over 16 KiB uploaded and worker storage values over
+  externalized, requests over 32 KiB uploaded and worker storage values over
   4 KiB kept in the vendor (`VGI_STORAGE_EXTERNALIZE=1`). The targeted tests
   check values exactly and that the vendor's counters
   (`blob_test.vgi_test_blob_stats()`) moved.

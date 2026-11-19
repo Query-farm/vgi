@@ -561,32 +561,31 @@ test_http_demo_storage_debug:
 
 # HTTP suite with everything externalized through a fake blob vendor
 # (test/run_http_vendor_integration.sh): results over 4 KiB are fetched from
-# vgi_rpc.location pointers, requests over 16 KiB (unary, init and exchange)
+# vgi_rpc.location pointers, requests over 32 KiB (unary, init and exchange)
 # go up through __upload_url__, and worker storage values over 4 KiB live in
-# the vendor. Runs the targeted external_storage/ tests, which assert the vendor's
-# counters moved, plus the integration suite as a regression net.
+# the vendor. First the targeted external_storage/ tests, one file at a time
+# (they assert deltas of the vendor's lane-wide counters, which concurrent
+# files would disturb), then the integration suite as a regression net.
 # The targeted tests live outside test/sql/integration/ so the SDK repos'
 # lanes (which run that tree with strict skip allowlists) never see them.
-VGI_HTTP_VENDOR_SUITE = "test/sql/external_storage/*" "test/sql/integration/*" \
+VGI_HTTP_VENDOR_SUITE = "test/sql/integration/*" \
 	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
+VGI_HTTP_VENDOR_ENV = PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" \
+	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)"
 
-test_http_vendor:
-	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" \
-	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)" \
-	    ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)
+test_http_vendor: test_http_vendor_external
+	$(VGI_HTTP_VENDOR_ENV) ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)
 
 test_http_vendor_debug:
-	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" BUILD_DIR=debug \
-	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)" \
-	    ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)
+	$(VGI_HTTP_VENDOR_ENV) BUILD_DIR=debug \
+	    ./test/run_http_vendor_integration.sh "test/sql/external_storage/*" -j 1
+	$(VGI_HTTP_VENDOR_ENV) BUILD_DIR=debug ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)
 
 # Just the targeted externalization tests, against the vendor.
 test_http_vendor_external:
-	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" \
-	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)" \
-	    ./test/run_http_vendor_integration.sh "test/sql/external_storage/*"
+	$(VGI_HTTP_VENDOR_ENV) ./test/run_http_vendor_integration.sh "test/sql/external_storage/*" -j 1
 
 # Container (OCI/Docker) transport tests (uses test/run_docker_integration.sh).
 # Skips cleanly when no container runtime is present, so it's safe to run

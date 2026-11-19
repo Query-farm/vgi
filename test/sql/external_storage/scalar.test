@@ -3,7 +3,7 @@
 # group: [vgi_external_storage]
 #
 # Lane: make test_http_vendor (results > 4 KiB are vendor pointers, requests
-# > 16 KiB must go up through __upload_url__). Each case checks the values
+# > 32 KiB must go up through __upload_url__). Each case checks the values
 # exactly AND that the fake vendor's counters moved, so a lane that silently
 # stopped externalizing fails here instead of passing inline.
 
@@ -45,7 +45,7 @@ FROM (SELECT i, bt.blob_repeat(chr((97 + i % 26)::INTEGER), 2000 + i) AS r FROM 
 ----
 3000	true
 
-# --- large input: VARCHAR batches over the 16 KiB request cap ----------------
+# --- large input: VARCHAR batches over the 32 KiB request cap ----------------
 
 statement ok
 CREATE TABLE s2 AS SELECT * FROM bt.vgi_test_blob_stats();

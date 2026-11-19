@@ -1478,8 +1478,10 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 	VgiMetadata metadata(request_batch->metadata()->pairs());
 	metadata.Set(RPC_LOCATION_KEY, urls[0].download_url);
 	auto pointer = VgiBatch::MakeEmpty(request_batch->schema());
+	const auto inline_bytes = body.size();
 	body = SerializeBatch(*pointer, &metadata)->ToVector();
-	VGI_STDERR_DEBUG("[VGI] http.request_externalized url=%s\n", base_url.c_str());
+	VGI_STDERR_DEBUG("[VGI] http.request_externalized url=%s inline_bytes=%llu pointer_bytes=%llu\n", base_url.c_str(),
+	                 static_cast<unsigned long long>(inline_bytes), static_cast<unsigned long long>(body.size()));
 	return true;
 }
 

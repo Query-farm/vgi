@@ -5,7 +5,7 @@
 # Lane: make test_http_vendor. blob_buffer_echo stores every input batch raw
 # in worker storage (process), then replays them (finalize):
 #   * the table_buffering_process request carries a whole input batch, over the
-#     16 KiB request cap -> uploaded (upload_urls);
+#     32 KiB request cap -> uploaded (upload_urls);
 #   * each stored batch is over VGI_STORAGE_EXTERNALIZE_BYTES -> kept in the
 #     vendor (puts) and read back on finalize (gets);
 #   * each replayed batch is over the result threshold -> fetched by the client.

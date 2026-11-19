@@ -697,7 +697,8 @@ if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS
   add_executable(vgi_http_interrupt_tests
     test/cpp/test_main.cpp
     test/cpp/test_http_interrupt.cpp
-    test/cpp/test_http_secret_free.cpp)
+    test/cpp/test_http_secret_free.cpp
+    test/cpp/test_external_location.cpp)
   target_include_directories(vgi_http_interrupt_tests PRIVATE
     src/include
     duckdb/src/include

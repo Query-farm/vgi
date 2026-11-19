@@ -4,7 +4,7 @@
 #
 # Lane: make test_http_vendor. blob_tio puts each input batch in worker
 # storage, reads it back and emits it with checksums: the exchange request is
-# uploaded (over 16 KiB), the state value lives in the vendor (over 4 KiB),
+# uploaded (over 32 KiB), the state value lives in the vendor (over 4 KiB),
 # and the output is a vendor pointer (over 4 KiB).
 
 require-env VGI_BLOB_VENDOR_URL
