@@ -46,12 +46,13 @@ jobs:
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
-      # Pin the coordinated Protocol 3.3 fixtures. Exact major+minor matching
-      # deliberately rejects the earlier 3.2 workers. Temporarily an unreleased
-      # vgi-python main commit (a full SHA: the install fetches it by name) for the
-      # planned_events table behind scan_planning_predicates*.test; move back to a
-      # release tag once vgi-python tags one that contains it.
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || '3cf1489db202ff6341176d9b12c9dc63bdced254' }}
+      # Pin the coordinated Protocol 3.4 fixtures. Exact major+minor matching
+      # deliberately rejects released 3.3 workers. TODO(release-wave): an
+      # unreleased vgi-python protocol-3.4 commit (a full SHA: the install
+      # fetches it by name; 3141d12 plus the rebuilt vgi-client.js). Its uv.lock
+      # pins vgi-rpc-python protocol-3.4 a07ccf2 (upload URLs v2), so CI installs
+      # vgi-rpc only through it. Move to the vgi-python 3.4 release tag.
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || '46da09926b2332fb52677cef24cb2bf194f6e99d' }}
       GEN: ninja
       BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"
@@ -204,8 +205,9 @@ jobs:
           git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-rust.git /tmp/vgi-rpc-rust
           git -C /tmp/vgi-rpc-rust checkout 9e7dfb59686682be0ff4a46183988e2724416393
           cargo build --locked --release --manifest-path /tmp/vgi-rpc-rust/Cargo.toml -p vgi-iroh-bridge
-          # vgi-rpc comes from the fixtures' own uv.lock (vgi-python v0.48.0 locks
-          # the published vgi-rpc 0.52.3), not from a source checkout.
+          # vgi-rpc comes from the fixtures' own uv.lock (TODO(release-wave): the
+          # pinned vgi-python protocol-3.4 commit locks vgi-rpc-python a07ccf2
+          # from git), not from a source checkout.
 
       - name: Run native Iroh raw and HTTP integration
         env:

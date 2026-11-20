@@ -68,9 +68,10 @@ jobs:
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
-      # Protocol 3.3 fixture release (0.51.0); exact major+minor matching
-      # rejects 3.2 workers. 0.50.1+ has spatial_filter_example(..., edge_rows := true).
-      VGI_FIXTURES_REF: v0.52.1
+      # Protocol 3.4 fixtures; exact major+minor matching rejects 3.3 workers.
+      # TODO(release-wave): unreleased vgi-python protocol-3.4 commit (its
+      # uv.lock pins vgi-rpc-python a07ccf2); move to the 3.4 release tag.
+      VGI_FIXTURES_REF: 46da09926b2332fb52677cef24cb2bf194f6e99d
     steps:
       - uses: actions/checkout@v4
 
