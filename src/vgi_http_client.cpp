@@ -1654,18 +1654,16 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 	}
 	if (caps.upload_url_version != kUploadUrlProtocolVersion) {
 		// v1 ("true") vended blank URLs that accept any bytes; never fall back to it.
-		throw IOException(BuildHttpExtraInfo(caps.upload_url_version < kUploadUrlProtocolVersion
-		                                         ? http_error::kServerTooOld
-		                                         : http_error::kUnsupported,
-		                                     base_url),
-		                  "VGI server's upload protocol is %s: the request of %llu bytes exceeds its "
-		                  "VGI-Max-Request-Bytes (%lld) and must be uploaded, but the server advertises "
-		                  "VGI-Upload-URL-Support %s and this client needs %d. Upgrade the worker [url: %s]",
-		                  caps.upload_url_version < kUploadUrlProtocolVersion ? "too old" : "unsupported",
-		                  static_cast<unsigned long long>(body.size()), static_cast<long long>(caps.max_request_bytes),
-		                  caps.upload_url_version == 1 ? std::string("true (v1)")
-		                                               : std::to_string(caps.upload_url_version),
-		                  kUploadUrlProtocolVersion, base_url);
+		// Wording follows vgi-rpc's reference client (UPLOAD_URL_V2.md).
+		const bool too_old = caps.upload_url_version < kUploadUrlProtocolVersion;
+		throw IOException(BuildHttpExtraInfo(too_old ? http_error::kServerTooOld : http_error::kUnsupported, base_url),
+		                  "VGI server upload protocol is %s: it advertises VGI-Upload-URL-Support v%d and this "
+		                  "client needs %d (the request of %llu bytes exceeds the server's VGI-Max-Request-Bytes "
+		                  "(%lld) and must be uploaded). %s [url: %s]",
+		                  too_old ? "too old" : "newer than this client", caps.upload_url_version,
+		                  kUploadUrlProtocolVersion, static_cast<unsigned long long>(body.size()),
+		                  static_cast<long long>(caps.max_request_bytes),
+		                  too_old ? "Upgrade the worker" : "Upgrade the vgi extension", base_url);
 	}
 	if (caps.max_upload_bytes > 0 && static_cast<int64_t>(body.size()) > caps.max_upload_bytes) {
 		throw IOException(BuildHttpExtraInfo(http_error::kLimitExceeded, base_url),

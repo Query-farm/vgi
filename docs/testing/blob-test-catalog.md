@@ -208,13 +208,14 @@ ISO-8601 UTC. Object ids are 32 lowercase hex characters.
 | `POST /v1/blobs/get` | `{object_id}` | `{object_id, download_url, size, sha256_b64, content_encoding, expires_at}`. 404 `not_uploaded` / `not_found`. |
 | `POST /v1/blobs/delete` | `{object_ids: [...]}` (at most 1,000) | `{deleted}` |
 | `POST /v1/blobs/delete_scope` | `{shard, execution_id}` | `{deleted}` |
-| `POST /v1/upload_urls` | `{count: 1..100}` | `{region, urls: [{object_id, upload_url, download_url, expires_at, download_expires_at}]}` (unsized, purpose `rpc`) |
+| `POST /v1/upload_urls` | `{count: 1..100}` | `{region, urls: [{object_id, upload_url, download_url, expires_at, download_expires_at}]}` (unsized, purpose `rpc`). Retired by upload URLs v2: servers serve `__upload_url__` from sized `/v1/blobs/put` instead, and the tests assert this counter never moves. |
 | `GET /v1/info` | none | `{tenant, region, jurisdiction, upload_hosts, download_hosts, url_prefixes, limits, ttl_seconds}`. Pin signed URLs to these hosts and prefixes. |
 
 Signed URLs behave like R2's. A PUT must send exactly the `required_headers`
 (`content-length`, `x-amz-checksum-sha256`, and `content-encoding` when one was
-declared), and a body that does not hash to the declared digest gets
-`400 BadDigest`. Downloads support `HEAD` and single `Range` requests. A URL
+declared). A body of another length gets `400 IncompleteBody`, a missing or
+different checksum header `403 SignatureDoesNotMatch`, and a body that does
+not hash to the declared digest `400 BadDigest`. Downloads support `HEAD` and single `Range` requests. A URL
 whose query has been stripped fails `403`.
 
 ### Test routes (`--test-routes`)
@@ -227,9 +228,10 @@ httpfs.
 
 | Route | Effect / body |
 |---|---|
-| `GET /__stats__` | `{puts, gets, deletes, delete_scopes, upload_urls, storage_puts, storage_gets, objects, bytes, bytes_uploaded, bytes_downloaded}`. These are calls to the five `/v1` routes in order; signed-URL PUTs and GET/HEADs; live objects and their bytes; and cumulative bytes accepted by signed PUTs and served by signed GETs. All but `objects` and `bytes` only grow, so tests compare deltas. |
+| `GET /__stats__` | `{puts, gets, deletes, delete_scopes, upload_urls, storage_puts, storage_gets, objects, bytes, bytes_uploaded, bytes_downloaded, upload_refusals, upload_bad_digest, upload_incomplete_body, upload_signature_mismatch, uploads_corrupted}`. These are calls to the five `/v1` routes in order; signed-URL PUTs and GET/HEADs; live objects and their bytes; cumulative bytes accepted by signed PUTs and served by signed GETs; signed PUTs the store refused (the sum, then by S3 code); and PUT bodies an upload fault damaged. All but `objects` and `bytes` only grow, so tests compare deltas. |
 | `GET /__admin__/fault?purpose=fs\|rpc&action=corrupt\|missing&count=N` | Arms a fault for the next `N` **objects** of that purpose that are downloaded. The first signed `GET` of such an object marks it. After that, every `GET` of it is faulted until reset: `corrupt` XORs every byte with `0xFF` (same length) and `missing` answers `404 NoSuchKey`. So a probe `GET`, ranged reads and retries all see the same damage. Arming replaces the fault armed for that purpose, so repeating the request is harmless. `count=0` disarms. Body: `{ok, purpose, action, count}`. |
-| `GET /__admin__/reset` | Clears armed and applied faults. Body: `{ok}`. |
+| `GET /__admin__/fault?purpose=upload&action=corrupt&count=N` | Corrupts the next `N` signed `PUT` bodies in transit (client uploads and server writes alike), so the store's checksum check refuses them with `400 BadDigest` and stores nothing. `corrupt` is the only upload action; arming replaces the armed upload fault. Body: `{ok, purpose, action, count}`. |
+| `GET /__admin__/reset` | Clears armed and applied download and upload faults. Body: `{ok}`. |
 
 From SQL:
 

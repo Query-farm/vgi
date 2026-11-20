@@ -23,7 +23,8 @@
 #   VGI_BLOB_VENDOR_TOKEN                bearer token (default test-token, tenant-a).
 #   VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES  4096: result batches over this are vendor pointers.
 #   VGI_RPC_MAX_REQUEST_BYTES            32768: the worker's advertised request cap; larger
-#                                        requests go up through vendor upload URLs.
+#                                        requests go up through sized vendor upload URLs
+#                                        (VGI-Upload-URL-Support: 2).
 #   VGI_RPC_MAX_UPLOAD_BYTES             268435456: the advertised upload cap.
 #   VGI_STORAGE_EXTERNALIZE              1: wrap the worker's function storage so large
 #                                        values live in the vendor.
@@ -36,7 +37,9 @@
 # Also set (not exported): VGI_FAKE_BLOB_VENDOR_PID, VGI_FAKE_BLOB_VENDOR_LOG.
 # The contract the worker must meet is docs/testing/blob-test-catalog.md.
 
-: "${VGI_RPC_FAKE_VENDOR_REF:=af57e6bb395e5198b2a5336def976d73bfc87d8f}"
+# protocol-3.4 branch (upload URLs v2: sized client PUTs, upload fault and
+# refusal counters). TODO(release-wave): pin the released vgi-rpc.
+: "${VGI_RPC_FAKE_VENDOR_REF:=a07ccf2e1bf1c0832ae43757a55e8b4817674b2d}"
 : "${VGI_RPC_FAKE_VENDOR_FROM:=git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}}"
 : "${VGI_BLOB_VENDOR_TOKEN:=test-token}"
 
