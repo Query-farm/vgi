@@ -27,7 +27,7 @@ Reflection declares no version and is exempt from the version gate, so its
 requests carry no `vgi_rpc.protocol_version` key at all: the serializers omit
 the key for any `VgiProtocolId` whose version is empty.
 
-The current contract identifies itself as **`vgi.v3` / `3.3.0`**. Its
+The current contract identifies itself as **`vgi.v3` / `3.4.0`**. Its
 breaking catalog, macro and expression contracts are distinct from the
 published `vgi.v2` / `2.2.0` surface. The major version is part of the routing
 name, so a request for an unsupported major is rejected before entering that
@@ -84,6 +84,15 @@ modes, and only one of them was cheap.
 generator cannot see: that the value reaches the wire, on the right method, and
 is absent on reserved methods where its presence is rejected. Those are the
 secret-protocol and reserved-method cases the integration suite never reaches.
+
+## Protocol 3.4
+
+3.4.0 changes no vgi record. It moves every peer to vgi-rpc's upload URLs v2
+(`VGI-Upload-URL-Support: 2`: `__upload_url__/init` takes one `(size, sha256)`
+entry per upload, the PUT carries the returned `upload_headers`, and the
+request pointer carries `vgi_rpc.location.sha256`), and the extension refuses
+a result pointer without `vgi_rpc.location.sha256`. See
+`docs/external_locations.md`. A 3.3 worker fails the exact major+minor check.
 
 ## Protocol 3.3 write-path changes
 

@@ -1,0 +1,169 @@
+# name: test/sql/external_storage/catalog_integrity.test
+# description: A corrupted or missing externalized catalog_contents fails the statement instead of falling back to per-schema calls
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, or any SDK lane that sources
+# test/start_fake_blob_vendor.sh. The blob_test catalog's catalog_contents
+# answer is over the 4 KiB result threshold, so it is a vendor object of
+# purpose `rpc` that the extension downloads from the pointer's
+# vgi_rpc.location. A worker that advertises catalog_contents but raises still
+# falls back to catalog_schemas + catalog_schema_contents_*
+# (integration/catalog/catalog_contents_fallback.test). A snapshot that
+# arrives damaged is a storage failure, not a missing capability: falling back
+# would hide the corruption behind a slower load, so the statement fails.
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CREATE MACRO contents_events(outcome) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.contents%'
+      AND message LIKE '%outcome=' || outcome || '%');
+
+# --- positive control: one catalog_contents, fetched from the vendor ------------
+
+statement ok
+CREATE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name LIKE 'blob_%';
+----
+7
+
+statement ok
+CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+# The snapshot really was an externalized object (otherwise this file proves nothing).
+query I
+SELECT s1.storage_gets > s0.storage_gets FROM s0, s1;
+----
+true
+
+query I
+SELECT contents_events('loaded') >= 1 AND contents_events('fallback') = 0;
+----
+true
+
+# --- corrupted snapshot ---------------------------------------------------------
+# vgi_clear_cache() drops the cached catalog, so the next enumeration fetches
+# catalog_contents again. count=100: every `rpc` download until the reset.
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=rpc&action=corrupt&count=100');
+----
+true
+
+statement error
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt';
+----
+VGI external location SHA-256 checksum mismatch
+
+# No silent fallback: the failure was logged as an error, never as a fallback.
+query I
+SELECT contents_events('error') >= 1 AND contents_events('fallback') = 0;
+----
+true
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc%' AND message LIKE '%method=catalog_schemas,%';
+----
+0
+
+statement ok
+SET errors_as_json=true;
+
+statement ok
+CALL vgi_clear_cache();
+
+statement error
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bt';
+----
+<REGEX>:.*"error_subtype":"CHECKSUM_MISMATCH".*
+
+statement error
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bt';
+----
+<REGEX>:.*"delivery":"external_location".*
+
+statement ok
+RESET errors_as_json;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- missing snapshot -----------------------------------------------------------
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=rpc&action=missing&count=100');
+----
+true
+
+statement error
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt';
+----
+<REGEX>:.*(404|Not Found|NoSuchKey).*
+
+query I
+SELECT contents_events('error') >= 1 AND contents_events('fallback') = 0;
+----
+true
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- the faults were the cause: the catalog loads again --------------------------
+
+statement ok
+CALL vgi_clear_cache();
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name LIKE 'blob_%';
+----
+7
+
+query I
+SELECT bt.blob_len('abc');
+----
+3
+
+statement ok
+DETACH bt;

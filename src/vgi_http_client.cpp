@@ -864,6 +864,33 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 
 // External locations
 
+// An engine HTTP error (connection refused, TLS, timeout) names the URL it
+// requested in full. For a pre-signed URL that is the credential: rethrow with
+// every copy of it replaced by its redacted form. Called only from a catch
+// handler; an exception that does not mention the URL is rethrown unchanged.
+[[noreturn]] static void RethrowRedactingUrl(const std::exception &e, const std::string &url,
+                                             const std::string &shown) {
+	ErrorData data(e);
+	bool mentioned = data.RawMessage().find(url) != std::string::npos;
+	for (const auto &entry : data.ExtraInfo()) {
+		mentioned = mentioned || entry.second.find(url) != std::string::npos;
+	}
+	if (!mentioned || url == shown) {
+		throw;
+	}
+	auto message = StringUtil::Replace(data.RawMessage(), url, shown);
+	std::unordered_map<std::string, std::string> extra_info;
+	for (const auto &entry : data.ExtraInfo()) {
+		if (entry.first != "stack_trace_pointers") {
+			extra_info[entry.first] = StringUtil::Replace(entry.second, url, shown);
+		}
+	}
+	if (data.Type() == ExceptionType::IO || data.Type() == ExceptionType::HTTP) {
+		throw IOException(extra_info, message);
+	}
+	throw Exception(extra_info, data.Type(), message);
+}
+
 std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientContext *cancellation,
                          HttpSecrets secrets, uint64_t max_bytes) {
 	auto &db = *context.db;
@@ -908,10 +935,12 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 		body.append(reinterpret_cast<const char *>(data), data_length);
 		return true;
 	};
+	// Callers fetch pre-signed URLs: never report the query.
+	const auto shown = RedactPresignedUrl(url);
 	auto throw_too_large = [&]() {
-		throw IOException(BuildHttpExtraInfo(http_error::kResponseTooLarge, url),
+		throw IOException(BuildHttpExtraInfo(http_error::kResponseTooLarge, shown),
 		                  "VGI external location exceeds vgi_external_location_max_bytes (%llu) [url: %s]",
-		                  static_cast<unsigned long long>(max_bytes), RedactCredentials(url));
+		                  static_cast<unsigned long long>(max_bytes), shown);
 	};
 
 	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
@@ -921,7 +950,12 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 		params->interrupt_context = cancellation->shared_from_this();
 	}
 #endif
-	auto response = http_util.Request(get);
+	unique_ptr<HTTPResponse> response;
+	try {
+		response = http_util.Request(get);
+	} catch (std::exception &e) {
+		RethrowRedactingUrl(e, url, shown);
+	}
 	if (IsInterruptedRequest(cancellation, response.get())) {
 		throw InterruptException();
 	}
@@ -929,14 +963,14 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 		throw_too_large();
 	}
 	if (!response) {
-		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
-		                  "VGI external location fetch returned no response (transport failure) [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, shown),
+		                  "VGI external location fetch returned no response (transport failure) [url: %s]", shown);
 	}
 
 	if (!response->Success()) {
-		throw IOException(BuildHttpExtraInfo(http_error::kHttpError, url, static_cast<int>(response->status)),
+		throw IOException(BuildHttpExtraInfo(http_error::kHttpError, shown, static_cast<int>(response->status)),
 		                  "VGI external location fetch failed (HTTP %d) [url: %s]", static_cast<int>(response->status),
-		                  url);
+		                  shown);
 	}
 
 	// As for POSTs: in the browser only X-VGI-Content-Encoding is still encoded.
@@ -980,53 +1014,91 @@ bool ExternalLocationUrlAllowed(const std::string &url) {
 #endif
 }
 
-UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::string &location_url,
-                                            const std::string &worker_path, const std::string &execution_id_hex,
-                                             const std::string &attach_opaque_data_digest,
-                                             const VgiMetadataPtr &pointer_metadata,
-                                             ClientContext *cancellation, const std::string &conn_id_hex,
-                                             const std::string &transaction_opaque_data_digest) {
+// Every failure while resolving a pointer is a storage failure: tag it
+// `delivery=external_location` so callers can tell a damaged or missing object
+// from the worker's own answer (catalog_contents must not fall back on one).
+// Called only from a catch handler.
+[[noreturn]] static void RethrowAsExternalLocationFailure(const std::exception &e) {
+	ErrorData data(e);
+	if (data.Type() == ExceptionType::INTERRUPT) {
+		throw;
+	}
+	auto it = data.ExtraInfo().find(error_key::kDelivery);
+	if (it != data.ExtraInfo().end()) {
+		throw;
+	}
+	std::unordered_map<std::string, std::string> extra_info;
+	for (const auto &entry : data.ExtraInfo()) {
+		if (entry.first != "stack_trace_pointers") {
+			extra_info[entry.first] = entry.second;
+		}
+	}
+	extra_info[error_key::kDelivery] = "external_location";
+	if (data.Type() == ExceptionType::IO || data.Type() == ExceptionType::HTTP) {
+		throw IOException(extra_info, data.RawMessage());
+	}
+	if (data.Type() == ExceptionType::INVALID_INPUT) {
+		throw InvalidInputException(extra_info, data.RawMessage());
+	}
+	throw Exception(extra_info, data.Type(), data.RawMessage());
+}
+
+static UnaryResponseResult ResolveExternalLocationImpl(ClientContext &context, const std::string &location_url,
+                                                       const std::string &worker_path,
+                                                       const std::string &execution_id_hex,
+                                                       const std::string &attach_opaque_data_digest,
+                                                       const VgiMetadataPtr &pointer_metadata,
+                                                       ClientContext *cancellation, const std::string &conn_id_hex,
+                                                       const std::string &transaction_opaque_data_digest) {
+	// The URL is pre-signed: its query is the credential, so every message,
+	// field and log line names only scheme://host/path.
+	const auto shown_url = RedactPresignedUrl(location_url);
 	// The fetched URL is a pre-signed object, not the worker; name both.
 	auto location_error = [&](const char *error_subtype) {
-		auto extra_info = BuildHttpExtraInfo(error_subtype, location_url);
+		auto extra_info = BuildHttpExtraInfo(error_subtype, shown_url);
 		auto worker_info = BuildExtraInfo(worker_path, -1, execution_id_hex);
 		extra_info.insert(worker_info.begin(), worker_info.end());
+		extra_info[error_key::kDelivery] = "external_location";
 		return extra_info;
 	};
 	if (IsHttpiTransport(location_url)) {
 		throw IOException(location_error(http_error::kUnsupported),
 		                  "VGI external locations over httpi:// are unsupported; the worker must return an "
 		                  "https:// pre-signed URL [url: %s]",
-		                  location_url);
+		                  shown_url);
 	}
 	if (!ExternalLocationUrlAllowed(location_url)) {
 		throw IOException(location_error(http_error::kUnsupported),
 		                  "VGI external location refused: the URL must be https:// (plain http is accepted only for a "
 		                  "loopback host with %s=1) [url: %s]",
-		                  kAllowLoopbackExternalLocationsEnv, RedactCredentials(location_url));
+		                  kAllowLoopbackExternalLocationsEnv, shown_url);
 	}
+	// Protocol 3.4: the pointer's SHA-256 is mandatory. Without it the client
+	// cannot tell a damaged object from a good one, so refuse before fetching.
+	int64_t sha_idx = pointer_metadata ? pointer_metadata->FindKey(RPC_LOCATION_SHA256_KEY) : -1;
+	if (sha_idx < 0) {
+		throw IOException(location_error(http_error::kProtocolViolation),
+		                  "VGI external location pointer is missing vgi_rpc.location.sha256, which protocol %s "
+		                  "requires; the worker must send the SHA-256 of the stored bytes [url: %s]",
+		                  std::string(generated::VGI_PROTOCOL_VERSION), shown_url);
+	}
+	const auto expected_hex = pointer_metadata->value(sha_idx);
+
 	auto body = HttpGetBytes(context, location_url, cancellation, HttpSecrets::NONE,
 	                         GetExternalLocationMaxBytes(context));
 
 	if (body.empty()) {
 		throw IOException(location_error(http_error::kProtocolViolation),
-		                  "VGI external location returned empty response [url: %s]", location_url);
+		                  "VGI external location returned empty response [url: %s]", shown_url);
 	}
 
-	if (pointer_metadata) {
-		int64_t sha_idx = pointer_metadata->FindKey(RPC_LOCATION_SHA256_KEY);
-		if (sha_idx >= 0) {
-			auto expected_hex = pointer_metadata->value(sha_idx);
-			// VgiSha256Hex, not mbedtls: side modules on WASM can't call it directly.
-			auto actual_hex = VgiSha256Hex(body);
-
-			if (actual_hex != expected_hex) {
-				throw IOException(location_error(http_error::kChecksumMismatch),
-				                  "VGI external location SHA-256 checksum mismatch [url: %s]: "
-				                  "expected %s, got %s",
-				                  location_url, expected_hex, actual_hex);
-			}
-		}
+	// VgiSha256Hex, not mbedtls: side modules on WASM can't call it directly.
+	auto actual_hex = VgiSha256Hex(body);
+	if (actual_hex != expected_hex) {
+		throw IOException(location_error(http_error::kChecksumMismatch).ExpectedActual(expected_hex, actual_hex),
+		                  "VGI external location SHA-256 checksum mismatch [url: %s]: "
+		                  "expected %s, got %s",
+		                  shown_url, expected_hex, actual_hex);
 	}
 
 	// The stream may hold log batches followed by the data batch. Adopt the
@@ -1036,7 +1108,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 	// Errors name the fetched URL; log records keep the worker that pointed at it.
 	WorkerStreamOptions opts;
 	opts.context = &context;
-	opts.worker = location_url;
+	opts.worker = shown_url;
 	opts.log_worker = worker_path;
 	opts.http_messages = true;
 	opts.lenient = true;
@@ -1050,15 +1122,30 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 		throw IOException(location_error(http_error::kProtocolViolation),
 		                  "VGI external location redirect loop: resolved batch from %s "
 		                  "contains another vgi_rpc.location",
-		                  location_url);
+		                  shown_url);
 	}
 
 	if (!result.batch) {
 		throw IOException(location_error(http_error::kProtocolViolation),
-		                  "VGI external location contained no data batch [url: %s]", location_url);
+		                  "VGI external location contained no data batch [url: %s]", shown_url);
 	}
 
 	return result;
+}
+
+UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::string &location_url,
+                                            const std::string &worker_path, const std::string &execution_id_hex,
+                                            const std::string &attach_opaque_data_digest,
+                                            const VgiMetadataPtr &pointer_metadata, ClientContext *cancellation,
+                                            const std::string &conn_id_hex,
+                                            const std::string &transaction_opaque_data_digest) {
+	try {
+		return ResolveExternalLocationImpl(context, location_url, worker_path, execution_id_hex,
+		                                   attach_opaque_data_digest, pointer_metadata, cancellation, conn_id_hex,
+		                                   transaction_opaque_data_digest);
+	} catch (std::exception &e) {
+		RethrowAsExternalLocationFailure(e);
+	}
 }
 
 UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context, UnaryResponseResult &result,
@@ -1238,6 +1325,25 @@ static std::optional<int64_t> ParseAdvertisedResponseMaximum(const RpcHttpRespon
 	return ParseCanonicalResponseMaximum(values[0]);
 }
 
+// VGI-Upload-URL-Support: "true" is v1 (the retired count shape), a positive
+// integer is that version, anything else means no upload support.
+static int ParseUploadUrlVersion(const std::string &value) {
+	if (value == "true") {
+		return 1;
+	}
+	if (value.empty() || value.size() > 4 || value.front() == '0') {
+		return 0;
+	}
+	int version = 0;
+	for (const auto c : value) {
+		if (c < '0' || c > '9') {
+			return 0;
+		}
+		version = version * 10 + (c - '0');
+	}
+	return version;
+}
+
 template <class RESPONSE>
 static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 	ServerCapabilities caps;
@@ -1254,7 +1360,7 @@ static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 		caps.max_response_bytes = *max_response;
 	}
 	if (response.HasHeader("VGI-Upload-URL-Support")) {
-		caps.upload_url_support = response.GetHeaderValue("VGI-Upload-URL-Support") == "true";
+		caps.upload_url_version = ParseUploadUrlVersion(response.GetHeaderValue("VGI-Upload-URL-Support"));
 	}
 	if (response.HasHeader("VGI-Max-Upload-Bytes")) {
 		try {
@@ -1362,12 +1468,23 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	return ParseCapabilityHeaders(*response);
 }
 
-std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::string &base_url, int count,
+std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::string &base_url,
+                                               const std::vector<UploadRequest> &uploads,
                                                const std::shared_ptr<CatalogAuth> &auth,
                                                const std::shared_ptr<IrohClientConfig> &iroh_config) {
-	static const VgiSchemaPtr schema = MakeSchema({type::Int64().Named("count")});
+	// Upload URLs v2: uploads list<struct<size: int64 not null, sha256: utf8 not null>> not null.
+	static const VgiSchemaPtr schema = MakeSchema({type::List(type::Struct({type::Int64().Named("size", false),
+	                                                                         type::Utf8().Named("sha256", false)}))
+	                                                   .Named("uploads", false)});
 	VgiBatchBuilder builder(schema);
-	append::Int(builder.column(0), count);
+	ArrowArray *list = builder.column(0);
+	ArrowArray *item = list->children[0];
+	for (const auto &upload : uploads) {
+		append::Int(item->children[0], upload.size);
+		append::String(item->children[1], upload.sha256_hex);
+		append::FinishElement(item);
+	}
+	append::FinishElement(list);
 	builder.FinishRow();
 	auto batch = builder.Finish();
 
@@ -1378,25 +1495,87 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
 		                  "VGI server returned no upload URLs [url: %s]", base_url);
 	}
+	if (result.batch->num_rows() != static_cast<int64_t>(uploads.size())) {
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI server returned %lld upload URLs for %llu requested [url: %s]",
+		                  static_cast<long long>(result.batch->num_rows()),
+		                  static_cast<unsigned long long>(uploads.size()), base_url);
+	}
 
-	// Response columns: upload_url, download_url (expires_at unused).
+	// Response columns: upload_url, download_url, expires_at (unused), upload_headers.
 	auto upload_col = result.batch->GetColumnByName("upload_url");
 	auto download_col = result.batch->GetColumnByName("download_url");
+	auto headers_col = result.batch->GetColumnByName("upload_headers");
 
-	if (!upload_col || !download_col) {
+	if (!upload_col || !download_col || !headers_col) {
 		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
-		                  "VGI upload URL response missing required columns [url: %s]", base_url);
+		                  "VGI upload URL response missing required columns (upload_url, download_url, "
+		                  "upload_headers) [url: %s]",
+		                  base_url);
 	}
+	if (headers_col.storage_type() != NANOARROW_TYPE_MAP || headers_col.num_children() != 1 ||
+	    headers_col.child(0).num_children() != 2) {
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI upload URL response column upload_headers must be map<utf8, utf8>, got %s [url: %s]",
+		                  headers_col.type_string(), base_url);
+	}
+	auto header_keys = headers_col.child(0).child(0);
+	auto header_values = headers_col.child(0).child(1);
 
 	std::vector<UploadUrl> urls;
 	for (int64_t i = 0; i < result.batch->num_rows(); i++) {
-		urls.push_back({upload_col.GetString(i), download_col.GetString(i)});
+		if (upload_col.IsNull(i) || download_col.IsNull(i) || headers_col.IsNull(i)) {
+			throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+			                  "VGI upload URL response row %lld has a null upload_url, download_url or "
+			                  "upload_headers [url: %s]",
+			                  static_cast<long long>(i), base_url);
+		}
+		UploadUrl url {upload_col.GetString(i), download_col.GetString(i), {}};
+		int64_t begin = 0;
+		int64_t end = 0;
+		headers_col.ListRange(i, begin, end);
+		for (int64_t h = begin; h < end; h++) {
+			if (header_values.IsNull(h)) {
+				throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+				                  "VGI upload URL response has a null upload_headers value [url: %s]", base_url);
+			}
+			auto name = header_keys.GetString(h);
+			if (StringUtil::CIEquals(name, "Content-Length")) {
+				// The client sends Content-Length itself, exactly `size`.
+				continue;
+			}
+			url.upload_headers.emplace_back(std::move(name), header_values.GetString(h));
+		}
+		urls.push_back(std::move(url));
 	}
 	return urls;
 }
 
+// The S3-style `<Code>` of a storage error body (BadDigest, IncompleteBody,
+// SignatureDoesNotMatch, ...), or "" when there is none. Only the code is ever
+// reported: the rest of such a body can echo the request (canonical request,
+// string to sign), which is too close to the credential to print.
+static std::string StorageErrorCode(const std::string &body) {
+	const auto open = body.find("<Code>");
+	if (open == std::string::npos) {
+		return std::string();
+	}
+	const auto start = open + 6;
+	const auto close = body.find("</Code>", start);
+	if (close == std::string::npos || close == start || close - start > 64) {
+		return std::string();
+	}
+	auto code = body.substr(start, close - start);
+	for (const auto c : code) {
+		if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' && c != '-') {
+			return std::string();
+		}
+	}
+	return code;
+}
+
 void HttpPutBytes(ClientContext &context, const std::string &url, const std::vector<uint8_t> &data,
-                  HttpEncoding encoding) {
+                  HttpEncoding encoding, const std::vector<std::pair<std::string, std::string>> &extra_headers) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 	// A pre-signed upload URL: no secrets (see vgi_http_params.hpp).
@@ -1418,18 +1597,48 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const std::vec
 		headers.Insert("Content-Encoding", EncodingName(encoding));
 		headers.Insert("X-VGI-Content-Encoding", EncodingName(encoding));
 	}
+	// Signed headers (upload URLs v2), verbatim. A Content-Type among them
+	// replaces the default rather than being sent twice.
+	for (const auto &header : extra_headers) {
+		if (StringUtil::CIEquals(header.first, "Content-Type")) {
+			content_type = header.second;
+			continue;
+		}
+		headers.Insert(header.first, header.second);
+	}
 
+	// A pre-signed upload URL: never report its query.
+	const auto shown = RedactPresignedUrl(url);
 	PutRequestInfo put(url, headers, *params, reinterpret_cast<const_data_ptr_t>(body_data),
 	                   static_cast<idx_t>(body_size), content_type);
-	auto response = http_util.Request(put);
+	unique_ptr<HTTPResponse> response;
+	try {
+		response = http_util.Request(put);
+	} catch (std::exception &e) {
+		RethrowRedactingUrl(e, url, shown);
+	}
 	if (!response) {
-		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, url),
-		                  "VGI upload returned no response (transport failure) [url: %s]", url);
+		throw IOException(BuildHttpExtraInfo(http_error::kTransportFailure, shown),
+		                  "VGI upload returned no response (transport failure) [url: %s]", shown);
 	}
 
 	if (!response->Success()) {
-		throw IOException(BuildHttpExtraInfo(http_error::kHttpError, url, static_cast<int>(response->status)),
-		                  "VGI upload failed (HTTP %d) [url: %s]", static_cast<int>(response->status), url);
+		const auto code = StorageErrorCode(response->body);
+		// The URL is signed for the body's size and SHA-256 (upload URLs v2), so
+		// storage itself refuses bytes that are not the ones hashed.
+		std::string detail;
+		const char *subtype = http_error::kHttpError;
+		if (code == "BadDigest" || code == "XAmzContentSHA256Mismatch" || code == "InvalidDigest") {
+			detail = ": storage checksum mismatch (" + code + "), the uploaded bytes do not match their SHA-256";
+			subtype = http_error::kChecksumMismatch;
+		} else if (code == "IncompleteBody" || code == "EntityTooSmall" || code == "EntityTooLarge") {
+			detail = ": storage size mismatch (" + code + "), the uploaded bytes do not match their declared size";
+			subtype = http_error::kChecksumMismatch;
+		} else if (!code.empty()) {
+			detail = ": storage error " + code;
+		}
+		throw IOException(BuildHttpExtraInfo(subtype, shown, static_cast<int>(response->status)),
+		                  "VGI upload failed (HTTP %d)%s [url: %s]", static_cast<int>(response->status), detail, shown);
 	}
 }
 
@@ -1439,9 +1648,24 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 	if (caps.max_request_bytes <= 0 || static_cast<int64_t>(body.size()) <= caps.max_request_bytes) {
 		return false;
 	}
-	if (!caps.upload_url_support) {
+	if (caps.upload_url_version == 0) {
 		// Sent inline: the server's 413 names its cap and the missing upload path.
 		return false;
+	}
+	if (caps.upload_url_version != kUploadUrlProtocolVersion) {
+		// v1 ("true") vended blank URLs that accept any bytes; never fall back to it.
+		throw IOException(BuildHttpExtraInfo(caps.upload_url_version < kUploadUrlProtocolVersion
+		                                         ? http_error::kServerTooOld
+		                                         : http_error::kUnsupported,
+		                                     base_url),
+		                  "VGI server's upload protocol is %s: the request of %llu bytes exceeds its "
+		                  "VGI-Max-Request-Bytes (%lld) and must be uploaded, but the server advertises "
+		                  "VGI-Upload-URL-Support %s and this client needs %d. Upgrade the worker [url: %s]",
+		                  caps.upload_url_version < kUploadUrlProtocolVersion ? "too old" : "unsupported",
+		                  static_cast<unsigned long long>(body.size()), static_cast<long long>(caps.max_request_bytes),
+		                  caps.upload_url_version == 1 ? std::string("true (v1)")
+		                                               : std::to_string(caps.upload_url_version),
+		                  kUploadUrlProtocolVersion, base_url);
 	}
 	if (caps.max_upload_bytes > 0 && static_cast<int64_t>(body.size()) > caps.max_upload_bytes) {
 		throw IOException(BuildHttpExtraInfo(http_error::kLimitExceeded, base_url),
@@ -1458,7 +1682,10 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 	if (!request_batch) {
 		throw InternalException("vgi: request body to externalize holds no batch [url: %s]", base_url);
 	}
-	auto urls = HttpRequestUploadUrls(context, base_url, 1, auth, iroh_config);
+	const std::string body_view(reinterpret_cast<const char *>(body.data()), body.size());
+	const auto body_sha256 = VgiSha256Hex(body_view);
+	auto urls = HttpRequestUploadUrls(context, base_url, {UploadRequest {static_cast<int64_t>(body.size()), body_sha256}},
+	                                  auth, iroh_config);
 	if (urls.empty()) {
 		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
 		                  "VGI server returned no upload URLs [url: %s]", base_url);
@@ -1470,13 +1697,16 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 			throw IOException(BuildHttpExtraInfo(http_error::kUnsupported, base_url),
 			                  "VGI server vended an upload URL that is not https:// (plain http is accepted only for "
 			                  "a loopback host with %s=1) [url: %s]",
-			                  kAllowLoopbackExternalLocationsEnv, RedactCredentials(*vended));
+			                  kAllowLoopbackExternalLocationsEnv, RedactPresignedUrl(*vended));
 		}
 	}
-	HttpPutBytes(context, urls[0].upload_url, body, HttpEncoding::NONE);
+	// Exactly the hashed bytes, uncompressed: the URL is signed for this size
+	// and digest, so storage rejects anything else.
+	HttpPutBytes(context, urls[0].upload_url, body, HttpEncoding::NONE, urls[0].upload_headers);
 
 	VgiMetadata metadata(request_batch->metadata()->pairs());
 	metadata.Set(RPC_LOCATION_KEY, urls[0].download_url);
+	metadata.Set(RPC_LOCATION_SHA256_KEY, body_sha256);
 	auto pointer = VgiBatch::MakeEmpty(request_batch->schema());
 	const auto inline_bytes = body.size();
 	body = SerializeBatch(*pointer, &metadata)->ToVector();

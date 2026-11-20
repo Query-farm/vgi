@@ -55,7 +55,7 @@ is kept. The worker must honour every variable in the first group.
 | `VGI_BLOB_VENDOR_URL` | `http://127.0.0.1:<port>` | The vendor's base URL. With it set, the HTTP server externalizes results, offers upload URLs and (with `VGI_STORAGE_EXTERNALIZE`) keeps large storage values in the vendor. `http://` is allowed only for loopback. |
 | `VGI_BLOB_VENDOR_TOKEN` | `test-token` | Bearer token for every `/v1` call. Never put it on a signed-URL request. |
 | `VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES` | `4096` | A result batch whose Arrow buffers total at least this many bytes is uploaded (purpose `rpc`) and replaced by a pointer. The pointer **must** carry `vgi_rpc.location.sha256` (`result_integrity.test`). |
-| `VGI_RPC_MAX_REQUEST_BYTES` | `32768` | Advertise `VGI-Max-Request-Bytes` and `VGI-Upload-URL-Support: true`. Serve `__upload_url__/init` from the vendor's `/v1/upload_urls`, and accept requests sent as upload pointers. |
+| `VGI_RPC_MAX_REQUEST_BYTES` | `32768` | Advertise `VGI-Max-Request-Bytes` and `VGI-Upload-URL-Support: 2` (upload URLs v2, protocol 3.4). Serve `__upload_url__/init` (`uploads = [{size, sha256}]`) from the vendor's sized `POST /v1/blobs/put` (purpose `rpc`), returning its `required_headers` as `upload_headers`. Accept requests sent as upload pointers, require their `vgi_rpc.location.sha256`, and verify the downloaded bytes against it. |
 | `VGI_RPC_MAX_UPLOAD_BYTES` | `268435456` | Advertise `VGI-Max-Upload-Bytes`. |
 | `VGI_STORAGE_EXTERNALIZE` | `1` | Wrap the function-storage backend (e.g. SQLite) in the envelope described below. |
 | `VGI_STORAGE_EXTERNALIZE_BYTES` | `4096` | A storage value of **at least** this many bytes is a vendor blob (purpose `fs`). A smaller one is stored inline. The tests use it as `${VGI_STORAGE_EXTERNALIZE_BYTES}`. |
@@ -138,9 +138,17 @@ to the function. That gives wrong rows or a decode error, never these
 messages, so `storage_integrity.test` fails.
 
 Result downloads are checked by the extension, not the worker. A result
-pointer without `vgi_rpc.location.sha256` cannot be verified, so
-`result_integrity.test` requires one (`CHECKSUM_MISMATCH`, "VGI external
-location SHA-256 checksum mismatch").
+pointer without `vgi_rpc.location.sha256` cannot be verified: since protocol
+3.4 the extension refuses it ("missing vgi_rpc.location.sha256"), and a
+mismatch is `CHECKSUM_MISMATCH`, "VGI external location SHA-256 checksum
+mismatch" (`result_integrity.test`).
+
+Client uploads (protocol 3.4, upload URLs v2) are checked by storage: the
+extension hashes the request, asks for a URL signed for that size and
+SHA-256, and PUTs exactly those bytes with the returned `upload_headers`. A
+body that does not match is refused by the vendor (`400 BadDigest`), and the
+query fails with `CHECKSUM_MISMATCH`, "storage checksum mismatch"
+(`upload_integrity.test`).
 
 ## Storage value envelope (v1)
 
@@ -240,4 +248,7 @@ SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs
 | `table_in_out.test` | Table-in-out input, per-batch state and output are externalized. |
 | `storage_integrity.test` | A corrupted storage blob fails `blob_tio`, `blob_buffer_echo` and `blob_store_values` with the integrity pattern. A missing one fails `blob_tio` and `blob_buffer_echo` with the missing pattern. The same queries pass after reset. |
 | `storage_values.test` | Values one byte below, at and one byte above the threshold round-trip, and exactly the last two become blobs (`puts` +2, `gets` +2, bytes exact). The threshold counts UTF-8 bytes. Empty values, NULLs and empty inputs work, and store nothing. 25 batches and 100 vendored values out of 3,000 in one execution round-trip exactly. |
-| `result_integrity.test` | A corrupted result (table and scalar) fails with `CHECKSUM_MISMATCH`, and a missing one fails with a 404. Neither ever returns rows. Its faults use `count=100`, which damages every `rpc` download until the reset. The first query after an error may re-fetch the catalog, which is itself an externalized result, and the extension answers that failure by falling back to per-schema calls. Each faulted query uses fresh arguments, so no cached result can stand in. |
+| `result_integrity.test` | A corrupted result (table and scalar) fails with `CHECKSUM_MISMATCH`, and a missing one fails with a 404. Neither ever returns rows. Its faults use `count=100`, which damages every `rpc` download until the reset. The first query after an error may re-fetch the catalog, which is itself an externalized result and then fails with the same error. Each faulted query uses fresh arguments, so no cached result can stand in. |
+| `catalog_integrity.test` | The `blob_test` catalog's `catalog_contents` is a vendor object. Corrupted, it fails the enumeration with `CHECKSUM_MISMATCH` (`delivery = external_location`); missing, with a 404. Neither falls back to `catalog_schemas` (logged `outcome=error`, never `outcome=fallback`). The catalog loads again after the reset. |
+| `upload_integrity.test` | An oversized request (scalar input and table bind parameter) round-trips through a sized upload: `__upload_url__` is served from sized `puts`, the signed PUT carries the bytes, and the result is exact. The corrupt-upload fault makes storage refuse the PUT, and the query fails with `CHECKSUM_MISMATCH`, "storage checksum mismatch". It passes again after the reset. |
+| `redaction.test` | Errors for a missing or corrupted result object and for a refused upload name the URL as `scheme://host/path?<redacted>`, in the message and in `errors_as_json`, and never contain `X-Amz-Signature`, `X-Amz-Credential` or `X-Amz-Algorithm`. |

@@ -22,7 +22,7 @@ namespace generated {
 // custom_metadata under `vgi_rpc.protocol_version` so the server can
 // enforce an exact major+minor match at the dispatch boundary.
 // Sourced from VgiProtocol.protocol_version (vgi-python).
-inline constexpr std::string_view VGI_PROTOCOL_VERSION = "3.3.0";
+inline constexpr std::string_view VGI_PROTOCOL_VERSION = "3.4.0";
 
 inline constexpr std::string_view VGI_CATALOG_CONTRACT_HASH = "e0965c93219b6ef6574d82c007c600462594a08085db1242b127ed27e193da0f";
 

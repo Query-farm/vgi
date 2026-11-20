@@ -175,10 +175,23 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
                                                    const std::string &transaction_opaque_data_digest = "",
                                                    const std::string &conn_id_hex = "");
 
+// The upload-URL protocol version this client speaks (VGI-Upload-URL-Support).
+inline constexpr int kUploadUrlProtocolVersion = 2;
+
+// One upload to request from __upload_url__/init (v2): the exact byte length
+// and lowercase hex SHA-256 of the body the client will PUT.
+struct UploadRequest {
+	int64_t size;
+	std::string sha256_hex;
+};
+
 // One entry returned by __upload_url__/init.
 struct UploadUrl {
 	std::string upload_url;
 	std::string download_url;
+	// Headers the PUT must carry verbatim (signed by the server; e.g.
+	// x-amz-checksum-sha256). Never Content-Length.
+	std::vector<std::pair<std::string, std::string>> upload_headers;
 };
 
 // Probe {base_url}/health (mandatory and auth-exempt): HEAD natively, since
@@ -191,25 +204,30 @@ ServerCapabilities HttpDiscoverCapabilities(
     const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
     const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
 
-// Posts to {base_url}/__upload_url__/init.
+// Posts to {base_url}/__upload_url__/init (upload URLs v2): one URL per
+// request entry, in order.
 std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
                                                const std::string &base_url,
-                                               int count,
+                                               const std::vector<UploadRequest> &uploads,
                                                const std::shared_ptr<CatalogAuth> &auth = nullptr,
                                                const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
 
-// PUT to a pre-signed URL. A non-NONE encoding compresses the body and stamps
-// both Content-Encoding and X-VGI-Content-Encoding.
+// PUT to a pre-signed URL with a plain Content-Length (never chunked). A
+// non-NONE encoding compresses the body and stamps both Content-Encoding and
+// X-VGI-Content-Encoding. `extra_headers` are sent verbatim (upload_headers).
 void HttpPutBytes(ClientContext &context, const std::string &url,
-                   const std::vector<uint8_t> &data, HttpEncoding encoding = HttpEncoding::NONE);
+                   const std::vector<uint8_t> &data, HttpEncoding encoding = HttpEncoding::NONE,
+                   const std::vector<std::pair<std::string, std::string>> &extra_headers = {});
 
 // A request body over the server's VGI-Max-Request-Bytes, when the server
-// advertises VGI-Upload-URL-Support: PUT it to an __upload_url__ URL and
-// replace `body` with a zero-row pointer batch (same schema, the request's
-// metadata plus vgi_rpc.location). Returns whether it did. Throws when the
-// body also exceeds VGI-Max-Upload-Bytes or a vended URL is not https (see
-// ExternalLocationUrlAllowed). Without upload support the body is left
-// inline for the server to refuse with 413.
+// advertises VGI-Upload-URL-Support: 2: hash it, request one sized URL for
+// (size, sha256), PUT exactly those bytes with the returned upload_headers,
+// and replace `body` with a zero-row pointer batch (same schema, the
+// request's metadata plus vgi_rpc.location and vgi_rpc.location.sha256).
+// Returns whether it did. Throws when the server advertises only v1
+// ("true"), when the body also exceeds VGI-Max-Upload-Bytes, or when a vended
+// URL is not https (see ExternalLocationUrlAllowed). Without upload support
+// the body is left inline for the server to refuse with 413.
 bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base_url, std::vector<uint8_t> &body,
                                  const ServerCapabilities &caps, const std::shared_ptr<CatalogAuth> &auth,
                                  const std::shared_ptr<IrohClientConfig> &iroh_config);

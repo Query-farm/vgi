@@ -221,13 +221,32 @@ TEST_CASE("request bodies within the cap, or without upload support, stay inline
 	CHECK_FALSE(MaybeExternalizeRequestBody(context, "http://127.0.0.1:9", body, caps, nullptr, nullptr));
 	// Under the cap.
 	caps.max_request_bytes = 1000;
-	caps.upload_url_support = true;
+	caps.upload_url_version = 2;
 	CHECK_FALSE(MaybeExternalizeRequestBody(context, "http://127.0.0.1:9", body, caps, nullptr, nullptr));
 	// Over the cap without upload support: inline, for the server's 413.
 	caps.max_request_bytes = 100;
-	caps.upload_url_support = false;
+	caps.upload_url_version = 0;
 	CHECK_FALSE(MaybeExternalizeRequestBody(context, "http://127.0.0.1:9", body, caps, nullptr, nullptr));
 	CHECK(body == original);
+}
+
+TEST_CASE("a server advertising only upload URLs v1 is refused before any request", "[external-location]") {
+	Fixture f;
+	ServerCapabilities caps;
+	caps.discovered = true;
+	caps.max_request_bytes = 100;
+	caps.upload_url_version = 1; // VGI-Upload-URL-Support: true
+	std::vector<uint8_t> body(1000, 0x5a);
+	try {
+		// Port 9 is closed: reaching the network would fail differently.
+		MaybeExternalizeRequestBody(f.context(), "http://127.0.0.1:9", body, caps, nullptr, nullptr);
+		FAIL("an upload to a v1 server was attempted");
+	} catch (const IOException &e) {
+		const std::string error = e.what();
+		CHECK(error.find("upload protocol is too old") != std::string::npos);
+		CHECK(error.find("\"error_subtype\":\"SERVER_TOO_OLD\"") != std::string::npos);
+	}
+	CHECK(body.size() == 1000);
 }
 
 TEST_CASE("a request over both the request and upload caps is refused before any request", "[external-location]") {
@@ -235,7 +254,7 @@ TEST_CASE("a request over both the request and upload caps is refused before any
 	ServerCapabilities caps;
 	caps.discovered = true;
 	caps.max_request_bytes = 100;
-	caps.upload_url_support = true;
+	caps.upload_url_version = 2;
 	caps.max_upload_bytes = 500;
 	std::vector<uint8_t> body(1000, 0x5a);
 	try {

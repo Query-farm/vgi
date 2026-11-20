@@ -11,8 +11,8 @@
 #
 # The worker's pointers must carry vgi_rpc.location.sha256 (the SHA-256 of the
 # stored IPC bytes): with it the extension refuses the corrupted body
-# (CHECKSUM_MISMATCH). Without it the extension can only hope the damaged bytes
-# fail to decode, and this file fails. The requests here stay under the 32 KiB
+# (CHECKSUM_MISMATCH). Since protocol 3.4 a pointer without it is refused
+# outright ("missing vgi_rpc.location.sha256"), and this file fails. The requests here stay under the 32 KiB
 # request cap, so no client upload (also purpose `rpc`) takes the fault.
 
 require-env VGI_BLOB_VENDOR_URL
@@ -53,8 +53,9 @@ true
 # results, and a cache hit would never download the damaged object. The faults
 # take count=100, i.e. every `rpc` download until the reset: the first query
 # after an error may re-fetch the catalog (itself an externalized result, whose
-# failure the extension answers by falling back to per-schema calls), and a
-# count of 1 would be spent there instead of on the result.
+# damaged copy fails the statement with the same error, see
+# catalog_integrity.test), and a count of 1 would be spent there instead of on
+# the result.
 
 query I
 SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=rpc&action=corrupt&count=100');

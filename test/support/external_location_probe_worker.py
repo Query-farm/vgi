@@ -15,7 +15,7 @@ All functions return ``(i BIGINT, payload VARCHAR)``; row ``i`` holds
 Function                               Pointer
 =====================================  =========================================
 ``ext_probe_ok(rows, width)``          correct ``vgi_rpc.location.sha256``
-``ext_probe_no_sha(rows, width)``      no digest (accepted unchecked)
+``ext_probe_no_sha(rows, width)``      no digest (refused: protocol 3.4 requires one)
 ``ext_probe_bad_sha(rows, width)``     a digest of different bytes
 ``ext_probe_corrupt(rows, width)``     digest of the object, server sends it altered
 ``ext_probe_unsized(rows, width)``     correct digest, body without Content-Length

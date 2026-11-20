@@ -3,7 +3,7 @@
 # group: [vgi_external_storage]
 #
 # ext_probe serves the pointed-at objects itself on 127.0.0.1, so it can lie:
-# a digest of other bytes, an object altered after hashing, a body without
+# a digest of other bytes, no digest at all, an object altered after hashing, a body without
 # Content-Length, a gzip body that inflates past the cap.
 
 require-env VGI_EXTERNAL_PROBE_WORKER
@@ -30,11 +30,6 @@ FROM ep.ext_probe_ok(500, 100);
 500	50000	true	true
 
 query II
-SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_no_sha(500, 100);
-----
-500	50000
-
-query II
 SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_unsized(500, 100);
 ----
 500	50000
@@ -45,6 +40,24 @@ SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_gzip(500, 100);
 500	50000
 
 # --- integrity -----------------------------------------------------------------
+
+# Protocol 3.4: a pointer without vgi_rpc.location.sha256 is refused before
+# anything is fetched (it could not be verified).
+statement error
+SELECT count(*) FROM ep.ext_probe_no_sha(500, 100);
+----
+missing vgi_rpc.location.sha256
+
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT count(*) FROM ep.ext_probe_no_sha(500, 100);
+----
+"error_subtype":"PROTOCOL_VIOLATION"
+
+statement ok
+RESET errors_as_json;
 
 statement error
 SELECT * FROM ep.ext_probe_bad_sha(500, 100);

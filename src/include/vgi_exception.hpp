@@ -135,6 +135,9 @@ inline constexpr const char *kOAuthEndpoint = "oauth_endpoint";
 inline constexpr const char *kAllowedTransports = "allowed_transports";
 inline constexpr const char *kSecretType = "secret_type";
 inline constexpr const char *kCompanion = "companion"; // companion catalog alias
+// "external_location": the failure happened while fetching or decoding a
+// vgi_rpc.location pointer's object (storage, not the worker's answer).
+inline constexpr const char *kDelivery = "delivery";
 } // namespace error_key
 
 // `error_subtype` values. Transport-neutral: "unreachable", "not a VGI
@@ -218,7 +221,11 @@ namespace http_error = error_subtype;
 
 // Remove credentials from a URL or connection string before it is reported:
 // URI userinfo (`scheme://user:pass@host` keeps `user`) and the value of any
-// `password=` / `pwd=` / `secret=` / `token=` key=value pair.
+// `password=` / `pwd=` / `secret=` / `token=` key=value pair, plus the
+// signing parameters of pre-signed URLs (`X-Amz-Signature=`,
+// `X-Amz-Credential=`, `X-Amz-Security-Token=`, `X-Goog-Signature=`, Azure
+// SAS `sig=`). A URL known to be pre-signed goes through RedactPresignedUrl,
+// which drops the whole query.
 inline std::string RedactCredentials(const std::string &text) {
 	std::string out = text;
 	// URI userinfo password.
@@ -235,7 +242,7 @@ inline std::string RedactCredentials(const std::string &text) {
 		}
 	}
 	// key=value secrets (libpq / ODBC style, also query strings).
-	static const char *const kSecretKeys[] = {"password", "pwd", "secret", "token"};
+	static const char *const kSecretKeys[] = {"password", "pwd", "secret", "token", "signature", "sig", "credential"};
 	std::string lower = out;
 	std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
 	for (const char *key : kSecretKeys) {
@@ -248,7 +255,7 @@ inline std::string RedactCredentials(const std::string &text) {
 				pos = value_start;
 				continue;
 			}
-			auto value_end = out.find_first_of(" &;", value_start);
+			auto value_end = out.find_first_of(" &;#]\"", value_start);
 			if (value_end == std::string::npos) {
 				value_end = out.size();
 			}
@@ -258,6 +265,17 @@ inline std::string RedactCredentials(const std::string &text) {
 		}
 	}
 	return out;
+}
+
+// A pre-signed URL (an external location, an upload or download URL) carries
+// its credential in the query string: report only scheme://host/path. The
+// marker says a query was there without showing any of it.
+inline std::string RedactPresignedUrl(const std::string &url) {
+	const auto cut = url.find_first_of("?#");
+	if (cut == std::string::npos) {
+		return RedactCredentials(url);
+	}
+	return RedactCredentials(url.substr(0, cut)) + "?<redacted>";
 }
 
 // Fluent builder for extra_info. It IS the map, so it passes straight to any

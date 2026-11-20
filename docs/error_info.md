@@ -92,7 +92,8 @@ sent as an empty string.
 | `error_subtype` | One of the values above. DuckDB's own key convention. |
 | `transport` | `subprocess`, `launch`, `unix`, `oci`, `github`, `database`, `http`, `https`, `tcp`, `httpi`, `iroh`, `worker`: the same tokens `vgi_allowed_transports` accepts. |
 | `worker_path`, `worker_pid`, `execution_id` | The worker location (credentials redacted), process id, and the function execution: the worker-minted id shared by every RPC of one function call (absent for catalog and other unary RPCs). The same value is the `execution_id` key in VGI `duckdb_logs`, so it joins an error to its log lines. |
-| `url`, `http_status`, `content_type`, `body_preview` | HTTP request context. `url` has userinfo passwords and secret query values redacted; `body_preview` is a short single-line excerpt of a non-VGI response. |
+| `url`, `http_status`, `content_type`, `body_preview` | HTTP request context. `url` has userinfo passwords and secret query values (including pre-signed URL signatures and credentials) redacted; a pre-signed external-location, upload or download URL is reported as `scheme://host/path?<redacted>`, never with its query. `body_preview` is a short single-line excerpt of a non-VGI response. |
+| `delivery` | `external_location`: the failure happened while fetching, verifying or decoding the object a `vgi_rpc.location` pointer names (storage), not in the worker's own answer. |
 | `exit_code`, `exit_signal` | How a worker process ended. |
 | `missing_program` | A program the worker needs that is not installed or not on PATH (`uv`, `java`, a `#!` interpreter), when the failure identifies one. The message then ends with a `hint:` line naming where to install it. |
 | `catalog`, `entity_kind`, `entity` | The ATTACH alias, and what was being resolved (`schema` / `table` / `function` …) and its qualified name. |

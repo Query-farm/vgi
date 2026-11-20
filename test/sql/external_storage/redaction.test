@@ -1,0 +1,161 @@
+# name: test/sql/external_storage/redaction.test
+# description: Errors about pre-signed URLs never print the signature
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, or any SDK lane that sources
+# test/start_fake_blob_vendor.sh. A pre-signed URL's query string is its
+# credential: the fake vendor's URLs carry X-Amz-Algorithm, X-Amz-Credential
+# and X-Amz-Signature, like R2's. Every error that names such a URL (a missing
+# or corrupted result object, a refused upload) shows only
+# scheme://host/path?<redacted>, in the message and in errors_as_json's fields.
+# Each faulted query uses fresh arguments, so no cached result stands in.
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Load the catalog before arming any fault (catalog_contents is itself an rpc object).
+query I
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name LIKE 'blob_%';
+----
+7
+
+# --- missing result object: HTTP 404 on the signed GET ---------------------------
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=rpc&action=missing&count=100');
+----
+true
+
+# The error is the fetch failure, and it names the redacted URL ...
+statement error
+SELECT count(*) FROM bt.blob_rows(2001, 100);
+----
+<REGEX>:(?s).*VGI external location fetch failed \(HTTP 404\).*\?<redacted>.*
+
+# ... and never any of the query string.
+statement error
+SELECT count(*) FROM bt.blob_rows(2002, 100);
+----
+<!REGEX>:(?s).*(X-Amz-Signature|X-Amz-Credential|X-Amz-Algorithm|Signature=).*
+
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT count(*) FROM bt.blob_rows(2003, 100);
+----
+<REGEX>:(?s).*"url":"http://127\.0\.0\.1:[0-9]+/[^"?]*\?<redacted>".*
+
+statement error
+SELECT count(*) FROM bt.blob_rows(2004, 100);
+----
+<!REGEX>:(?s).*(X-Amz-Signature|X-Amz-Credential|X-Amz-Algorithm|Signature=).*
+
+statement ok
+RESET errors_as_json;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- corrupted result object: the checksum error names the URL too ---------------
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=rpc&action=corrupt&count=100');
+----
+true
+
+statement error
+SELECT bt.blob_repeat('rda', 10000) = repeat('rda', 10000);
+----
+<REGEX>:(?s).*VGI external location SHA-256 checksum mismatch \[url: http://127\.0\.0\.1:[0-9]+/[^ ?]*\?<redacted>\].*
+
+statement error
+SELECT bt.blob_repeat('rdb', 10000) = repeat('rdb', 10000);
+----
+<!REGEX>:(?s).*(X-Amz-Signature|X-Amz-Credential|X-Amz-Algorithm|Signature=).*
+
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT bt.blob_repeat('rdc', 10000) = repeat('rdc', 10000);
+----
+<!REGEX>:(?s).*(X-Amz-Signature|X-Amz-Credential|X-Amz-Algorithm|Signature=).*
+
+statement ok
+RESET errors_as_json;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- refused upload: storage rejects a corrupted PUT ------------------------------
+# Requests over the 32 KiB request cap go up through a signed PUT; the fault
+# corrupts the next client uploads in transit, so storage answers 400.
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=upload&action=corrupt&count=100');
+----
+true
+
+statement error
+SELECT bt.blob_len(repeat('r', 70001));
+----
+<REGEX>:(?s).*VGI upload failed \(HTTP 400\).*\?<redacted>.*
+
+statement error
+SELECT bt.blob_len(repeat('r', 70002));
+----
+<!REGEX>:(?s).*(X-Amz-Signature|X-Amz-Credential|X-Amz-Algorithm|Signature=).*
+
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT bt.blob_len(repeat('r', 70003));
+----
+<!REGEX>:(?s).*(X-Amz-Signature|X-Amz-Credential|X-Amz-Algorithm|Signature=).*
+
+statement ok
+RESET errors_as_json;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- the faults were the cause ---------------------------------------------------
+
+query I
+SELECT count(*) FROM bt.blob_rows(2005, 100);
+----
+2005
+
+query I
+SELECT bt.blob_len(repeat('r', 70004));
+----
+70004
+
+statement ok
+DETACH bt;

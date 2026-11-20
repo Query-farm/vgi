@@ -187,8 +187,13 @@ those manifests separate.
 3. Each per-kind load (`LoadEntries` / inventory) decodes and consumes its seed
    instead of issuing `catalog_schema_contents_*` — once per schema and kind;
    the per-name single-entry paths see a loaded set and hit the cache.
-4. If the call fails, fall back to `catalog_schemas` + lazy per-schema loads
-   (today's behaviour).
+4. If the worker fails the call, fall back to `catalog_schemas` + lazy
+   per-schema loads (today's behaviour). A snapshot that arrives damaged is
+   not a worker failure and is never answered by falling back: an
+   externalized answer that is corrupted, missing or over a size cap
+   (`extra_info` `delivery = external_location`, or `CHECKSUM_MISMATCH` /
+   `RESPONSE_TOO_LARGE`) fails the statement (`outcome=error`), as does an
+   interrupt. `test/sql/external_storage/catalog_integrity.test`.
 5. `vgi_clear_cache()` / a version bump clears the sets and seeds; the next
    enumeration calls `catalog_contents` again (unless the version-0 rule says
    otherwise).
@@ -238,7 +243,7 @@ poll — still one RPC per transaction:
 | `not_modified` | keeps every cache; records the version |
 | full contents, version current | replaces the snapshot: clears the sets, stores the new etag, and hands the contents to the next schema-set load (no second call) |
 | full contents, older version | clears the sets; the reload fetches its own snapshot under the adoption rule |
-| error | forgets the etag and falls back to the `catalog_version` poll |
+| error | forgets the etag and falls back to the `catalog_version` poll; a damaged snapshot (see step 4) fails the statement instead (`action=revalidate_error`) |
 
 When nothing is cached at transaction start (the schema set was just cleared by
 DDL or `vgi_clear_cache()`) the check is skipped: the coming load fetches a
@@ -268,11 +273,12 @@ revalidate; vgi-python builds their response once per (catalog, version).
   (`schemas`, `catalog_version`, `etag`; `source=revalidation` when the
   snapshot came from the transaction-start check), `outcome=skipped`
   (`reason=unversioned_reload`, the version-0 rule), `outcome=stale`
-  (`attempt`, `catalog_version`, `known_version`), or `outcome=fallback`
-  (`error_message`).
+  (`attempt`, `catalog_version`, `known_version`), `outcome=fallback`
+  (`error_message`), or `outcome=error` (`error_message`; a damaged snapshot,
+  rethrown).
 - `catalog.invalidate` at transaction start: `via=catalog_contents` with
-  `action` `not_modified`, `clear_modified`, `clear_stale` or
-  `revalidate_failed`; otherwise the version poll's `noop`, `clear_changed`,
+  `action` `not_modified`, `clear_modified`, `clear_stale`,
+  `revalidate_failed` or `revalidate_error` (rethrown); otherwise the version poll's `noop`, `clear_changed`,
   `clear_unknown`.
 - `catalog.seed_decode` (`schema`, `kind`, `items`) each time a kind is decoded
   from the snapshot — at most once per schema and kind.

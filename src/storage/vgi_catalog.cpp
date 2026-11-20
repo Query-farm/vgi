@@ -647,6 +647,31 @@ bool VgiCatalog::AdoptCatalogVersion(int64_t version) {
 	return false;
 }
 
+// A failed catalog_contents falls back to the per-schema RPCs only when the
+// worker itself could not answer (it advertised the call but raised, or
+// answered nothing usable). A snapshot that arrived damaged must fail the
+// statement: a corrupted or missing externalized object (checksum, size, 404
+// on the pointer's URL), a body over a client size bound, or an interrupt.
+// Falling back there would hide storage corruption behind a slower load.
+static bool CatalogContentsFailureIsFatal(const std::exception &e) {
+	ErrorData data(e);
+	if (data.Type() == ExceptionType::INTERRUPT) {
+		return true;
+	}
+	const auto &info = data.ExtraInfo();
+	auto delivery = info.find(vgi::error_key::kDelivery);
+	if (delivery != info.end() && delivery->second == "external_location") {
+		return true;
+	}
+	auto subtype = info.find(vgi::error_key::kErrorSubtype);
+	if (subtype != info.end() &&
+	    (subtype->second == vgi::error_subtype::kChecksumMismatch ||
+	     subtype->second == vgi::error_subtype::kResponseTooLarge)) {
+		return true;
+	}
+	return false;
+}
+
 bool VgiCatalog::ReloadUsesCatalogContents() {
 	if (attach_result_->catalog_version_frozen || GetKnownCatalogVersion() != 0) {
 		return true;
@@ -710,8 +735,12 @@ std::shared_ptr<vgi::VgiCatalogContents> VgiCatalog::TakeCatalogContents(ClientC
 		try {
 			snapshot = std::make_shared<vgi::VgiCatalogContents>(vgi::InvokeCatalogContents(rpc_ctx, context));
 		} catch (std::exception &e) {
-			VGI_LOG(context, "catalog.contents", {{"outcome", "fallback"}, {"error_message", e.what()}});
 			forget_etag();
+			if (CatalogContentsFailureIsFatal(e)) {
+				VGI_LOG(context, "catalog.contents", {{"outcome", "error"}, {"error_message", e.what()}});
+				throw;
+			}
+			VGI_LOG(context, "catalog.contents", {{"outcome", "fallback"}, {"error_message", e.what()}});
 			return nullptr;
 		}
 		const int64_t known = GetKnownCatalogVersion();
@@ -745,10 +774,17 @@ std::optional<bool> VgiCatalog::RevalidateContents(ClientContext &context, const
 	try {
 		snapshot = std::make_shared<vgi::VgiCatalogContents>(vgi::InvokeCatalogContents(rpc_ctx, context, etag));
 	} catch (std::exception &e) {
+		{
+			std::lock_guard<std::mutex> lk(contents_mutex_);
+			contents_etag_.reset();
+		}
+		if (CatalogContentsFailureIsFatal(e)) {
+			VGI_LOG(context, "catalog.invalidate",
+			        {{"via", "catalog_contents"}, {"action", "revalidate_error"}, {"error_message", e.what()}});
+			throw;
+		}
 		VGI_LOG(context, "catalog.invalidate",
 		        {{"via", "catalog_contents"}, {"action", "revalidate_failed"}, {"error_message", e.what()}});
-		std::lock_guard<std::mutex> lk(contents_mutex_);
-		contents_etag_.reset();
 		return std::nullopt;
 	}
 	const int64_t last_version = GetKnownCatalogVersion();

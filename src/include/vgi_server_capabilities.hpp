@@ -25,7 +25,10 @@ struct ServerCapabilities {
 	bool accept_max_response_bytes_support = false;
 	int64_t max_request_bytes = -1;   // -1 = no limit advertised
 	int64_t max_response_bytes = -1;  // -1 = no limit advertised
-	bool upload_url_support = false;
+	// VGI-Upload-URL-Support: 0 = absent (no uploads), 1 = "true" (v1, the
+	// retired count shape), N = the integer the server advertised. The client
+	// uploads only to version 2 (sized, hashed URLs).
+	int upload_url_version = 0;
 	int64_t max_upload_bytes = -1;    // -1 = no limit advertised
 	// Codecs the server accepts on requests and produces on responses, in its
 	// preference order. Always read with ``encodings_advertised``: empty alone
