@@ -601,11 +601,24 @@ struct PlanningPredicate {
 // BETWEEN is a function in DuckDB 2.0; its own filter pushdown splits it into
 // two comparisons later, but this rewrite runs first. Split it here so the
 // filter encoder and FilterCombiner see plain comparisons.
+//
+// Identify BETWEEN by its expression type, as the engine does (FilterCombiner,
+// statistics propagation), never by bind data alone: LIKE, ILIKE, regexp_matches
+// and many other functions carry bind data too. Treating one as a BETWEEN reads
+// a third argument a two-argument function lacks (an INTERNAL "index 2 within
+// vector of size 2" error), and for a three-argument one such as LIKE ... ESCAPE
+// or regexp_matches(s, p, options) reads its bind data as BETWEEN's (undefined
+// behaviour). scan_planning_predicates*.test covers both shapes.
+static bool IsSplittableBetween(const BoundFunctionExpression &func) {
+	return func.GetExpressionType() == ExpressionType::COMPARE_BETWEEN && func.GetChildren().size() == 3 &&
+	       BoundBetweenExpression::HasValidBindData(func);
+}
+
 static vector<unique_ptr<Expression>> NormalizeConjunct(const Expression &conjunct) {
 	vector<unique_ptr<Expression>> out;
 	if (conjunct.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		const auto &func = conjunct.Cast<BoundFunctionExpression>();
-		if (BoundBetweenExpression::HasValidBindData(func)) {
+		if (IsSplittableBetween(func)) {
 			out.push_back(BoundComparisonExpression::Create(BoundBetweenExpression::LowerComparisonType(func),
 			                                                BoundBetweenExpression::Input(func).Copy(),
 			                                                BoundBetweenExpression::LowerBound(func).Copy()));

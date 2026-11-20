@@ -65,6 +65,7 @@ numbers	First 100 integers (demonstrates explicit columns)
 planned_days	Protocol 3.2: worker-side pruning of per-day files — scan_planning_filtered.test
 planned_days_bf	Protocol 3.2: pruning by branch_filter contradiction — scan_planning_branch_filter.test
 planned_days_stats	Protocol 3.2: client-side pruning by ScanBranch statistics — scan_planning_stats.test
+planned_events	Protocol 3.2: filtered planning, non-prunable predicates — scan_planning_predicates.test
 products	Product table with column defaults
 projects	Projects with composite PK and FK to departments
 rowid_first	Table with row_id at column index 0
