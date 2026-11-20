@@ -41,9 +41,10 @@ FROM (SELECT bt.blob_repeat('abc', 100000) AS r);
 statement ok
 CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
-# The server put the result in the vendor; the client downloaded it.
+# The server put the result in the vendor (an rpc write, not a client
+# upload); the client downloaded it.
 query II
-SELECT s1.puts > s0.puts, s1.storage_gets > s0.storage_gets FROM s0, s1;
+SELECT s1.puts_rpc > s0.puts_rpc, s1.storage_gets > s0.storage_gets FROM s0, s1;
 ----
 true	true
 
@@ -75,13 +76,14 @@ statement ok
 CREATE TABLE s3 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 # The client asked for sized upload URLs (minted from the vendor's
-# /v1/blobs/put, never the retired unsized /v1/upload_urls) and PUT the
-# request batches to them. blob_len's results are small, so every put here is
-# an upload.
-query III
-SELECT s3.puts > s2.puts, s3.upload_urls = s2.upload_urls, s3.bytes_uploaded - s2.bytes_uploaded > 2000000 FROM s2, s3;
+# /v1/blobs/put with origin=client_upload, never the retired unsized
+# /v1/upload_urls) and PUT the request batches to them.
+query IIII
+SELECT s3.puts_upload > s2.puts_upload, s3.upload_urls = s2.upload_urls, s3.client_uploads > s2.client_uploads,
+       s3.client_upload_bytes - s2.client_upload_bytes > 2000000
+FROM s2, s3;
 ----
-true	true	true
+true	true	true	true
 
 statement ok
 DETACH bt;

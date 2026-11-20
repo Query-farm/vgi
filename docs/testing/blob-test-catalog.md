@@ -45,6 +45,18 @@ It prints `PORT:<n>` and then `URL:<base>`. Set `VGI_RPC_FAKE_VENDOR_FROM` to
 replace the whole `--from` spec, for example with a local checkout or
 `vgi-rpc==X.Y.Z`.
 
+If the vendor dies mid-lane, every later test fails with "connection refused".
+To find out why, the script keeps the vendor's output in
+`$VGI_FAKE_BLOB_VENDOR_LOG`, in `VGI_FAKE_BLOB_VENDOR_LOG_DIR` (default
+`${TMPDIR:-/tmp}`). It prints the path at start and keeps the file after
+`stop_fake_blob_vendor`. The vendor logs each `SIGTERM`, `SIGINT` or `SIGHUP`
+it receives, with the sender's pid and command line on Linux, and then its
+final counters. The script appends the time the process disappeared.
+`stop_fake_blob_vendor` reports whether the vendor was still alive; if it had
+died, it prints the exit status or signal and the last 40 log lines. Stop a
+vendor with `kill $VGI_FAKE_BLOB_VENDOR_PID`, never with `pkill -f` on its
+command line, which every lane on the machine shares.
+
 ## Environment
 
 `test/start_fake_blob_vendor.sh` exports these. A value the caller already set
@@ -55,7 +67,7 @@ is kept. The worker must honour every variable in the first group.
 | `VGI_BLOB_VENDOR_URL` | `http://127.0.0.1:<port>` | The vendor's base URL. With it set, the HTTP server externalizes results, offers upload URLs and (with `VGI_STORAGE_EXTERNALIZE`) keeps large storage values in the vendor. `http://` is allowed only for loopback. |
 | `VGI_BLOB_VENDOR_TOKEN` | `test-token` | Bearer token for every `/v1` call. Never put it on a signed-URL request. |
 | `VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES` | `4096` | A result batch whose Arrow buffers total at least this many bytes is uploaded (purpose `rpc`) and replaced by a pointer. The pointer **must** carry `vgi_rpc.location.sha256` (`result_integrity.test`). |
-| `VGI_RPC_MAX_REQUEST_BYTES` | `32768` | Advertise `VGI-Max-Request-Bytes` and `VGI-Upload-URL-Support: 2` (upload URLs v2, protocol 3.4). Serve `__upload_url__/init` (`uploads = [{size, sha256}]`) from the vendor's sized `POST /v1/blobs/put` (purpose `rpc`), returning its `required_headers` as `upload_headers`. Accept requests sent as upload pointers, require their `vgi_rpc.location.sha256`, and verify the downloaded bytes against it. |
+| `VGI_RPC_MAX_REQUEST_BYTES` | `32768` | Advertise `VGI-Max-Request-Bytes` and `VGI-Upload-URL-Support: 2` (upload URLs v2, protocol 3.4). Serve `__upload_url__/init` (`uploads = [{size, sha256}]`) from the vendor's sized `POST /v1/blobs/put` (purpose `rpc`, with `origin: "client_upload"`, which the tests count as `puts_upload`), returning its `required_headers` as `upload_headers`. Accept requests sent as upload pointers, require their `vgi_rpc.location.sha256`, and verify the downloaded bytes against it. |
 | `VGI_RPC_MAX_UPLOAD_BYTES` | `268435456` | Advertise `VGI-Max-Upload-Bytes`. |
 | `VGI_STORAGE_EXTERNALIZE` | `1` | Wrap the function-storage backend (e.g. SQLite) in the envelope described below. |
 | `VGI_STORAGE_EXTERNALIZE_BYTES` | `4096` | A storage value of **at least** this many bytes is a vendor blob (purpose `fs`). A smaller one is stored inline. The tests use it as `${VGI_STORAGE_EXTERNALIZE_BYTES}`. |
@@ -204,7 +216,7 @@ ISO-8601 UTC. Object ids are 32 lowercase hex characters.
 
 | Route | Request | Response |
 |---|---|---|
-| `POST /v1/blobs/put` | `{size, sha256_b64, purpose: "rpc"\|"fs", scope?: {shard, execution_id}, content_encoding?, idempotency_key?}` | `{object_id, region, upload_url, upload_method: "PUT", required_headers, expires_at}` plus `download_url, download_expires_at` for purpose `rpc`. A repeated idempotency key with the same bytes returns the same object; with other bytes, 409 `idempotency_conflict`. 413 `object_too_large` / `quota_exceeded`. |
+| `POST /v1/blobs/put` | `{size, sha256_b64, purpose: "rpc"\|"fs", scope?: {shard, execution_id}, content_encoding?, idempotency_key?, origin?: "client_upload"}` | `{object_id, region, upload_url, upload_method: "PUT", required_headers, expires_at}` plus `download_url, download_expires_at` for purpose `rpc`. A repeated idempotency key with the same bytes returns the same object; with other bytes, 409 `idempotency_conflict`. 413 `object_too_large` / `quota_exceeded`. `origin: "client_upload"` is advisory: a server sends it on grants it mints for a client to upload a request (`__upload_url__`), never on its own writes. The real vendor ignores it; the fake counts and faults client uploads by it. |
 | `POST /v1/blobs/get` | `{object_id}` | `{object_id, download_url, size, sha256_b64, content_encoding, expires_at}`. 404 `not_uploaded` / `not_found`. |
 | `POST /v1/blobs/delete` | `{object_ids: [...]}` (at most 1,000) | `{deleted}` |
 | `POST /v1/blobs/delete_scope` | `{shard, execution_id}` | `{deleted}` |
@@ -228,9 +240,9 @@ httpfs.
 
 | Route | Effect / body |
 |---|---|
-| `GET /__stats__` | `{puts, gets, deletes, delete_scopes, upload_urls, storage_puts, storage_gets, objects, bytes, bytes_uploaded, bytes_downloaded, upload_refusals, upload_bad_digest, upload_incomplete_body, upload_signature_mismatch, uploads_corrupted}`. These are calls to the five `/v1` routes in order; signed-URL PUTs and GET/HEADs; live objects and their bytes; cumulative bytes accepted by signed PUTs and served by signed GETs; signed PUTs the store refused (the sum, then by S3 code); and PUT bodies an upload fault damaged. All but `objects` and `bytes` only grow, so tests compare deltas. |
+| `GET /__stats__` | `{puts, gets, deletes, delete_scopes, upload_urls, storage_puts, storage_gets, objects, bytes, bytes_uploaded, bytes_downloaded, upload_refusals, upload_bad_digest, upload_incomplete_body, upload_signature_mismatch, uploads_corrupted, puts_rpc, puts_fs, puts_upload, client_uploads, client_upload_bytes, client_upload_refusals}`. These are calls to the five `/v1` routes in order; signed-URL PUTs and GET/HEADs; live objects and their bytes; cumulative bytes accepted by signed PUTs and served by signed GETs; signed PUTs the store refused (the sum, then by S3 code); and PUT bodies an upload fault damaged. Then by purpose: `/v1/blobs/put` grants issued for the server's rpc writes (results), for function storage (`fs`), and for client uploads (`origin: "client_upload"`; counted only here), which sum to the grants issued (`puts` also counts refused calls); and signed PUTs to client-upload objects: accepted, their bytes, and refused. All but `objects` and `bytes` only grow, so tests compare deltas. |
 | `GET /__admin__/fault?purpose=fs\|rpc&action=corrupt\|missing&count=N` | Arms a fault for the next `N` **objects** of that purpose that are downloaded. The first signed `GET` of such an object marks it. After that, every `GET` of it is faulted until reset: `corrupt` XORs every byte with `0xFF` (same length) and `missing` answers `404 NoSuchKey`. So a probe `GET`, ranged reads and retries all see the same damage. Arming replaces the fault armed for that purpose, so repeating the request is harmless. `count=0` disarms. Body: `{ok, purpose, action, count}`. |
-| `GET /__admin__/fault?purpose=upload&action=corrupt&count=N` | Corrupts the next `N` signed `PUT` bodies in transit (client uploads and server writes alike), so the store's checksum check refuses them with `400 BadDigest` and stores nothing. `corrupt` is the only upload action; arming replaces the armed upload fault. Body: `{ok, purpose, action, count}`. |
+| `GET /__admin__/fault?purpose=upload&action=corrupt&count=N` | Corrupts the next `N` client-upload `PUT` bodies in transit (objects granted with `origin: "client_upload"`, or by the retired `/v1/upload_urls`), so the store's checksum check refuses them with `400 BadDigest` and stores nothing. Server writes (results, storage values) are never corrupted, so a test may return large results while it is armed. `corrupt` is the only upload action; arming replaces the armed upload fault. Body: `{ok, purpose, action, count}`. |
 | `GET /__admin__/reset` | Clears armed and applied download and upload faults. Body: `{ok}`. |
 
 From SQL:
@@ -244,13 +256,13 @@ SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs
 
 | File | What it proves |
 |---|---|
-| `scalar.test` | Large scalar outputs come back exactly from vendor pointers (`puts`, `storage_gets` move). Large scalar inputs are uploaded (`upload_urls`, `bytes_uploaded` move). |
-| `table.test` | Large table outputs come back exactly. Large bind parameters are uploaded, and a small one is not. |
-| `buffered.test` | Buffered input, storage and output are all externalized, with 1 and 4 threads. |
-| `table_in_out.test` | Table-in-out input, per-batch state and output are externalized. |
+| `scalar.test` | Large scalar outputs come back exactly from vendor pointers (`puts_rpc`, `storage_gets` move). Large scalar inputs are uploaded (`puts_upload`, `client_uploads`, `client_upload_bytes` move; `upload_urls` does not). |
+| `table.test` | Large table outputs come back exactly (`puts_rpc`). Large bind parameters are uploaded (`puts_upload`, `client_uploads`), and a small one is not. |
+| `buffered.test` | Buffered input, storage and output are all externalized, with 1 and 4 threads: the client uploads its input (`puts_upload`, `client_uploads`), the worker stores it (`puts_fs`, `gets`), and the client fetches the output. |
+| `table_in_out.test` | Table-in-out input, per-batch state and output are externalized (`puts_upload`, `client_uploads`, `puts_fs`, `gets`). |
 | `storage_integrity.test` | A corrupted storage blob fails `blob_tio`, `blob_buffer_echo` and `blob_store_values` with the integrity pattern. A missing one fails `blob_tio` and `blob_buffer_echo` with the missing pattern. The same queries pass after reset. |
 | `storage_values.test` | Values one byte below, at and one byte above the threshold round-trip, and exactly the last two become blobs (`puts` +2, `gets` +2, bytes exact). The threshold counts UTF-8 bytes. Empty values, NULLs and empty inputs work, and store nothing. 25 batches and 100 vendored values out of 3,000 in one execution round-trip exactly. |
 | `result_integrity.test` | A corrupted result (table and scalar) fails with `CHECKSUM_MISMATCH`, and a missing one fails with a 404. Neither ever returns rows. Its faults use `count=100`, which damages every `rpc` download until the reset. The first query after an error may re-fetch the catalog, which is itself an externalized result and then fails with the same error. Each faulted query uses fresh arguments, so no cached result can stand in. |
 | `catalog_integrity.test` | The `blob_test` catalog's `catalog_contents` is a vendor object. Corrupted, it fails the enumeration with `CHECKSUM_MISMATCH` (`delivery = external_location`); missing, with a 404. Neither falls back to `catalog_schemas` (logged `outcome=error`, never `outcome=fallback`). The catalog loads again after the reset. |
-| `upload_integrity.test` | An oversized request (scalar input and table bind parameter) round-trips through a sized upload: `__upload_url__` is served from sized `puts`, the signed PUT carries the bytes, and the result is exact. The corrupt-upload fault makes storage refuse the PUT, and the query fails with `CHECKSUM_MISMATCH`, "storage checksum mismatch". It passes again after the reset. |
+| `upload_integrity.test` | An oversized request (scalar input and table bind parameter) round-trips through a sized upload: `__upload_url__` is served from sized client-upload grants (`puts_upload`), the signed PUT carries the bytes (`client_uploads`, `client_upload_bytes`), and the result is exact. The corrupt-upload fault makes storage refuse the PUT (`client_upload_refusals`), and the query fails with `CHECKSUM_MISMATCH`, "storage checksum mismatch", while a large result (a server write) still comes back intact. It passes again after the reset. |
 | `redaction.test` | Errors for a missing or corrupted result object and for a refused upload name the URL as `scheme://host/path?<redacted>`, in the message and in `errors_as_json`, and never contain `X-Amz-Signature`, `X-Amz-Credential` or `X-Amz-Algorithm`. |

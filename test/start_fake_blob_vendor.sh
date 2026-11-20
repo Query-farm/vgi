@@ -13,6 +13,8 @@
 #   VGI_RPC_FAKE_VENDOR_REF   vgi-rpc-python commit to run (bump here).
 #   VGI_RPC_FAKE_VENDOR_FROM  full `uvx --from` spec, overriding the ref, e.g.
 #                             a local checkout or 'vgi-rpc==X.Y.Z'.
+#   VGI_FAKE_BLOB_VENDOR_LOG_DIR
+#                             where the vendor's log goes (default ${TMPDIR:-/tmp}).
 #
 # Exported for the worker and the tests (each keeps a caller's value, so a lane
 # can override any threshold):
@@ -36,27 +38,71 @@
 #
 # Also set (not exported): VGI_FAKE_BLOB_VENDOR_PID, VGI_FAKE_BLOB_VENDOR_LOG.
 # The contract the worker must meet is docs/testing/blob-test-catalog.md.
+#
+# Diagnosing a vendor that dies mid-lane ("connection refused" for the rest of
+# the suite): the vendor's stdout/stderr go to $VGI_FAKE_BLOB_VENDOR_LOG, in
+# VGI_FAKE_BLOB_VENDOR_LOG_DIR (default ${TMPDIR:-/tmp}). Its path is printed at
+# start and the file is kept after stop. The vendor logs each SIGTERM/SIGINT/
+# SIGHUP it receives with the sender's pid and command line. A watcher appends
+# the time the process disappeared, and stop_fake_blob_vendor reports whether it
+# was still alive; if it had died, it prints the exit status or signal and the
+# log's tail. Never stop a vendor with `pkill -f` on the shared command line:
+# kill $VGI_FAKE_BLOB_VENDOR_PID.
 
 # protocol-3.4 branch (upload URLs v2: sized client PUTs, upload fault and
-# refusal counters). TODO(release-wave): pin the released vgi-rpc.
-: "${VGI_RPC_FAKE_VENDOR_REF:=a07ccf2e1bf1c0832ae43757a55e8b4817674b2d}"
+# refusal counters; client-upload counters and an upload fault limited to
+# client uploads, both keyed on origin="client_upload"; signal logging).
+# TODO(release-wave): pin the released vgi-rpc.
+: "${VGI_RPC_FAKE_VENDOR_REF:=f0fb6754ae5b70900ba21629a1e2d48eb2182774}"
 : "${VGI_RPC_FAKE_VENDOR_FROM:=git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}}"
 : "${VGI_BLOB_VENDOR_TOKEN:=test-token}"
 
-stop_fake_blob_vendor() {
-    if [[ -n "${VGI_FAKE_BLOB_VENDOR_PID:-}" ]]; then
-        kill "$VGI_FAKE_BLOB_VENDOR_PID" 2>/dev/null || true
-        wait "$VGI_FAKE_BLOB_VENDOR_PID" 2>/dev/null || true
-        VGI_FAKE_BLOB_VENDOR_PID=""
+# Describe an exit status from `wait`: "exit N" or "signal NAME (N)".
+_fake_blob_vendor_status() {
+    local status=$1
+    if (( status > 128 )); then
+        echo "signal $(kill -l "$((status - 128))" 2>/dev/null || echo '?') ($((status - 128)))"
+    else
+        echo "exit $status"
     fi
-    if [[ -n "${VGI_FAKE_BLOB_VENDOR_LOG:-}" ]]; then
-        rm -f "$VGI_FAKE_BLOB_VENDOR_LOG"
+}
+
+stop_fake_blob_vendor() {
+    local pid="${VGI_FAKE_BLOB_VENDOR_PID:-}" status=0
+    if [[ -n "${VGI_FAKE_BLOB_VENDOR_WATCH_PID:-}" ]]; then
+        kill "$VGI_FAKE_BLOB_VENDOR_WATCH_PID" 2>/dev/null || true
+        wait "$VGI_FAKE_BLOB_VENDOR_WATCH_PID" 2>/dev/null || true
+        VGI_FAKE_BLOB_VENDOR_WATCH_PID=""
+    fi
+    [[ -n "$pid" ]] || return 0
+    VGI_FAKE_BLOB_VENDOR_PID=""
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || status=$?
+        echo "fake blob vendor: was alive at stop (pid $pid, then $(_fake_blob_vendor_status "$status")); log kept: $VGI_FAKE_BLOB_VENDOR_LOG"
+    else
+        # Already gone: reap it for its status (it is this shell's child).
+        wait "$pid" 2>/dev/null || status=$?
+        {
+            echo "WARNING: fake blob vendor (pid $pid) had DIED before stop: $(_fake_blob_vendor_status "$status")."
+            echo "  Every vendor request after that failed (connection refused). Log: $VGI_FAKE_BLOB_VENDOR_LOG"
+            echo "  ---- last 40 log lines ----"
+            tail -n 40 "$VGI_FAKE_BLOB_VENDOR_LOG" 2>/dev/null | sed 's/^/  | /'
+            echo "  ----"
+        } >&2
     fi
 }
 
 _start_fake_blob_vendor() {
-    VGI_FAKE_BLOB_VENDOR_LOG="$(mktemp "${TMPDIR:-/tmp}/vgi-fake-vendor.XXXXXX")"
-    # exec: the PID is the vendor's own (uvx execs the tool), so kill stops it.
+    local log_dir="${VGI_FAKE_BLOB_VENDOR_LOG_DIR:-${TMPDIR:-/tmp}}"
+    mkdir -p "$log_dir"
+    VGI_FAKE_BLOB_VENDOR_LOG="$(mktemp "$log_dir/vgi-fake-vendor.XXXXXX")"
+    mv "$VGI_FAKE_BLOB_VENDOR_LOG" "$VGI_FAKE_BLOB_VENDOR_LOG.log"
+    VGI_FAKE_BLOB_VENDOR_LOG="$VGI_FAKE_BLOB_VENDOR_LOG.log"
+    echo "fake blob vendor log: $VGI_FAKE_BLOB_VENDOR_LOG"
+    # The PID is uvx's; uvx runs the vendor as its child and forwards SIGTERM
+    # to it, so `kill $VGI_FAKE_BLOB_VENDOR_PID` stops both. A SIGTERM sent by
+    # uvx is therefore logged by the vendor as coming from uvx's pid.
     bash -c 'exec uvx --from "$1" vgi-rpc-fake-vendor --test-routes --token "$2=tenant-a"' _ \
         "$VGI_RPC_FAKE_VENDOR_FROM" "$VGI_BLOB_VENDOR_TOKEN" > "$VGI_FAKE_BLOB_VENDOR_LOG" 2>&1 &
     VGI_FAKE_BLOB_VENDOR_PID=$!
@@ -80,6 +126,16 @@ _start_fake_blob_vendor() {
         return 1
     fi
     echo "fake blob vendor: $url (pid $VGI_FAKE_BLOB_VENDOR_PID, from $VGI_RPC_FAKE_VENDOR_FROM)"
+
+    # Note in the log when (not why: the vendor logs signals itself) the process
+    # disappeared, so a death can be lined up with the test that was running.
+    # Lanes run with `set -e`; keep the watcher's failures to itself.
+    (
+        trap - EXIT
+        while kill -0 "$VGI_FAKE_BLOB_VENDOR_PID" 2>/dev/null; do sleep 1; done
+        echo "start_fake_blob_vendor.sh: $(date -u +%Y-%m-%dT%H:%M:%SZ) vendor pid $VGI_FAKE_BLOB_VENDOR_PID is gone" >> "$VGI_FAKE_BLOB_VENDOR_LOG"
+    ) </dev/null >/dev/null 2>&1 &
+    VGI_FAKE_BLOB_VENDOR_WATCH_PID=$!
 
     export VGI_BLOB_VENDOR_URL="$url"
     export VGI_BLOB_VENDOR_TOKEN

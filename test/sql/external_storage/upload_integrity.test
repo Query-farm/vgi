@@ -6,16 +6,18 @@
 # test/start_fake_blob_vendor.sh. A request over the worker's 32 KiB
 # VGI-Max-Request-Bytes is hashed by the extension, which asks
 # __upload_url__/init for one URL signed for that (size, sha256). The server
-# mints it from the vendor's sized POST /v1/blobs/put (`puts`), never the
-# retired unsized /v1/upload_urls (`upload_urls`). The extension PUTs exactly
-# those bytes with the returned upload_headers (`storage_puts`,
-# `bytes_uploaded`) and sends a pointer carrying vgi_rpc.location.sha256.
+# mints it from the vendor's sized POST /v1/blobs/put with
+# origin=client_upload (`puts_upload`), never the retired unsized
+# /v1/upload_urls (`upload_urls`). The extension PUTs exactly those bytes with
+# the returned upload_headers (`client_uploads`, `client_upload_bytes`) and
+# sends a pointer carrying vgi_rpc.location.sha256.
 #
 # GET /__admin__/fault?purpose=upload&action=corrupt&count=N damages the next
-# N signed PUT bodies in transit: the store's checksum check refuses them with
-# 400 BadDigest (`upload_refusals`, `uploads_corrupted`), and the query fails
-# with a storage checksum error. The functions here return small results, so
-# no server-side result PUT can take the fault instead.
+# N client-upload PUT bodies in transit: the store's checksum check refuses
+# them with 400 BadDigest (`client_upload_refusals`, `uploads_corrupted`), and
+# the query fails with a storage checksum error. The server's own writes
+# (results, storage values) never take the fault: a large result still comes
+# back while it is armed.
 
 require-env VGI_BLOB_VENDOR_URL
 
@@ -59,8 +61,9 @@ CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats_
 
 # Sized URLs were minted and used; the unsized route was not; nothing was refused.
 query IIIII
-SELECT s1.puts > s0.puts, s1.upload_urls = s0.upload_urls, s1.storage_puts > s0.storage_puts,
-       s1.bytes_uploaded - s0.bytes_uploaded >= 100000, s1.upload_refusals = s0.upload_refusals
+SELECT s1.puts_upload > s0.puts_upload, s1.upload_urls = s0.upload_urls, s1.client_uploads > s0.client_uploads,
+       s1.client_upload_bytes - s0.client_upload_bytes >= 100000,
+       s1.client_upload_refusals = s0.client_upload_refusals
 FROM s0, s1;
 ----
 true	true	true	true	true
@@ -78,10 +81,12 @@ SELECT payload_len, payload_sha256 = sha256(repeat('q', 120000)) FROM bt.blob_pa
 statement ok
 CREATE TABLE s3 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
-query III
-SELECT s3.puts > s2.puts, s3.upload_urls = s2.upload_urls, s3.upload_refusals = s2.upload_refusals FROM s2, s3;
+query IIII
+SELECT s3.puts_upload > s2.puts_upload, s3.upload_urls = s2.upload_urls, s3.client_uploads > s2.client_uploads,
+       s3.client_upload_refusals = s2.client_upload_refusals
+FROM s2, s3;
 ----
-true	true	true
+true	true	true	true
 
 # --- a corrupted upload is refused by storage --------------------------------------
 
@@ -92,6 +97,21 @@ true
 
 statement ok
 CREATE TABLE s4 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+# The armed fault spares server writes: a 300 KB result is still put in the
+# vendor and fetched intact.
+query II
+SELECT strlen(r), r = repeat('abc', 100000) FROM (SELECT bt.blob_repeat('abc', 100000) AS r);
+----
+300000	true
+
+statement ok
+CREATE TABLE s4b AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query I
+SELECT s4b.puts_rpc > s4.puts_rpc FROM s4, s4b;
+----
+true
 
 statement error
 SELECT bt.blob_len(repeat('v', 100001));
@@ -118,10 +138,12 @@ statement ok
 CREATE TABLE s5 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 # Storage refused the damaged bodies; the extension did not retry around it.
-query II
-SELECT s5.uploads_corrupted - s4.uploads_corrupted >= 3, s5.upload_bad_digest - s4.upload_bad_digest >= 3 FROM s4, s5;
+query III
+SELECT s5.uploads_corrupted - s4b.uploads_corrupted >= 3, s5.upload_bad_digest - s4b.upload_bad_digest >= 3,
+       s5.client_upload_refusals - s4b.client_upload_refusals >= 3
+FROM s4b, s5;
 ----
-true	true
+true	true	true
 
 query I
 SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');

@@ -4,8 +4,9 @@
 #
 # Lane: make test_http_vendor. blob_tio puts each input batch in worker
 # storage, reads it back and emits it with checksums: the exchange request is
-# uploaded (over 32 KiB), the state value lives in the vendor (over 4 KiB),
-# and the output is a vendor pointer (over 4 KiB).
+# uploaded (over 32 KiB: puts_upload, client_uploads), the state value lives in
+# the vendor (over 4 KiB: puts_fs), and the output is a vendor pointer (over
+# 4 KiB).
 
 require-env VGI_BLOB_VENDOR_URL
 
@@ -47,11 +48,12 @@ FROM bt.blob_tio((SELECT s, i FROM src));
 statement ok
 CREATE OR REPLACE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
-query IIII
-SELECT s1.upload_urls = s0.upload_urls, s1.puts > s0.puts, s1.gets > s0.gets, s1.storage_gets > s0.storage_gets
+query IIIIII
+SELECT s1.upload_urls = s0.upload_urls, s1.puts_fs > s0.puts_fs, s1.gets > s0.gets, s1.storage_gets > s0.storage_gets,
+       s1.puts_upload > s0.puts_upload, s1.client_uploads > s0.client_uploads
 FROM s0, s1;
 ----
-true	true	true	true
+true	true	true	true	true	true
 
 endloop
 
