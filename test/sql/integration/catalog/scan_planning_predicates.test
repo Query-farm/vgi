@@ -26,6 +26,11 @@ require httpfs
 
 require json
 
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
 statement ok
 COPY (SELECT DATE '2026-10-01' AS event_date, to_timestamp(epoch(DATE '2026-10-01') + i * 3600) AS ts, ['KXBTC15M', 'KXETH15M', 'KXGOLD', 'KX_AAA%GAS', 'kxwti15m'][i % 5 + 1] AS series, CASE WHEN i = 7 THEN NULL ELSE ['KXBTC15M', 'KXETH15M', 'KXGOLD', 'KX_AAA%GAS', 'kxwti15m'][i % 5 + 1] || '-' || strftime(DATE '2026-10-01', '%d') || '-' || i END AS ticker, i::BIGINT AS n, i / 10.0 AS price, i % 2 = 0 AS flag FROM range(10) t(i)) TO '${VGI_TEST_BRANCH_DIR}/planned_events_2026-10-01.parquet' (FORMAT 'parquet');
 
@@ -339,7 +344,7 @@ SELECT count(*) FROM ((FROM example.data.planned_events WHERE ts BETWEEN TIMESTA
 query I
 SELECT count(*) FROM example.data.planned_events WHERE date_trunc('day', ts) = TIMESTAMPTZ '2026-10-02 00:00:00+00';
 ----
-0
+10
 
 query I
 SELECT count(*) FROM ((FROM example.data.planned_events WHERE date_trunc('day', ts) = TIMESTAMPTZ '2026-10-02 00:00:00+00' EXCEPT ALL FROM ref WHERE date_trunc('day', ts) = TIMESTAMPTZ '2026-10-02 00:00:00+00')
@@ -363,7 +368,7 @@ SELECT count(*) FROM ((FROM example.data.planned_events WHERE epoch(ts) % 7200 =
 query I
 SELECT count(*) FROM example.data.planned_events WHERE ts::DATE = DATE '2026-10-05';
 ----
-6
+10
 
 query I
 SELECT count(*) FROM ((FROM example.data.planned_events WHERE ts::DATE = DATE '2026-10-05' EXCEPT ALL FROM ref WHERE ts::DATE = DATE '2026-10-05')

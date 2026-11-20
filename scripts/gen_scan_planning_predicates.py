@@ -25,6 +25,7 @@ DAY_SQL = (
 
 tmp = tempfile.mkdtemp()
 con = hb.connect()
+con.sql("SET TimeZone = 'UTC'")  # same as the generated tests
 for d in DAYS:
     con.sql(f"COPY ({DAY_SQL.format(day=d)}) TO '{tmp}/planned_events_{d}.parquet' (FORMAT parquet)")
 con.sql(f"CREATE VIEW ref AS FROM read_parquet('{tmp}/planned_events_*.parquet')")
@@ -59,10 +60,14 @@ require httpfs
 
 require json
 
+require icu
+
 """
 
 def setup() -> str:
-    out = []
+    # TIMESTAMPTZ functions (date_trunc, ::DATE) work in the session time zone: pin it, or the
+    # expected values depend on the machine that runs (or generated) the test.
+    out = ["statement ok\nSET TimeZone = 'UTC';\n"]
     for d in DAYS:
         out.append(f"statement ok\nCOPY ({DAY_SQL.format(day=d)}) TO '${{VGI_TEST_BRANCH_DIR}}/planned_events_{d}.parquet' (FORMAT 'parquet');\n")
     out.append("statement ok\nCREATE VIEW ref AS FROM read_parquet('${VGI_TEST_BRANCH_DIR}/planned_events_*.parquet');\n")
