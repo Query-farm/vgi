@@ -74,11 +74,14 @@ FROM (SELECT repeat('y', 200) || i::VARCHAR AS s FROM range(10000) t(i));
 statement ok
 CREATE TABLE s3 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
-# The client asked for upload URLs and PUT the request batches to them.
-query II
-SELECT s3.upload_urls > s2.upload_urls, s3.bytes_uploaded - s2.bytes_uploaded > 2000000 FROM s2, s3;
+# The client asked for sized upload URLs (minted from the vendor's
+# /v1/blobs/put, never the retired unsized /v1/upload_urls) and PUT the
+# request batches to them. blob_len's results are small, so every put here is
+# an upload.
+query III
+SELECT s3.puts > s2.puts, s3.upload_urls = s2.upload_urls, s3.bytes_uploaded - s2.bytes_uploaded > 2000000 FROM s2, s3;
 ----
-true	true
+true	true	true
 
 statement ok
 DETACH bt;

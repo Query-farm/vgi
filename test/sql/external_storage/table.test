@@ -68,10 +68,12 @@ SELECT payload_len, payload_sha256 = sha256(repeat('p', 100000)) FROM bt.blob_pa
 statement ok
 CREATE TABLE s3 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
-query I
-SELECT s3.upload_urls > s2.upload_urls FROM s2, s3;
+# A sized upload URL was minted (the echo's one-row result is inline, so the
+# put is the upload's), never an unsized one.
+query II
+SELECT s3.puts > s2.puts, s3.upload_urls = s2.upload_urls FROM s2, s3;
 ----
-true
+true	true
 
 # Multi-byte text: lengths are UTF-8 bytes on both sides.
 query II
@@ -92,7 +94,7 @@ statement ok
 CREATE TABLE s5 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query I
-SELECT s5.upload_urls = s4.upload_urls FROM s4, s5;
+SELECT s5.puts = s4.puts FROM s4, s5;
 ----
 true
 

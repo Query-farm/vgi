@@ -1,0 +1,144 @@
+# name: test/sql/external_storage/upload_integrity.test
+# description: Oversized requests go up through sized, hashed upload URLs (upload URLs v2), and storage refuses a corrupted upload
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, or any SDK lane that sources
+# test/start_fake_blob_vendor.sh. A request over the worker's 32 KiB
+# VGI-Max-Request-Bytes is hashed by the extension, which asks
+# __upload_url__/init for one URL signed for that (size, sha256). The server
+# mints it from the vendor's sized POST /v1/blobs/put (`puts`), never the
+# retired unsized /v1/upload_urls (`upload_urls`). The extension PUTs exactly
+# those bytes with the returned upload_headers (`storage_puts`,
+# `bytes_uploaded`) and sends a pointer carrying vgi_rpc.location.sha256.
+#
+# GET /__admin__/fault?purpose=upload&action=corrupt&count=N damages the next
+# N signed PUT bodies in transit: the store's checksum check refuses them with
+# 400 BadDigest (`upload_refusals`, `uploads_corrupted`), and the query fails
+# with a storage checksum error. The functions here return small results, so
+# no server-side result PUT can take the fault instead.
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Load the catalog first (catalog_contents is itself a vendor object).
+query I
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name LIKE 'blob_%';
+----
+7
+
+# --- an oversized scalar input round-trips through one sized upload -------------
+
+statement ok
+CREATE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query I
+SELECT bt.blob_len(repeat('u', 100000));
+----
+100000
+
+statement ok
+CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+# Sized URLs were minted and used; the unsized route was not; nothing was refused.
+query IIIII
+SELECT s1.puts > s0.puts, s1.upload_urls = s0.upload_urls, s1.storage_puts > s0.storage_puts,
+       s1.bytes_uploaded - s0.bytes_uploaded >= 100000, s1.upload_refusals = s0.upload_refusals
+FROM s0, s1;
+----
+true	true	true	true	true
+
+# --- an oversized bind parameter (bind + init requests) -------------------------
+
+statement ok
+CREATE TABLE s2 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query II
+SELECT payload_len, payload_sha256 = sha256(repeat('q', 120000)) FROM bt.blob_param_echo(repeat('q', 120000));
+----
+120000	true
+
+statement ok
+CREATE TABLE s3 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+query III
+SELECT s3.puts > s2.puts, s3.upload_urls = s2.upload_urls, s3.upload_refusals = s2.upload_refusals FROM s2, s3;
+----
+true	true	true
+
+# --- a corrupted upload is refused by storage --------------------------------------
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=upload&action=corrupt&count=100');
+----
+true
+
+statement ok
+CREATE TABLE s4 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+statement error
+SELECT bt.blob_len(repeat('v', 100001));
+----
+<REGEX>:(?s).*VGI upload failed \(HTTP 400\): storage checksum mismatch \(BadDigest\).*
+
+statement ok
+SET errors_as_json=true;
+
+statement error
+SELECT bt.blob_len(repeat('v', 100002));
+----
+<REGEX>:(?s).*"error_subtype":"CHECKSUM_MISMATCH".*
+
+statement error
+SELECT payload_len FROM bt.blob_param_echo(repeat('v', 120001));
+----
+<REGEX>:(?s).*"error_subtype":"CHECKSUM_MISMATCH".*
+
+statement ok
+RESET errors_as_json;
+
+statement ok
+CREATE TABLE s5 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+# Storage refused the damaged bodies; the extension did not retry around it.
+query II
+SELECT s5.uploads_corrupted - s4.uploads_corrupted >= 3, s5.upload_bad_digest - s4.upload_bad_digest >= 3 FROM s4, s5;
+----
+true	true
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+# --- the fault was the cause: the same shapes pass again (fresh arguments) --------
+
+query I
+SELECT bt.blob_len(repeat('v', 100003));
+----
+100003
+
+query II
+SELECT payload_len, payload_sha256 = sha256(repeat('v', 120002)) FROM bt.blob_param_echo(repeat('v', 120002));
+----
+120002	true
+
+statement ok
+DETACH bt;

@@ -5,7 +5,8 @@
 # Lane: make test_http_vendor. blob_buffer_echo stores every input batch raw
 # in worker storage (process), then replays them (finalize):
 #   * the table_buffering_process request carries a whole input batch, over the
-#     32 KiB request cap -> uploaded (upload_urls);
+#     32 KiB request cap -> uploaded through a sized URL (puts; never the
+#     retired unsized upload_urls);
 #   * each stored batch is over VGI_STORAGE_EXTERNALIZE_BYTES -> kept in the
 #     vendor (puts) and read back on finalize (gets);
 #   * each replayed batch is over the result threshold -> fetched by the client.
@@ -52,7 +53,7 @@ statement ok
 CREATE OR REPLACE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query IIII
-SELECT s1.upload_urls > s0.upload_urls, s1.puts > s0.puts, s1.gets > s0.gets, s1.storage_gets > s0.storage_gets
+SELECT s1.upload_urls = s0.upload_urls, s1.puts > s0.puts, s1.gets > s0.gets, s1.storage_gets > s0.storage_gets
 FROM s0, s1;
 ----
 true	true	true	true
