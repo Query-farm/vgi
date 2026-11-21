@@ -167,6 +167,9 @@ VGI_EXTERNAL_PROBE_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)
 # The fixture worker without vgi_rpc.Reflection.v1, standing in for a worker
 # that predates reflection (test/sql/integration/reflection/pre_reflection.test).
 VGI_NO_REFLECTION_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/no_reflection_worker.py
+# Journals every aggregate RPC (test/sql/aggregate_lifetime/: one aggregate_destructor
+# per execution, after all of its other calls).
+VGI_AGG_LIFETIME_WORKER ?= uv run --project $(VGI_PYTHON_DIR) python $(CURDIR)/test/support/aggregate_lifetime_worker.py
 
 # The schema_reconcile and projection_pushdown_repro fixtures are now
 # hosted inside vgi-fixture-worker (VGI_TEST_WORKER) — no separate worker
@@ -225,6 +228,7 @@ test_shm:
 	VGI_VISIBILITY_WORKER="$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
 
@@ -244,6 +248,7 @@ test_shm_debug:
 	VGI_VISIBILITY_WORKER="$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
 
@@ -273,6 +278,7 @@ test_spawn:
 	VGI_VISIBILITY_WORKER="$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
 
@@ -291,6 +297,7 @@ test_spawn_debug:
 	VGI_VISIBILITY_WORKER="$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
 
@@ -348,6 +355,7 @@ test_launcher:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="launch:$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -370,6 +378,7 @@ test_launcher_debug:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="launch:$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -411,6 +420,7 @@ test_launcher_cloudflare_do:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="launch:$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -440,6 +450,7 @@ test_launcher_cloudflare_do_debug:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="launch:$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -776,6 +787,7 @@ test_python:
 	VGI_VISIBILITY_WORKER="launch:$(VGI_VISIBILITY_WORKER)" \
 	VGI_WRITE_CONTRACT_WORKER="launch:$(VGI_WRITE_CONTRACT_WORKER)" \
 	VGI_NO_REFLECTION_WORKER="launch:$(VGI_NO_REFLECTION_WORKER)" \
+	VGI_AGG_LIFETIME_WORKER="launch:$(VGI_AGG_LIFETIME_WORKER)" \
 	VGI_EXTERNAL_PROBE_WORKER="launch:$(VGI_EXTERNAL_PROBE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -870,6 +882,7 @@ VGI_EXPECTED_SKIPS := \
 	--allow-skip 'require-env VGI_WRITE_CONTRACT_WORKER' \
 	--allow-skip 'require-env VGI_MALFORMED_BATCH_WORKER' \
 	--allow-skip 'require-env VGI_NO_REFLECTION_WORKER' \
+	--allow-skip 'require-env VGI_AGG_LIFETIME_WORKER' \
 	--allow-skip 'require-env VGI_SCHEMA_RECONCILE_DB' \
 	--allow-skip 'require-env VGI_RULES_WORKER' \
 	--allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT' \

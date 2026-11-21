@@ -1,0 +1,133 @@
+# name: test/sql/aggregate_lifetime/destructor_lifetime.test
+# description: One aggregate_destructor per execution, after every other call of it
+# group: [vgi_aggregate_lifetime]
+#
+# aggregate_destructor clears an execution's whole worker storage, bind-time
+# arguments included. The extension used to send it from the state destroy
+# callback, as soon as as many states had been destroyed as created. With
+# PARTITION BY, one partition's states can all be created and destroyed before
+# the next partition creates any: the destructor fired while the execution was
+# still running, and a second one followed. A prepared statement runs one bind
+# (one execution_id) many times, so its second run came after the destructor.
+# Workers whose storage is shared across processes (vgi-rust's SQLite storage)
+# failed the next call with "no bind-time arguments in function storage";
+# vgi-python's stdio storage is per process and hid it.
+#
+# test/support/aggregate_lifetime_worker.py journals every aggregate RPC in the
+# order it saw them; this file checks the journal. threads = 1 makes the
+# partition case deterministic (partitions run one after another); the
+# threads = 4 pass covers the parallel window, GROUP BY and combine paths.
+# Lives outside test/sql/integration/ because it needs that worker
+# (VGI_AGG_LIFETIME_WORKER), which the SDK lanes do not have.
+
+require-env VGI_AGG_LIFETIME_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'agglife' AS agglife (TYPE vgi, LOCATION '${VGI_AGG_LIFETIME_WORKER} --journal {TEST_DIR}/agg_lifetime_journal.csv');
+
+statement ok
+SET threads = 1;
+
+# The vgi-rust streaming_mixed_keys failure: two window expressions with
+# different PARTITION BY (two executions), the second partition of each
+# starting after the first partition's states are gone.
+query IIII
+SELECT k, x,
+       agglife.main.vgi_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s_k,
+       agglife.main.vgi_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x) AS s_g
+FROM (VALUES ('a', 'p', 3), ('b', 'p', 1), ('a', 'q', 2), ('b', 'q', 4)) t(k, g, x)
+ORDER BY x;
+----
+b	1	1	1
+a	2	2	2
+a	3	5	4
+b	4	5	6
+
+query I
+SELECT count(*) FILTER (WHERE s <> expected)
+FROM (
+  SELECT agglife.main.vgi_sum(x) OVER (PARTITION BY x % 3 ORDER BY x) AS s,
+         sum(x) OVER (PARTITION BY x % 3 ORDER BY x) AS expected
+  FROM range(30) t(x)
+);
+----
+0
+
+# A prepared statement executed twice: one bind, one execution_id. Its
+# destructor waits for the statement, not for its first execution.
+statement ok
+PREPARE twice AS SELECT agglife.main.vgi_sum(x) OVER (PARTITION BY x % 7) AS s FROM range(700) t(x);
+
+statement ok
+EXECUTE twice;
+
+statement ok
+EXECUTE twice;
+
+statement ok
+DEALLOCATE twice;
+
+statement ok
+SET threads = 4;
+
+query I
+SELECT count(*) FILTER (WHERE s <> expected)
+FROM (
+  SELECT agglife.main.vgi_sum(x) OVER (PARTITION BY x % 97) AS s,
+         sum(x) OVER (PARTITION BY x % 97) AS expected
+  FROM range(20000) t(x)
+);
+----
+0
+
+# GROUP BY with enough groups for a partitioned parallel finalize (combine).
+query I
+SELECT count(*) FILTER (WHERE s <> expected)
+FROM (
+  SELECT agglife.main.vgi_sum(x) AS s, sum(x) AS expected
+  FROM range(200000) t(x)
+  GROUP BY x % 5003
+);
+----
+0
+
+query I
+SELECT agglife.main.vgi_sum(x) = sum(x) FROM range(100000) t(x);
+----
+true
+
+statement ok
+CREATE TEMP TABLE journal AS
+SELECT * FROM read_csv('{TEST_DIR}/agg_lifetime_journal.csv', header = false,
+    columns = {'ts': 'BIGINT', 'pid': 'BIGINT', 'method': 'VARCHAR', 'execution_id': 'VARCHAR'});
+
+statement ok
+CREATE TEMP TABLE lifetimes AS
+SELECT execution_id,
+       count(*) FILTER (WHERE method <> 'destructor') AS calls,
+       count(*) FILTER (WHERE method = 'destructor') AS destructors,
+       min(ts) FILTER (WHERE method = 'destructor') AS destroyed_at,
+       max(ts) FILTER (WHERE method <> 'destructor') AS last_call_at
+FROM journal
+GROUP BY execution_id;
+
+# One execution per aggregate call site that ran: 2 + 1 + 1 (the prepared
+# statement, both runs) + 1 + 1 + 1.
+query I
+SELECT count(*) FROM lifetimes WHERE calls > 0;
+----
+7
+
+# Exactly one destructor per execution.
+query I
+SELECT count(*) FROM lifetimes WHERE calls > 0 AND destructors <> 1;
+----
+0
+
+# No call of an execution after its destructor.
+query I
+SELECT count(*) FROM lifetimes WHERE calls > 0 AND last_call_at > destroyed_at;
+----
+0

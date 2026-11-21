@@ -93,14 +93,30 @@ struct VgiAggregateBindData : public FunctionData {
 	weak_ptr<ClientContext> context;
 	vector<Value> const_values;
 
-	// Shared by all copies of this bind data (DuckDB copies during planning).
+	// One execution of the aggregate: shared by all copies of this bind data
+	// (DuckDB copies during planning), so it dies with the last of them, once
+	// the plan is gone and with it every state of every partition.
 	struct ExecState {
 		std::atomic<int64_t> group_id_counter{0};
-		std::atomic<int64_t> destroy_counter{0};
 		// Assigns a partition_id per OVER partition (VgiAggregateWindowInit);
 		// the worker keys its window storage on it.
 		std::atomic<int64_t> partition_id_counter{0};
 		std::vector<uint8_t> execution_id;
+
+		// What the execution's aggregate_destructor needs, set at bind.
+		std::shared_ptr<VgiAttachParameters> attach_params;
+		std::vector<uint8_t> attach_opaque_data;
+		std::string function_name;
+		std::string schema_name;
+		weak_ptr<ClientContext> context;
+
+		// Sends the execution's one aggregate_destructor, which frees all of its
+		// worker storage, bind-time arguments included. Not from the state
+		// destroy callback: there, "as many states destroyed as created" also
+		// holds between two partitions of a window or a partitioned GROUP BY
+		// finalize, while the next partition is still to run; and a prepared
+		// statement runs one bind (one execution_id) many times.
+		~ExecState();
 	};
 	std::shared_ptr<ExecState> exec_state = std::make_shared<ExecState>();
 

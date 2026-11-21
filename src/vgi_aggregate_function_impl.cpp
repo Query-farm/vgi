@@ -273,6 +273,39 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 
 // VgiAggregateBindData
 
+VgiAggregateBindData::ExecState::~ExecState() {
+	// No execution_id: the bind never reached the worker (or failed there), so
+	// there is nothing to free.
+	if (execution_id.empty() || !attach_params) {
+		return;
+	}
+	// Best-effort cleanup: must not throw.
+	try {
+		// The session may be gone (a plan outliving its connection): then there is
+		// no context to dispatch on and the worker state is not freed.
+		auto context_lock = context.lock();
+		if (!context_lock) {
+			return;
+		}
+		VgiAggregateBindData target;
+		target.exec_state = nullptr;
+		target.attach_params = attach_params;
+		target.attach_opaque_data = attach_opaque_data;
+		target.function_name = function_name;
+		target.schema_name = schema_name;
+		target.context = context;
+
+		vgi::VgiBatchBuilder gid_builder(GroupIdSchema());
+		vgi::append::Int(gid_builder.column(0), 0);
+		gid_builder.FinishRow();
+		auto request = BuildAggregateDestructorRequest(function_name, schema_name, execution_id, attach_opaque_data,
+		                                               gid_builder.Finish());
+		// enable_logging=false: may run during query teardown.
+		InvokeAggregateRpc(*context_lock, target, "aggregate_destructor", request, /*enable_logging=*/false);
+	} catch (...) {
+	}
+}
+
 unique_ptr<FunctionData> VgiAggregateBindData::Copy() const {
 	auto copy = make_uniq<VgiAggregateBindData>();
 	copy->attach_params = attach_params;
@@ -535,25 +568,23 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 		// both state structs (see VgiAggregateStateTag).
 		auto raw_states = UnifiedVectorFormat::GetData<VgiAggregateState *>(sdata);
 
-		int64_t aggregate_initialized = 0;
 		// One window destructor RPC per partition_id; states with partition_id -1
 		// are skipped.
 		std::vector<int64_t> window_partition_ids;
 
 		for (idx_t i = 0; i < count; i++) {
 			auto idx = sdata.sel->get_index(i);
-			auto tag = raw_states[idx]->tag;
-			if (tag == VgiAggregateStateTag::AGGREGATE) {
-				if (raw_states[idx]->group_id != -1) {
-					aggregate_initialized++;
-				}
-			} else if (tag == VgiAggregateStateTag::WINDOW) {
+			if (raw_states[idx]->tag == VgiAggregateStateTag::WINDOW) {
 				auto *win = reinterpret_cast<VgiAggregateWindowLocalState *>(raw_states[idx]);
 				if (win->partition_id != -1) {
 					window_partition_ids.push_back(win->partition_id);
 				}
 			}
-			// UNSET: never used, nothing to clean up.
+			// AGGREGATE: freed with the execution (~ExecState sends
+			// aggregate_destructor). UNSET: never used.
+		}
+		if (window_partition_ids.empty()) {
+			return;
 		}
 
 		// The session may be gone (destructor on a scheduler thread at shutdown):
@@ -569,32 +600,10 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 			try {
 				SendAggregateWindowDestructorRpc(context, bind_data, pid);
 			} catch (...) {
-				// Best-effort. The Python SDK's aggregate_destructor also clears an
-				// execution's window partitions, when one is sent.
+				// Best-effort. The execution's aggregate_destructor (~ExecState)
+				// also clears its window partitions.
 			}
 		}
-
-		// Aggregate destructor: one RPC, from the batch that destroys the last
-		// created group.
-		if (aggregate_initialized == 0) {
-			return;
-		}
-		auto prev = bind_data.exec_state->destroy_counter.fetch_add(aggregate_initialized);
-		auto total_created = bind_data.exec_state->group_id_counter.load();
-		if (prev + aggregate_initialized < total_created) {
-			return;
-		}
-
-		vgi::VgiBatchBuilder gid_builder(GroupIdSchema());
-		vgi::append::Int(gid_builder.column(0), 0);
-		gid_builder.FinishRow();
-		auto gid_batch = gid_builder.Finish();
-
-		auto request = BuildAggregateDestructorRequest(bind_data.function_name, bind_data.schema_name,
-		                                                bind_data.exec_state->execution_id,
-		                                                bind_data.attach_opaque_data, gid_batch);
-		// enable_logging=false: runs on scheduler threads during pipeline teardown.
-		InvokeAggregateRpc(context, bind_data, "aggregate_destructor", request, /*enable_logging=*/false);
 	} catch (...) {
 		// Destructors must not throw.
 	}
@@ -731,6 +740,12 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(BindAggregateFunctionInput &in
 	// ClientContext is always owned by a shared_ptr.
 	bind_data->context = context.shared_from_this();
 	bind_data->const_values = const_values;
+	auto &exec_state = *bind_data->exec_state;
+	exec_state.attach_params = bind_data->attach_params;
+	exec_state.attach_opaque_data = bind_data->attach_opaque_data;
+	exec_state.function_name = bind_data->function_name;
+	exec_state.schema_name = bind_data->schema_name;
+	exec_state.context = bind_data->context;
 
 	auto rpc_result = InvokeAggregateRpc(context, *bind_data, "aggregate_bind", request);
 
