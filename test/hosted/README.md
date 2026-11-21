@@ -95,9 +95,11 @@ bound port) when:
   - `Access-Control-Allow-Origin: *`.
 - Extra headers are never a failure (a 503 may carry the capability and CORS
   headers too).
-- Authentication runs before the body is size-checked, decompressed or
-  parsed: a body over the request-size limit, a garbage zstd/gzip body, or a
-  garbage Arrow body without a valid Pass gets 401, never 413/400/415.
+- Authentication runs before the body is read, size-checked, decompressed or
+  parsed. A garbage zstd/gzip or Arrow body without a valid Pass gets 401,
+  never 400/415. A body declared over the request cap (`Content-Length`) and
+  never sent gets an immediate 401, or an immediate 413 from the declared
+  length: neither reads the body, and a worker that waits for it fails.
 - CORS is open: a preflight gets any 2xx (Python 200, vgi-rpc-ts 204) with
   `Access-Control-Allow-Origin: *` and allows `POST` and the `Authorization`
   header; ordinary responses (401s included) carry
@@ -296,9 +298,9 @@ the SDK's real constants:
 | `pass.leeway_boundary` | ±15 s around the 60 s leeway, for `exp` and `nbf` |
 | `cors.preflight`, `cors.preflight_health` | preflights need no Pass (any 2xx), allow `*`, `POST`, `Authorization` |
 | `cors.allow_origin_on_responses` | 401 and accepted responses carry `Access-Control-Allow-Origin: *` |
-| `body.oversize_no_pass`, `body.oversize_invalid_pass` | a 4 MiB body over the 64 KiB limit → 401, not 413 |
+| `body.oversize_no_pass`, `body.oversize_invalid_pass`, `body.oversize_64gib` | 4 MiB (over the 64 KiB cap) or 64 GiB declared and never sent → an immediate 401 or 413 |
 | `body.garbage_compressed`, `body.garbage_arrow` | garbage zstd/gzip/Arrow bodies → 401 |
-| `body.streaming.*` (opt-in) | a 16 MiB or 64 GiB body declared but never sent, and an unfinished chunked body → 401 |
+| `body.streaming.*` (opt-in) | 32 KiB (under the cap) declared and never sent, without and with an invalid Pass, and an unfinished chunked body → 401 |
 | `logs.no_authorization*` | no credential sent to a worker appears in its output |
 | `jwks.unavailable_at_start` | the JWKS is down from the start → 503 + `Retry-After`; recovers when it is back |
 | `jwks.max_age_honoured` | `max-age=3`: after it, the rotated-out key is rejected and the new key accepted |
@@ -309,13 +311,16 @@ the SDK's real constants:
 
 ### `body.streaming.*` is opt-in
 
-These rules declare a body and never send it, so a worker that receives the
-whole body before authenticating never answers. vgi-python, the reference,
-does not pass them: waitress buffers the whole request (and answers 413 itself
-above 1 GiB) before the WSGI app runs, and granian buffers Content-Length
-bodies. So the required rule is the application-level one (`body.oversize_*`,
-`body.garbage_*`); run `--streaming-body` to see whether your SDK also
-authenticates before the body arrives.
+These rules declare a body under the request cap and never send it, so a
+worker that receives the body before authenticating never answers. vgi-python,
+the reference, does not pass them: waitress reads the whole body before the
+WSGI app runs. In hosted mode vgi-python caps that buffer at the request cap
+(`VGI_RPC_MAX_REQUEST_BYTES`, default 32 MiB) and answers 413 from the
+declared length above it, and it refuses `--server granian`, which has no
+cap. The remaining exposure is at most one capped body per open connection
+before the 401. So the required rules are `body.oversize_*` and
+`body.garbage_*`; run `--streaming-body` to see whether your SDK also
+authenticates before any of the body arrives.
 
 ## vgi-python's lane
 
@@ -324,6 +329,9 @@ cd vgi-python
 uv sync --all-extras
 uv run --no-sync python ../vgi/test/hosted/run_hosted_conformance.py \
   --worker-cmd 'uv run --no-sync python -m vgi.serve vgi._test_fixtures.orchard_hosted:OrchardHostedWorker --http --host 127.0.0.1 --port 0 --debug' \
+  --refuse-cmd 'uv run --no-sync python -m vgi._test_fixtures.orchard_hosted' \
+  --refuse-cmd 'uv run --no-sync python -m vgi.serve vgi._test_fixtures.orchard_hosted:OrchardHostedWorker' \
+  --refuse-cmd 'uv run --no-sync python -m vgi.serve vgi._test_fixtures.orchard_hosted:OrchardHostedWorker --http --server granian --port 0' \
   --refuse-cmd 'uv run --no-sync python -m vgi._test_fixtures.orchard_hosted --unix /tmp/vgi-hosted-refuse-{port}.sock' \
   --refuse-cmd 'uv run --no-sync python -m vgi._test_fixtures.orchard_hosted --tcp 127.0.0.1:{port}' \
   --refuse-cmd 'uv run --no-sync python -m vgi.serve vgi._test_fixtures.orchard_hosted:OrchardHostedWorker --iroh-raw-upstream 0'
@@ -332,9 +340,6 @@ uv run --no-sync python ../vgi/test/hosted/run_hosted_conformance.py \
 vgi-python's `scripts/hosted_conformance.sh` wraps this, and its CI job
 `orchard-hosted-conformance` runs it against a pinned vgi commit.
 
-There is no stdio `--refuse-cmd` in that lane: vgi-python's `Worker.main`
-refuses `--unix` and `--tcp` in hosted mode but still serves stdio (a pipe
-from the parent process, never a network listener). The porting brief lists
-stdio among the transports to refuse; until that is settled, an SDK that
-refuses stdio should add it with `--refuse-cmd`, and one that does not is
-consistent with the reference.
+The first two refuse commands are stdio (`Worker.main` and `vgi-serve`
+without `--http`). Every SDK must refuse stdio in hosted mode too; pass the
+SDK's stdio command with `--refuse-cmd`.

@@ -1076,18 +1076,20 @@ BODY_LIMIT = 64 * 1024
 
 
 def group_body(ctx: Ctx) -> None:
-    """Authentication runs before the body is size-checked, decompressed or parsed.
+    """Authentication runs before the body is read, size-checked, decompressed or parsed.
 
-    The worker runs with ``VGI_RPC_MAX_REQUEST_BYTES=65536``; a 4 MiB body
-    without a valid Pass must still get 401, not 413. The ``body.streaming.*``
-    rules (opt-in, ``--streaming-body``) go further: the body is declared but
-    never sent, so a worker that receives the body before authenticating never
-    answers.
+    The worker runs with ``VGI_RPC_MAX_REQUEST_BYTES=65536``. Bodies are
+    declared and never sent, so a worker that waits for (or buffers) the body
+    before answering times out and fails. Over the cap, a 413 sent from the
+    declared ``Content-Length`` before any of the body is read is allowed as
+    well as the 401: neither reads the body. Under the cap
+    (``body.streaming.*``, opt-in with ``--streaming-body``) only the 401 is.
     """
     suite, m, cfg = ctx.suite, ctx.minter, ctx.cfg
-    rules = ("body.oversize_no_pass", "body.oversize_invalid_pass", "body.garbage_compressed", "body.garbage_arrow")
-    streaming = ("body.streaming.declared_16mib_unsent", "body.streaming.declared_64gib_unsent",
-                 "body.streaming.declared_64gib_invalid_pass", "body.streaming.unfinished_chunked")  # fmt: skip
+    rules = ("body.oversize_no_pass", "body.oversize_invalid_pass", "body.oversize_64gib",
+             "body.garbage_compressed", "body.garbage_arrow")  # fmt: skip
+    streaming = ("body.streaming.declared_under_cap_unsent", "body.streaming.declared_under_cap_invalid_pass",
+                 "body.streaming.unfinished_chunked")  # fmt: skip
     if not ctx.args.streaming_body:
         for rule in streaming:
             if suite.selected(rule):
@@ -1106,16 +1108,23 @@ def group_body(ctx: Ctx) -> None:
     rpc = cfg.rpc_path
     arrow = "Content-Type: application/vnd.apache.arrow.stream\r\n"
     try:
-
-        def oversize(token: str | None, reasons: tuple[str, ...]) -> None:
-            body = secrets.token_bytes(4 * 1024 * 1024)
+        # Declared but never sent. Nothing follows the headers, so the server's
+        # close is a clean FIN and its response is not lost to a TCP reset.
+        def declared(token: str | None, length: int, what: str, reasons: tuple[str, ...], allow_413: bool) -> None:
             auth = f"Authorization: Bearer {token}\r\n" if token is not None else ""
-            head = f"POST {rpc} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}{arrow}Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
-            status, data = raw_exchange(w.url, head, body, timeout=30)
-            assert_raw_401(status, data, f"a 4 MiB body over the {BODY_LIMIT}-byte limit", reasons)
+            head = f"POST {rpc} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}{arrow}Content-Length: {length}\r\nConnection: close\r\n\r\n"
+            status, data = raw_exchange(w.url, head, b"", timeout=15)
+            if allow_413 and status == 413:
+                return
+            assert_raw_401(status, data, what + (" (401, or 413 from the declared length)" if allow_413 else ""), reasons)
 
-        suite.run("body.oversize_no_pass", lambda: oversize(None, ("missing_credential",)))
-        suite.run("body.oversize_invalid_pass", lambda: oversize(m.mint(a, aud=OTHER_AUDIENCE), ("invalid_credential",)))
+        over = 4 * 1024 * 1024
+        suite.run(
+            "body.oversize_no_pass", lambda: declared(None, over, "4 MiB declared over the 64 KiB cap, never sent, no Pass", ("missing_credential",), True)
+        )
+        suite.run("body.oversize_invalid_pass",
+                  lambda: declared(m.mint(a, aud=OTHER_AUDIENCE), over, "4 MiB declared over the cap, invalid Pass", ("invalid_credential",), True))  # fmt: skip
+        suite.run("body.oversize_64gib", lambda: declared(None, 64 * 1024**3, "64 GiB declared, never sent, no Pass", ("missing_credential",), True))
 
         def garbage_compressed() -> None:
             garbage = secrets.token_bytes(32 * 1024)
@@ -1134,24 +1143,17 @@ def group_body(ctx: Ctx) -> None:
 
         suite.run("body.garbage_arrow", garbage_arrow)
 
-        # Declared but never sent. Nothing follows the headers, so the server's
-        # close is a clean FIN and its response is not lost to a TCP reset.
-        def declared(token: str | None, length: int, what: str, reasons: tuple[str, ...]) -> None:
-            auth = f"Authorization: Bearer {token}\r\n" if token is not None else ""
-            head = f"POST {rpc} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}{arrow}Content-Length: {length}\r\nConnection: close\r\n\r\n"
-            status, data = raw_exchange(w.url, head, b"", timeout=15)
-            assert_raw_401(status, data, what, reasons)
-
         def unfinished_chunked() -> None:
             head = f"POST {rpc} HTTP/1.1\r\nHost: 127.0.0.1\r\n{arrow}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-            status, data = raw_exchange(w.url, head, b"10000\r\n", timeout=15)
+            status, data = raw_exchange(w.url, head, b"8000\r\n", timeout=15)
             assert_raw_401(status, data, "an unfinished chunked body without a Pass", ("missing_credential",))
 
         if streaming:
-            suite.run(streaming[0], lambda: declared(None, 16 * 1024**2, "16 MiB declared, never sent, no Pass", ("missing_credential",)))
-            suite.run(streaming[1], lambda: declared(None, 64 * 1024**3, "64 GiB declared, never sent, no Pass", ("missing_credential",)))
-            suite.run(streaming[2], lambda: declared(m.mint(a, aud=OTHER_AUDIENCE), 64 * 1024**3, "64 GiB declared, invalid Pass", ("invalid_credential",)))
-            suite.run(streaming[3], unfinished_chunked)
+            under = BODY_LIMIT // 2
+            suite.run(streaming[0], lambda: declared(None, under, "32 KiB declared under the cap, never sent, no Pass", ("missing_credential",), False))
+            suite.run(streaming[1],
+                      lambda: declared(m.mint(a, aud=OTHER_AUDIENCE), under, "32 KiB declared, never sent, invalid Pass", ("invalid_credential",), False))  # fmt: skip
+            suite.run(streaming[2], unfinished_chunked)
         suite.run("logs.no_authorization_body_worker", lambda: assert_no_leak(w, m))
     finally:
         w.stop()
