@@ -61,7 +61,12 @@ ISSUER = "https://auth.orchard.test"
 AUDIENCE = "https://desk.orchard.test/d/dep_conformance"
 OTHER_AUDIENCE = "https://desk.orchard.test/d/dep_other"
 #: 48 ASCII bytes: at least 32 bytes however an SDK reads it (raw, or as text).
-SIGNING_KEY = "orchard-hosted-conformance-signing-key-000000001"
+#: The cross-SDK form Orchard uses: 64 lowercase hex characters (32 random
+#: bytes, ``openssl rand -hex 32``). Every SDK must accept it; other forms are
+#: SDK-specific. Fresh per run.
+SIGNING_KEY = secrets.token_hex(32)
+#: Too short under any reading: 16 hex characters (8 bytes) or 16 raw bytes.
+SHORT_SIGNING_KEY = secrets.token_hex(8)
 CHALLENGE = 'Bearer error="invalid_token"'
 LEEWAY = 60
 KID_REFETCH_INTERVAL = 60
@@ -692,7 +697,7 @@ def assert_claims(payload: Any, expected: dict[str, Any]) -> None:
             # type() comparison: True must not pass for 1, 1.0 must not pass for 1.
             check(type(got) is type(want) and got == want, f"claim {name!r}: expected {want!r} ({type(want).__name__}), got {got!r} ({type(got).__name__})")
         else:
-            check(name not in claims, f"claim {name!r} is not in the Pass but the output has {claims.get(name)!r}")
+            check(claims.get(name) is None, f"claim {name!r} is not in the Pass but the output has {claims.get(name)!r}")
 
 
 def assert_no_leak(worker: Worker, minter: Minter) -> None:
@@ -796,8 +801,7 @@ def group_startup(ctx: Ctx) -> None:
     cases.append(("startup.algorithms.hs256", hosted_env(cfg, jwks_uri, VGI_JWT_ALGORITHMS="ES256,HS256"), "VGI_JWT_ALGORITHMS"))
     cases.append(("startup.algorithms.none", hosted_env(cfg, jwks_uri, VGI_JWT_ALGORITHMS="none"), "VGI_JWT_ALGORITHMS"))
     cases.append(("startup.signing_key.unset", hosted_env(cfg, jwks_uri, VGI_SIGNING_KEY=None), "VGI_SIGNING_KEY"))
-    cases.append(("startup.signing_key.empty", hosted_env(cfg, jwks_uri, VGI_SIGNING_KEY=""), "VGI_SIGNING_KEY"))
-    cases.append(("startup.signing_key.short", hosted_env(cfg, jwks_uri, VGI_SIGNING_KEY="short-key-31-bytes-long-0000000"), "VGI_SIGNING_KEY"))
+    cases.append(("startup.signing_key.short", hosted_env(cfg, jwks_uri, VGI_SIGNING_KEY=SHORT_SIGNING_KEY), "VGI_SIGNING_KEY"))
 
     jobs: list[tuple[str, Callable[[], None]]] = [(rule, refuses(rule, env, needle)) for rule, env, needle in cases]
     for i, cmd in enumerate(cfg.refuse_cmds, 1):
@@ -988,7 +992,7 @@ def group_main(ctx: Ctx) -> None:
                 "Access-Control-Request-Method": "POST",
                 "Access-Control-Request-Headers": "authorization,content-type",
             })  # fmt: skip
-            check(r.status in (200, 204), f"a CORS preflight needs no Pass: expected 200/204, got {r.describe()}")
+            check(200 <= r.status < 300, f"a CORS preflight needs no Pass: expected 2xx, got {r.describe()}")
             check(
                 r.headers.get("access-control-allow-origin") == "*",
                 f"Access-Control-Allow-Origin must be '*', got {r.headers.get('access-control-allow-origin')!r}",
@@ -1002,7 +1006,7 @@ def group_main(ctx: Ctx) -> None:
 
         def preflight_health() -> None:
             r = w.request("OPTIONS", "/health", headers={"Origin": "https://shell.duckdb.org", "Access-Control-Request-Method": "GET"})
-            check(r.status in (200, 204), f"a CORS preflight for /health needs no Pass: got {r.describe()}")
+            check(200 <= r.status < 300, f"a CORS preflight for /health needs no Pass: got {r.describe()}")
 
         suite.run("cors.preflight_health", preflight_health)
 

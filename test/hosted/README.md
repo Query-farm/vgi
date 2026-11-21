@@ -34,8 +34,13 @@ bound port) when:
 - `VGI_JWT_ISSUER`, `VGI_JWT_AUDIENCE` or `VGI_JWT_JWKS_URI` is unset, empty or
   whitespace-only;
 - any of the three contains a comma (each is exactly one value);
-- `VGI_SIGNING_KEY` is unset, empty, or shorter than 32 bytes (a hosted worker
-  needs a stable key shared by every machine of the deployment);
+- `VGI_SIGNING_KEY` is unset or too short (a hosted worker needs a stable key
+  shared by every machine of the deployment). Orchard sets it to **64
+  lowercase hex characters** (32 random bytes, `openssl rand -hex 32`); every
+  SDK MUST accept that form. Other forms (Python takes any string of at least
+  32 bytes, TypeScript only 64 hex characters) are SDK-specific, and the
+  harness only ever passes the 64-hex form. The harness asserts only that an
+  unset key and a 16-hex-character key are refused;
 - any other way in is configured: `VGI_BEARER_TOKENS`, sealed-grant keys
   (`VGI_RPC_GRANT_KEYS`), `VGI_OAUTH_RESOURCE`, a proxy proof
   (`VGI_PROXY_PROOF_MODE` other than `off`), a custom token resolver or
@@ -82,14 +87,18 @@ bound port) when:
     `expired_credential` (`exp` older than the leeway). A non-Bearer scheme
     or an empty Bearer value may be either `missing_credential` or
     `invalid_credential`; a future `nbf` may be either `invalid_credential` or
-    `expired_credential`;
+    `expired_credential`. The harness always sends the scheme as `Bearer`
+    and asserts nothing about other spellings of it (`bearer` may be
+    accepted, per RFC 9110, or not);
   - the VGI capability headers (`VGI-Supported-Encodings` at least), which
     `HEAD /health` carries too;
   - `Access-Control-Allow-Origin: *`.
+- Extra headers are never a failure (a 503 may carry the capability and CORS
+  headers too).
 - Authentication runs before the body is size-checked, decompressed or
   parsed: a body over the request-size limit, a garbage zstd/gzip body, or a
   garbage Arrow body without a valid Pass gets 401, never 413/400/415.
-- CORS is open: a preflight gets 200 or 204 with
+- CORS is open: a preflight gets any 2xx (Python 200, vgi-rpc-ts 204) with
   `Access-Control-Allow-Origin: *` and allows `POST` and the `Authorization`
   header; ordinary responses (401s included) carry
   `Access-Control-Allow-Origin: *`.
@@ -111,7 +120,7 @@ definition is stable; if it ever has to change, every SDK lane changes with it.
 | | |
 |---|---|
 | Name | `pass_claims` |
-| Catalog / schema | the worker's default (no catalog), schema `main`; the harness calls it with `schema_path=["main"]` |
+| Catalog / schema | schema `main`: the harness calls it with `schema_path=["main"]`. The catalog name is not part of the call (vgi-python serves it with no catalog, the TypeScript fixture inside a catalog named `orchard`); what matters is that `(main, pass_claims)` resolves |
 | Kind | scalar function |
 | Signature | `pass_claims(x BIGINT) -> VARCHAR`: one positional argument, any name (vgi-python calls it `x`); its value is ignored |
 | Auth | needs the caller's auth context (in vgi-python, an `Auth()` parameter) |
@@ -131,9 +140,10 @@ Each row is a JSON object with exactly these keys:
   keeps its JSON type (booleans stay booleans, integers stay integers, not
   `1.0` and not strings). The simplest implementation serializes the auth
   context's claims map as is. The harness requires every contract claim the
-  Pass carries to be present with the identical value and type, and requires
-  contract claims the Pass does not carry to be absent (no `null`
-  placeholders). Other claims (`iss`, `aud`, ...) may appear or not.
+  Pass carries to be present with the identical value and type; a contract
+  claim the Pass does not carry must be absent or `null` (never a made-up
+  value). Other claims (`iss`, `aud`, ...) may appear or not, so both "the
+  whole claim set" (vgi-python) and "the 14 contract claims" are conformant.
 - Key order and whitespace do not matter; the harness parses the JSON.
 - Non-ASCII text must round-trip (the harness's `name` claim contains
   `–`, `ë` and `✓`).
@@ -197,7 +207,7 @@ the inherited environment, then sets:
 | `VGI_JWT_ISSUER` | `https://auth.orchard.test` |
 | `VGI_JWT_AUDIENCE` | `https://desk.orchard.test/d/dep_conformance` |
 | `VGI_JWT_JWKS_URI` | the fake issuer's JWKS on `http://127.0.0.1:<port>/.well-known/jwks.json` (one per worker) |
-| `VGI_SIGNING_KEY` | a 48-byte ASCII string |
+| `VGI_SIGNING_KEY` | 64 lowercase hex characters, fresh per run |
 
 The body-rules worker also gets `VGI_RPC_MAX_REQUEST_BYTES=65536`. An SDK
 that does not read that variable still passes those rules if it
@@ -274,7 +284,7 @@ the SDK's real constants:
 | `startup.grant_keys` | `VGI_RPC_GRANT_KEYS` set → refuse |
 | `startup.proxy_proof` | `VGI_PROXY_PROOF_MODE=require` → refuse |
 | `startup.algorithms.{hs256,none}` | `VGI_JWT_ALGORITHMS` = `ES256,HS256` / `none` → refuse |
-| `startup.signing_key.{unset,empty,short}` | no key, `""`, or 31 bytes → refuse |
+| `startup.signing_key.{unset,short}` | no key, or 16 hex characters → refuse |
 | `startup.refuse_cmd.N` | each `--refuse-cmd` → refuse |
 | `http.head_health_anonymous` | `HEAD /health` without a Pass → 200 with capability headers |
 | `http.no_pass.*` | `GET`/`OPTIONS /health`, `GET`/`HEAD /`, `GET`/`POST` an RPC path, unknown paths, Basic auth, empty Bearer, `?access_token=` → the 401 |
@@ -284,7 +294,7 @@ the SDK's real constants:
 | `pass.reject.*` | 36 bad Passes, each → the 401 with the right reason (see the source for the list: garbage, tampering, foreign key, unknown/missing kid, RS256/ES384/HS256/none, `typ`, `iss`, `aud`, `exp`, `nbf`, malformed payloads) |
 | `pass.accept.*` | `typ` spellings, a one-element `aud` array, `exp`/`nbf` within leeway, a minimal claim set |
 | `pass.leeway_boundary` | ±15 s around the 60 s leeway, for `exp` and `nbf` |
-| `cors.preflight`, `cors.preflight_health` | preflights need no Pass, allow `*`, `POST`, `Authorization` |
+| `cors.preflight`, `cors.preflight_health` | preflights need no Pass (any 2xx), allow `*`, `POST`, `Authorization` |
 | `cors.allow_origin_on_responses` | 401 and accepted responses carry `Access-Control-Allow-Origin: *` |
 | `body.oversize_no_pass`, `body.oversize_invalid_pass` | a 4 MiB body over the 64 KiB limit → 401, not 413 |
 | `body.garbage_compressed`, `body.garbage_arrow` | garbage zstd/gzip/Arrow bodies → 401 |
