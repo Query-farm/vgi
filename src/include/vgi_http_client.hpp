@@ -227,7 +227,9 @@ void HttpPutBytes(ClientContext &context, const std::string &url,
 // Returns whether it did. Throws when the server advertises only v1
 // ("true"), when the body also exceeds VGI-Max-Upload-Bytes, or when a vended
 // URL is not https (see ExternalLocationUrlAllowed). Without upload support
-// the body is left inline for the server to refuse with 413.
+// the body is left inline for the server to refuse with 413, and so is a body
+// whose metadata alone reaches the cap (the pointer keeps every metadata key,
+// so no upload could bring it under).
 bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base_url, std::vector<uint8_t> &body,
                                  const ServerCapabilities &caps, const std::shared_ptr<CatalogAuth> &auth,
                                  const std::shared_ptr<IrohClientConfig> &iroh_config);

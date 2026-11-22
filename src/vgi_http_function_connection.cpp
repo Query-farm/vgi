@@ -202,6 +202,22 @@ ServerCapabilities HttpFunctionConnection::FreshCapabilities() {
 	return caps;
 }
 
+std::string HttpFunctionConnection::PostStreamRequest(ClientContext &context, const std::string &url,
+                                                      std::vector<uint8_t> &body, const ServerCapabilities &size_caps,
+                                                      ServerCapabilities *harvested,
+                                                      duckdb::unique_ptr<HTTPClient> *client_holder,
+                                                      ClientContext *cancellation,
+                                                      const RpcErrorContext *error_context) {
+	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto iroh = attach_params_ ? attach_params_->iroh() : nullptr;
+	// Returns at once for a body within the cap (the per-batch common case).
+	MaybeExternalizeRequestBody(context, base_url_, body, size_caps, auth, iroh);
+	auto cached_params =
+	    attach_params_ && IsHttpTransport(url) ? attach_params_->GetOrInitHttpParams(context, url) : nullptr;
+	return HttpPostArrowIpc(context, url, body, auth, /*cookie_jar=*/nullptr, cached_params, client_holder, harvested,
+	                        iroh, cancellation, error_context);
+}
+
 std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
     const VgiBatchPtr &batch,
     const VgiSchemaPtr &schema) {
@@ -564,24 +580,14 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 #endif
 	}
 
-	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-#ifdef __EMSCRIPTEN__
-#endif
-	auto cached_params_init = attach_params_ && IsHttpTransport(init_url)
-	    ? attach_params_->GetOrInitHttpParams(context_, init_url) : nullptr;
-#ifdef __EMSCRIPTEN__
-#endif
 	// See CurrentCapabilities. A large init (e.g. a big table-function
-	// parameter carried in the bind request) goes up via an upload URL.
+	// parameter carried in the bind request) goes up via an upload URL; the
+	// size decision must not act on a stale VGI-Max-Request-Bytes.
 	ServerCapabilities harvested = FreshCapabilities();
-	MaybeExternalizeRequestBody(context_, base_url_, body, harvested, auth,
-	                            attach_params_ ? attach_params_->iroh() : nullptr);
 	const auto call_error_context = HttpCallErrorContext(base_url_, init_url, "init", function_name_, function_type_,
 	                                                       GetExecutionIdHex(), GetAttachOpaqueDataDigest(), GetConnIdHex());
-	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
-	                                        /*cookie_jar=*/nullptr, cached_params_init, &http_client_,
-	                                        &harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-	                                        &context_, &call_error_context);
+	auto response_body = PostStreamRequest(context_, init_url, body, harvested, &harvested, &http_client_, &context_,
+	                                       &call_error_context);
 	PublishHarvestedCapabilities(harvested);
 #ifdef __EMSCRIPTEN__
 #endif
@@ -882,16 +888,13 @@ VgiBatchPtr HttpFunctionConnection::ReadDataBatch() {
 			VGI_LOG(context_, "http_function_connection.producer_exchange", fields);
 		}
 
-		auto p_auth = attach_params_ ? attach_params_->auth() : nullptr;
-		auto p_cached_params = attach_params_ && IsHttpTransport(exchange_url)
-		    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
+		// Sized against the snapshot every response refreshes, never a /health
+		// probe: this is the per-batch hot path.
 		ServerCapabilities p_harvested = CurrentCapabilities();
 		const auto call_error_context = HttpCallErrorContext(base_url_, exchange_url, "exchange", function_name_, function_type_,
 		                                                       GetExecutionIdHex(), GetAttachOpaqueDataDigest(), GetConnIdHex());
-		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
-		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_,
-		                                        &p_harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-		                                        &context_, &call_error_context);
+		auto response_body = PostStreamRequest(context_, exchange_url, body, p_harvested, &p_harvested, &http_client_,
+		                                       &context_, &call_error_context);
 		PublishHarvestedCapabilities(p_harvested);
 
 		BufferDataBatches(VgiBuffer::FromString(std::move(response_body)));
@@ -922,25 +925,16 @@ VgiBatchPtr HttpFunctionConnection::ReadDataBatch() {
 
 	auto body = SerializeBatchWithState(input_batch, input_schema_);
 
+	std::string exchange_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/exchange";
+
 	// A body over max_request_bytes goes through a server-vended upload URL.
 	// Capabilities are normally warm from /init.
 	capabilities_ = FreshCapabilities();
-	MaybeExternalizeRequestBody(context_, base_url_, body, capabilities_,
-	                            attach_params_ ? attach_params_->auth() : nullptr,
-	                            attach_params_ ? attach_params_->iroh() : nullptr);
-
-	std::string exchange_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/exchange";
-
-	auto x_auth = attach_params_ ? attach_params_->auth() : nullptr;
-	auto x_cached_params = attach_params_ && IsHttpTransport(exchange_url)
-	    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
-	ServerCapabilities x_harvested = CurrentCapabilities();
+	ServerCapabilities x_harvested = capabilities_;
 	const auto call_error_context = HttpCallErrorContext(base_url_, exchange_url, "exchange", function_name_, function_type_,
 	                                                       GetExecutionIdHex(), GetAttachOpaqueDataDigest(), GetConnIdHex());
-	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
-	                                        /*cookie_jar=*/nullptr, x_cached_params, &http_client_,
-	                                        &x_harvested, attach_params_ ? attach_params_->iroh() : nullptr,
-	                                        &context_, &call_error_context);
+	auto response_body = PostStreamRequest(context_, exchange_url, body, capabilities_, &x_harvested, &http_client_,
+	                                       &context_, &call_error_context);
 	PublishHarvestedCapabilities(x_harvested);
 
 	// Owning buffer; decoded batches reference it zero-copy.
@@ -1083,15 +1077,13 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 	}
 
 	std::string exchange_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/exchange";
-	auto c_auth = attach_params_ ? attach_params_->auth() : nullptr;
-	// live_context, never context_: see IFunctionConnection::CancelStream.
-	auto c_cached_params = attach_params_ && IsHttpTransport(exchange_url)
-	    ? attach_params_->GetOrInitHttpParams(live_context, exchange_url) : nullptr;
+	// live_context, never context_: see IFunctionConnection::CancelStream. The
+	// size snapshot comes from the per-catalog cache, not capabilities_: this
+	// may run on the cancel dispatcher's thread.
+	const auto c_caps = attach_params_ ? attach_params_->LoadServerCapabilities() : ServerCapabilities {};
 	// Best-effort: dispatcher catches any thrown exception.
-	(void)HttpPostArrowIpc(live_context, exchange_url, body, c_auth,
-	                        /*cookie_jar=*/nullptr, c_cached_params, nullptr, nullptr,
-	                        attach_params_ ? attach_params_->iroh() : nullptr,
-	                        &live_context);
+	(void)PostStreamRequest(live_context, exchange_url, body, c_caps, /*harvested=*/nullptr,
+	                        /*client_holder=*/nullptr, &live_context, /*error_context=*/nullptr);
 }
 
 } // namespace vgi

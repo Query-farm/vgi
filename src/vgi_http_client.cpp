@@ -1680,6 +1680,26 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 	if (!request_batch) {
 		throw InternalException("vgi: request body to externalize holds no batch [url: %s]", base_url);
 	}
+	// The pointer carries every metadata key, so it is never smaller than the
+	// request's metadata. When that alone reaches the cap (large state tokens;
+	// a producer tick or a cancel is nothing but metadata), an upload cannot
+	// bring the request under it: send it inline rather than pay for an upload
+	// whose pointer the server refuses anyway. Compression may still fit it,
+	// and otherwise the server's 413 names its cap.
+	if (request_batch->metadata()) {
+		uint64_t metadata_bytes = 0;
+		for (const auto &pair : request_batch->metadata()->pairs()) {
+			metadata_bytes += pair.first.size() + pair.second.size();
+		}
+		if (static_cast<int64_t>(metadata_bytes) >= caps.max_request_bytes) {
+			VGI_STDERR_DEBUG("[VGI] http.request_not_externalized url=%s body_bytes=%llu metadata_bytes=%llu "
+			                 "max_request_bytes=%lld\n",
+			                 base_url.c_str(), static_cast<unsigned long long>(body.size()),
+			                 static_cast<unsigned long long>(metadata_bytes),
+			                 static_cast<long long>(caps.max_request_bytes));
+			return false;
+		}
+	}
 	const std::string body_view(reinterpret_cast<const char *>(body.data()), body.size());
 	const auto body_sha256 = VgiSha256Hex(body_view);
 	auto urls = HttpRequestUploadUrls(context, base_url, {UploadRequest {static_cast<int64_t>(body.size()), body_sha256}},

@@ -278,6 +278,18 @@ private:
 	std::vector<uint8_t> SerializeBatchWithState(const VgiBatchPtr &batch,
 	                                              const VgiSchemaPtr &schema);
 
+	// POST one request of this stream (init, exchange, producer tick, cancel)
+	// to `url`. The one place a stream request leaves: a body over
+	// `size_caps`' VGI-Max-Request-Bytes first goes up through an upload URL
+	// (MaybeExternalizeRequestBody); a body within it costs one comparison.
+	// `harvested`, `client_holder`, `cancellation` and `error_context` are
+	// HttpPostArrowIpc's (null harvested/client_holder: neither is touched, for
+	// a cancel sent from another thread).
+	std::string PostStreamRequest(ClientContext &context, const std::string &url, std::vector<uint8_t> &body,
+	                              const ServerCapabilities &size_caps, ServerCapabilities *harvested,
+	                              duckdb::unique_ptr<HTTPClient> *client_holder, ClientContext *cancellation,
+	                              const RpcErrorContext *error_context);
+
 	// Capture stream_state / call_state tokens from metadata; returns `batch`.
 	VgiBatchPtr ExtractStreamState(
 	    const VgiBatchPtr &batch,

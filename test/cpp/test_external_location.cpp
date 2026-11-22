@@ -13,6 +13,7 @@
 #include "vgi_exception.hpp"
 #include "vgi_extension.hpp"
 #include "vgi_http_client.hpp"
+#include "vgi_ipc.hpp"
 #include "vgi_server_capabilities.hpp"
 
 #include <arpa/inet.h>
@@ -267,4 +268,23 @@ TEST_CASE("a request over both the request and upload caps is refused before any
 		CHECK(error.find("\"error_subtype\":\"LIMIT_EXCEEDED\"") != std::string::npos);
 	}
 	CHECK(body.size() == 1000);
+}
+
+TEST_CASE("a request whose metadata alone reaches the cap stays inline, with no upload", "[external-location]") {
+	// A producer tick or a cancel is an empty batch carrying only state
+	// tokens. The pointer keeps every metadata key, so uploading cannot bring
+	// it under the cap: it goes inline (the server compresses or 413s), and no
+	// upload URL is requested (port 9 is closed, so an attempt would throw).
+	Fixture f;
+	ServerCapabilities caps;
+	caps.discovered = true;
+	caps.max_request_bytes = 1000;
+	caps.upload_url_version = 2;
+	VgiMetadata metadata {{"vgi_rpc.stream_state#b64", std::string(2000, 'A')}};
+	auto tick = VgiBatch::MakeEmpty(VgiSchema::Empty());
+	const auto original = SerializeBatch(*tick, &metadata)->ToVector();
+	REQUIRE(original.size() > 1000);
+	auto body = original;
+	CHECK_FALSE(MaybeExternalizeRequestBody(f.context(), "http://127.0.0.1:9", body, caps, nullptr, nullptr));
+	CHECK(body == original);
 }
