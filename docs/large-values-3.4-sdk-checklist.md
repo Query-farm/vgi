@@ -54,10 +54,52 @@ Cross-cutting findings (each detailed in the SDK sections):
   rule 11.
 - **Projection paths cap `bind_call` at 8 MiB** (Rust, Java, C++), so large
   inline arguments already break projection pushdown.
-- **Fix 1** (advertised upload cap ≤ fetch cap): Python correct; Java and C#
-  mismatched (no clamp; C# not wired in vgi-csharp); C++ broken by default
-  (2 GiB advertised vs 256 MiB fetch); C correct by construction. C++ also
-  advertises a 4 KiB request cap by default when externalization is on.
+- **Java's projection/repeatability bind envelope is unsealed and carries
+  secrets.** `ProjectionExpressions.envelope` (vgi-java
+  `vgi/src/main/java/farm/query/vgi/internal/ProjectionExpressions.java`,
+  `BindEnvelope`), called from `internal/VgiServiceImpl.java` `bindTable`
+  (~line 632), returns `MARKER || BindEnvelope{bind_call, bind_result}` as the
+  bind response's `opaque_data` with no AEAD, and `bind_call` is the full
+  re-serialized `BindRequest` including `secrets`. It must be sealed and carry
+  the received bytes (spec §6).
+
+### Fix 1 per SDK (advertised `VGI-Max-Upload-Bytes` ≤ the server's fetch cap)
+
+| SDK | Status | Evidence on `protocol-3.4` |
+|---|---|---|
+| Python | correct | vgi-rpc-python `vgi_rpc/http/server/_factory.py` `_resolve_max_upload_bytes`: defaults to the fetch cap, refuses an explicit cap above it |
+| Go | **mismatched** (re-checked) | vgi-rpc-go `vgirpc/vendor.go:1460-1469` (`ConfigureHTTPServerFromEnv` → `SetMaxUploadBytes(maxUpload)` verbatim from `VGI_RPC_MAX_UPLOAD_BYTES`), `vgirpc/http.go:640`, advertised at `http.go:353-354`; fetch cap a fixed 256 MiB default (`vgirpc/external.go:122`, `:792`); no clamp, no default to the fetch cap, nothing advertised when unset |
+| TypeScript | **mismatched** (re-checked) | vgi-rpc-typescript `src/vendor.ts:1191` (`maxUploadBytesFromEnv`, verbatim), advertised at `src/http/handler.ts:799-800`; vgi-typescript `src/http/blob-vendor.ts:77-78`; fetch cap default 256 MiB (`src/external.ts:119`); no clamp, nothing advertised when unset |
+| Java | mismatched | see the vgi-java section §6 |
+| C# | mismatched (latent: vgi-csharp wires no externalization) | see the vgi-csharp section §6 |
+| C | correct (upload cap = fetch cap by construction) | see the vgi-c section §6 |
+| C++ | **broken by default** (2 GiB advertised vs 256 MiB fetch); also advertises a 4 KiB request cap when externalization is on | see the vgi-cpp section §6 |
+
+## Port checks (every SDK, during Phase 2/4)
+
+Run and record these in each SDK's port; they come from the spec review.
+
+1. **Nothing builds stream state lazily on the first exchange.** The `init`
+   ref (and any other framework ref) is created in the init handler; state
+   transitions (e.g. producer → finalize, buffering phases) copy the ref and
+   never call `state_ref()`. Grep the stream-state constructors and every
+   `/exchange` entry path; a `state_ref()` reachable from a continuation is a
+   bug (it raises `state_ref_misuse`).
+2. **`rehydrate` / continuation entry resolves the init at the turn's entry**
+   (where a context exists), as vgi-go `rehydrate.go:281` does.
+3. **Split-token fingerprint** uses size + sha256 for `arguments_location`
+   (Python `vgi/split_token.py:151`, Go, Rust, TS, C++).
+4. **Buffering / persisted init** re-serializes the received `bind_call` bytes
+   (reference form), never a resolved argument (Python `worker.py:830`, Go, TS,
+   Java, C#, C, C++).
+5. **Opaque opening** keeps opened values beside the bind call; the re-encoded
+   `bind_call` equals the received bytes (spec §3.4 test 4).
+6. **C#, C++, C only:** the capability-gated skips (STATE_REF_V1.md §15: 1
+   stored half, 2, 3, 5, 10) are in the lane's `EXPECTED_SKIP_REASONS` with
+   their reason, and nothing else is skipped.
+7. **Fix 1** as in the table above (Go, TS, Java, C#, C++ to fix).
+8. **`token_ttl`**: the vgi framework passes 21600 explicitly (Go, Rust, C
+   never set it today).
 
 ---
 

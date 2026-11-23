@@ -28,6 +28,12 @@ SDKs was changed. Spec: [`large-values-3.4.md`](large-values-3.4.md).
    Python's init decode cheaper first (it carries the output schema twice).
 
 Other observations that matter for Phase 2/4:
+- Under the vendor lanes' 32 KiB request cap the inline limit is ≈5 KB, so
+  `bigin` (1000-value IN list, ~5.4 KB compressed init) takes the stored form;
+  vendor-lane storage-counter assertions may move (spec §9).
+- Phase 5 tolerance against this baseline: realistic workers ≤ 3% per-turn
+  regression; wide-schema Python within 10% once Phase 2 removes the
+  duplicated output schema from Python's state (spec §5a, §9).
 - Worst-case per-turn token bytes are already 22–24 KB (TS, Rust: cursor + call
   token at 500 columns), so the turn budget and the call token's schemas going
   behind a `StateRef` both matter.

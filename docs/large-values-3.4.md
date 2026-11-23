@@ -70,6 +70,10 @@ class ArgumentsLocation(ArrowSerializableDataclass):
   other request data are uploaded.
 - `sha256` is validated as 64 lowercase hex; `size` ≥ 1. Violations are
   `invalid_arguments_ref`.
+- **Field order is normative.** `arguments_location` is the **last** field of
+  `BindRequest`, and `ArgumentsLocation`'s fields are exactly `{ref, size,
+  sha256}` in that order. vgi-csharp decodes embedded records positionally
+  (`EmbeddedIpc.cs`), so any other order breaks it.
 - The protocol version stays **3.4.0** (unreleased; this is part of it).
 
 ## 3. Generated types (prerequisite)
@@ -161,7 +165,8 @@ meet all of the following:
     in a per-call overlay next to the wrapper, and the held bytes (with the
     sealed envelopes) are what is re-encoded. Re-encoding after an in-place
     open would put plaintext attach data on the wire or into a state token.
-    Rust's `open_batch` MUST stop rewriting `bind_call`.
+    Rust's `open_batch` MUST stop rewriting `bind_call`. Conformance
+    (§3.4 test 4) asserts it.
 
 vgi-python, which is the generator's source, today always re-serializes nested
 records (`vgi_rpc/utils.py`, the `binary_dataclass` encode path) and does not
@@ -201,6 +206,12 @@ C++) MUST pass, in their own test suites:
    `arguments == null` with the location set (Go `[]byte` and Java `byte[]`
    accept nil silently, so this MUST be asserted explicitly); the worker
    refuses `bind-both-null` and `bind-both-set` with `invalid_bind_request`.
+4. **Re-encode after opening opaque data (rule 11):** with opaque sealing
+   active, run the SDK's request-entry opening path (TS `openOpaque`, Rust
+   `open_batch`, C# `OpaqueSealing`, C `opaque.c`, and equivalents) on a
+   fixture whose `bind_call` carries sealed attach and transaction envelopes,
+   then re-encode the embedding request: the re-encoded `bind_call` MUST equal
+   the received bytes.
 
 ## 4. The extension's build-time rule
 
@@ -208,15 +219,21 @@ The extension decides **once per bind**, in `BuildBindRequestBytes`
 (`src/vgi_bind_protocol.cpp`), whether to externalize the arguments:
 
 ```
-A = the worker's VGI-Arguments-Ref-Bytes if advertised and valid, else 4194304 (4 MiB)
+A = the worker's VGI-Arguments-Ref-Bytes (§5)
 M = the worker's VGI-Max-Request-Bytes if > 0, else infinity
 externalize  iff  transport is HTTP or Iroh
+              and the worker sends a valid VGI-Arguments-Ref-Bytes header
               and the worker advertises VGI-Upload-URL-Support: 2
               and len(arguments_ipc) > min(A, M / 4)
               and (VGI-Max-Upload-Bytes is not advertised or len(arguments_ipc) <= it)
 ```
 
 (`M / 4` uses integer division. With no request cap the threshold is `A`.)
+**The header is the capability signal:** a worker that does not send it does
+not support argument references, and the extension never externalizes
+arguments to it; an over-cap request then takes the ordinary whole-request
+upload, as today. This makes the rollout order-independent (new extension with
+old worker, and old extension with new worker, both keep working).
 
 When it externalizes:
 
@@ -235,9 +252,18 @@ Rules:
   statistics, init, dynamic-to-string, plan, projection).
 - **Rebuilds reuse the location.** The scoped-secret retry in
   `PerformBindProtocol` rebuilds the bind request; it MUST reuse the same
-  `ArgumentsLocation` and MUST NOT upload again. The inline-bound catalog path
-  (`src/vgi_table_function_impl.cpp`, `BuildBindResultFromInlinedBytes`) applies
-  the same rule with the attach's discovered capabilities.
+  `ArgumentsLocation` and MUST NOT upload again. (The inline-bound catalog
+  path, `BuildBindResultFromInlinedBytes`, is out of scope: those functions
+  have no per-call inputs, so their arguments are never large.)
+- **One reference per query and argument.** The extension keeps a per-query
+  (per-`ClientContext`) memo from the argument's SHA-256 (and size) to its
+  `ArgumentsLocation`. Every bind in that query with the same argument bytes
+  reuses the memoized location instead of uploading again. In particular the
+  plan rebind in `VgiTableScanDeserialize` (`src/storage/vgi_table_entry.cpp:910-927`)
+  MUST rebuild byte-identical `bind_request_bytes`, so it never trips
+  `Repeatable VGI source bind state changed; bind a fresh query`. A digest key
+  is fine here: the memo is client-side and holds only this query's own
+  references. The memo dies with the query.
 - **Earlier discovery.** Capability discovery moves before building the bind
   request (HTTP and Iroh), and the discovered caps are handed to the bind's
   `HttpInvokeUnary` (`src/vgi_http_function_connection.cpp`, `PerformBindRpc`).
@@ -258,14 +284,16 @@ A worker capability header, sent with the other vgi-rpc capability headers
 (`VGI-Max-Request-Bytes`, `VGI-Upload-URL-Support`, …) on capability
 discovery and on every response that carries them.
 
+- **Mandatory capability signal.** A worker that supports argument references
+  MUST send it, always, whenever it advertises `VGI-Upload-URL-Support: 2`.
+  A worker that does not support them MUST NOT send it. Its presence is what
+  enables the extension's rule (§4); absence means "no argument references".
 - Value: a positive decimal integer of bytes, no sign, no leading zero, at most
-  19 digits. Anything else is ignored (the extension uses the default).
-- Default when absent: **4194304** (4 MiB).
-- Workers advertise it only when they advertise `VGI-Upload-URL-Support: 2`.
-  Each vgi SDK sets it from `VGI_ARGUMENTS_REF_BYTES` (env) or the
-  equivalent server option; default: not sent (the extension's default applies).
-- It is a hint for the extension's threshold; workers MUST accept an
-  `arguments_location` regardless of size.
+  19 digits. The extension treats an invalid value as absent.
+- Value sent: **4194304** (4 MiB) by default; each vgi SDK lets the operator
+  override it with `VGI_ARGUMENTS_REF_BYTES` (env) or the equivalent server
+  option.
+- Workers MUST accept an `arguments_location` regardless of its size.
 
 ## 5a. Worker resolution
 
@@ -288,7 +316,10 @@ Every vgi SDK reads arguments only through one helper (Python
 | `arguments_ref_missing` | `NOT_FOUND` | storage reports the object absent (404 / vendor `not_found`) |
 
 **Prepared statements.** Argument objects live until the bucket lifecycle
-deletes them (≥ ~1 day). An `EXECUTE` after that fails with
+deletes them (≥ ~1 day), and a worker's object cache treats an entry fetched
+more than 1 day ago as a miss (STATE_REF_V1.md §11). The user-visible
+semantics: **a prepared statement's large argument may fail at any time after
+1 day**, whichever replica serves it. That `EXECUTE` fails with
 `arguments_ref_missing` and the exact message
 
 ```
@@ -298,13 +329,26 @@ this prepared statement's large argument has expired; prepare it again
 There is no transparent rebind. The extension surfaces the worker's message
 unchanged.
 
-**Python specifics.** The decoded `BindRequest` tolerates `arguments = None`
-(today `Arguments.deserialize_from_bytes(b"")` raises, `vgi/arguments.py`);
-every non-fixture read goes through `resolved_arguments(ctx)`; the resolved
-value is memoized in a declared `Transient()` slot holding the **`object_id`**,
-not the value (`BindRequest` is `frozen=True, slots=True`), so the object cache
-alone bounds resident bytes; re-serializing emits `arguments_location`, never
-the value.
+**Python specifics.**
+- The decoded `BindRequest` tolerates `arguments = None` (today
+  `Arguments.deserialize_from_bytes(b"")` raises, `vgi/arguments.py`).
+- vgi-python holds the **received `bind_call` bytes** (wrapper rule 1) and
+  re-encoding an embedding request emits those held bytes, so the location
+  (never the value) is what goes back on the wire or into a `StateRef`.
+- **Fleet workers keep seeing resolved `bind_call.arguments`.** The
+  `BindRequest` handed to user code carries the resolved `Arguments` in memory
+  in its `arguments` field, so existing worker code that reads
+  `bind_call.arguments` directly (vgi-hue, vgi-kafka, vgi-cedar-proxy tests)
+  keeps working unchanged. Framework code reads through
+  `resolved_arguments(ctx)`.
+- **Accepted memory pin:** that user-facing object holds the resolved value
+  for its own lifetime: one turn on HTTP, the whole stream on pipe. This pin is
+  deliberate and outside the object cache's byte bound; it is not a memo, and
+  nothing here claims the object cache alone bounds these bytes.
+- **Resolution happens at the turn's entry**, where a `CallContext` exists,
+  before `rehydrate()` runs; `rehydrate()` (which receives only the
+  implementation) reads the already-resolved init. vgi-go's `rehydrate.go:281`
+  follows the same shape.
 
 Inventory findings that shape the Python port (checklist §1, §3, §4):
 - 15 production readers, not 13: the 13 direct reads plus two `getattr`
@@ -312,20 +356,16 @@ Inventory findings that shape the Python port (checklist §1, §3, §4):
 - Two readers run per turn or per batch (overload resolution in `worker.py`,
   scalar const params in `scalar_function.py`), so `resolved_arguments` must
   hit its `object_id` memo plus the object cache, never re-fetch.
-- `rehydrate()` receives only the implementation, not a `CallContext`, yet it
-  reads the init first thing; resolving `init: StateRef` there needs storage
-  reachable from the implementation (or the resolve moved to the turn's entry,
-  where a context exists).
-- **Fleet code reads `bind_call.arguments` directly** (seen in local checkouts
-  of vgi-hue, vgi-kafka and vgi-cedar-proxy tests). vgi-python MUST keep that
-  working for worker code: the `BindRequest` handed to user code exposes the
-  resolved arguments through `arguments`, while the framework keeps the
-  location for anything it re-serializes. (How, given `frozen=True,
-  slots=True`, is a Phase 2 implementation choice.)
+- `rehydrate()` receives only the implementation, not a `CallContext`; hence
+  resolution at the turn's entry (above).
+- Python's stream state carries the output schema twice (inside the init
+  request and as the call token's schema). **Phase 2 removes the duplicate**
+  from the state; Phase 5's wide-schema tolerance (§9) assumes it.
 
-**Split-token fingerprints.** vgi-go (`split_token.go`), vgi-rust
-(`split_token.rs`, `dispatch.rs`) and vgi-typescript (`splits.ts`) fingerprint
-the raw `arguments` bytes so a split token cannot be redeemed against a
+**Split-token fingerprints.** vgi-python (`vgi/split_token.py:151`, which
+hashes `repr(arguments)`), vgi-go (`split_token.go`), vgi-rust
+(`split_token.rs`, `dispatch.rs`), vgi-typescript (`splits.ts`) and vgi-cpp
+(its two split fingerprints, checklist) fingerprint the raw `arguments` so a split token cannot be redeemed against a
 different bind. With `arguments_location` the bytes are null, so every SDK
 that fingerprints arguments MUST, when `arguments_location` is set, fingerprint
 the 8-byte little-endian `size` followed by the 32 raw `sha256` bytes in their
@@ -380,15 +420,28 @@ Per SDK (sites in the checklist §3):
 - **vgi-java:** has no single carried init request either: the scalar cursor
   carries arguments IPC, settings and secrets directly; the table cursor
   carries filters and join keys. The port gathers them into `init: StateRef`.
-  Its projection/repeatability bind envelope embeds the whole `BindRequest`
-  in `bind_opaque_data` (`VgiServiceImpl.java`, `ProjectionExpressions.java`);
-  it MUST embed the reference form (`arguments_location`), never the value.
-- **vgi-csharp, vgi-cpp, vgi-c:** HTTP streams are stateful in process today
-  (C#/C++ in-memory registries, C `resume = NULL`). `init: StateRef` is
-  inline and in memory (STATE_REF_V1.md §5.4) until they serialize state; the
-  API still exists so worker code is portable. C# decodes embedded records
-  positionally (`EmbeddedIpc.cs`), so `arguments_location` MUST be the last
-  field of `BindRequest` (it is, §2).
+  Its projection/repeatability bind envelope
+  (`ProjectionExpressions.envelope`, used from `internal/VgiServiceImpl.java`
+  `bindTable`) is **not sealed today**: it is `MARKER || BindEnvelope{bind_call,
+  bind_result}` returned as the bind response's `opaque_data`, and its
+  `bind_call` is the full re-serialized `BindRequest` **including `secrets`**,
+  so secrets go back to the client in clear and into serialized plans. The
+  envelope MUST be AEAD-sealed (with the worker's opaque-data key, bound to
+  the caller like the other opaque envelopes) and MUST embed the received
+  `bind_call` bytes (reference form, `arguments_location`), never a resolved
+  argument.
+- **vgi-csharp, vgi-cpp, vgi-c stay single-replica in 3.4 (decided).** Their
+  HTTP streams live in process memory (C#/C++ in-memory registries, C
+  `resume = NULL`); stateless continuations are post-3.4. In 3.4 their
+  `init: StateRef` is in-memory and inline only (STATE_REF_V1.md §5.4): the
+  API exists so worker code is portable, nothing is stored, and nothing is
+  sealed per turn. The shared conformance tests that need stored tags,
+  cross-replica behaviour, the cursor rule or tag expiry are
+  capability-gated skips for these three SDKs and MUST be listed, with the
+  reason, in each lane's expected-skip list (`EXPECTED_SKIP_REASONS`). Phase 5
+  claims no cross-replica behaviour for them. They still implement Part B
+  (argument references), the generated or hand-edited bind types and the
+  object cache.
 - **Existing per-SDK parse memos are removed** (decision 3): vgi-typescript's
   128-entry LRU of parsed init requests (`carried-init-request.ts`) pins parsed
   values, which breaks "memos don't pin" once values can be large.
@@ -396,6 +449,13 @@ Per SDK (sites in the checklist §3):
   buffering) MUST emit `arguments_location`, never a resolved argument.
 - No vgi SDK passes anything in vgi-rpc's `call_state` slot. The slot itself
   stays in vgi-rpc for other services, and the vgi-rpc call token stays.
+
+- **Build `init` in the init handler.** Every framework MUST create the
+  `init` ref while handling the init request, and state transitions MUST copy
+  the ref, never call `state_ref()` again. Nothing may build stream state
+  lazily on the first exchange (that would be a continuation, where
+  `state_ref()` is refused). Each SDK's port checks this (checklist, "Port
+  checks").
 
 **No per-turn parse memo.** An inline `init` is decompressed and parsed every
 HTTP turn (decision 3). Phase 0 measured it as not material for a realistic
@@ -425,7 +485,15 @@ only if later evidence shows otherwise.
 - Argument objects hold the argument IPC only (no secrets); `StateRef`
   objects are AEAD ciphertext.
 - On unauthenticated workers, argument references and `StateRef` tags are
-  bearer capabilities (accepted, documented).
+  bearer capabilities (accepted, documented). An argument reference has no
+  `created_at` and no TTL check, so on an unauthenticated worker it stays
+  usable by anyone who holds it until the object is deleted: **about 1–2
+  days** (bucket lifecycle ≥ 1 day, asynchronous). `StateRef` tags expire with
+  `token_ttl` (6 h).
+- The `__upload_url__` grant and the `bind` that presents its reference MUST
+  be served under the same `AuthContext`, including the peer-evidence binding
+  digest (both feed `ARGREF_AAD`, STATE_REF_V1.md §4, §10.2); the extension
+  sends both with the same credentials on the same connection settings.
 - Multi-replica workers MUST share a token key; with a random per-process key
   a restart invalidates streams and argument references.
 
@@ -445,9 +513,30 @@ manual definition-of-done run):
 5. an aggregate regression (unchanged path);
 6. a large-filter / join-key scan → `init` takes the stored form (`puts_state_ref == 1`);
 7. a prepared statement after the object is deleted (fake vendor delete-object
-   route) → the §5a message;
+   route) → the §5a message. The test MUST force a cold object cache (restart
+   the worker, or run it with a tiny `VGI_RPC_OBJECT_CACHE_BYTES`), or the
+   cached argument would mask the deletion;
 8. a tampered reference → `invalid_arguments_ref`;
-9. `arguments = null` with an invalid combination → `invalid_bind_request`.
+9. `arguments = null` with an invalid combination → `invalid_bind_request`;
+10. a worker that does not send `VGI-Arguments-Ref-Bytes` → no argument
+    reference; an over-cap bind takes the whole-request upload (§4);
+11. a query whose plan is serialized and rebound (`VgiTableScanDeserialize`)
+    with a large argument → one upload, and no
+    `Repeatable VGI source bind state changed` (§4 per-query memo).
+
+**Counter assertions may move.** Under the 32 KiB request cap the vendor lanes
+use, the `turn_budget / 4` term puts the inline limit near 5 KB, so a scan with
+a 1000-value IN list (`bigin`, ~5.4 KB compressed init) already takes the
+stored form. Existing vendor-lane assertions on storage counters (`puts_rpc`,
+`storage_puts`, `storage_gets`) may change when `init: StateRef` lands; update
+them deliberately, using the new `puts_state_ref` / `gets_state_ref` keys to
+tell the two apart.
+
+**Phase 5 per-turn tolerance.** The realistic-worker per-turn comparison
+(Phase 0 baseline: [measurements](large-values-3.4-measurements.md)) passes when
+a realistic worker regresses by **≤ 3%** per turn, and wide-schema Python stays
+**within 10%** of its baseline after Phase 2 removes the duplicated output
+schema from Python's state (§5a).
 
 Fixtures: a parallel-stream fixture (several streams on one argument) and a
 scalar fixture, in every SDK's fixture worker set, plus `blob_param_echo`.
