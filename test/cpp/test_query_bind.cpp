@@ -44,7 +44,9 @@ TEST_CASE("A bind request without arguments still carries one args row", "[query
 	auto bytes = BuildBindRequestBytes(*con.context, "f", "TABLE", nullptr, nullptr, {}, {}, {}, {}, false,
 	                                   "test-worker");
 	auto request = DecodeIpcRecord<generated::BindRequest>(bytes, "test-worker");
-	auto args = DeserializeFromIpcBytes(request.arguments);
+	REQUIRE(request.arguments.has_value());
+	CHECK_FALSE(request.arguments_location.has_value());
+	auto args = DeserializeFromIpcBytes(*request.arguments);
 	REQUIRE(args->num_rows() == 1);
 	CHECK_FALSE(args->GetColumnByName("args").IsNull(0));
 }
