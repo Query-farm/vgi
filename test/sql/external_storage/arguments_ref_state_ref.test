@@ -8,13 +8,18 @@
 # sets VGI_WORKER_INIT_STATE_REF=1 for such a worker; until vgi-python ships it
 # this file skips with that reason, which the lane lists as expected.
 #
-# Under the lane's 32 KiB request cap the inline limit is about 5 KB
-# (turn_budget / 4, STATE_REF_V1.md §9), so a 1000-value IN list of random
-# 64-bit keys (~8 KB raw, ~5-6 KB compressed) pushes the init over it: the
+# A 1000-value IN list of random 64-bit keys (~8 KB raw, ~5 KB compressed)
+# pushes the init over the inline limit (STATE_REF_V1.md §9): the
 # worker stores the init once (`puts_state_ref`, a server write, not a client
 # upload) and every continuation carries the ~130-byte tag. The filters and
 # join keys live in the init request, so this is how they stay out of every
 # turn. No turn needs a whole-request upload.
+#
+# The inline limit is pinned below the init's size so the stored form does not
+# depend on the turn budget's exact value (VGI no longer uses the call token's
+# call_state slot, which leaves a ~5 KB init inline under the default budget).
+#
+# server-env: VGI_RPC_STATE_REF_INLINE_BYTES=2048
 
 require-env VGI_WORKER_INIT_STATE_REF
 

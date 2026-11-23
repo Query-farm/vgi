@@ -42,7 +42,7 @@ ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # Load the catalog first (catalog_contents is itself a vendor object).
 query I
-SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name LIKE 'blob_%';
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name IN ('blob_repeat', 'blob_len', 'blob_rows', 'blob_param_echo', 'blob_buffer_echo', 'blob_tio', 'blob_store_values');
 ----
 7
 

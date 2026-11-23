@@ -155,12 +155,30 @@ FROM vgi_http_request_stats();
 # --- 11. a serialized-plan rebind reuses the reference ------------------------
 #
 # blob_param_table is a catalog table whose scan binds blob_param_echo with a
-# fixed 64 KiB argument and reports STABLE_WITHIN_QUERY. The recursive CTE
-# copies the plan, which rebinds the scan in VgiTableScanDeserialize and
-# compares the rebuilt bind request byte for byte. The per-query memo makes the
-# rebind reuse the first upload's reference, so the bytes match (no
-# "Repeatable VGI source bind state changed") and there is one upload.
+# fixed 64 KiB argument and reports STABLE_WITHIN_QUERY. With
+# debug_verify_serializer DuckDB serializes every SELECT plan and replaces it
+# with the deserialized copy, which rebinds the scan in VgiTableScanDeserialize
+# and compares the rebuilt bind request byte for byte. The per-query memo makes
+# that rebind reuse the first upload's reference, so the bytes match (no
+# "Repeatable VGI source bind state changed") and there is still one upload.
 
+statement ok
+SET debug_verify_serializer = true;
+
+statement ok
+SELECT count(*) FROM vgi_http_request_stats(reset => true);
+
+query II
+SELECT payload_len, payload_sha256 = sha256(repeat('t', 65536)) FROM bt.main.blob_param_table;
+----
+65536	true
+
+query II
+SELECT sum(arguments_ref_uploads), sum(arguments_ref_reuses) >= 1 FROM vgi_http_request_stats();
+----
+1	true
+
+# The plan copies of a recursive CTE run their scans on the same bind bytes.
 statement ok
 SELECT count(*) FROM vgi_http_request_stats(reset => true);
 
@@ -176,10 +194,13 @@ SELECT i FROM r ORDER BY i;
 1
 2
 
-query II
-SELECT sum(arguments_ref_uploads), sum(arguments_ref_reuses) >= 1 FROM vgi_http_request_stats();
+query I
+SELECT sum(arguments_ref_uploads) FROM vgi_http_request_stats();
 ----
-1	true
+1
+
+statement ok
+SET debug_verify_serializer = false;
 
 statement ok
 DETACH bt;

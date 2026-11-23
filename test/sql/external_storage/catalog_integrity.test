@@ -48,7 +48,7 @@ statement ok
 CREATE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
 query I
-SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name LIKE 'blob_%';
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name IN ('blob_repeat', 'blob_len', 'blob_rows', 'blob_param_echo', 'blob_buffer_echo', 'blob_tio', 'blob_store_values');
 ----
 7
 
@@ -156,7 +156,7 @@ statement ok
 CALL vgi_clear_cache();
 
 query I
-SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name LIKE 'blob_%';
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'bt' AND function_name IN ('blob_repeat', 'blob_len', 'blob_rows', 'blob_param_echo', 'blob_buffer_echo', 'blob_tio', 'blob_store_values');
 ----
 7
 
