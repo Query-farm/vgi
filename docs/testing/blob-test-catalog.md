@@ -269,7 +269,7 @@ new, unlisted one still fails the lane. The extension's own vendor lane
 | Variable | Set by the lane when | Files |
 |---|---|---|
 | `VGI_WORKER_ARGUMENTS_REF` | the worker implements argument references (sends `VGI-Arguments-Ref-Bytes`, resolves `arguments_location`, refuses bad ones with the spec's kinds) **and** serves the four fixtures below | `arguments_ref.test`, `_streams`, `_prepared`, `_errors` |
-| `VGI_WORKER_INIT_STATE_REF` | the worker carries its init request as a vgi-rpc `StateRef` (vgi spec §6) and the fake vendor has `puts_state_ref` | `arguments_ref_state_ref.test` |
+| `VGI_WORKER_INIT_STATE_REF` | the worker carries its init request as a vgi-rpc `StateRef` (vgi spec §6) and the fake vendor has `puts_state_ref` | `arguments_ref_state_ref.test` | A filtered producer scan (`example.sequence` with a pushed 1000-value IN list, 40 batches) with the `StateRef` inline limit pinned to 256 bytes: the init snapshot is stored at most once (`puts_state_ref` +0 or +1, since an SDK may need no stored snapshot), every request stays under the cap with no whole-request upload, and the results are exact. |
 | `VGI_FAKE_VENDOR_DELETE_ROUTE` | the fake vendor serves `GET /__admin__/delete?origin=client_upload` (below) | `arguments_ref_prepared.test` |
 | `VGI_TEST_ARGUMENTS_REF_FAULTS` | always, on the extension's vendor lane (`test/start_fake_blob_vendor.sh` exports it): enables the extension's malformed-`BindRequest` hook | `arguments_ref_errors.test` |
 
