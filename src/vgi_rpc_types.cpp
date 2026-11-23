@@ -724,10 +724,20 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
                  bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value,
                  const CopyFromBindContext *copy_from, const CopyToBindContext *copy_to,
                  const std::string &schema_name,
-                 const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
+                 const std::optional<std::vector<std::optional<std::string>>> &argument_names,
+                 const ArgumentsLocationRef *arguments_location) {
 	generated::BindRequest request;
 	request.function_name = function_name;
-	request.arguments = arguments_ipc_bytes;
+	// Exactly one of arguments / arguments_location is non-null.
+	if (arguments_location) {
+		generated::ArgumentsLocation location;
+		location.ref = arguments_location->ref;
+		location.size = arguments_location->size;
+		location.sha256 = arguments_location->sha256_hex;
+		request.arguments_location = std::move(location);
+	} else {
+		request.arguments = arguments_ipc_bytes;
+	}
 	request.function_type =
 	    RequireEnum(generated::FunctionTypeFromWire(function_type), function_type, "FunctionType");
 	request.input_schema = BytesOrNull(input_schema_bytes);

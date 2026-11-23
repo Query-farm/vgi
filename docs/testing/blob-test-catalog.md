@@ -77,6 +77,7 @@ For the extension only:
 | Variable | Lane value | Meaning |
 |---|---|---|
 | `VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS` | `1` | Lets the extension fetch and upload the fake's `http://127.0.0.1` signed URLs. |
+| `VGI_TEST_ARGUMENTS_REF_FAULTS` | `1` | Enables the extension's malformed-`BindRequest` test hook (`SET VARIABLE vgi_test_arguments_ref_fault`), see *Protocol 3.4 large values*. |
 | `VGI_TEST_WORKER` | your worker | Set by the lane, not by the script. |
 | `VGI_RPC_FAKE_VENDOR_REF` / `VGI_RPC_FAKE_VENDOR_FROM` | pinned commit | The vendor build to run (see above). |
 
@@ -220,7 +221,7 @@ ISO-8601 UTC. Object ids are 32 lowercase hex characters.
 | `POST /v1/blobs/get` | `{object_id}` | `{object_id, download_url, size, sha256_b64, content_encoding, expires_at}`. 404 `not_uploaded` / `not_found`. |
 | `POST /v1/blobs/delete` | `{object_ids: [...]}` (at most 1,000) | `{deleted}` |
 | `POST /v1/blobs/delete_scope` | `{shard, execution_id}` | `{deleted}` |
-| `POST /v1/upload_urls` | `{count: 1..100}` | `{region, urls: [{object_id, upload_url, download_url, expires_at, download_expires_at}]}` (unsized, purpose `rpc`). Retired by upload URLs v2: servers serve `__upload_url__` from sized `/v1/blobs/put` instead, and the tests assert this counter never moves. |
+| ~~`POST /v1/upload_urls`~~ | removed | **Removed in protocol 3.4** from the vendor and the fake vendor (vgi-rpc STATE_REF_V1.md §13): servers serve `__upload_url__` from sized `/v1/blobs/put`. The route now answers 404 like any unknown path. The fake vendor keeps its `upload_urls` stats key, always 0, and the tests still assert it never moves. |
 | `GET /v1/info` | none | `{tenant, region, jurisdiction, upload_hosts, download_hosts, url_prefixes, limits, ttl_seconds}`. Pin signed URLs to these hosts and prefixes. |
 
 Signed URLs behave like R2's. A PUT must send exactly the `required_headers`
@@ -240,9 +241,9 @@ httpfs.
 
 | Route | Effect / body |
 |---|---|
-| `GET /__stats__` | `{puts, gets, deletes, delete_scopes, upload_urls, storage_puts, storage_gets, objects, bytes, bytes_uploaded, bytes_downloaded, upload_refusals, upload_bad_digest, upload_incomplete_body, upload_signature_mismatch, uploads_corrupted, puts_rpc, puts_fs, puts_upload, client_uploads, client_upload_bytes, client_upload_refusals}`. These are calls to the five `/v1` routes in order; signed-URL PUTs and GET/HEADs; live objects and their bytes; cumulative bytes accepted by signed PUTs and served by signed GETs; signed PUTs the store refused (the sum, then by S3 code); and PUT bodies an upload fault damaged. Then by purpose: `/v1/blobs/put` grants issued for the server's rpc writes (results), for function storage (`fs`), and for client uploads (`origin: "client_upload"`; counted only here), which sum to the grants issued (`puts` also counts refused calls); and signed PUTs to client-upload objects: accepted, their bytes, and refused. All but `objects` and `bytes` only grow, so tests compare deltas. |
+| `GET /__stats__` | `{puts, gets, deletes, delete_scopes, upload_urls, storage_puts, storage_gets, objects, bytes, bytes_uploaded, bytes_downloaded, upload_refusals, upload_bad_digest, upload_incomplete_body, upload_signature_mismatch, uploads_corrupted, puts_rpc, puts_fs, puts_upload, client_uploads, client_upload_bytes, client_upload_refusals, puts_state_ref, gets_state_ref, gets_upload}` (the last three from protocol 3.4, STATE_REF_V1.md §10.3: grants with `origin: "state_ref"`, and `/v1/blobs/get` calls on objects granted with `origin` `state_ref` and `client_upload`). These are calls to the five `/v1` routes in order; signed-URL PUTs and GET/HEADs; live objects and their bytes; cumulative bytes accepted by signed PUTs and served by signed GETs; signed PUTs the store refused (the sum, then by S3 code); and PUT bodies an upload fault damaged. Then by purpose: `/v1/blobs/put` grants issued for the server's rpc writes (results), for function storage (`fs`), and for client uploads (`origin: "client_upload"`; counted only here), which sum to the grants issued (`puts` also counts refused calls); and signed PUTs to client-upload objects: accepted, their bytes, and refused. All but `objects` and `bytes` only grow, so tests compare deltas. |
 | `GET /__admin__/fault?purpose=fs\|rpc&action=corrupt\|missing&count=N` | Arms a fault for the next `N` **objects** of that purpose that are downloaded. The first signed `GET` of such an object marks it. After that, every `GET` of it is faulted until reset: `corrupt` XORs every byte with `0xFF` (same length) and `missing` answers `404 NoSuchKey`. So a probe `GET`, ranged reads and retries all see the same damage. Arming replaces the fault armed for that purpose, so repeating the request is harmless. `count=0` disarms. Body: `{ok, purpose, action, count}`. |
-| `GET /__admin__/fault?purpose=upload&action=corrupt&count=N` | Corrupts the next `N` client-upload `PUT` bodies in transit (objects granted with `origin: "client_upload"`, or by the retired `/v1/upload_urls`), so the store's checksum check refuses them with `400 BadDigest` and stores nothing. Server writes (results, storage values) are never corrupted, so a test may return large results while it is armed. `corrupt` is the only upload action; arming replaces the armed upload fault. Body: `{ok, purpose, action, count}`. |
+| `GET /__admin__/fault?purpose=upload&action=corrupt&count=N` | Corrupts the next `N` client-upload `PUT` bodies in transit (objects granted with `origin: "client_upload"`), so the store's checksum check refuses them with `400 BadDigest` and stores nothing. Server writes (results, storage values) are never corrupted, so a test may return large results while it is armed. `corrupt` is the only upload action; arming replaces the armed upload fault. Body: `{ok, purpose, action, count}`. |
 | `GET /__admin__/reset` | Clears armed and applied download and upload faults. Body: `{ok}`. |
 
 From SQL:
@@ -251,6 +252,81 @@ From SQL:
 SELECT puts FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/fault?purpose=fs&action=corrupt&count=1');
 ```
+
+## Protocol 3.4 large values
+
+`arguments_ref*.test` check argument references and `init: StateRef`
+(`docs/large-values-3.4.md`). They need more from the worker, the fixture
+server and the fake vendor than the files above, so each declares what it
+needs with `require-env`, and a lane sets the variable once its worker or
+vendor provides it. Until then the file skips with that reason, and the lane
+lists the reason as expected (`--allow-skip`), so the skip is visible and a
+new, unlisted one still fails the lane.
+
+| Variable | Set by the lane when | Files |
+|---|---|---|
+| `VGI_WORKER_ARGUMENTS_REF` | the worker implements argument references (sends `VGI-Arguments-Ref-Bytes`, resolves `arguments_location`, refuses bad ones with the spec's kinds) **and** serves the four fixtures below | `arguments_ref.test`, `_streams`, `_prepared`, `_errors` |
+| `VGI_WORKER_INIT_STATE_REF` | the worker carries its init request as a vgi-rpc `StateRef` (vgi spec §6) and the fake vendor has `puts_state_ref` | `arguments_ref_state_ref.test` |
+| `VGI_FAKE_VENDOR_DELETE_ROUTE` | the fake vendor serves `GET /__admin__/delete?origin=client_upload` (below) | `arguments_ref_prepared.test` |
+| `VGI_TEST_ARGUMENTS_REF_FAULTS` | always, on the extension's vendor lane (`test/start_fake_blob_vendor.sh` exports it): enables the extension's malformed-`BindRequest` hook | `arguments_ref_errors.test` |
+
+`arguments_ref_fallback.test` and `arguments_ref_aggregate.test` need none of
+these and run against any worker.
+
+**Fixture server switches**, set per file with the test runner's
+`# server-env: NAME=VALUE` directive (`scripts/run_tests.py`, applied to that
+file's own worker server only):
+
+- `VGI_TEST_DISABLE_ARGUMENTS_REF=1`: the HTTP fixture server does not send
+  `VGI-Arguments-Ref-Bytes` (so it behaves like a worker without argument
+  references, while still offering upload URLs v2). A worker without
+  argument-reference support ignores it. Used by `arguments_ref_fallback.test`.
+- `VGI_RPC_OBJECT_CACHE_BYTES=1`: vgi-rpc's object-cache bound
+  (STATE_REF_V1.md §11), so every resolve is a vendor GET (a cold cache). Used
+  by `arguments_ref_prepared.test`.
+
+**Fake vendor route** (vgi-rpc-python `fake_vendor.py`, test routes):
+
+| Route | Effect / body |
+|---|---|
+| `GET /__admin__/delete?origin=client_upload` | Deletes every live object that was granted with that `origin` (standing in for the bucket lifecycle rule): its signed GET and `/v1/blobs/get` then answer 404 `not_found`. `origin` is required (`client_upload` or `state_ref`). Body: `{ok, deleted}`. |
+
+**Fixtures** in `blob_test`, besides the seven above (protocol 3.4; the
+SDK-neutral contract every SDK's fixture worker set serves):
+
+| Function | Kind | Arguments | Output |
+|---|---|---|---|
+| `blob_param_batches(payload, batches)` | table | `payload VARCHAR`, `batches BIGINT >= 0` (positional) | `i BIGINT, payload_len BIGINT, payload_sha256 VARCHAR` |
+| `blob_param_streams(payload, streams)` | table | `payload VARCHAR`, `streams BIGINT >= 1` (positional) | `stream BIGINT, payload_len BIGINT, payload_sha256 VARCHAR` |
+| `blob_param_scalar(i, payload)` | scalar | `i BIGINT` (per row), `payload VARCHAR` (a **constant** parameter, bound once) | `VARCHAR` |
+| `blob_param_table` | catalog table | none | `payload_len BIGINT, payload_sha256 VARCHAR` |
+
+- **`blob_param_batches`**: a producer that emits `batches` batches of one row
+  each, row `i` = `(i, strlen(payload), sha256(payload))`, one batch per
+  stream turn (so a 60-batch call is at least 60 continuations).
+- **`blob_param_streams`**: one bind, planned as `streams` parallel streams
+  (one split each, so DuckDB can run them on several threads); each stream
+  emits one row `(stream index, strlen(payload), sha256(payload))`. Every
+  stream's init embeds the same `bind_call`, so with argument references the
+  worker process resolves the argument from the vendor once.
+- **`blob_param_scalar`**: `sha256(payload)` for every row whose `i` is not
+  NULL (NULL otherwise). `payload` must be a constant parameter (Python
+  `ConstParam`), so it rides the scalar's bind, not its input batches.
+- **`blob_param_table`**: a table whose scan binds `blob_param_echo` with the
+  fixed argument `repeat('t', 65536)`, reports repeatability
+  `STABLE_WITHIN_QUERY`, and does **not** inline its bind result in the
+  catalog (so every scan binds over RPC). Its one row is
+  `(65536, sha256(repeat('t', 65536)))`.
+
+| File | What it proves |
+|---|---|
+| `arguments_ref.test` | An 8 MiB argument goes up once (`client_uploads` +1, of about the argument's size) and travels by reference: no whole-request upload and every request under 16 KiB (`vgi_http_request_stats`); a small argument stays inline. A 60-batch producer on it never needs a whole-request upload and keeps every turn under 16 KiB. A scalar with a large constant parameter uploads it once. A serialized-plan rebind (`blob_param_table` in a recursive CTE) reuses the reference (`arguments_ref_reuses`) and never trips "Repeatable VGI source bind state changed". |
+| `arguments_ref_streams.test` | Eight parallel streams on one 8 MiB argument: one client upload and one worker GET (`gets_upload` +1). |
+| `arguments_ref_state_ref.test` | A 1000-value IN list over `example.echo` makes the init request large: the worker stores it once (`puts_state_ref` +1) and no turn needs a whole-request upload. |
+| `arguments_ref_prepared.test` | With the object deleted and a cold worker cache, `EXECUTE` of a prepared statement fails with "this prepared statement's large argument has expired; prepare it again", without uploading again; preparing it again works. |
+| `arguments_ref_errors.test` | A tampered `ref` fails with `invalid_arguments_ref`; both or neither of `arguments` / `arguments_location` fail with "BindRequest must set exactly one of 'arguments' and 'arguments_location'". |
+| `arguments_ref_fallback.test` | A worker that does not send `VGI-Arguments-Ref-Bytes` gets the arguments inline; an over-cap bind takes the whole-request upload, as before 3.4. |
+| `arguments_ref_aggregate.test` | Aggregates never use argument references; an aggregate with an 80 KiB input batch still works through the whole-request upload. |
 
 ## The tests
 

@@ -197,6 +197,16 @@ struct CopyToBindContext {
 	std::string file_path;
 };
 
+// BindRequest.arguments_location (protocol 3.4, docs/large-values-3.4.md §2):
+// the arguments IPC was uploaded once and the worker resolves it from `ref`
+// (sealed by its __upload_url__ grant). `size` and `sha256_hex` describe
+// exactly the uploaded bytes.
+struct ArgumentsLocationRef {
+	std::vector<uint8_t> ref;
+	int64_t size = 0;
+	std::string sha256_hex;
+};
+
 // Build a BindRequest batch (wire shape: generated::BindRequest). Empty byte
 // vectors / strings are sent as null. `secrets` is a batch with one struct
 // column per secret; resolved_secrets_provided is true once scoped secrets have
@@ -220,7 +230,10 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
                  const std::string &schema_name = {},
                  // Resolved names aligned with the complete logical argument list.
                  // A null list means unavailable; null elements are unnamed varargs.
-                 const std::optional<std::vector<std::optional<std::string>>> &argument_names = std::nullopt);
+                 const std::optional<std::vector<std::optional<std::string>>> &argument_names = std::nullopt,
+                 // Set: `arguments` is null and this location is sent instead
+                 // (arguments_ipc_bytes is then ignored). Exactly one is non-null.
+                 const ArgumentsLocationRef *arguments_location = nullptr);
 
 // Parsed BindResponse
 struct BindResponseResult {

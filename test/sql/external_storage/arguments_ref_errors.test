@@ -1,0 +1,83 @@
+# name: test/sql/external_storage/arguments_ref_errors.test
+# description: The worker refuses a tampered argument reference and an invalid arguments / arguments_location combination (protocol 3.4)
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, with a worker that implements protocol 3.4
+# argument references (VGI_WORKER_ARGUMENTS_REF=1; skipped with that reason
+# until vgi-python ships them, which the lane lists as expected).
+#
+# The extension never builds these requests itself. Its test hook does
+# (VGI_TEST_ARGUMENTS_REF_FAULTS=1, which the vendor lane exports, then
+# SET VARIABLE vgi_test_arguments_ref_fault): it rewrites the next bind's
+# BindRequest after the build-time decision. docs/large-values-3.4.md §2, §5a:
+#   tamper     a flipped byte in arguments_location.ref -> invalid_arguments_ref
+#   both_set   arguments AND arguments_location         -> invalid_bind_request
+#   both_null  neither                                  -> invalid_bind_request
+
+require-env VGI_WORKER_ARGUMENTS_REF
+
+require-env VGI_TEST_ARGUMENTS_REF_FAULTS
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Each query uses a fresh argument, so no result cache or memo stands in.
+
+statement ok
+SET VARIABLE vgi_test_arguments_ref_fault = 'tamper';
+
+statement error
+SELECT payload_len FROM bt.blob_param_echo(repeat('a', 100000));
+----
+<REGEX>:(?s).*invalid_arguments_ref.*
+
+statement ok
+SET VARIABLE vgi_test_arguments_ref_fault = 'both_set';
+
+statement error
+SELECT payload_len FROM bt.blob_param_echo(repeat('b', 100000));
+----
+<REGEX>:(?s).*BindRequest must set exactly one of 'arguments' and 'arguments_location'.*
+
+statement ok
+SET VARIABLE vgi_test_arguments_ref_fault = 'both_null';
+
+statement error
+SELECT payload_len FROM bt.blob_param_echo('small');
+----
+<REGEX>:(?s).*BindRequest must set exactly one of 'arguments' and 'arguments_location'.*
+
+# The hook off: the same calls work.
+statement ok
+SET VARIABLE vgi_test_arguments_ref_fault = 'none';
+
+query I
+SELECT payload_len FROM bt.blob_param_echo(repeat('a', 100000));
+----
+100000
+
+query I
+SELECT payload_len FROM bt.blob_param_echo('small');
+----
+5
+
+statement ok
+DETACH bt;

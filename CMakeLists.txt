@@ -332,6 +332,7 @@ src/vgi_transport.cpp
 src/vgi_container_runtime.cpp
 src/vgi_http_compression.cpp
 src/vgi_http_client.cpp
+src/vgi_http_request_stats.cpp
 src/vgi_http_params.cpp
 src/vgi_http_function_connection.cpp
 src/vgi_iroh_config.cpp

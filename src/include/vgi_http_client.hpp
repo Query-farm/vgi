@@ -192,6 +192,12 @@ struct UploadUrl {
 	// Headers the PUT must carry verbatim (signed by the server; e.g.
 	// x-amz-checksum-sha256). Never Content-Length.
 	std::vector<std::pair<std::string, std::string>> upload_headers;
+	// Protocol 3.4 grant columns (vgi-rpc STATE_REF_V1.md §10.2), read by name
+	// and optional: the storage id of the object this PUT creates, and a sealed
+	// argument reference to it. Only argument references need them.
+	std::string object_id;
+	std::vector<uint8_t> ref;
+	bool has_ref = false;
 };
 
 // Probe {base_url}/health (mandatory and auth-exempt): HEAD natively, since
@@ -218,6 +224,11 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
 void HttpPutBytes(ClientContext &context, const std::string &url,
                    const std::vector<uint8_t> &data, HttpEncoding encoding = HttpEncoding::NONE,
                    const std::vector<std::pair<std::string, std::string>> &extra_headers = {});
+// The same, PUTting `size` bytes at `data` without copying them (an argument
+// is uploaded straight from its IPC buffer).
+void HttpPutBytes(ClientContext &context, const std::string &url, const uint8_t *data, size_t size,
+                   HttpEncoding encoding = HttpEncoding::NONE,
+                   const std::vector<std::pair<std::string, std::string>> &extra_headers = {});
 
 // A request body over the server's VGI-Max-Request-Bytes, when the server
 // advertises VGI-Upload-URL-Support: 2: hash it, request one sized URL for
@@ -230,6 +241,41 @@ void HttpPutBytes(ClientContext &context, const std::string &url,
 // the body is left inline for the server to refuse with 413, and so is a body
 // whose metadata alone reaches the cap (the pointer keeps every metadata key,
 // so no upload could bring it under).
+// --- Argument references (protocol 3.4, docs/large-values-3.4.md §4-§5) ---
+
+// The worker capability header that enables argument references.
+inline constexpr const char *kArgumentsRefBytesHeader = "VGI-Arguments-Ref-Bytes";
+
+// Parse a VGI-Arguments-Ref-Bytes value: a positive decimal integer, no sign,
+// no leading zero, at most 19 digits; -1 for anything else (= absent).
+int64_t ParseArgumentsRefBytes(const std::string &value);
+
+// The build-time rule: whether a bind's `arguments_size`-byte arguments IPC
+// goes up once and travels as BindRequest.arguments_location. True iff the
+// worker sends a valid VGI-Arguments-Ref-Bytes (A), advertises upload URLs v2,
+// arguments_size > min(A, VGI-Max-Request-Bytes / 4) (an unset request cap
+// counts as infinite) and the size is within any advertised
+// VGI-Max-Upload-Bytes. The caller only asks for HTTP and Iroh connections.
+bool ShouldExternalizeArguments(const ServerCapabilities &caps, uint64_t arguments_size);
+
+// An uploaded argument: the grant's sealed `ref`, and the exact size and
+// lowercase hex SHA-256 of the uploaded bytes.
+struct UploadedArguments {
+	std::vector<uint8_t> ref;
+	int64_t size = 0;
+	std::string sha256_hex;
+};
+
+// Hash `size` bytes at `data`, request one sized upload URL from the worker's
+// __upload_url__/init, PUT the bytes straight from `data` with the returned
+// upload_headers, and return the grant's `ref`. Throws when the grant carries
+// no `ref` (a worker that advertises VGI-Arguments-Ref-Bytes must mint one) or
+// vends a URL that is not https (see ExternalLocationUrlAllowed).
+UploadedArguments UploadArgumentsForReference(ClientContext &context, const std::string &base_url,
+                                              const uint8_t *data, size_t size,
+                                              const std::shared_ptr<CatalogAuth> &auth,
+                                              const std::shared_ptr<IrohClientConfig> &iroh_config);
+
 bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base_url, std::vector<uint8_t> &body,
                                  const ServerCapabilities &caps, const std::shared_ptr<CatalogAuth> &auth,
                                  const std::shared_ptr<IrohClientConfig> &iroh_config);

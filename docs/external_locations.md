@@ -78,6 +78,53 @@ a cap below the widest request schema still 413s: echo over the fixture's
 `all_types` table has a ~20 KiB schema, which is why the vendor lane uses a
 32 KiB cap rather than 16 KiB.
 
+The body is read, hashed and PUT in place: no copy of a large request is
+made on the way up.
+
+## Arguments by reference (protocol 3.4)
+
+Normative spec: [`large-values-3.4.md`](large-values-3.4.md) §2-§5. A large
+argument would otherwise ride the `bind` request and every request that embeds
+it (cardinality, statistics, init, dynamic-to-string, plan, projection),
+uploaded whole each time. Instead, `HttpFunctionConnection::PerformBindRpc`
+(HTTP and Iroh; never pipe, stdio or unix):
+
+1. discovers the worker's capabilities **before** building the bind request,
+   and hands that snapshot to the bind's `HttpInvokeUnary` (no second probe);
+2. serializes the arguments IPC once and decides once
+   (`ShouldExternalizeArguments`): by reference iff the worker sends a valid
+   `VGI-Arguments-Ref-Bytes` (A), advertises `VGI-Upload-URL-Support: 2`, the
+   size is over `min(A, VGI-Max-Request-Bytes / 4)` (an unset cap counts as
+   infinite) and within any `VGI-Max-Upload-Bytes`. Without the header the
+   arguments go inline and an over-cap bind takes the whole-request upload
+   above, so old workers keep working;
+3. hashes the arguments buffer, asks `__upload_url__/init` for one URL
+   (`[(size, sha256)]`) and PUTs straight from that buffer; the grant's `ref`
+   column (sealed by the worker) becomes `BindRequest.arguments_location =
+   {ref, size, sha256}` with `arguments` null;
+4. reuses that location for the scoped-secret retry, and records it in a
+   per-query memo (keyed by worker URL, ATTACH and the argument's size and
+   SHA-256, cleared at query end). Every other bind in the query with the same
+   argument (several scans, scalar connections, the plan rebind in
+   `VgiTableScanDeserialize`) reuses it, so it uploads once and rebuilds
+   byte-identical `bind_request_bytes`.
+
+A missing object (a prepared statement past the bucket lifecycle) is the
+worker's `arguments_ref_missing`, "this prepared statement's large argument
+has expired; prepare it again", surfaced unchanged; there is no transparent
+rebind. Aggregates never use references.
+
+Telemetry: the `arguments_ref.upload` log event (size, ms), and
+`vgi_http_request_stats([reset := true])`: per worker URL, the request count,
+the largest and total request body (uncompressed IPC, after any upload replaced
+it with a pointer), whole-request uploads, and argument-reference uploads and
+memo reuses.
+
+Test hook: with `VGI_TEST_ARGUMENTS_REF_FAULTS=1` in the environment,
+`SET VARIABLE vgi_test_arguments_ref_fault = 'tamper' | 'both_set' |
+'both_null'` rewrites the next binds' `BindRequest` so the worker's refusals can
+be tested (`arguments_ref_errors.test`). It is ignored without the variable.
+
 ## Tests
 
 - `make test_http_vendor` runs `test/sql/external_storage/` and the

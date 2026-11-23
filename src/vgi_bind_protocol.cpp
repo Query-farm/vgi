@@ -18,6 +18,52 @@ static std::string SecretScopeFor(bool secret_dependent,
 	return secret_dependent ? ComputeSecretCacheFingerprint(resolved_secrets) : std::string();
 }
 
+//! The one-row {args: struct} IPC stream a BindRequest's `arguments` holds.
+static std::vector<uint8_t> SerializeArgumentsIpc(const VgiBatchPtr &arguments_batch) {
+	// ArrowArguments::batch already is the one-row {args: struct} batch.
+	if (arguments_batch) {
+		return SerializeToIpcBytes(arguments_batch);
+	}
+	// One valid empty row: Python's Arguments.deserialize_from_bytes reads row 0.
+	VgiBatchBuilder builder(MakeSchema({type::Struct({}).Named("args")}));
+	append::FinishElement(builder.column(0));
+	builder.FinishRow();
+	return SerializeToIpcBytes(builder.Finish());
+}
+
+//! BuildBindRequestBytes over already-serialized arguments; with
+//! `arguments_location` set, the arguments travel by reference instead.
+static std::vector<uint8_t> BuildBindRequestBytesFrom(
+    ClientContext &context, const std::string &function_name, const std::string &function_type,
+    const std::vector<uint8_t> &arguments_bytes, const ArgumentsLocationRef *arguments_location,
+    const VgiSchemaPtr &input_schema, const std::vector<uint8_t> &attach_opaque_data,
+    const std::vector<uint8_t> &transaction_opaque_data, const std::map<std::string, Value> &settings,
+    const std::map<std::string, std::map<std::string, Value>> &resolved_secrets, bool resolved_secrets_provided,
+    const std::string &at_unit, const std::string &at_value, const CopyFromBindContext *copy_from,
+    const CopyToBindContext *copy_to, const std::string &schema_name,
+    const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
+	std::vector<uint8_t> settings_bytes;
+	if (!settings.empty()) {
+		auto settings_batch = BuildSettingsBatch(context, settings);
+		settings_bytes = SerializeToIpcBytes(settings_batch);
+	}
+
+	std::vector<uint8_t> input_schema_bytes;
+	if (input_schema) {
+		input_schema_bytes = SerializeSchemaToIpcBytes(input_schema);
+	}
+
+	// BuildSecretsBatch returns IPC bytes, despite its name.
+	auto secrets_bytes = BuildSecretsBatch(context, resolved_secrets);
+
+	auto bind_request = BuildBindRequest(function_name, arguments_bytes, function_type,
+	                                     input_schema_bytes, settings_bytes, secrets_bytes,
+	                                     attach_opaque_data, transaction_opaque_data, resolved_secrets_provided,
+	                                     at_unit, at_value, copy_from, copy_to, schema_name, argument_names,
+	                                     arguments_location);
+	return SerializeToIpcBytes(bind_request);
+}
+
 std::vector<uint8_t> BuildBindRequestBytes(
     ClientContext &context,
     const std::string &function_name,
@@ -36,38 +82,11 @@ std::vector<uint8_t> BuildBindRequestBytes(
     const CopyToBindContext *copy_to,
     const std::string &schema_name,
     const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
-
-	// ArrowArguments::batch already is the one-row {args: struct} batch.
-	std::vector<uint8_t> arguments_bytes;
-	if (arguments_batch) {
-		arguments_bytes = SerializeToIpcBytes(arguments_batch);
-	} else {
-		// One valid empty row: Python's Arguments.deserialize_from_bytes reads row 0.
-		VgiBatchBuilder builder(MakeSchema({type::Struct({}).Named("args")}));
-		append::FinishElement(builder.column(0));
-		builder.FinishRow();
-		arguments_bytes = SerializeToIpcBytes(builder.Finish());
-	}
-
-	std::vector<uint8_t> settings_bytes;
-	if (!settings.empty()) {
-		auto settings_batch = BuildSettingsBatch(context, settings);
-		settings_bytes = SerializeToIpcBytes(settings_batch);
-	}
-
-	std::vector<uint8_t> input_schema_bytes;
-	if (input_schema) {
-		input_schema_bytes = SerializeSchemaToIpcBytes(input_schema);
-	}
-
-	// BuildSecretsBatch returns IPC bytes, despite its name.
-	auto secrets_bytes = BuildSecretsBatch(context, resolved_secrets);
-
-	auto bind_request = BuildBindRequest(function_name, arguments_bytes, function_type,
-	                                     input_schema_bytes, settings_bytes, secrets_bytes,
-	                                     attach_opaque_data, transaction_opaque_data, resolved_secrets_provided,
-	                                     at_unit, at_value, copy_from, copy_to, schema_name, argument_names);
-	return SerializeToIpcBytes(bind_request);
+	(void)worker_label;
+	return BuildBindRequestBytesFrom(context, function_name, function_type, SerializeArgumentsIpc(arguments_batch),
+	                                 /*arguments_location=*/nullptr, input_schema, attach_opaque_data,
+	                                 transaction_opaque_data, settings, resolved_secrets, resolved_secrets_provided,
+	                                 at_unit, at_value, copy_from, copy_to, schema_name, argument_names);
 }
 
 BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_bytes,
@@ -121,7 +140,8 @@ BindResult PerformBindProtocol(
     const CopyFromBindContext *copy_from,
     const CopyToBindContext *copy_to,
     const std::string &schema_name,
-    const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
+    const std::optional<std::vector<std::optional<std::string>>> &argument_names,
+    const ArgumentsExternalizerFn &externalize_arguments) {
 
 	// Resolve declared secrets up front; scoped secrets the worker requests
 	// mid-bind are merged in below.
@@ -132,11 +152,25 @@ BindResult PerformBindProtocol(
 	auto secrets = ExtractVgiSecrets(context, required_secrets);
 	bool secret_dependent = !required_secrets.empty();
 
-	auto bind_request_bytes = BuildBindRequestBytes(
-	    context, function_name, function_type, arguments_batch, input_schema,
-	    attach_opaque_data, transaction_opaque_data, settings, secrets,
-	    /*resolved_secrets_provided=*/false, worker_label, at_unit, at_value, copy_from, copy_to, schema_name,
-	    argument_names);
+	// Decided once per bind (docs/large-values-3.4.md §4): the arguments go
+	// inline, or up once and by reference. Every BindRequest this bind builds,
+	// including the scoped-secret retry below, reuses that decision, so no
+	// retry uploads again and later requests embed these exact bytes.
+	auto arguments_bytes = SerializeArgumentsIpc(arguments_batch);
+	std::optional<ArgumentsLocationRef> arguments_location;
+	if (externalize_arguments) {
+		arguments_location = externalize_arguments(arguments_bytes);
+		if (arguments_location) {
+			// Only the reference travels from here on.
+			std::vector<uint8_t>().swap(arguments_bytes);
+		}
+	}
+	const auto *location = arguments_location ? &*arguments_location : nullptr;
+
+	auto bind_request_bytes = BuildBindRequestBytesFrom(
+	    context, function_name, function_type, arguments_bytes, location, input_schema, attach_opaque_data,
+	    transaction_opaque_data, settings, secrets, /*resolved_secrets_provided=*/false, at_unit, at_value, copy_from,
+	    copy_to, schema_name, argument_names);
 
 	auto bind_response_batch = transport_fn(bind_request_bytes);
 
@@ -163,11 +197,10 @@ BindResult PerformBindProtocol(
 			secrets[k] = std::move(v);
 		}
 
-		bind_request_bytes = BuildBindRequestBytes(
-		    context, function_name, function_type, arguments_batch, input_schema,
-		    attach_opaque_data, transaction_opaque_data, settings, secrets,
-		    /*resolved_secrets_provided=*/true, worker_label, at_unit, at_value, copy_from, copy_to, schema_name,
-		    argument_names);
+		bind_request_bytes = BuildBindRequestBytesFrom(
+		    context, function_name, function_type, arguments_bytes, location, input_schema, attach_opaque_data,
+		    transaction_opaque_data, settings, secrets, /*resolved_secrets_provided=*/true, at_unit, at_value,
+		    copy_from, copy_to, schema_name, argument_names);
 
 		bind_response_batch = transport_fn(bind_request_bytes);
 

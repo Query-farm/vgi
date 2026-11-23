@@ -6,7 +6,9 @@
 # in worker storage (process), then replays them (finalize):
 #   * the table_buffering_process request carries a whole input batch, over the
 #     32 KiB request cap -> uploaded through a sized URL (puts_upload grants,
-#     client_uploads PUTs; never the retired unsized upload_urls);
+#     client_uploads PUTs). The vendor no longer has the unsized
+#     /v1/upload_urls (removed in protocol 3.4); its `upload_urls` counter
+#     stays and is always 0, which the query below still checks;
 #   * each stored batch is over VGI_STORAGE_EXTERNALIZE_BYTES -> kept in the
 #     vendor (puts_fs) and read back on finalize (gets);
 #   * each replayed batch is over the result threshold -> fetched by the client.

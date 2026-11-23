@@ -35,6 +35,9 @@
 #   VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS
 #                                        1: lets the extension fetch the fake's
 #                                        http://127.0.0.1 signed URLs (production is https).
+#   VGI_TEST_ARGUMENTS_REF_FAULTS        1: enables the extension's malformed-BindRequest
+#                                        hook (SET VARIABLE vgi_test_arguments_ref_fault) that
+#                                        arguments_ref_errors.test drives. Extension only.
 #
 # Also set (not exported): VGI_FAKE_BLOB_VENDOR_PID, VGI_FAKE_BLOB_VENDOR_LOG.
 # The contract the worker must meet is docs/testing/blob-test-catalog.md.
@@ -150,6 +153,7 @@ _start_fake_blob_vendor() {
     export VGI_STORAGE_EXTERNALIZE="${VGI_STORAGE_EXTERNALIZE:-1}"
     export VGI_STORAGE_EXTERNALIZE_BYTES="${VGI_STORAGE_EXTERNALIZE_BYTES:-4096}"
     export VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1
+    export VGI_TEST_ARGUMENTS_REF_FAULTS="${VGI_TEST_ARGUMENTS_REF_FAULTS:-1}"
 }
 
 _start_fake_blob_vendor

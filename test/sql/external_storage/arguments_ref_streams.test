@@ -1,0 +1,75 @@
+# name: test/sql/external_storage/arguments_ref_streams.test
+# description: Parallel streams on one large argument share one upload and one worker-side GET (protocol 3.4 argument references)
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, with a worker that implements protocol 3.4
+# argument references and the large-value fixtures
+# (VGI_WORKER_ARGUMENTS_REF=1; skipped with that reason until vgi-python ships
+# them, which the lane lists as expected).
+#
+# blob_param_streams(payload, n) plans n parallel streams (one split each) of
+# one bind. Every stream's init embeds the same bind_call, i.e. the same
+# argument reference. The extension uploads the argument once; the worker
+# resolves the reference through its object cache (keyed by object_id,
+# single-flight), so the fixture server, one process, fetches the argument
+# from the vendor exactly once (`gets_upload`: /v1/blobs/get calls on objects
+# granted with origin client_upload, vgi-rpc STATE_REF_V1.md §10.3).
+
+require-env VGI_WORKER_ARGUMENTS_REF
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_RPC_MAX_REQUEST_BYTES
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=4;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET VARIABLE big = (SELECT string_agg(md5(i::VARCHAR), '' ORDER BY i) FROM range(262144) t(i));
+
+statement ok
+CREATE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+statement ok
+SELECT count(*) FROM vgi_http_request_stats(reset => true);
+
+query IIII
+SELECT count(*), count(DISTINCT stream), bool_and(payload_len = 8388608),
+       bool_and(payload_sha256 = sha256(getvariable('big')))
+FROM bt.blob_param_streams(getvariable('big'), 8);
+----
+8	8	true	true
+
+statement ok
+CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+# One upload by the extension, one GET by the worker.
+query II
+SELECT s1.client_uploads - s0.client_uploads, s1.gets_upload - s0.gets_upload FROM s0, s1;
+----
+1	1
+
+query III
+SELECT sum(arguments_ref_uploads), sum(request_uploads), max(max_request_bytes) < ${VGI_RPC_MAX_REQUEST_BYTES}
+FROM vgi_http_request_stats();
+----
+1	0	true
+
+statement ok
+DETACH bt;

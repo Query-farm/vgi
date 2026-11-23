@@ -12,6 +12,7 @@
 
 
 #include "vgi_protocol.hpp"
+#include "vgi_rpc_types.hpp" // ArgumentsLocationRef
 
 namespace duckdb {
 
@@ -27,6 +28,14 @@ struct CopyToBindContext;
 // Sends serialized BindRequest bytes over the transport (subprocess, HTTP, ...)
 // and returns the transport-validated BindResponse batch.
 using BindTransportFn = std::function<VgiBatchPtr(const std::vector<uint8_t> &request_bytes)>;
+
+// Argument references (protocol 3.4, docs/large-values-3.4.md §4). Given the
+// bind's serialized arguments IPC, either returns the location to send instead
+// of the bytes (having uploaded them, or reused an upload from this query), or
+// nullopt to send them inline. Only the HTTP and Iroh transports supply one;
+// it is called once per bind, before the first BindRequest is built.
+using ArgumentsExternalizerFn =
+    std::function<std::optional<ArgumentsLocationRef>(const std::vector<uint8_t> &arguments_ipc)>;
 
 // Full bind: send the BindRequest, and if the worker answers with a secret-scope
 // request, resolve those secrets and resend once (a second request is an error).
@@ -47,7 +56,8 @@ BindResult PerformBindProtocol(
     const CopyFromBindContext *copy_from = nullptr,  // COPY FROM; null = omit
     const CopyToBindContext *copy_to = nullptr,      // COPY TO; null = omit
     const std::string &schema_name = {},  // owning catalog schema; empty = null
-    const std::optional<std::vector<std::optional<std::string>>> &argument_names = std::nullopt);
+    const std::optional<std::vector<std::optional<std::string>>> &argument_names = std::nullopt,
+    const ArgumentsExternalizerFn &externalize_arguments = nullptr);  // null = always inline
 
 // The IPC BindRequest bytes PerformBindProtocol sends. Also used by the inline-
 // bind path, which has the BindResponse already but still needs identical

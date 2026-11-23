@@ -115,6 +115,7 @@
 #include "vgi_secret_types_function.hpp"
 #include "vgi_catalog_contents_function.hpp"
 #include "vgi_clear_cache.hpp"
+#include "vgi_http_request_stats.hpp"
 #include "vgi_result_cache.hpp"
 #include "vgi_companion_catalogs.hpp"
 #include "vgi_github_functions.hpp"
@@ -3593,6 +3594,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	vgi::RegisterVgiResultCacheFlushFunction(loader);
 	vgi::RegisterVgiResultCacheReapFunction(loader);
 	vgi::RegisterVgiResultCacheStatsFunction(loader);
+	vgi::RegisterVgiHttpRequestStatsFunction(loader);
 
 	// Registry diagnostics: COPY formats, global functions, secret providers,
 	// companions.

@@ -18,7 +18,7 @@ namespace vgi {
 // (ParseCapabilityHeaders). The server middleware emits the capability headers
 // (VGI-Accept-Max-Response-Bytes-Support, VGI-Max-Request-Bytes,
 // VGI-Max-Response-Bytes, VGI-Upload-URL-Support, VGI-Max-Upload-Bytes,
-// VGI-Supported-Encodings) on every response. A positive discovery is required
+// VGI-Arguments-Ref-Bytes, VGI-Supported-Encodings) on every response. A positive discovery is required
 // before the first application call; later responses refresh the snapshot.
 struct ServerCapabilities {
 	bool discovered = false;
@@ -30,6 +30,11 @@ struct ServerCapabilities {
 	// uploads only to version 2 (sized, hashed URLs).
 	int upload_url_version = 0;
 	int64_t max_upload_bytes = -1;    // -1 = no limit advertised
+	// VGI-Arguments-Ref-Bytes (protocol 3.4, docs/large-values-3.4.md §5): the
+	// worker accepts BindRequest.arguments_location, and wants arguments over
+	// this many bytes sent that way. -1 = absent or invalid: the worker does
+	// not support argument references, and the client never sends one.
+	int64_t arguments_ref_bytes = -1;
 	// Codecs the server accepts on requests and produces on responses, in its
 	// preference order. Always read with ``encodings_advertised``: empty alone
 	// is ambiguous.

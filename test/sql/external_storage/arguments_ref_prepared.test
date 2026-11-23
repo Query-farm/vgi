@@ -1,0 +1,93 @@
+# name: test/sql/external_storage/arguments_ref_prepared.test
+# description: A prepared statement whose large argument object was deleted fails with the spec's message, never a silent rebind (protocol 3.4)
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor, with a worker that implements protocol 3.4
+# argument references (VGI_WORKER_ARGUMENTS_REF=1) and a fake vendor with the
+# delete-object test route (VGI_FAKE_VENDOR_DELETE_ROUTE=1). Until both ship
+# this file skips with those reasons, which the lane lists as expected.
+#
+# docs/large-values-3.4.md §5a: a prepared statement keeps its bind request,
+# i.e. the argument reference. Once the bucket lifecycle has deleted the
+# object, EXECUTE fails with arguments_ref_missing and exactly
+#   this prepared statement's large argument has expired; prepare it again
+# which the extension surfaces unchanged. There is no transparent rebind.
+#
+# GET /__admin__/delete?origin=client_upload deletes every live object granted
+# with origin client_upload, standing in for the lifecycle rule. The worker's
+# object cache would otherwise mask the deletion, so this file's worker runs
+# with a 1-byte cache (VGI_RPC_OBJECT_CACHE_BYTES, STATE_REF_V1.md §11): every
+# resolve is a vendor GET, i.e. a cold cache.
+#
+# server-env: VGI_RPC_OBJECT_CACHE_BYTES=1
+
+require-env VGI_WORKER_ARGUMENTS_REF
+
+require-env VGI_FAKE_VENDOR_DELETE_ROUTE
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT count(*) FROM vgi_http_request_stats(reset => true);
+
+statement ok
+PREPARE p AS SELECT payload_len, payload_sha256 = sha256(repeat('q', 100000)) AS ok
+FROM bt.blob_param_echo(repeat('q', 100000));
+
+query II
+EXECUTE p;
+----
+100000	true
+
+query I
+SELECT sum(arguments_ref_uploads) FROM vgi_http_request_stats();
+----
+1
+
+# The lifecycle rule ran: the argument object is gone.
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/delete?origin=client_upload');
+----
+true
+
+statement error
+EXECUTE p;
+----
+<REGEX>:(?s).*this prepared statement's large argument has expired; prepare it again.*
+
+# Nothing was uploaded again behind the user's back.
+query I
+SELECT sum(arguments_ref_uploads) FROM vgi_http_request_stats();
+----
+1
+
+# Preparing it again works (a fresh upload).
+statement ok
+PREPARE p2 AS SELECT payload_len FROM bt.blob_param_echo(repeat('q', 100000));
+
+query I
+EXECUTE p2;
+----
+100000
+
+statement ok
+DETACH bt;

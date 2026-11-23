@@ -1,0 +1,91 @@
+# name: test/sql/external_storage/arguments_ref_fallback.test
+# description: A worker that does not send VGI-Arguments-Ref-Bytes never gets an argument reference: an over-cap bind takes the whole-request upload
+# group: [vgi_external_storage]
+#
+# Lane: make test_http_vendor. Protocol 3.4 (docs/large-values-3.4.md §4-§5):
+# the VGI-Arguments-Ref-Bytes header is the capability signal. Without it the
+# extension sends the arguments inline, and a bind (and the cardinality,
+# statistics and init requests that embed it) over the worker's 32 KiB
+# VGI-Max-Request-Bytes goes up through the ordinary whole-request upload, as
+# before 3.4. The rollout is order-independent because of this.
+#
+# The worker below is told not to advertise argument references
+# (VGI_TEST_DISABLE_ARGUMENTS_REF=1, a fixture-server test switch; a worker
+# without argument-reference support ignores it and never sends the header).
+# The extension's own counters (vgi_http_request_stats) show which path ran.
+#
+# server-env: VGI_TEST_DISABLE_ARGUMENTS_REF=1
+
+require-env VGI_BLOB_VENDOR_URL
+
+require-env VGI_RPC_MAX_REQUEST_BYTES
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET threads=1;
+
+query I
+SELECT ok FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__admin__/reset');
+----
+true
+
+statement ok
+ATTACH 'blob_test' AS bt (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# A 64 KiB argument: twice the request cap. It compresses well on purpose.
+# Without argument references the worker's stream state carries the whole
+# init request (bind included) on every continuation; only compression keeps
+# that under the cap, and an incompressible argument this size 413s on the
+# first continuation. That is the pre-3.4 failure argument references and
+# init StateRef fix (docs/large-values-3.4.md §1), not what this file tests.
+statement ok
+SET VARIABLE big = repeat('fallback', 8192);
+
+query I
+SELECT strlen(getvariable('big'));
+----
+65536
+
+statement ok
+CREATE TABLE s0 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+statement ok
+SELECT count(*) FROM vgi_http_request_stats(reset => true);
+
+query II
+SELECT payload_len, payload_sha256 = sha256(getvariable('big')) FROM bt.blob_param_echo(getvariable('big'));
+----
+65536	true
+
+statement ok
+CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
+
+# No argument reference; the oversized requests were uploaded whole (one
+# client upload per request that embeds the bind: at least the bind itself).
+query III
+SELECT sum(arguments_ref_uploads), sum(arguments_ref_reuses), sum(request_uploads) >= 1
+FROM vgi_http_request_stats();
+----
+0	0	true
+
+query II
+SELECT s1.client_uploads - s0.client_uploads >= 1, s1.upload_urls = s0.upload_urls FROM s0, s1;
+----
+true	true
+
+# Every request that left was within the cap (the uploads replaced the bodies
+# with pointers).
+query I
+SELECT max(max_request_bytes) <= ${VGI_RPC_MAX_REQUEST_BYTES} FROM vgi_http_request_stats();
+----
+true
+
+statement ok
+DETACH bt;

@@ -1,9 +1,14 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_http_function_connection.hpp"
+#include "vgi_http_request_stats.hpp"
 #include "vgi_query_rpc.hpp"
+
+#include <cstdlib>
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #ifdef __EMSCRIPTEN__
 #include <pthread.h>
 #endif
@@ -19,6 +24,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_sha256.hpp"
 #include "vgi_protocol.hpp" // BindResult
 #include "vgi_transport.hpp"
 #include "generated/vgi_request_builders.hpp"
@@ -214,6 +220,7 @@ std::string HttpFunctionConnection::PostStreamRequest(ClientContext &context, co
 	MaybeExternalizeRequestBody(context, base_url_, body, size_caps, auth, iroh);
 	auto cached_params =
 	    attach_params_ && IsHttpTransport(url) ? attach_params_->GetOrInitHttpParams(context, url) : nullptr;
+	RecordHttpRequestBody(base_url_, body.size());
 	return HttpPostArrowIpc(context, url, body, auth, /*cookie_jar=*/nullptr, cached_params, client_holder, harvested,
 	                        iroh, cancellation, error_context);
 }
@@ -419,6 +426,124 @@ void HttpFunctionConnection::BufferDataBatches(VgiBufferPtr owned, size_t offset
 	}
 }
 
+// Argument references (protocol 3.4, docs/large-values-3.4.md §4)
+
+namespace {
+
+// The per-query memo from an argument's (SHA-256, size) to the location it
+// was uploaded to. Every bind in one query with the same argument bytes for
+// the same worker and ATTACH reuses one reference: the scoped-secret retry,
+// several scans of one function, and the plan rebind in
+// VgiTableScanDeserialize, which must rebuild byte-identical
+// bind_request_bytes. A digest key is safe here: the memo is client-side and
+// holds only this query's own references. It dies with the query.
+class VgiArgumentsRefMemo : public ClientContextState {
+public:
+	static constexpr const char *kKey = "vgi_arguments_ref_memo";
+
+	using ClientContextState::QueryEnd;
+	void QueryBegin(ClientContext &) override {
+		Clear();
+	}
+	void QueryEnd(ClientContext &, optional_ptr<ErrorData>) override {
+		Clear();
+	}
+
+	std::optional<ArgumentsLocationRef> Find(const std::string &key) {
+		std::lock_guard<std::mutex> lock(mu_);
+		auto it = locations_.find(key);
+		if (it == locations_.end()) {
+			return std::nullopt;
+		}
+		return it->second;
+	}
+	void Store(const std::string &key, const ArgumentsLocationRef &location) {
+		std::lock_guard<std::mutex> lock(mu_);
+		locations_.emplace(key, location);
+	}
+
+private:
+	void Clear() {
+		std::lock_guard<std::mutex> lock(mu_);
+		locations_.clear();
+	}
+
+	std::mutex mu_;
+	std::unordered_map<std::string, ArgumentsLocationRef> locations_;
+};
+
+// Test hook for the reference error paths (test/sql/external_storage/
+// arguments_ref_errors.test): with VGI_TEST_ARGUMENTS_REF_FAULTS=1 in the
+// environment, `SET VARIABLE vgi_test_arguments_ref_fault = '<fault>'` makes
+// the next binds send a malformed BindRequest the worker must refuse:
+//   tamper     flip a byte of arguments_location.ref    -> invalid_arguments_ref
+//   both_set   send arguments AND arguments_location     -> invalid_bind_request
+//   both_null  send neither                              -> invalid_bind_request
+// Never honored without the environment variable.
+enum class ArgumentsRefFault { NONE, TAMPER, BOTH_SET, BOTH_NULL };
+
+ArgumentsRefFault ArgumentsRefTestFault(ClientContext &context) {
+	const char *env = std::getenv("VGI_TEST_ARGUMENTS_REF_FAULTS");
+	if (!env || std::string(env) != "1") {
+		return ArgumentsRefFault::NONE;
+	}
+	Value value;
+	if (!ClientConfig::GetConfig(context).GetUserVariable(std::string("vgi_test_arguments_ref_fault"), value) ||
+	    value.IsNull()) {
+		return ArgumentsRefFault::NONE;
+	}
+	const auto fault = StringUtil::Lower(value.ToString());
+	if (fault.empty() || fault == "none") {
+		return ArgumentsRefFault::NONE;
+	}
+	if (fault == "tamper") {
+		return ArgumentsRefFault::TAMPER;
+	}
+	if (fault == "both_set") {
+		return ArgumentsRefFault::BOTH_SET;
+	}
+	if (fault == "both_null") {
+		return ArgumentsRefFault::BOTH_NULL;
+	}
+	throw InvalidInputException("vgi_test_arguments_ref_fault must be tamper, both_set, both_null or none, got '%s'",
+	                            fault);
+}
+
+// Rewrite an outgoing BindRequest for `fault`. `inline_arguments` are the
+// arguments IPC bytes (for both_set).
+std::vector<uint8_t> ApplyArgumentsRefFault(const std::vector<uint8_t> &request_bytes, ArgumentsRefFault fault,
+                                            const std::vector<uint8_t> &inline_arguments,
+                                            const std::string &worker_path) {
+	auto batch = DeserializeFromIpcBytes(request_bytes.data(), request_bytes.size());
+	generated::BindRequest request;
+	generated::FromBatch(batch, 0, request, worker_path);
+	switch (fault) {
+	case ArgumentsRefFault::TAMPER:
+		if (!request.arguments_location || request.arguments_location->ref.empty()) {
+			throw InvalidInputException("vgi_test_arguments_ref_fault 'tamper' needs a bind whose arguments travel by "
+			                            "reference (over the worker's VGI-Arguments-Ref-Bytes threshold)");
+		}
+		request.arguments_location->ref.back() ^= 0x01;
+		break;
+	case ArgumentsRefFault::BOTH_SET:
+		if (!request.arguments_location) {
+			throw InvalidInputException("vgi_test_arguments_ref_fault 'both_set' needs a bind whose arguments travel "
+			                            "by reference (over the worker's VGI-Arguments-Ref-Bytes threshold)");
+		}
+		request.arguments = inline_arguments;
+		break;
+	case ArgumentsRefFault::BOTH_NULL:
+		request.arguments.reset();
+		request.arguments_location.reset();
+		break;
+	case ArgumentsRefFault::NONE:
+		return request_bytes;
+	}
+	return SerializeToIpcBytes(generated::ToBatch(request));
+}
+
+} // namespace
+
 // Bind
 
 void HttpFunctionConnection::SetInputSchema(const VgiSchemaPtr &input_schema) {
@@ -444,19 +569,64 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		VGI_LOG(context_, "http_function_connection.bind", fields);
 	}
 
+	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto iroh = attach_params_ ? attach_params_->iroh() : nullptr;
+
+	// Capability discovery comes before the bind request is built: whether the
+	// arguments travel by reference depends on VGI-Arguments-Ref-Bytes,
+	// VGI-Upload-URL-Support and VGI-Max-Request-Bytes. The same snapshot is
+	// the bind's in/out capability slot, so HttpInvokeUnary never probes again.
+	auto cached_params = attach_params_ && IsHttpTransport(base_url_)
+	                         ? attach_params_->GetOrInitHttpParams(context_, base_url_)
+	                         : nullptr;
+	ServerCapabilities b_caps = CurrentCapabilities();
+	if (!b_caps.discovered || (b_caps.cache_expires_at != std::chrono::steady_clock::time_point {} &&
+	                           std::chrono::steady_clock::now() >= b_caps.cache_expires_at)) {
+		// The catalog's cached HTTPParams, as HttpInvokeUnary would probe with.
+		b_caps = HttpDiscoverCapabilities(context_, base_url_, iroh, cached_params);
+		PublishHarvestedCapabilities(b_caps);
+	}
+
+	const auto fault = ArgumentsRefTestFault(context_);
+	std::vector<uint8_t> fault_inline_arguments;
+
+	auto externalize = [&](const std::vector<uint8_t> &arguments_ipc) -> std::optional<ArgumentsLocationRef> {
+		if (!ShouldExternalizeArguments(b_caps, arguments_ipc.size())) {
+			return std::nullopt;
+		}
+		if (fault == ArgumentsRefFault::BOTH_SET) {
+			fault_inline_arguments = arguments_ipc;
+		}
+		const auto sha256_hex = VgiSha256Hex(arguments_ipc.data(), arguments_ipc.size());
+		// Per worker and ATTACH: a reference is sealed for one worker and principal.
+		const auto memo_key = base_url_ + '\n' + std::to_string(reinterpret_cast<uintptr_t>(attach_params_.get())) +
+		                      '\n' + std::to_string(arguments_ipc.size()) + '\n' + sha256_hex;
+		auto memo = context_.registered_state->GetOrCreate<VgiArgumentsRefMemo>(VgiArgumentsRefMemo::kKey);
+		if (auto reused = memo->Find(memo_key)) {
+			RecordArgumentsRefReuse(base_url_);
+			return reused;
+		}
+		auto uploaded =
+		    UploadArgumentsForReference(context_, base_url_, arguments_ipc.data(), arguments_ipc.size(), auth, iroh);
+		ArgumentsLocationRef location {std::move(uploaded.ref), uploaded.size, std::move(uploaded.sha256_hex)};
+		memo->Store(memo_key, location);
+		return location;
+	};
+
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> VgiBatchPtr {
-		auto rpc_params = ::duckdb::vgi::generated::BuildBindParams(request_bytes);
-		auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-		auto cached_params = attach_params_ && IsHttpTransport(base_url_)
-		    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
-		// In/out capability snapshot: picks this request's Content-Encoding and
-		// is refreshed from the response (see CurrentCapabilities).
-		ServerCapabilities b_caps = CurrentCapabilities();
+		const std::vector<uint8_t> *sent = &request_bytes;
+		std::vector<uint8_t> faulted;
+		if (fault != ArgumentsRefFault::NONE) {
+			faulted = ApplyArgumentsRefFault(request_bytes, fault, fault_inline_arguments, base_url_);
+			sent = &faulted;
+		}
+		auto rpc_params = ::duckdb::vgi::generated::BuildBindParams(*sent);
 		const auto call_error_fields = HttpFunctionInfo(nullptr, base_url_, function_name_, function_type_);
+		// b_caps picks this request's Content-Encoding and is refreshed from the
+		// response (see CurrentCapabilities).
 		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth,
 		                             /*cookie_jar=*/nullptr, cached_params,
-		                             "", "", "", "", VGI_MAIN_PROTOCOL, &http_client_, &b_caps,
-		                             attach_params_ ? attach_params_->iroh() : nullptr,
+		                             "", "", "", "", VGI_MAIN_PROTOCOL, &http_client_, &b_caps, iroh,
 		                             &call_error_fields);
 		PublishHarvestedCapabilities(b_caps);
 		return UnwrapResultEnvelope(resp.batch, "bind",
@@ -468,7 +638,8 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 	                                        transaction_opaque_data_, settings_, required_secrets_,
 	                                        base_url_, transport_fn, at_unit_, at_value_,
 	                                        copy_from_ ? &*copy_from_ : nullptr,
-	                                        copy_to_ ? &*copy_to_ : nullptr, schema_name_, argument_names_);
+	                                        copy_to_ ? &*copy_to_ : nullptr, schema_name_, argument_names_,
+	                                        externalize);
 
 	{
 		auto fields = BuildConnLogFields(*this);

@@ -107,6 +107,24 @@ def discover(patterns: list[str], root: Path) -> list[Path]:
 _SERIAL_GROUP_RE = re.compile(r"^#\s*serial-group:\s*(\S+)", re.MULTILINE)
 
 
+_SERVER_ENV_RE = re.compile(r"^#\s*server-env:\s*([A-Za-z_][A-Za-z0-9_]*)=(\S*)\s*$", re.MULTILINE)
+
+
+def server_env(path: Path) -> dict[str, str]:
+    """The `# server-env: NAME=VALUE` lines a test file declares in its first lines.
+
+    With --server-per-test they are added to that file's own worker server's
+    environment (and nothing else's), e.g. a tiny object cache for a test that
+    needs a cold one. Without --server-per-test they have no effect.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = "".join(fh.readline() for _ in range(40))
+    except OSError:
+        return {}
+    return dict(_SERVER_ENV_RE.findall(head))
+
+
 def serial_group(path: Path) -> str | None:
     """The `# serial-group:` a test file declares in its first lines, if any."""
     try:
@@ -169,12 +187,15 @@ def _thread_stacks(pid: int) -> str:
 _PORT_RE = re.compile(r"PORT:(\d+)\r?\n")
 
 
-def _start_server(cmd: str, log_path: Path, startup_timeout: float) -> tuple[subprocess.Popen, int]:
+def _start_server(
+    cmd: str, log_path: Path, startup_timeout: float, env: dict[str, str] | None = None
+) -> tuple[subprocess.Popen, int]:
     """Start one test's own worker server and wait for it to print ``PORT:<n>``."""
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             cmd,
             shell=True,
+            env=env,
             executable="/bin/bash",  # the command may use bash quoting (printf %q)
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -245,7 +266,10 @@ def run_one(
         server_log = log_dir / (str(test_path).replace("/", "__") + ".server.log")
         s0 = time.monotonic()
         try:
-            server, port = _start_server(server_cmd, server_log, startup_timeout=120)
+            extra = server_env(test_path)
+            server, port = _start_server(
+                server_cmd, server_log, startup_timeout=120, env={**env, **extra} if extra else None
+            )
         except RuntimeError as exc:
             return {
                 "path": test_path,

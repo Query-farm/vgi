@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <thread>
@@ -287,4 +288,65 @@ TEST_CASE("a request whose metadata alone reaches the cap stays inline, with no 
 	auto body = original;
 	CHECK_FALSE(MaybeExternalizeRequestBody(f.context(), "http://127.0.0.1:9", body, caps, nullptr, nullptr));
 	CHECK(body == original);
+}
+
+// --- Argument references (protocol 3.4, docs/large-values-3.4.md §4-§5) -----
+
+TEST_CASE("VGI-Arguments-Ref-Bytes parses as a canonical positive integer or not at all", "[external-location]") {
+	CHECK(ParseArgumentsRefBytes("4194304") == 4194304);
+	CHECK(ParseArgumentsRefBytes("1") == 1);
+	CHECK(ParseArgumentsRefBytes("9223372036854775807") == INT64_MAX);
+	// Invalid values count as absent: no argument references.
+	for (const char *bad : {"", "0", "04", "-1", "+5", "1.5", " 5", "5 ", "1e6", "abc", "9223372036854775808",
+	                        "99999999999999999999"}) {
+		INFO(bad);
+		CHECK(ParseArgumentsRefBytes(bad) == -1);
+	}
+}
+
+TEST_CASE("arguments travel by reference only under the build-time rule", "[external-location]") {
+	ServerCapabilities caps;
+	caps.discovered = true;
+	caps.upload_url_version = 2;
+	caps.arguments_ref_bytes = 1000;
+
+	SECTION("over the worker's threshold, with no request cap") {
+		CHECK_FALSE(ShouldExternalizeArguments(caps, 1000));
+		CHECK(ShouldExternalizeArguments(caps, 1001));
+	}
+	SECTION("the request cap lowers the threshold to max_request_bytes / 4 (integer division)") {
+		caps.max_request_bytes = 2003; // / 4 = 500
+		CHECK_FALSE(ShouldExternalizeArguments(caps, 500));
+		CHECK(ShouldExternalizeArguments(caps, 501));
+		caps.max_request_bytes = 100000; // / 4 = 25000 > A: A wins
+		CHECK_FALSE(ShouldExternalizeArguments(caps, 1000));
+		CHECK(ShouldExternalizeArguments(caps, 1001));
+	}
+	SECTION("an unset or non-positive request cap counts as infinite") {
+		caps.max_request_bytes = 0;
+		CHECK_FALSE(ShouldExternalizeArguments(caps, 1000));
+		CHECK(ShouldExternalizeArguments(caps, 1001));
+		caps.max_request_bytes = -1;
+		CHECK(ShouldExternalizeArguments(caps, 1001));
+	}
+	SECTION("the header is the capability signal: without it, never") {
+		caps.arguments_ref_bytes = -1;
+		caps.max_request_bytes = 100;
+		CHECK_FALSE(ShouldExternalizeArguments(caps, 1u << 30));
+	}
+	SECTION("only upload URLs v2") {
+		for (int version : {0, 1, 3}) {
+			caps.upload_url_version = version;
+			CHECK_FALSE(ShouldExternalizeArguments(caps, 1u << 20));
+		}
+	}
+	SECTION("never over an advertised VGI-Max-Upload-Bytes") {
+		caps.max_upload_bytes = 5000;
+		CHECK(ShouldExternalizeArguments(caps, 5000));
+		CHECK_FALSE(ShouldExternalizeArguments(caps, 5001));
+	}
+	SECTION("never before discovery") {
+		caps.discovered = false;
+		CHECK_FALSE(ShouldExternalizeArguments(caps, 1u << 20));
+	}
 }

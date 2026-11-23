@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <optional>
 
 #include "duckdb.hpp"
@@ -18,6 +19,7 @@
 #include "vgi_exception.hpp"
 #include "vgi_http_compression.hpp"
 #include "vgi_http_params.hpp"
+#include "vgi_http_request_stats.hpp"
 #include "vgi_httpi.hpp"
 #include "vgi_iroh_native.hpp"
 #include "vgi_logging.hpp"
@@ -843,6 +845,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	}
 	error_context.fields[error_key::kUrl] = RedactCredentials(url);
 	error_context.fields[error_key::kRpcMethod] = method_name;
+	RecordHttpRequestBody(base_url, body.size());
 	auto response_body =
 	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder,
 	                     effective_caps, iroh_config, /*cancellation=*/nullptr, &error_context);
@@ -1344,6 +1347,26 @@ static int ParseUploadUrlVersion(const std::string &value) {
 	return version;
 }
 
+// VGI-Arguments-Ref-Bytes: a positive decimal integer, no sign, no leading
+// zero, at most 19 digits (docs/large-values-3.4.md §5). Anything else is
+// treated as absent (-1).
+int64_t ParseArgumentsRefBytes(const std::string &value) {
+	if (value.empty() || value.size() > 19 || value.front() == '0') {
+		return -1;
+	}
+	uint64_t parsed = 0;
+	for (const auto c : value) {
+		if (c < '0' || c > '9') {
+			return -1;
+		}
+		parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+	}
+	if (parsed > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+		return -1;
+	}
+	return static_cast<int64_t>(parsed);
+}
+
 template <class RESPONSE>
 static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 	ServerCapabilities caps;
@@ -1367,6 +1390,9 @@ static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 			caps.max_upload_bytes = std::stoll(response.GetHeaderValue("VGI-Max-Upload-Bytes"));
 		} catch (...) {
 		}
+	}
+	if (response.HasHeader(kArgumentsRefBytesHeader)) {
+		caps.arguments_ref_bytes = ParseArgumentsRefBytes(response.GetHeaderValue(kArgumentsRefBytesHeader));
 	}
 	// Absent = pre-update server (assume zstd); present-but-empty = speaks no
 	// compression. Both parse to an empty list, so record presence separately.
@@ -1521,6 +1547,22 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 	}
 	auto header_keys = headers_col.child(0).child(0);
 	auto header_values = headers_col.child(0).child(1);
+	// Protocol 3.4 grant columns, by name and optional (STATE_REF_V1.md §10.2):
+	// a client that does not use argument references ignores them.
+	auto object_id_col = result.batch->GetColumnByName("object_id");
+	auto ref_col = result.batch->GetColumnByName("ref");
+	if (ref_col && ref_col.storage_type() != NANOARROW_TYPE_BINARY &&
+	    ref_col.storage_type() != NANOARROW_TYPE_LARGE_BINARY) {
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI upload URL response column ref must be binary, got %s [url: %s]", ref_col.type_string(),
+		                  base_url);
+	}
+	if (object_id_col && object_id_col.storage_type() != NANOARROW_TYPE_STRING &&
+	    object_id_col.storage_type() != NANOARROW_TYPE_LARGE_STRING) {
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI upload URL response column object_id must be utf8, got %s [url: %s]",
+		                  object_id_col.type_string(), base_url);
+	}
 
 	std::vector<UploadUrl> urls;
 	for (int64_t i = 0; i < result.batch->num_rows(); i++) {
@@ -1531,6 +1573,14 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 			                  static_cast<long long>(i), base_url);
 		}
 		UploadUrl url {upload_col.GetString(i), download_col.GetString(i), {}};
+		if (object_id_col && !object_id_col.IsNull(i)) {
+			url.object_id = object_id_col.GetString(i);
+		}
+		if (ref_col && !ref_col.IsNull(i)) {
+			const auto ref = ref_col.GetView(i);
+			url.ref.assign(ref.begin(), ref.end());
+			url.has_ref = true;
+		}
 		int64_t begin = 0;
 		int64_t end = 0;
 		headers_col.ListRange(i, begin, end);
@@ -1576,6 +1626,11 @@ static std::string StorageErrorCode(const std::string &body) {
 
 void HttpPutBytes(ClientContext &context, const std::string &url, const std::vector<uint8_t> &data,
                   HttpEncoding encoding, const std::vector<std::pair<std::string, std::string>> &extra_headers) {
+	HttpPutBytes(context, url, data.data(), data.size(), encoding, extra_headers);
+}
+
+void HttpPutBytes(ClientContext &context, const std::string &url, const uint8_t *data, size_t size,
+                  HttpEncoding encoding, const std::vector<std::pair<std::string, std::string>> &extra_headers) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 	// A pre-signed upload URL: no secrets (see vgi_http_params.hpp).
@@ -1586,12 +1641,12 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const std::vec
 	headers.Insert("User-Agent", SecretFreeUserAgent(context));
 	std::string content_type = "application/octet-stream";
 
-	const uint8_t *body_data = data.data();
-	size_t body_size = data.size();
+	const uint8_t *body_data = data;
+	size_t body_size = size;
 	std::vector<uint8_t> compressed;
 
 	if (encoding != HttpEncoding::NONE) {
-		compressed = Compress(encoding, data.data(), data.size());
+		compressed = Compress(encoding, data, size);
 		body_data = compressed.data();
 		body_size = compressed.size();
 		headers.Insert("Content-Encoding", EncodingName(encoding));
@@ -1642,6 +1697,71 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const std::vec
 	}
 }
 
+bool ShouldExternalizeArguments(const ServerCapabilities &caps, uint64_t arguments_size) {
+	// The header is the capability signal: without it, never.
+	if (!caps.discovered || caps.arguments_ref_bytes <= 0 || caps.upload_url_version != kUploadUrlProtocolVersion) {
+		return false;
+	}
+	uint64_t threshold = static_cast<uint64_t>(caps.arguments_ref_bytes);
+	if (caps.max_request_bytes > 0) {
+		// M / 4 in integer division; an unset (or <= 0) cap counts as infinite.
+		threshold = std::min(threshold, static_cast<uint64_t>(caps.max_request_bytes) / 4);
+	}
+	if (arguments_size <= threshold) {
+		return false;
+	}
+	// Over the upload cap: an upload would be refused. Left inline, the bind
+	// takes the ordinary path (and its whole-request upload, which refuses it
+	// with a clear message when it does not fit either).
+	if (caps.max_upload_bytes > 0 && arguments_size > static_cast<uint64_t>(caps.max_upload_bytes)) {
+		return false;
+	}
+	return true;
+}
+
+UploadedArguments UploadArgumentsForReference(ClientContext &context, const std::string &base_url,
+                                              const uint8_t *data, size_t size,
+                                              const std::shared_ptr<CatalogAuth> &auth,
+                                              const std::shared_ptr<IrohClientConfig> &iroh_config) {
+	const auto started = std::chrono::steady_clock::now();
+	UploadedArguments uploaded;
+	uploaded.size = static_cast<int64_t>(size);
+	uploaded.sha256_hex = VgiSha256Hex(data, size);
+	// The grant is requested with the same credentials and connection settings
+	// as the bind that presents its ref: both feed the worker's ARGREF AAD.
+	auto urls = HttpRequestUploadUrls(context, base_url, {UploadRequest {uploaded.size, uploaded.sha256_hex}}, auth,
+	                                  iroh_config);
+	if (urls.empty()) {
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI server returned no upload URLs [url: %s]", base_url);
+	}
+	if (!urls[0].has_ref || urls[0].ref.empty()) {
+		throw IOException(BuildHttpExtraInfo(http_error::kProtocolViolation, base_url),
+		                  "VGI server advertises %s but its upload grant carries no argument reference (column "
+		                  "'ref'); upgrade the worker [url: %s]",
+		                  kArgumentsRefBytesHeader, base_url);
+	}
+	if (!ExternalLocationUrlAllowed(urls[0].upload_url)) {
+		throw IOException(BuildHttpExtraInfo(http_error::kUnsupported, base_url),
+		                  "VGI server vended an upload URL that is not https:// (plain http is accepted only for "
+		                  "a loopback host with %s=1) [url: %s]",
+		                  kAllowLoopbackExternalLocationsEnv, RedactPresignedUrl(urls[0].upload_url));
+	}
+	// Exactly the hashed bytes, uncompressed, straight from the caller's buffer.
+	HttpPutBytes(context, urls[0].upload_url, data, size, HttpEncoding::NONE, urls[0].upload_headers);
+	uploaded.ref = std::move(urls[0].ref);
+
+	const auto normalized = NormalizeBaseUrl(base_url);
+	RecordArgumentsRefUpload(normalized, size);
+	const auto elapsed_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+	VGI_LOG(context, "arguments_ref.upload",
+	        {{"url", RedactCredentials(normalized)},
+	         {"size", std::to_string(size)},
+	         {"ms", std::to_string(elapsed_ms)}});
+	return uploaded;
+}
+
 bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base_url, std::vector<uint8_t> &body,
                                  const ServerCapabilities &caps, const std::shared_ptr<CatalogAuth> &auth,
                                  const std::shared_ptr<IrohClientConfig> &iroh_config) {
@@ -1674,8 +1794,10 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 	}
 	// The pointer keeps the request's schema and every metadata key (method,
 	// protocol, state tokens, validators): the server routes and reads tokens
-	// from the outer batch, then resolves the pointer for the payload.
-	auto reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(VgiBuffer::Copy(body.data(), body.size())));
+	// from the outer batch, then resolves the pointer for the payload. The
+	// reader borrows `body` (no copy); both are released before `body` is
+	// replaced below.
+	auto reader = VgiIpcReader::Open(std::make_shared<VgiBufferReader>(VgiBuffer::Wrap(body.data(), body.size())));
 	auto request_batch = reader->ReadNext();
 	if (!request_batch) {
 		throw InternalException("vgi: request body to externalize holds no batch [url: %s]", base_url);
@@ -1700,8 +1822,8 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 			return false;
 		}
 	}
-	const std::string body_view(reinterpret_cast<const char *>(body.data()), body.size());
-	const auto body_sha256 = VgiSha256Hex(body_view);
+	// Hashed in place: no copy of a possibly large body.
+	const auto body_sha256 = VgiSha256Hex(body.data(), body.size());
 	auto urls = HttpRequestUploadUrls(context, base_url, {UploadRequest {static_cast<int64_t>(body.size()), body_sha256}},
 	                                  auth, iroh_config);
 	if (urls.empty()) {
@@ -1727,7 +1849,13 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 	metadata.Set(RPC_LOCATION_SHA256_KEY, body_sha256);
 	auto pointer = VgiBatch::MakeEmpty(request_batch->schema());
 	const auto inline_bytes = body.size();
-	body = SerializeBatch(*pointer, &metadata)->ToVector();
+	auto pointer_body = SerializeBatch(*pointer, &metadata)->ToVector();
+	// Drop everything that borrows the old body before it is freed.
+	pointer.reset();
+	request_batch.reset();
+	reader.reset();
+	body = std::move(pointer_body);
+	RecordHttpRequestUpload(NormalizeBaseUrl(base_url), inline_bytes);
 	VGI_STDERR_DEBUG("[VGI] http.request_externalized url=%s inline_bytes=%llu pointer_bytes=%llu\n", base_url.c_str(),
 	                 static_cast<unsigned long long>(inline_bytes), static_cast<unsigned long long>(body.size()));
 	return true;

@@ -12,19 +12,27 @@ extern "C" void duckdb_wasm_sha256(const void *data, int len, void *out_hash);
 namespace duckdb {
 namespace vgi {
 
-std::string VgiSha256Raw(const std::string &bytes) {
-#if defined(__EMSCRIPTEN__)
+std::string VgiSha256Raw(const void *data, size_t size) {
 	std::string out(32, '\0');
-	duckdb_wasm_sha256(bytes.data(), static_cast<int>(bytes.size()), &out[0]);
-	return out;
+#if defined(__EMSCRIPTEN__)
+	duckdb_wasm_sha256(data, static_cast<int>(size), &out[0]);
 #else
-	return duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes);
+	duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(static_cast<const char *>(data), size, &out[0]);
 #endif
+	return out;
+}
+
+std::string VgiSha256Raw(const std::string &bytes) {
+	return VgiSha256Raw(bytes.data(), bytes.size());
 }
 
 std::string VgiSha256Hex(const std::string &bytes) {
+	return VgiSha256Hex(bytes.data(), bytes.size());
+}
+
+std::string VgiSha256Hex(const void *data, size_t size) {
 	static const char kHex[] = "0123456789abcdef";
-	const std::string raw = VgiSha256Raw(bytes);
+	const std::string raw = VgiSha256Raw(data, size);
 	std::string hex;
 	hex.reserve(raw.size() * 2);
 	for (unsigned char c : raw) {

@@ -586,17 +586,30 @@ VGI_HTTP_VENDOR_SUITE = "test/sql/integration/*" \
 VGI_HTTP_VENDOR_ENV = PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" \
 	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)"
 
+# The protocol 3.4 large-value files (test/sql/external_storage/arguments_ref*.test)
+# skip until the worker, fixture server and fake vendor provide what they need
+# (docs/testing/blob-test-catalog.md, "Protocol 3.4 large values"), and
+# fetch_loopback_refused.test needs the loopback hook unset, which this lane
+# always sets. These are the reasons this lane expects; any other skip fails it. Drop a reason, and set its
+# variable in VGI_HTTP_VENDOR_ENV, once the pinned vgi-python / vgi-rpc ship it.
+VGI_HTTP_VENDOR_EXPECTED_SKIPS := \
+	--allow-skip 'require-env-not VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS' \
+	--allow-skip 'require-env VGI_WORKER_ARGUMENTS_REF' \
+	--allow-skip 'require-env VGI_WORKER_INIT_STATE_REF' \
+	--allow-skip 'require-env VGI_FAKE_VENDOR_DELETE_ROUTE'
+
 test_http_vendor: test_http_vendor_external
 	$(VGI_HTTP_VENDOR_ENV) ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)
 
 test_http_vendor_debug:
 	$(VGI_HTTP_VENDOR_ENV) BUILD_DIR=debug \
-	    ./test/run_http_vendor_integration.sh "test/sql/external_storage/*" -j 1
+	    ./test/run_http_vendor_integration.sh "test/sql/external_storage/*" -j 1 $(VGI_HTTP_VENDOR_EXPECTED_SKIPS)
 	$(VGI_HTTP_VENDOR_ENV) BUILD_DIR=debug ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)
 
 # Just the targeted externalization tests, against the vendor.
 test_http_vendor_external:
-	$(VGI_HTTP_VENDOR_ENV) ./test/run_http_vendor_integration.sh "test/sql/external_storage/*" -j 1
+	$(VGI_HTTP_VENDOR_ENV) ./test/run_http_vendor_integration.sh "test/sql/external_storage/*" -j 1 \
+	    $(VGI_HTTP_VENDOR_EXPECTED_SKIPS)
 
 # Container (OCI/Docker) transport tests (uses test/run_docker_integration.sh).
 # Skips cleanly when no container runtime is present, so it's safe to run
