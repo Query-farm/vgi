@@ -4,8 +4,8 @@
 # dependencies = [
 #   "cryptography>=43",
 #   "pyarrow>=18",
-#   "vgi-python @ git+https://github.com/Query-farm/vgi-python@85ae674bb83aa3d3eb0b05e01c7b5ceb0984b6cd",
-#   "vgi-rpc[http] @ git+https://github.com/Query-farm/vgi-rpc-python@f0fb6754ae5b70900ba21629a1e2d48eb2182774",
+#   "vgi-python @ git+https://github.com/Query-farm/vgi-python@33099b4c194bb7b7ebb07e9fdddeed2f8f33b638",
+#   "vgi-rpc[http] @ git+https://github.com/Query-farm/vgi-rpc-python@6a21ee3b2fb21d9c348c9b615fd97dce8e0bb852",
 # ]
 # ///
 # Copyright 2025, 2026 Query Farm LLC - https://query.farm
