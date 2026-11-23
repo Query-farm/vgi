@@ -54,9 +54,11 @@
 
 # protocol-3.4 branch (upload URLs v2: sized client PUTs, upload fault and
 # refusal counters; client-upload counters and an upload fault limited to
-# client uploads, both keyed on origin="client_upload"; signal logging).
+# client uploads, both keyed on origin="client_upload"; signal logging; the
+# StateRef counters puts_state_ref/gets_state_ref/gets_upload and the
+# /__admin__/delete?origin= route the protocol 3.4 large-value tests use).
 # TODO(release-wave): pin the released vgi-rpc.
-: "${VGI_RPC_FAKE_VENDOR_REF:=f0fb6754ae5b70900ba21629a1e2d48eb2182774}"
+: "${VGI_RPC_FAKE_VENDOR_REF:=6a21ee3b2fb21d9c348c9b615fd97dce8e0bb852}"
 : "${VGI_RPC_FAKE_VENDOR_FROM:=git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}}"
 : "${VGI_BLOB_VENDOR_TOKEN:=test-token}"
 

@@ -78,7 +78,8 @@ benchmark_compare:
 	python3 benchmarks/bench.py compare $(BENCH_ARGS)
 
 # vgi-python checkout that provides the fixture workers below (exported: the
-# HTTP / AF_UNIX integration scripts read it too).
+# HTTP / AF_UNIX integration scripts read it too). The vendor lanes
+# (test_http_vendor*) need protocol-3.4 9016837 or later: see VGI_HTTP_VENDOR_ENV.
 VGI_PYTHON_DIR ?= $(HOME)/Development/vgi-python
 export VGI_PYTHON_DIR
 
@@ -583,20 +584,23 @@ VGI_HTTP_VENDOR_SUITE = "test/sql/integration/*" \
 	    "test/sql/engine_features/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
-VGI_HTTP_VENDOR_ENV = PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" \
-	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)"
-
+#
 # The protocol 3.4 large-value files (test/sql/external_storage/arguments_ref*.test)
-# skip until the worker, fixture server and fake vendor provide what they need
-# (docs/testing/blob-test-catalog.md, "Protocol 3.4 large values"), and
+# run here: VGI_WORKER_ARGUMENTS_REF, VGI_WORKER_INIT_STATE_REF and
+# VGI_FAKE_VENDOR_DELETE_ROUTE (docs/testing/blob-test-catalog.md, "Protocol 3.4
+# large values") say the worker and the fake vendor provide what they need. So
+# this lane REQUIRES a VGI_PYTHON_DIR at vgi-python protocol-3.4 9016837 or later
+# (argument references, init StateRef, the large-value blob_test fixtures) and
+# the fake vendor pinned in test/start_fake_blob_vendor.sh (vgi-rpc 6a21ee3+).
+# An older vgi-python fails these files rather than skipping them.
+VGI_HTTP_VENDOR_ENV = PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" \
+	VGI_EXTERNAL_PROBE_WORKER="$(VGI_EXTERNAL_PROBE_WORKER)" \
+	VGI_WORKER_ARGUMENTS_REF=1 VGI_WORKER_INIT_STATE_REF=1 VGI_FAKE_VENDOR_DELETE_ROUTE=1
+
 # fetch_loopback_refused.test needs the loopback hook unset, which this lane
-# always sets. These are the reasons this lane expects; any other skip fails it. Drop a reason, and set its
-# variable in VGI_HTTP_VENDOR_ENV, once the pinned vgi-python / vgi-rpc ship it.
+# always sets. That is the one skip this lane expects; any other skip fails it.
 VGI_HTTP_VENDOR_EXPECTED_SKIPS := \
-	--allow-skip 'require-env-not VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS' \
-	--allow-skip 'require-env VGI_WORKER_ARGUMENTS_REF' \
-	--allow-skip 'require-env VGI_WORKER_INIT_STATE_REF' \
-	--allow-skip 'require-env VGI_FAKE_VENDOR_DELETE_ROUTE'
+	--allow-skip 'require-env-not VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS'
 
 test_http_vendor: test_http_vendor_external
 	$(VGI_HTTP_VENDOR_ENV) ./test/run_http_vendor_integration.sh $(VGI_HTTP_VENDOR_SUITE)

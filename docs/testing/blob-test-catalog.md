@@ -261,7 +261,10 @@ server and the fake vendor than the files above, so each declares what it
 needs with `require-env`, and a lane sets the variable once its worker or
 vendor provides it. Until then the file skips with that reason, and the lane
 lists the reason as expected (`--allow-skip`), so the skip is visible and a
-new, unlisted one still fails the lane.
+new, unlisted one still fails the lane. The extension's own vendor lane
+(`make test_http_vendor`) sets all three, so it needs vgi-python
+`protocol-3.4` 9016837 or later and the fake vendor pinned in
+`test/start_fake_blob_vendor.sh` (vgi-rpc 6a21ee3 or later).
 
 | Variable | Set by the lane when | Files |
 |---|---|---|
