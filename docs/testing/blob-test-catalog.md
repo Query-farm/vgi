@@ -284,7 +284,7 @@ file's own worker server only):
   `VGI-Arguments-Ref-Bytes` (so it behaves like a worker without argument
   references, while still offering upload URLs v2). A worker without
   argument-reference support ignores it. Used by `arguments_ref_fallback.test`.
-- `VGI_RPC_STATE_REF_INLINE_BYTES=2048`: vgi-rpc's `StateRef` inline limit (STATE_REF_V1.md §9), so a ~5 KB init takes the stored form whatever the turn budget. Used by `arguments_ref_state_ref.test`.
+- `VGI_RPC_STATE_REF_INLINE_BYTES=256`: vgi-rpc's `StateRef` inline limit (STATE_REF_V1.md §9), below any SDK's compressed init request, so the init takes the stored form whatever its size or the turn budget. Used by `arguments_ref_state_ref.test`.
 - `VGI_RPC_OBJECT_CACHE_BYTES=1`: vgi-rpc's object-cache bound
   (STATE_REF_V1.md §11), so every resolve is a vendor GET (a cold cache). Used
   by `arguments_ref_prepared.test`.
@@ -326,7 +326,7 @@ SDK-neutral contract every SDK's fixture worker set serves):
 |---|---|
 | `arguments_ref.test` | An 8 MiB argument goes up once (`client_uploads` +1, of about the argument's size) and travels by reference: no whole-request upload and every request under 16 KiB (`vgi_http_request_stats`); a small argument stays inline. A 60-batch producer on it never needs a whole-request upload and keeps every turn under 16 KiB. A scalar with a large constant parameter uploads it once. A serialized-plan rebind (`blob_param_table` under `debug_verify_serializer`, which replaces each plan with its deserialized copy) reuses the reference (`arguments_ref_reuses`) and never trips "Repeatable VGI source bind state changed"; a recursive CTE over it uploads once. |
 | `arguments_ref_streams.test` | Eight parallel streams on one 8 MiB argument: one client upload and one worker GET (`gets_upload` +1). |
-| `arguments_ref_state_ref.test` | A 1000-value IN list over `example.echo` makes the init request larger than the inline limit (pinned to 2 KiB with `VGI_RPC_STATE_REF_INLINE_BYTES`): the worker stores it once (`puts_state_ref` +1) and no turn needs a whole-request upload. |
+| `arguments_ref_state_ref.test` | With the inline limit pinned to 256 bytes (`VGI_RPC_STATE_REF_INLINE_BYTES`), a scan over `example.echo` (with a 1000-value IN list, whether or not DuckDB pushes it into the init) stores its init once (`puts_state_ref` +1), returns exact results, and no request needs a whole-request upload. |
 | `arguments_ref_prepared.test` | With the object deleted and a cold worker cache, `EXECUTE` of a prepared statement fails with "this prepared statement's large argument has expired; prepare it again", without uploading again; preparing it again works. |
 | `arguments_ref_errors.test` | A tampered `ref` fails with `invalid_arguments_ref`; both or neither of `arguments` / `arguments_location` fail with "BindRequest must set exactly one of 'arguments' and 'arguments_location'". |
 | `arguments_ref_fallback.test` | A worker that does not send `VGI-Arguments-Ref-Bytes` gets the arguments inline; an over-cap bind takes the whole-request upload, as before 3.4. |

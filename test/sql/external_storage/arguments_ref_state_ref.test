@@ -1,25 +1,21 @@
 # name: test/sql/external_storage/arguments_ref_state_ref.test
-# description: A scan whose init request is large (a 1000-value IN list) carries it as a stored init StateRef (protocol 3.4)
+# description: A scan's init request goes into the worker's cursor as a stored init StateRef, stored once (protocol 3.4)
 # group: [vgi_external_storage]
 #
 # Lane: make test_http_vendor, with a worker that carries its init request as
 # a vgi-rpc StateRef in its cursor (docs/large-values-3.4.md §6) and a fake
 # vendor with the StateRef counters (vgi-rpc STATE_REF_V1.md §10.3). The lane
-# sets VGI_WORKER_INIT_STATE_REF=1 for such a worker; until vgi-python ships it
-# this file skips with that reason, which the lane lists as expected.
+# sets VGI_WORKER_INIT_STATE_REF=1 for such a worker.
 #
-# A 1000-value IN list of random 64-bit keys (~8 KB raw, ~5 KB compressed)
-# pushes the init over the inline limit (STATE_REF_V1.md §9): the
-# worker stores the init once (`puts_state_ref`, a server write, not a client
-# upload) and every continuation carries the ~130-byte tag. The filters and
-# join keys live in the init request, so this is how they stay out of every
-# turn. No turn needs a whole-request upload.
+# SDK-neutral by construction: the worker's StateRef inline limit is pinned to
+# 256 bytes, below any SDK's compressed init request (the bind call and output
+# schema alone exceed it), so the init takes the stored form whatever its exact
+# size and whether or not DuckDB pushed the IN list into it. The file asserts
+# behaviour, never one SDK's sizes: the worker stores the init exactly once
+# (`puts_state_ref` +1, a server write, not a client upload), every request
+# stays under the cap with no whole-request upload, and the results are exact.
 #
-# The inline limit is pinned below the init's size so the stored form does not
-# depend on the turn budget's exact value (VGI no longer uses the call token's
-# call_state slot, which leaves a ~5 KB init inline under the default budget).
-#
-# server-env: VGI_RPC_STATE_REF_INLINE_BYTES=2048
+# server-env: VGI_RPC_STATE_REF_INLINE_BYTES=256
 
 require-env VGI_WORKER_INIT_STATE_REF
 
@@ -62,7 +58,7 @@ WHERE n IN (3401847184194973110, 3695013261937116371, 1803275565920821062, 34636
 statement ok
 CREATE TABLE s1 AS SELECT * FROM read_json_auto('${VGI_BLOB_VENDOR_URL}/__stats__');
 
-# One stream, so the init is stored exactly once.
+# One stream, so the init is stored exactly once; continuations carry the tag.
 query II
 SELECT s1.puts_state_ref - s0.puts_state_ref, s1.client_uploads = s0.client_uploads FROM s0, s1;
 ----
