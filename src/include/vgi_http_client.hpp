@@ -40,7 +40,7 @@ constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.str
 // secret manager, which deadlocks under the MetaTransaction mutex
 // (duckdb/duckdb#22258).
 // client_holder, caps: as for HttpPostArrowIpc. Callers with a per-catalog
-// ServerCapabilitiesCache should load, pass and store back `caps` so the codec
+// ProtocolSession should load, pass and store back `caps` so the codec
 // choice is learned once per catalog, not per RPC.
 // protocol: selects both the URL's protocol segment and the vgi_rpc.protocol
 // routing key (the server requires them to agree). Reserved methods (`__x__`)
@@ -190,7 +190,6 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
                                                    const std::string &conn_id_hex = "");
 
 // The upload-URL protocol version this client speaks (VGI-Upload-URL-Support).
-inline constexpr int kUploadUrlProtocolVersion = 2;
 
 // One upload to request from __upload_url__/init (v2): the exact byte length
 // and lowercase hex SHA-256 of the body the client will PUT.

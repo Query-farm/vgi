@@ -1,0 +1,32 @@
+# name: test/sql/protocol_negotiation/attach_negotiated.test
+# description: ATTACH negotiates the protocol version, then queries work
+# group: [vgi_protocol_negotiation]
+#
+# Protocol version negotiation v1 (docs/protocol_versions.md): a worker in the
+# extension's window attaches and serves queries exactly as before. Over a
+# byte transport the worker's ranges come from its reflection answer, over HTTP
+# from VGI-Protocol-Versions; a worker released before negotiation advertises
+# neither and is spoken to at the extension's own version.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS pn (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT count(*) FROM pn.sequence(5);
+----
+5
+
+# The worker's hosted protocols still list the main protocol.
+query I
+SELECT count(*) > 0 FROM vgi_protocols(catalog := 'pn') WHERE protocol_name = 'vgi.v3';
+----
+true
+
+statement ok
+DETACH pn;

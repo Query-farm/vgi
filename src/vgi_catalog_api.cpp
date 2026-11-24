@@ -34,6 +34,8 @@
 #include "vgi_logging.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_protocol_constants.hpp"
+#include "vgi_protocol_codec.hpp"
+#include "vgi_reflection.hpp"
 
 #include <cstdlib>
 #include <deque>
@@ -277,14 +279,14 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 			opts.http_client_pool = ctx.params->GetOrInitHttpClientPool();
 			// Shared with the streaming connections: whichever first sees
 			// VGI-Supported-Encodings settles the codec for both.
-			opts.server_caps = ctx.params->server_caps();
+			opts.protocol_session = ctx.params->protocol_session();
 		} else if (IsContainerSharedLocation(ctx.params->worker_path())) {
 			// An oci:// container served over HTTP needs the same caches: without
 			// them each RPC re-probes /health and does a secret lookup, which
 			// throws inside VgiTransaction::Start (catalog_transaction_begin).
 			opts.cached_http_params = ctx.params->GetOrInitHttpParams(
 			    context, ctx.params->worker_path(), RequiresSingleAttemptUnary(method_name));
-			opts.server_caps = ctx.params->server_caps();
+			opts.protocol_session = ctx.params->protocol_session();
 		}
 		// Launcher overrides (`launch:` LOCATIONs only).
 		if (ctx.params->launcher_idle_timeout_seconds().has_value()) {
@@ -294,8 +296,13 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		if (ctx.params->launcher_state_dir().has_value()) {
 			opts.launcher_state_dir = *ctx.params->launcher_state_dir();
 		}
-		opts.protocol = protocol;
+		// The version this endpoint negotiated; its codec translates the reply
+		// back to the current version (identity for 3.4).
+		opts.protocol = NegotiatedProtocol(ctx.params->protocol_session().get(), protocol);
 		auto result = InvokePooledUnaryRpc(opts, method_name, params);
+		if (const auto *codec = IsReservedRpcMethod(method_name) ? nullptr : RequestCodec(opts.protocol)) {
+			codec->DecodeResponse(method_name, result);
+		}
 		instr.MarkOk();
 		return result;
 	} catch (const std::exception &e) {
@@ -330,9 +337,12 @@ static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &metho
 // Non-vgi.v3 protocols (vgi_rpc.Reflection.v1, ...)
 
 VgiBatchPtr InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
-                                                        const VgiProtocolId &protocol, const std::string &method_name,
-                                                        const VgiBatchPtr &params) {
+                                const VgiProtocolId &protocol, const std::string &method_name,
+                                const VgiBatchPtr &params, VgiMetadataPtr *response_metadata) {
 	auto response = InvokeRpcMethod(ctx, method_name, params, context, protocol);
+	if (response_metadata) {
+		*response_metadata = response.metadata;
+	}
 	const auto &worker_path = ctx.params->worker_path();
 	const std::string protocol_name(protocol.name);
 	auto reflection_violation = [&]() {
@@ -371,13 +381,77 @@ VgiBatchPtr InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &con
 	return payload;
 }
 
-VgiBatchPtr InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
-                                                                  ClientContext &context) {
+VgiBatchPtr InvokeReflectionListProtocols(const CatalogRpcContext &ctx, ClientContext &context,
+                                          VgiMetadataPtr *response_metadata) {
 	// Reflection declares no protocol_version and is exempt from the version
 	// gate, so the request carries the routing key and no version.
 	static constexpr VgiProtocolId kReflection {REFLECTION_PROTOCOL_NAME, ""};
-	return InvokeProtocolUnary(ctx, context, kReflection, "list_protocols", nullptr);
+	return InvokeProtocolUnary(ctx, context, kReflection, "list_protocols", nullptr, response_metadata);
 }
+
+// ---------------------------------------------------------------------------
+// Protocol version negotiation at ATTACH (docs/protocol_versions.md)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool HeaderTransport(const std::string &worker_path) {
+	return IsHttpTransport(worker_path) || IsHttpiTransport(worker_path) || IsContainerSharedLocation(worker_path);
+}
+
+// Byte transports: the worker's ranges from its reflection answer, before any
+// other call. vgi_rpc.protocol_versions when the worker sends it; otherwise
+// (a worker released before negotiation) the exact versions its listing
+// declares. A worker without reflection, or one whose answer fails, leaves the
+// ranges unknown: requests then carry the client's own version, as before.
+void LearnRangesFromReflection(const CatalogRpcContext &ctx, ClientContext &context) {
+	std::string advertised;
+	VgiProtocolListing listing;
+	try {
+		listing = InvokeListProtocols(ctx, context, /*tolerate_pre_reflection=*/true, &advertised);
+	} catch (const InterruptException &) {
+		throw;
+	} catch (const std::exception &e) {
+		VGI_LOG(context, "protocol.reflection_unavailable",
+		        {{"worker_path", ctx.params->worker_path()}, {"error", e.what()}});
+		return;
+	}
+	std::optional<ProtocolRanges> ranges;
+	if (!advertised.empty()) {
+		ranges = ParseProtocolRanges(advertised);
+	}
+	if (!ranges && !listing.predates_reflection) {
+		ProtocolRanges declared;
+		for (const auto &p : listing.protocols) {
+			if (auto v = ParseProtocolVersion(p.version)) {
+				declared[p.name] = ProtocolRange {*v, *v};
+			}
+		}
+		if (!declared.empty()) {
+			ranges = std::move(declared);
+		}
+	}
+	VGI_LOG(context, "protocol.server_ranges",
+	        {{"worker_path", ctx.params->worker_path()},
+	         {"source", !advertised.empty() ? "vgi_rpc.protocol_versions" : "reflection listing"},
+	         {"ranges", ranges ? FormatProtocolRanges(*ranges) : std::string("unknown")}});
+	if (ranges) {
+		ctx.params->protocol_session()->ObserveServerRanges(*ranges);
+	}
+}
+
+[[noreturn]] void ThrowDisjointProtocol(const ProtocolNegotiation &negotiation, const std::string &worker_path) {
+	const std::string name(VGI_MAIN_PROTOCOL.name);
+	ErrorInfo info;
+	info.Set(error_key::kErrorKind, kProtocolVersionUnsupportedKind)
+	    .Set("client_protocol_versions", name + "=" + negotiation.client.ToString())
+	    .Set("server_protocol_versions",
+	         negotiation.server ? name + "=" + negotiation.server->ToString() : std::string())
+	    .Worker(worker_path, -1, "");
+	throw InvalidInputException(info, DisjointProtocolMessage(name, negotiation, worker_path));
+}
+
+} // namespace
 
 // Typed catalog RPCs
 
@@ -450,7 +524,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	                                    std::shared_ptr<void> worker_artifact_anchor,
 	                                    const std::string &tcp_proxy,
 	                                    std::shared_ptr<IrohClientConfig> iroh,
-	                                    ServerCapabilities *discovered_capabilities) {
+	                                    std::shared_ptr<ProtocolSession> *session_out) {
 	// Launcher overrides must reach temp_params, as in InvokeCatalogs.
 	VgiAttachParametersConfig temp_cfg;
 	temp_cfg.worker_path = worker_path;
@@ -478,14 +552,63 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	auto request_batch = BuildCatalogAttachRequest(catalog_name, options_ipc_bytes, data_version_spec, implementation_version, query_offered);
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 	auto params = generated::BuildCatalogAttachParams(request_bytes);
-	auto response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
+
+	auto &session = *temp_params->protocol_session();
+	const std::string main_protocol(VGI_MAIN_PROTOCOL.name);
+	if (!HeaderTransport(worker_path)) {
+		LearnRangesFromReflection(ctx, context);
+	}
+	// Before anything else when the ranges are already known (byte transports);
+	// over HTTP they arrive with the first response, so this is ASSUMED here.
+	auto negotiation = session.Negotiate(main_protocol);
+	if (negotiation.outcome == ProtocolNegotiation::Outcome::DISJOINT) {
+		ThrowDisjointProtocol(negotiation, worker_path);
+	}
+
+	UnaryResponseResult response;
+	try {
+		response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
+	} catch (const InterruptException &) {
+		throw;
+	} catch (const std::exception &e) {
+		// What the refusal (or, over HTTP, any response's header) says the
+		// worker speaks.
+		if (auto refused = RangesFromRefusal(e)) {
+			session.ObserveServerRanges(*refused);
+		}
+		const auto sent = session.Version(main_protocol);
+		negotiation = session.Negotiate(main_protocol);
+		if (negotiation.outcome == ProtocolNegotiation::Outcome::DISJOINT) {
+			ThrowDisjointProtocol(negotiation, worker_path);
+		}
+		if (!IsProtocolVersionRefusal(e) || negotiation.outcome != ProtocolNegotiation::Outcome::AGREED ||
+		    negotiation.version == sent) {
+			// Not a version problem, or nothing better to offer: the worker's
+			// own error stands.
+			throw;
+		}
+		// catalog_attach is idempotent: one retry at the negotiated version.
+		VGI_LOG(context, "protocol.retry_negotiated",
+		        {{"worker_path", worker_path},
+		         {"protocol", main_protocol},
+		         {"refused", sent.ToString()},
+		         {"retry", negotiation.version.ToString()}});
+		response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
+	}
+	// Record what was agreed (HTTP learns the ranges on that first response).
+	negotiation = session.Negotiate(main_protocol);
+	VGI_LOG(context, "protocol.negotiated",
+	        {{"worker_path", worker_path},
+	         {"protocol", main_protocol},
+	         {"version", session.Version(main_protocol).ToString()},
+	         {"server", negotiation.server ? negotiation.server->ToString() : std::string("unknown")}});
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_attach", worker_path);
 	if (!result_batch) {
 		throw IOException(CatalogProtocolViolation("catalog_attach", worker_path), "Empty response from catalog_attach [worker: %s]", worker_path);
 	}
 	auto result = ParseCatalogAttachResult(result_batch, worker_path, context, query_offered);
-	if (discovered_capabilities) {
-		*discovered_capabilities = temp_params->LoadServerCapabilities();
+	if (session_out) {
+		*session_out = temp_params->protocol_session();
 	}
 	return result;
 }

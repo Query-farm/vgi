@@ -441,6 +441,7 @@ remain supported. Preserve this rule when changing pool/connection cleanup.
 | External locations: fetch hardening, request upload, vendor lane | `docs/external_locations.md` |
 | Shared-memory transport | `docs/shm_transport.md` |
 | Protocol routing | `docs/protocol_routing.md` |
+| Protocol version negotiation (`ProtocolSession`, codecs, supported window) | `docs/protocol_versions.md` |
 | Catalog profiling | `docs/catalog_profiling.md` |
 | `catalog_contents` | `docs/catalog_contents.md` |
 | Secret ATTACH options | `docs/attach_credentials.md` |

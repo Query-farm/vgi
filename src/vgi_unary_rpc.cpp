@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_unary_rpc.hpp"
 
+#include <exception>
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -18,6 +19,7 @@
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_retry.hpp"
+#include "vgi_protocol_session.hpp"
 #if defined(__EMSCRIPTEN__)
 #include "vgi_webworker_function_connection.hpp" // WebWorkerInvokeUnary (worker: unary branch)
 #endif
@@ -36,6 +38,23 @@
 
 namespace duckdb {
 namespace vgi {
+
+namespace {
+
+// A failed HTTP call still taught something: the capability headers (and
+// VGI-Protocol-Versions) of the response that refused it, which protocol
+// negotiation reads. The success path stores the snapshot itself.
+struct HarvestOnFailure {
+	ProtocolSession *session;
+	const ServerCapabilities &caps;
+	~HarvestOnFailure() {
+		if (session && std::uncaught_exceptions() > 0) {
+			session->Store(caps);
+		}
+	}
+};
+
+} // namespace
 
 namespace {
 
@@ -150,16 +169,17 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 		}
 		// Snapshot in to pick the request codec; refreshed from the response.
 		ServerCapabilities caps;
-		if (opts.server_caps) {
-			caps = opts.server_caps->Load();
+		if (opts.protocol_session) {
+			caps = opts.protocol_session->Load();
 		}
+		HarvestOnFailure harvest_on_failure {opts.protocol_session.get(), caps};
 		auto result = HttpInvokeUnary(
 		    opts.context, opts.worker_path, method_name, params, opts.auth, opts.cookie_jar, opts.cached_http_params,
 		                              /*execution_id_hex=*/"", /*attach_opaque_data_digest=*/"",
 		    /*transaction_opaque_data_digest=*/"", /*conn_id_hex=*/"", opts.protocol,
-		    opts.http_client_pool ? &pooled : nullptr, opts.server_caps ? &caps : nullptr, opts.iroh);
-		if (opts.server_caps) {
-			opts.server_caps->Store(caps);
+		    opts.http_client_pool ? &pooled : nullptr, opts.protocol_session ? &caps : nullptr, opts.iroh);
+		if (opts.protocol_session) {
+			opts.protocol_session->Store(caps);
 		}
 		if (opts.http_client_pool) {
 			opts.http_client_pool->Return(std::move(pooled));
@@ -168,22 +188,23 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 	}
 	if (IsHttpiTransport(opts.worker_path)) {
 		ServerCapabilities caps;
-		if (opts.server_caps) {
-			caps = opts.server_caps->Load();
+		if (opts.protocol_session) {
+			caps = opts.protocol_session->Load();
 		}
+		HarvestOnFailure harvest_on_failure {opts.protocol_session.get(), caps};
 #if defined(__EMSCRIPTEN__)
 		auto result = HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
 		                       opts.auth, opts.cookie_jar, opts.cached_http_params, "", "", "", "",
 		                       opts.protocol, nullptr,
-		                       opts.server_caps ? &caps : nullptr);
+		                       opts.protocol_session ? &caps : nullptr);
 #else
 		auto result = HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
 		                       opts.auth, opts.cookie_jar, nullptr, "", "", "", "",
 		                       opts.protocol, nullptr,
-		                       opts.server_caps ? &caps : nullptr, opts.iroh);
+		                       opts.protocol_session ? &caps : nullptr, opts.iroh);
 #endif
-		if (opts.server_caps) {
-			opts.server_caps->Store(caps);
+		if (opts.protocol_session) {
+			opts.protocol_session->Store(caps);
 		}
 		return result;
 	}
@@ -236,14 +257,15 @@ UnaryResponseResult InvokeUnaryRpcOnTransport(const UnaryRpcOptions &opts, const
 					request_dispatched = true;
 					// Same capability-snapshot handling as the http:// branch above.
 					ServerCapabilities caps;
-					if (opts.server_caps) {
-						caps = opts.server_caps->Load();
+					if (opts.protocol_session) {
+						caps = opts.protocol_session->Load();
 					}
+					HarvestOnFailure harvest_on_failure {opts.protocol_session.get(), caps};
 					auto result = HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth,
 					                              opts.cookie_jar, opts.cached_http_params, "", "", "", "",
-					                              opts.protocol, nullptr, opts.server_caps ? &caps : nullptr);
-					if (opts.server_caps) {
-						opts.server_caps->Store(caps);
+					                              opts.protocol, nullptr, opts.protocol_session ? &caps : nullptr);
+					if (opts.protocol_session) {
+						opts.protocol_session->Store(caps);
 					}
 					return result;
 				}

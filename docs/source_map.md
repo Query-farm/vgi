@@ -43,6 +43,8 @@
 | `vgi_attach_tickets.cpp` | Attach tickets: `issue_grant` / `seal_attach` clients and `vgi_export_session()`. The `attach_ticket` ATTACH option lives in `VgiCatalogAttach` (`vgi_extension.cpp`). See [attach-tickets.md](attach-tickets.md) |
 | `vgi_protocols.cpp` | `vgi_protocols()` SQL function — hosted protocols by LOCATION or by attached catalog |
 | `vgi_reflection.cpp` | Client side of `vgi_rpc.Reflection.v1`: `list_protocols` decode (tolerant, by name), pre-reflection detection, and the per-catalog capability check `GetHostedProtocols` / `HostsProtocol` |
+| `vgi_protocol_session.cpp` | Protocol version negotiation: `ProtocolSession` (per-endpoint versions + capability snapshot), negotiation, refusal parsing, the codec registry and `EncodeRpcRequest` (docs/protocol_versions.md) |
+| `vgi_protocol_window.cpp` | Version/range parsing and the client supported window, bound to the generated version constants |
 | `vgi_hosted_protocols.cpp` | std-only half: `HostedProtocolsCache` (held by `VgiAttachParameters`) and the per-LOCATION worker connection generations that invalidate it |
 | `vgi_batch_validation.cpp` | `vgi_validate_worker_batches` levels + `ValidateWorkerBatch` (Arrow `Validate`/`ValidateFull` on worker batches). See *Worker Batch Validation* |
 | `vgi_location_policy.cpp` | `vgi_allowed_transports` narrow-only LOCATION transport allowlist: classifier (mirrors dispatch), parser, per-DB CAS-narrowed state (owned by `VgiStorageExtension`), `CheckLocationPolicy` |

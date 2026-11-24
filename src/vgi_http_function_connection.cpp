@@ -16,6 +16,7 @@
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_bind_protocol.hpp"
+#include "vgi_protocol_codec.hpp"
 #include "vgi_table_buffering_builders.hpp"
 #include "vgi_catalog_metadata.hpp"
 #include "generated/vgi_protocol_constants.hpp"
@@ -31,6 +32,11 @@
 
 namespace duckdb {
 namespace vgi {
+
+// The worker protocol as this catalog's ProtocolSession negotiated it.
+static VgiProtocolId MainProtocolFor(const std::shared_ptr<VgiAttachParameters> &attach_params) {
+	return NegotiatedProtocol(attach_params ? attach_params->protocol_session().get() : nullptr, VGI_MAIN_PROTOCOL);
+}
 
 // `function_kind` token for a connection's function_type_ ("TABLE",
 // "SCALAR_FUNCTION", "TABLE_BUFFERING", ...).
@@ -626,7 +632,7 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		// response (see CurrentCapabilities).
 		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth,
 		                             /*cookie_jar=*/nullptr, cached_params,
-		                             "", "", "", "", VGI_MAIN_PROTOCOL, &http_client_, &b_caps, iroh,
+		                             "", "", "", "", MainProtocolFor(attach_params_), &http_client_, &b_caps, iroh,
 		                             &call_error_fields);
 		PublishHarvestedCapabilities(b_caps);
 		return UnwrapResultEnvelope(resp.batch, "bind",
@@ -731,7 +737,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		}
 		cond_sent_ = true;
 	}
-	auto body = SerializeRpcRequest("init", rpc_params, VGI_MAIN_PROTOCOL, extra_metadata);
+	auto body = SerializeRpcRequest("init", rpc_params, MainProtocolFor(attach_params_), extra_metadata);
 #ifdef __EMSCRIPTEN__
 #endif
 
@@ -955,7 +961,7 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_process", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
-	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
+	                             MainProtocolFor(attach_params_), &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr,
 	                             &call_error_fields);
 	PublishHarvestedCapabilities(tb_caps);
@@ -982,7 +988,7 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_combine", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
-	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
+	                             MainProtocolFor(attach_params_), &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr,
 	                             &call_error_fields);
 	PublishHarvestedCapabilities(tb_caps);
@@ -1007,7 +1013,7 @@ void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &func
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_destructor", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataDigest(), "", GetConnIdHex(),
-	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
+	                             MainProtocolFor(attach_params_), &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr,
 	                             &call_error_fields);
 	PublishHarvestedCapabilities(tb_caps);

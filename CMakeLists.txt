@@ -347,6 +347,8 @@ src/vgi_protocols.cpp
 src/vgi_engine_features.cpp
 src/vgi_attach_tickets.cpp
 src/vgi_reflection.cpp
+src/vgi_protocol_session.cpp
+src/vgi_protocol_window.cpp
 src/vgi_hosted_protocols.cpp
 src/vgi_location_policy.cpp
 src/vgi_location_classify.cpp
@@ -699,7 +701,8 @@ if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS
     test/cpp/test_main.cpp
     test/cpp/test_http_interrupt.cpp
     test/cpp/test_http_secret_free.cpp
-    test/cpp/test_external_location.cpp)
+    test/cpp/test_external_location.cpp
+    test/cpp/test_protocol_session.cpp)
   target_include_directories(vgi_http_interrupt_tests PRIVATE
     src/include
     duckdb/src/include

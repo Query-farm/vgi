@@ -35,8 +35,10 @@ bool IsReflectionNotHostedError(const std::exception &e);
 // One uncached list_protocols call through `ctx`. A worker that does not host
 // reflection yields PreReflectionListing() when `tolerate_pre_reflection`, and
 // rethrows the worker's error otherwise. Other failures always propagate.
+// protocol_versions, when non-null, receives the reply's
+// vgi_rpc.protocol_versions metadata ("" when absent).
 VgiProtocolListing InvokeListProtocols(const CatalogRpcContext &ctx, ClientContext &context,
-                                       bool tolerate_pre_reflection = true);
+                                       bool tolerate_pre_reflection = true, std::string *protocol_versions = nullptr);
 
 // The catalog's cached listing, fetched on first use. Never null; throws only
 // when the worker cannot be reached (a pre-reflection worker is a listing).

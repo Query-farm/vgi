@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_rpc_client.hpp"
+#include "vgi_protocol_codec.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/error_data.hpp"
@@ -297,26 +298,24 @@ void WriteRpcRequest(const std::shared_ptr<VgiOutputStream> &sink,
 	}
 
 	// Method, wire version, protocol version and routing key (see
-	// RPC_PROTOCOL_KEY / IsReservedRpcMethod), then caller extras (e.g. the
-	// shm segment advertisement on init).
-	VgiMetadata metadata;
-	metadata.Append(RPC_METHOD_KEY, method_name);
-	metadata.Append(RPC_REQUEST_VERSION_KEY, RPC_REQUEST_VERSION_VALUE);
-	// Omitted for a protocol that declares no version (reflection).
-	if (!protocol.version.empty()) {
-		metadata.Append(RPC_PROTOCOL_VERSION_KEY, std::string(protocol.version));
-	}
-	if (!IsReservedRpcMethod(method_name)) {
-		metadata.Append(RPC_PROTOCOL_KEY, std::string(protocol.name));
-	}
+	// RPC_PROTOCOL_KEY / IsReservedRpcMethod), the client's ranges, then caller
+	// extras (e.g. the shm segment advertisement on init), through the codec
+	// for the protocol version the request speaks (EncodeRpcRequest).
+	std::vector<std::pair<std::string, std::string>> extra;
 	if (extra_metadata) {
 		for (int64_t i = 0; i < extra_metadata->size(); ++i) {
-			metadata.Append(extra_metadata->key(i), extra_metadata->value(i));
+			extra.emplace_back(extra_metadata->key(i), extra_metadata->value(i));
 		}
+	}
+	std::vector<std::pair<std::string, std::string>> pairs;
+	auto encoded = EncodeRpcRequest(method_name, params_batch, protocol, extra, pairs);
+	VgiMetadata metadata;
+	for (auto &kv : pairs) {
+		metadata.Append(kv.first, kv.second);
 	}
 
 	try {
-		writer->Write(*params_batch, &metadata);
+		writer->Write(*encoded, &metadata);
 	} catch (const std::exception &e) {
 		throw IOException("Failed to write RPC request batch: " + ErrorData(e).RawMessage());
 	}
@@ -414,25 +413,14 @@ std::vector<uint8_t> SerializeRpcRequest(
     const std::string &method_name, const VgiBatchPtr &params_batch,
     const VgiProtocolId &protocol,
     const std::vector<std::pair<std::string, std::string>> &extra_metadata) {
-	// Same keys as WriteRpcRequest. The URL's protocol segment must be built
-	// from the same VgiProtocolId: the server rejects a mismatch.
+	// Same keys as WriteRpcRequest (EncodeRpcRequest). The URL's protocol
+	// segment must be built from the same VgiProtocolId: the server rejects a
+	// mismatch.
 	std::vector<std::pair<std::string, std::string>> pairs;
-	pairs.reserve(4 + extra_metadata.size());
-	pairs.emplace_back(RPC_METHOD_KEY, method_name);
-	pairs.emplace_back(RPC_REQUEST_VERSION_KEY, RPC_REQUEST_VERSION_VALUE);
-	// Omitted for a protocol that declares no version (reflection).
-	if (!protocol.version.empty()) {
-		pairs.emplace_back(RPC_PROTOCOL_VERSION_KEY, protocol.version);
-	}
-	if (!IsReservedRpcMethod(method_name)) {
-		pairs.emplace_back(RPC_PROTOCOL_KEY, protocol.name);
-	}
-	for (const auto &kv : extra_metadata) {
-		pairs.push_back(kv);
-	}
+	auto encoded = EncodeRpcRequest(method_name, params_batch, protocol, extra_metadata, pairs);
 	auto metadata = VgiMetadata::Make(std::move(pairs));
 
-	return SerializeToIpcBytes(params_batch, metadata);
+	return SerializeToIpcBytes(encoded, metadata);
 }
 
 std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name,

@@ -1,0 +1,26 @@
+# name: test/sql/protocol_negotiation/range_disjoint.test
+# description: A worker whose protocol range misses the extension's window fails ATTACH, naming both ranges
+# group: [vgi_protocol_negotiation]
+#
+# VGI_PROTOCOL_RANGE_WORKER is the vgi-python fixture worker started with
+# VGI_TEST_PROTOCOL_RANGE=3.3-3.3: it advertises vgi.v3 3.3-3.3 (describe and
+# VGI-Protocol-Versions) and refuses 3.4 requests with
+# protocol_version_unsupported. The Makefile defines it only when the
+# vgi-python checkout has that switch, so lanes on older fixtures skip this.
+
+require-env VGI_PROTOCOL_RANGE_WORKER
+
+require vgi
+
+require httpfs
+
+statement error
+ATTACH 'example' AS old_range (TYPE vgi, LOCATION '${VGI_PROTOCOL_RANGE_WORKER}');
+----
+<REGEX>:.*protocol_version_unsupported: the VGI worker supports vgi\.v3 3\.3-3\.3; this vgi extension supports vgi\.v3 \d+\.\d+-\d+\.\d+\. The worker is too old: upgrade the worker.*
+
+# Nothing was attached.
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'old_range';
+----
+0

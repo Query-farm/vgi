@@ -2,6 +2,7 @@
 #include "vgi_logging.hpp"
 #include "duckdb.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_protocol_codec.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "yyjson.hpp"
 
@@ -291,6 +292,12 @@ bool HandleBatchLogMessage(const vgi::VgiBatchPtr &batch, const vgi::VgiMetadata
 		// so a caller can show the worker's message without it.
 		vgi::ErrorInfo extra_info(vgi::error_subtype::kWorkerException);
 		extra_info.Set(vgi::error_key::kExceptionType, exception_type).Set(vgi::error_key::kTraceback, traceback);
+		// A protocol_version_unsupported refusal names the server's ranges
+		// machine-readably; negotiation reads them from here.
+		int64_t versions_idx = custom_metadata->FindKey(vgi::kProtocolVersionsMetadataKey);
+		if (versions_idx >= 0) {
+			extra_info.Set(vgi::kProtocolVersionsErrorKey, custom_metadata->value(versions_idx));
+		}
 		if (error_context) {
 			extra_info.Merge(*error_context);
 		}

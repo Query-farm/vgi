@@ -2304,12 +2304,12 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 
 	// The worker validates the version specs; its error is the ATTACH failure.
-	vgi::ServerCapabilities attach_capabilities;
+	std::shared_ptr<vgi::ProtocolSession> attach_session;
 	auto invoke_attach = [&]() {
 		return vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
 		                                data_version_spec, implementation_version, cookie_jar, attach_options,
 		                                launcher_idle_for_attach, launcher_state_dir_for_attach, worker_artifact_anchor,
-		                                tcp_proxy, iroh_config, &attach_capabilities);
+		                                tcp_proxy, iroh_config, &attach_session);
 	};
 	vgi::CatalogAttachResult attach_result;
 	if (!attach_ticket_given) {
@@ -2443,9 +2443,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 	attach_cfg.attach_options_canonical = vgi::CanonicalAttachOptions(key_options);
 	attach_cfg.retained_attach = std::move(retained_attach);
+	// The ProtocolSession ATTACH negotiated (versions and capabilities) is the
+	// catalog's from now on, so no probe is needed.
+	attach_cfg.protocol_session = std::move(attach_session);
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(std::move(attach_cfg));
-	// Reuse the capabilities the attach RPC negotiated, so no probe is needed.
-	attach_params->StoreServerCapabilities(attach_capabilities);
 
 	// Prime the HTTPParams cache outside any VGI transaction: see
 	// VgiAttachParameters::GetOrInitHttpParams (duckdb#22258).

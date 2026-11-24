@@ -15,6 +15,7 @@
 
 #include "vgi_hosted_protocols.hpp"     // arrow-free; per-catalog reflection cache
 #include "vgi_server_capabilities.hpp" // arrow-free; per-catalog capability snapshot
+#include "vgi_protocol_session.hpp"    // std only; per-endpoint versions + capabilities
 
 namespace duckdb {
 
@@ -68,6 +69,9 @@ struct VgiAttachParametersConfig {
 	// vgi_export_session() can seal_attach it. Never logged or serialized
 	// anywhere else. Null for internal/temporary parameters.
 	std::shared_ptr<const VgiRetainedAttach> retained_attach;
+	// The endpoint's ProtocolSession, when ATTACH negotiated one (it carries
+	// over to the catalog's parameters). Null: start a fresh session.
+	std::shared_ptr<ProtocolSession> protocol_session;
 };
 
 // Parameters for connecting to a VGI worker
@@ -85,6 +89,9 @@ struct VgiAttachParameters {
 	      attach_options_canonical_(std::move(cfg.attach_options_canonical)) {
 		worker_artifact_anchor_ = std::move(cfg.worker_artifact_anchor);
 		retained_attach_ = std::move(cfg.retained_attach);
+		if (cfg.protocol_session) {
+			protocol_session_ = std::move(cfg.protocol_session);
+		}
 	}
 
 	// Legacy positional constructor, still used by vgi_table_function_impl.cpp.
@@ -199,17 +206,17 @@ public:
 	// new one skips the HEAD /health probe. Load() returns discovered=false
 	// until something has been harvested.
 	void StoreServerCapabilities(const ServerCapabilities &caps) const {
-		server_caps_->Store(caps);
+		protocol_session_->Store(caps);
 	}
 	ServerCapabilities LoadServerCapabilities() const {
-		return server_caps_->Load();
+		return protocol_session_->Load();
 	}
-	// The same snapshot as a shared holder, for paths that don't hold the
+	// The endpoint's ProtocolSession (negotiated versions and the capability
+	// snapshot) as a shared holder, for paths that don't hold the
 	// VgiAttachParameters (unary catalog RPCs via UnaryRpcOptions). Sharing the
-	// holder, not a copy, lets a codec downgrade learned by one path apply to
-	// all.
-	const std::shared_ptr<ServerCapabilitiesCache> &server_caps() const {
-		return server_caps_;
+	// holder, not a copy, lets what one path learns apply to all. Never null.
+	const std::shared_ptr<ProtocolSession> &protocol_session() const {
+		return protocol_session_;
 	}
 
 	// Lazy-initialized per-catalog keep-alive HTTP client pool for unary
@@ -245,8 +252,8 @@ private:
 	mutable std::shared_ptr<HTTPParams> cached_http_params_;
 	mutable std::shared_ptr<HTTPParams> cached_single_attempt_http_params_;
 
-	// Never null; shared_ptr so server_caps() can hand out the same holder.
-	std::shared_ptr<ServerCapabilitiesCache> server_caps_ = std::make_shared<ServerCapabilitiesCache>();
+	// Never null; shared_ptr so protocol_session() can hand out the same holder.
+	std::shared_ptr<ProtocolSession> protocol_session_ = std::make_shared<ProtocolSession>();
 
 	// Lazy init guarded by http_params_mutex_.
 	mutable std::shared_ptr<VgiHttpClientPool> http_client_pool_;

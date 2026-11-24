@@ -15,6 +15,7 @@
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
+#include "vgi_protocol_codec.hpp"
 #include "vgi_worker_pool.hpp"
 #include "generated/vgi_request_builders.hpp"
 
@@ -249,7 +250,8 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 			opts.cached_http_params = bind_data.attach_params->GetOrInitHttpParams(context, agg_worker_path);
 		}
 		opts.http_client_pool = bind_data.attach_params->GetOrInitHttpClientPool();
-		opts.server_caps = bind_data.attach_params->server_caps();
+		opts.protocol_session = bind_data.attach_params->protocol_session();
+	opts.protocol = NegotiatedProtocol(opts.protocol_session.get(), opts.protocol);
 	}
 	if (bind_data.attach_params->launcher_idle_timeout_seconds().has_value()) {
 		opts.launcher_idle_timeout =

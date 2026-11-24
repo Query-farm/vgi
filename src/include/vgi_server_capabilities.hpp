@@ -10,9 +10,15 @@
 #include <vector>
 
 #include "vgi_http_compression.hpp" // HttpEncoding (arrow-free)
+#include "vgi_protocol_window.hpp"  // ProtocolRanges (std only)
+
+#include <optional>
 
 namespace duckdb {
 namespace vgi {
+
+// The VGI-Upload-URL-Support version this client uploads to (sized, hashed URLs).
+inline constexpr int kUploadUrlProtocolVersion = 2;
 
 // Server capabilities harvested from HTTP response headers
 // (ParseCapabilityHeaders). The server middleware emits the capability headers
@@ -49,6 +55,9 @@ struct ServerCapabilities {
 	// When to re-probe, from Cache-Control: max-age=N (in practice only on
 	// OPTIONS responses). Default-constructed means no expiry hint.
 	std::chrono::steady_clock::time_point cache_expires_at{};
+	// VGI-Protocol-Versions: the protocol ranges the server serves. nullopt
+	// when the response carried none (a server released before negotiation).
+	std::optional<ProtocolRanges> protocol_ranges;
 };
 
 // Can the server decompress a request body encoded with ``enc``? Identity
@@ -85,29 +94,10 @@ inline HttpEncoding ChooseRequestEncoding(const ServerCapabilities &caps) {
 	return HttpEncoding::NONE;
 }
 
-// Thread-safe holder for one server's harvested snapshot, one per ATTACH
-// (VgiAttachParameters::server_caps). Shared by the streaming
-// HttpFunctionConnections and the unary catalog RPCs so the first request to
-// learn the capabilities sets the codec choice for all.
-class ServerCapabilitiesCache {
-public:
-	ServerCapabilities Load() const {
-		std::lock_guard<std::mutex> lock(mu_);
-		return caps_;
-	}
-	// Undiscovered snapshots are ignored, so callers can always store back.
-	void Store(const ServerCapabilities &caps) {
-		if (!caps.discovered) {
-			return;
-		}
-		std::lock_guard<std::mutex> lock(mu_);
-		caps_ = caps;
-	}
-
-private:
-	mutable std::mutex mu_;
-	ServerCapabilities caps_;
-};
+// The per-ATTACH holder of a snapshot is ProtocolSession
+// (vgi_protocol_session.hpp), shared by the streaming HttpFunctionConnections
+// and the unary catalog RPCs so the first request to learn the capabilities
+// sets the codec choice for all.
 
 } // namespace vgi
 } // namespace duckdb

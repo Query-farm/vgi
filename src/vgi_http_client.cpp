@@ -26,6 +26,7 @@
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_unary_retry.hpp"
+#include "vgi_protocol_codec.hpp"
 #include "vgi_sha256.hpp"
 #include "vgi_transport.hpp"
 
@@ -367,6 +368,7 @@ static std::string HttpPostArrowIpcInternal(
 	}
 	add_header("X-VGI-Accept-Encoding", ClientAcceptEncoding());
 	add_header(kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes));
+	add_header(kClientProtocolVersionsHeader, ClientProtocolVersionsString());
 	if (!bearer_token.empty()) {
 		add_header("Authorization", "Bearer " + bearer_token);
 	}
@@ -516,9 +518,12 @@ static std::string HttpPostArrowIpcInternal(
 		if (response_caps.cache_expires_at == std::chrono::steady_clock::time_point{}) {
 			response_caps.cache_expires_at = harvested_caps->cache_expires_at;
 		}
+		if (!response_caps.protocol_ranges) {
+			response_caps.protocol_ranges = harvested_caps->protocol_ranges;
+		}
 		*harvested_caps = response_caps;
 	}
-	if (!response_caps.accept_max_response_bytes_support) {
+	if (!CapabilitiesSupport(response_caps, ProtocolFeature::ACCEPT_MAX_RESPONSE_BYTES)) {
 		throw IOException(BuildHttpExtraInfo(http_error::kServerTooOld, url),
 		                  "VGI HTTP server does not advertise %s: true; it predates the response size budget "
 		                  "this client requires, so upgrade the worker [url: %s]",
@@ -842,7 +847,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	     std::chrono::steady_clock::now() >= effective_caps->cache_expires_at)) {
 		*effective_caps = HttpDiscoverCapabilities(context, base_url, iroh_config, cached_http_params);
 	}
-	if (!effective_caps->discovered || !effective_caps->accept_max_response_bytes_support) {
+	if (!CapabilitiesSupport(*effective_caps, ProtocolFeature::ACCEPT_MAX_RESPONSE_BYTES)) {
 		throw IOException(BuildHttpExtraInfo(http_error::kServerTooOld, base_url),
 		                  "VGI HTTP server does not advertise %s: true; it predates the response size budget "
 		                  "this client requires, so upgrade the worker [url: %s]",
@@ -1268,7 +1273,8 @@ template <class RESPONSE>
 static bool HasCapabilityHeaders(const RESPONSE &response) {
 	return response.HasHeader(kAcceptMaxResponseBytesSupportHeader) ||
 	       response.HasHeader(kSupportedEncodingsHeader) || response.HasHeader("VGI-Max-Request-Bytes") ||
-	       response.HasHeader("VGI-Upload-URL-Support") || response.HasHeader("VGI-Max-Upload-Bytes");
+	       response.HasHeader("VGI-Upload-URL-Support") || response.HasHeader("VGI-Max-Upload-Bytes") ||
+	       response.HasHeader(kProtocolVersionsHeader);
 }
 
 // Printable, single-line, bounded preview of a response body for an error
@@ -1449,6 +1455,10 @@ static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 	if (max_age.count() > 0) {
 		caps.cache_expires_at = std::chrono::steady_clock::now() + max_age;
 	}
+	// Absent (a server released before negotiation) or unparseable: unknown.
+	if (response.HasHeader(kProtocolVersionsHeader)) {
+		caps.protocol_ranges = ParseProtocolRanges(response.GetHeaderValue(kProtocolVersionsHeader));
+	}
 
 	return caps;
 }
@@ -1464,7 +1474,9 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 		RpcHttpResponse response;
 		response.browser = httpi::BrowserRequest(
 		    context, url, "OPTIONS",
-		    {{kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes)}}, nullptr, 0,
+		    {{kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes)},
+		     {kClientProtocolVersionsHeader, ClientProtocolVersionsString()}},
+		    nullptr, 0,
 		    GetHttpTimeoutSeconds(context), kMaxBufferedRepresentationBytes,
 		    static_cast<size_t>(accepted_max_response_bytes));
 		if (!HasCapabilityHeaders(response)) {
@@ -1484,7 +1496,9 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 		RpcHttpResponse response;
 		response.iroh = PerformIrohHttpRequest(
 		    iroh_config, &context, "OPTIONS", parsed.path.empty() ? "/" : parsed.path,
-		    {{kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes)}}, nullptr, 0,
+		    {{kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes)},
+		     {kClientProtocolVersionsHeader, ClientProtocolVersionsString()}},
+		    nullptr, 0,
 		    static_cast<uint64_t>(accepted_max_response_bytes));
 		if (!HasCapabilityHeaders(response)) {
 			ThrowNotAVgiServer(response, static_cast<int>(response.Status()), response.FallbackBody(), url);
@@ -1513,6 +1527,7 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 
 	HTTPHeaders headers;
 	headers.Insert(kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes));
+	headers.Insert(kClientProtocolVersionsHeader, ClientProtocolVersionsString());
 	HeadRequestInfo head(url, headers, *params);
 	// Report transport failures ourselves, with structured extra_info.
 	head.try_request = true;
@@ -1745,7 +1760,7 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const uint8_t 
 
 bool ShouldExternalizeArguments(const ServerCapabilities &caps, uint64_t arguments_size) {
 	// The header is the capability signal: without it, never.
-	if (!caps.discovered || caps.arguments_ref_bytes <= 0 || caps.upload_url_version != kUploadUrlProtocolVersion) {
+	if (!CapabilitiesSupport(caps, ProtocolFeature::ARGUMENTS_REF)) {
 		return false;
 	}
 	uint64_t threshold = static_cast<uint64_t>(caps.arguments_ref_bytes);

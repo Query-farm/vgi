@@ -2,13 +2,13 @@
 # description: VGI application protocol_version mismatch is fatal at the dispatch boundary
 # group: [vgi_integration_protocol_version]
 
-# The fixture worker advertises an older protocol_version (a previous minor)
-# while the C++ extension declares and sends 3.4.0 on every request. The
-# vgi-rpc framework enforces an exact major+minor match at the dispatch
-# boundary, so the very first RPC ATTACH issues (catalog discovery) must fail
-# with a directional ProtocolVersionError that round-trips back as an
-# IOException. This guards the real rolling-upgrade boundary: a worker built
-# against the previous minor cannot silently omit records the extension expects.
+# The fixture worker declares a protocol_version outside the extension's
+# supported window. ATTACH negotiates first (docs/protocol_versions.md): over a
+# byte transport the worker's reflection answer names its version, over HTTP
+# its refusal of catalog_attach does. Either way the ranges are disjoint, so
+# ATTACH fails with the protocol_version_unsupported error naming both. This
+# guards the rolling-upgrade boundary: a worker outside the window cannot
+# silently omit records the extension expects.
 #
 # Provisioned via the VGI_BAD_PROTOCOL_WORKER fixture
 # (vgi-fixture-bad-protocol-worker) — see vgi-python/vgi/_test_fixtures/bad_protocol.py.
@@ -24,4 +24,4 @@ require httpfs
 statement error
 ATTACH 'badproto' AS badproto (TYPE vgi, LOCATION '${VGI_BAD_PROTOCOL_WORKER}');
 ----
-protocol_version mismatch
+<REGEX>:.*protocol_version_unsupported: the VGI worker supports vgi\.v3 \d+\.\d+-\d+\.\d+; this vgi extension supports vgi\.v3 \d+\.\d+-\d+\.\d+\..*

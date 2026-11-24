@@ -20,7 +20,7 @@ namespace vgi {
 class CatalogAuth;             // vgi_oauth.hpp
 class SessionCookieJar;        // vgi_cookie_jar.hpp
 class VgiHttpClientPool;       // vgi_http_client.hpp
-class ServerCapabilitiesCache; // vgi_server_capabilities.hpp
+class ProtocolSession; // vgi_protocol_session.hpp
 struct IrohClientConfig;
 
 // Options for a pooled unary RPC invocation. Several call sites aggregate-
@@ -60,10 +60,10 @@ struct UnaryRpcOptions {
 	// Per-catalog keep-alive client pool (http:// only): a client is checked
 	// out per call and returned on success. Null = fresh connection per call.
 	std::shared_ptr<VgiHttpClientPool> http_client_pool;
-	// Per-catalog capability snapshot (VgiAttachParameters::server_caps), read
+	// Per-catalog capability snapshot (VgiAttachParameters::protocol_session), read
 	// to pick the request Content-Encoding and stored back from the response.
 	// Null = each call starts from the pre-discovery default (zstd). HTTP only.
-	std::shared_ptr<ServerCapabilitiesCache> server_caps;
+	std::shared_ptr<ProtocolSession> protocol_session;
 	// Explicit SOCKS5h proxy for tcp://. Transport-only: never serialized as a
 	// worker/catalog option.
 	std::string tcp_proxy;

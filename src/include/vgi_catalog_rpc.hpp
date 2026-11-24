@@ -51,8 +51,13 @@ inline std::string MapOnConflict(OnCreateConflict conflict) {
 // implementation_version are the user's ATTACH semver constraints (empty =
 // unconstrained); the worker returns the resolved versions. cookie_jar (HTTP
 // only) captures Set-Cookie and supplies Cookie on later RPCs.
-// discovered_capabilities, when non-null, receives the temporary connection's
-// capability snapshot for reuse by this attachment only.
+// Negotiates the protocol version first (docs/protocol_versions.md): over a
+// byte transport the worker's ranges come from its reflection answer before
+// catalog_attach; over HTTP from VGI-Protocol-Versions on the capability probe.
+// Disjoint ranges fail with the "protocol_version_unsupported" ATTACH error
+// naming both; a refusal is retried once at the highest common version
+// (catalog_attach is idempotent). session_out, when non-null, receives the
+// endpoint's ProtocolSession (versions and capabilities) for the attachment.
 CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const std::string &catalog_name,
                                         ClientContext &context, bool worker_debug = false, bool use_pool = true,
                                         const std::shared_ptr<CatalogAuth> &auth = nullptr,
@@ -65,7 +70,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         std::shared_ptr<void> worker_artifact_anchor = nullptr,
                                         const std::string &tcp_proxy = "",
                                         std::shared_ptr<IrohClientConfig> iroh = nullptr,
-                                        ServerCapabilities *discovered_capabilities = nullptr);
+                                        std::shared_ptr<ProtocolSession> *session_out = nullptr);
 
 // Tell the worker the attachment was detached and may be released.
 void InvokeCatalogDetach(const CatalogRpcContext &ctx, ClientContext &context);
@@ -87,15 +92,17 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 // ProtocolList payload; use the vgi_reflection.hpp helpers instead. A worker
 // without reflection throws VgiRpcException (protocol_not_supported, or
 // method_not_implemented from a server that predates routing keys).
-VgiBatchPtr InvokeReflectionListProtocols(const CatalogRpcContext &ctx,
-                                                                  ClientContext &context);
+// response_metadata, when non-null, receives the reply's custom metadata
+// (vgi_rpc.protocol_versions rides there).
+VgiBatchPtr InvokeReflectionListProtocols(const CatalogRpcContext &ctx, ClientContext &context,
+                                          VgiMetadataPtr *response_metadata = nullptr);
 
 // One unary call to a non-vgi.v3 protocol (routing key and, when non-empty,
 // version from `protocol`). Returns the one-row payload of the `result`
 // envelope. Worker errors throw VgiRpcException with error_kind / error_code.
 VgiBatchPtr InvokeProtocolUnary(const CatalogRpcContext &ctx, ClientContext &context,
-                                                        const VgiProtocolId &protocol, const std::string &method_name,
-                                                        const VgiBatchPtr &params);
+                                const VgiProtocolId &protocol, const std::string &method_name,
+                                const VgiBatchPtr &params, VgiMetadataPtr *response_metadata = nullptr);
 
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);
 
