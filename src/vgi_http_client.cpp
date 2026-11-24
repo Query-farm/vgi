@@ -1724,10 +1724,12 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const uint8_t 
 	if (!response->Success()) {
 		const auto code = StorageErrorCode(response->body);
 		// The URL is signed for the body's size and SHA-256 (upload URLs v2), so
-		// storage itself refuses bytes that are not the ones hashed.
+		// storage itself refuses bytes that are not the ones hashed: S3 and R2
+		// answer BadDigest, MinIO XAmzContentChecksumMismatch.
 		std::string detail;
 		const char *subtype = http_error::kHttpError;
-		if (code == "BadDigest" || code == "XAmzContentSHA256Mismatch" || code == "InvalidDigest") {
+		if (code == "BadDigest" || code == "XAmzContentSHA256Mismatch" || code == "XAmzContentChecksumMismatch" ||
+		    code == "InvalidDigest") {
 			detail = ": storage checksum mismatch (" + code + "), the uploaded bytes do not match their SHA-256";
 			subtype = http_error::kChecksumMismatch;
 		} else if (code == "IncompleteBody" || code == "EntityTooSmall" || code == "EntityTooLarge") {

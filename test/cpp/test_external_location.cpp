@@ -371,6 +371,7 @@ enum class TrickleMode {
 	GET_STALL_ONCE, // the first request stalls after half the body, later ones get it all
 	PUT_SLOW,       // read the request body chunk by chunk with a pause between chunks
 	PUT_STALL,      // read the request head, then never read again
+	PUT_REJECT,     // read the whole request, answer 400 with the S3 error code in body_
 };
 
 class TrickleServer {
@@ -485,7 +486,7 @@ private:
 			return;
 		}
 		const auto lower = StringUtil::Lower(head.substr(0, head_end));
-		if (mode_ == TrickleMode::PUT_SLOW || mode_ == TrickleMode::PUT_STALL) {
+		if (mode_ == TrickleMode::PUT_SLOW || mode_ == TrickleMode::PUT_STALL || mode_ == TrickleMode::PUT_REJECT) {
 			size_t length = 0;
 			auto pos = lower.find("content-length:");
 			if (pos != std::string::npos) {
@@ -513,6 +514,13 @@ private:
 				body_received_.fetch_add(static_cast<size_t>(n));
 			}
 			std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+			if (mode_ == TrickleMode::PUT_REJECT) {
+				const auto error = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>" + body_ +
+				                   "</Code><Message>checksum</Message></Error>";
+				reply = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/xml\r\nConnection: close\r\n"
+				        "Content-Length: " +
+				        std::to_string(error.size()) + "\r\n\r\n" + error;
+			}
 			SendAll(fd, reply.data(), reply.size());
 			return;
 		}
@@ -725,4 +733,25 @@ TEST_CASE("a PUT whose server stops reading fails within the stall timeout per a
 	}
 	CHECK(elapsed < 3 * kStallBound);
 	CHECK(error.find("sekrit-sig-value") == std::string::npos);
+}
+
+TEST_CASE("S3, R2 and MinIO checksum refusals of a pre-signed PUT are CHECKSUM_MISMATCH", "[external-location]") {
+	ScopedLoopbackHook on("1");
+	const auto body = PatternBody(4096);
+	for (const char *code : {"BadDigest", "XAmzContentSHA256Mismatch", "XAmzContentChecksumMismatch"}) {
+		INFO("code " << code);
+		TrickleServer server(TrickleMode::PUT_REJECT, code, 64 * 1024, 0);
+		Fixture f;
+		try {
+			HttpPutBytes(f.context(), server.Url(), reinterpret_cast<const uint8_t *>(body.data()), body.size(),
+			             HttpEncoding::NONE, {});
+			FAIL("a refused PUT succeeded");
+		} catch (const IOException &e) {
+			const std::string error = e.what();
+			CHECK(error.find("storage checksum mismatch") != std::string::npos);
+			CHECK(error.find("\"error_subtype\":\"CHECKSUM_MISMATCH\"") != std::string::npos);
+			CHECK(error.find("sekrit-sig-value") == std::string::npos);
+		}
+		CHECK(server.Requests() == 1);
+	}
 }
