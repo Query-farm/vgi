@@ -176,7 +176,11 @@ std::string_view ProtocolSession::WireVersion(std::string_view protocol, std::st
 		}
 	}
 	const auto *window = FindClientProtocolWindow(protocol);
-	return window ? window->current_wire_version : fallback;
+	if (!window) {
+		return fallback;
+	}
+	const auto *codec = FindProtocolCodec(protocol, window->range.max);
+	return codec ? codec->wire_version() : window->current_wire_version;
 }
 
 bool ProtocolSession::UseVersion(std::string_view protocol, const ProtocolVersion &version) {
@@ -218,7 +222,9 @@ const std::vector<std::unique_ptr<ProtocolCodec>> &Registry() {
 		std::vector<std::unique_ptr<ProtocolCodec>> codecs;
 		for (const auto &window : ClientProtocolWindows()) {
 			auto current = ParseProtocolVersion(window.current_wire_version);
-			codecs.push_back(std::make_unique<IdentityCodec>(window.protocol, *current, window.current_wire_version));
+			const auto patch_at = window.current_wire_version.rfind('.');
+			codecs.push_back(std::make_unique<IdentityCodec>(window.protocol, *current,
+			                                                 window.current_wire_version.substr(patch_at + 1)));
 		}
 		return codecs;
 	}();
@@ -312,10 +318,21 @@ namespace {
 //     Server: 3.4.0
 std::optional<ProtocolRanges> RangesFromLegacyRefusalMessage(const std::string &message) {
 	static constexpr std::string_view kProtocolMarker = "for protocol '";
-	static constexpr std::string_view kServerMarker = "Server: ";
 	const auto p = message.find(kProtocolMarker);
-	const auto s = message.find(kServerMarker);
-	if (p == std::string::npos || s == std::string::npos) {
+	if (p == std::string::npos) {
+		return std::nullopt;
+	}
+	// (?:Server:\s*|server requires\s+)(\d+\.\d+), as the reference reads it.
+	size_t s = std::string::npos;
+	size_t marker_size = 0;
+	for (std::string_view marker : {std::string_view("Server: "), std::string_view("server requires ")}) {
+		const auto at = message.find(marker);
+		if (at != std::string::npos && (s == std::string::npos || at < s)) {
+			s = at;
+			marker_size = marker.size();
+		}
+	}
+	if (s == std::string::npos) {
 		return std::nullopt;
 	}
 	const auto name_start = p + kProtocolMarker.size();
@@ -323,8 +340,11 @@ std::optional<ProtocolRanges> RangesFromLegacyRefusalMessage(const std::string &
 	if (name_end == std::string::npos) {
 		return std::nullopt;
 	}
-	const auto version_start = s + kServerMarker.size();
-	auto version_end = message.find_first_of(" \r\n", version_start);
+	auto version_start = s + marker_size;
+	while (version_start < message.size() && message[version_start] == ' ') {
+		version_start++;
+	}
+	auto version_end = message.find_first_of(" \r\n;,", version_start);
 	if (version_end == std::string::npos) {
 		version_end = message.size();
 	}
@@ -346,7 +366,8 @@ std::optional<ProtocolRanges> RangesFromRefusal(const std::exception &e) {
 	ErrorData data(e);
 	auto it = data.ExtraInfo().find(kProtocolVersionsErrorKey);
 	if (it != data.ExtraInfo().end()) {
-		if (auto ranges = ParseProtocolRanges(it->second)) {
+		auto ranges = ParseProtocolRanges(it->second);
+		if (!ranges.empty()) {
 			return ranges;
 		}
 	}

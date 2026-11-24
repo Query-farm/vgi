@@ -149,7 +149,8 @@ bool IsReflectionNotHostedError(const std::exception &e) {
 }
 
 VgiProtocolListing InvokeListProtocols(const CatalogRpcContext &ctx, ClientContext &context,
-                                       bool tolerate_pre_reflection, std::string *protocol_versions) {
+                                       bool tolerate_pre_reflection,
+                                       std::optional<std::string> *protocol_versions) {
 	VgiBatchPtr payload;
 	VgiMetadataPtr metadata;
 	try {

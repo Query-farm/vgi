@@ -62,10 +62,12 @@ using ProtocolRanges = std::map<std::string, ProtocolRange, std::less<>>;
 // "3.4" or "3.4.0" (patch ignored). nullopt when malformed.
 std::optional<ProtocolVersion> ParseProtocolVersion(std::string_view text);
 
-// `<name>=<min>-<max>[, <name>=<min>-<max>]...`. Malformed entries are skipped
-// (an advertisement is informational and must never fail a call on its own);
-// nullopt when no entry parses.
-std::optional<ProtocolRanges> ParseProtocolRanges(std::string_view text);
+// `<name>=<min>-<max>[, <name>=<min>-<max>]...`. Entries that do not parse are
+// skipped and a repeated name keeps its first window (an advertisement must
+// never fail a call on its own). An empty result from a PRESENT advertisement
+// means the server negotiates but gates nothing; an ABSENT advertisement
+// (std::nullopt at the call sites) is a server released before negotiation.
+ProtocolRanges ParseProtocolRanges(std::string_view text);
 
 // The wire form of `ranges`, in name order.
 std::string FormatProtocolRanges(const ProtocolRanges &ranges);
@@ -73,6 +75,7 @@ std::string FormatProtocolRanges(const ProtocolRanges &ranges);
 // One protocol the client speaks: the range of versions it can talk (the
 // policy is the current minor and the previous one, N-1..N) and the version it
 // stamps when speaking its newest (`current_wire_version`, MAJOR.MINOR.PATCH).
+// A negotiated older version carries the same patch (3.5.2 -> 3.4.2).
 struct ProtocolWindow {
 	std::string_view protocol;
 	ProtocolRange range;

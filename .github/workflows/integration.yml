@@ -52,7 +52,7 @@ jobs:
       # fetches it by name; 3141d12 plus the rebuilt vgi-client.js). Its uv.lock
       # pins vgi-rpc-python protocol-3.4 a07ccf2 (upload URLs v2), so CI installs
       # vgi-rpc only through it. Move to the vgi-python 3.4 release tag.
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || '46da09926b2332fb52677cef24cb2bf194f6e99d' }}
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'f2c066fb1d38603acb75361d019f8801012970ca' }}
       GEN: ninja
       BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"
@@ -289,6 +289,16 @@ jobs:
             --allow-skip 'require-env-not VGI_ENGINE_DELETE_RETURNING_VIRTUAL_COLUMNS' \
             "test/sql/integration/*" \
             "test/sql/engine_features/*"
+
+      # Protocol version negotiation v1 (docs/protocol_versions.md): attach at the
+      # negotiated version, and a worker advertising vgi.v3 3.3-3.3 (the
+      # vgi-python fixture switch VGI_TEST_PROTOCOL_RANGE) fails ATTACH naming
+      # both ranges. Outside test/sql/integration/, so SDK lanes never see it.
+      - name: Run the protocol negotiation tests
+        env:
+          VGI_TEST_WORKER: launch:uv run --project /tmp/vgi-python vgi-fixture-worker
+          VGI_PROTOCOL_RANGE_WORKER: launch:env VGI_TEST_PROTOCOL_RANGE=3.3-3.3 uv run --project /tmp/vgi-python vgi-fixture-worker
+        run: python3 scripts/run_tests.py -j 2 --isolate-launcher --min-executed 2 "test/sql/protocol_negotiation/*"
 
       - name: Cache statistics
         if: always()

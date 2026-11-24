@@ -26,8 +26,10 @@ namespace vgi {
 
 class ProtocolCodec {
 public:
-	ProtocolCodec(std::string_view protocol, ProtocolVersion version, std::string_view wire_version)
-	    : protocol_(protocol), version_(version), wire_version_(wire_version) {
+	// `client_patch`: the PATCH of the client's newest version, which every
+	// negotiated version carries (PROTOCOL_VERSIONS_V1: 3.5.2 -> 3.4.2).
+	ProtocolCodec(std::string_view protocol, ProtocolVersion version, std::string_view client_patch)
+	    : protocol_(protocol), version_(version), wire_version_(version.ToString() + "." + std::string(client_patch)) {
 	}
 	virtual ~ProtocolCodec() = default;
 
@@ -38,7 +40,8 @@ public:
 		return version_;
 	}
 	// MAJOR.MINOR.PATCH stamped as vgi_rpc.protocol_version: this version's
-	// major.minor and the client's patch. Static storage.
+	// major.minor and the client's patch. Lives as long as the codec (the
+	// registry is static).
 	std::string_view wire_version() const {
 		return wire_version_;
 	}
@@ -53,7 +56,7 @@ public:
 private:
 	std::string_view protocol_;
 	ProtocolVersion version_;
-	std::string_view wire_version_;
+	std::string wire_version_;
 };
 
 // The codec for (protocol, version), or nullptr when none is registered.

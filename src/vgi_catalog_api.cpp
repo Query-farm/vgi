@@ -400,12 +400,23 @@ bool HeaderTransport(const std::string &worker_path) {
 }
 
 // Byte transports: the worker's ranges from its reflection answer, before any
-// other call. vgi_rpc.protocol_versions when the worker sends it; otherwise
-// (a worker released before negotiation) the exact versions its listing
-// declares. A worker without reflection, or one whose answer fails, leaves the
-// ranges unknown: requests then carry the client's own version, as before.
+// other call. vgi_rpc.protocol_versions when the worker sends it (empty: it
+// negotiates and gates nothing); otherwise (a worker released before
+// negotiation) the exact versions its listing declares. A worker without
+// reflection, or one whose answer fails, leaves the ranges unknown: requests
+// then carry the client's own version, as before.
+//
+// Only a client whose window spans more than one version probes: a
+// single-version client has nothing to choose, so it sends its version and
+// learns the worker's ranges from a refusal (no extra round trip; the
+// reference client does the same).
+bool ShouldProbeRanges() {
+	const auto *window = FindClientProtocolWindow(VGI_MAIN_PROTOCOL.name);
+	return window && window->range.min != window->range.max;
+}
+
 void LearnRangesFromReflection(const CatalogRpcContext &ctx, ClientContext &context) {
-	std::string advertised;
+	std::optional<std::string> advertised;
 	VgiProtocolListing listing;
 	try {
 		listing = InvokeListProtocols(ctx, context, /*tolerate_pre_reflection=*/true, &advertised);
@@ -417,8 +428,8 @@ void LearnRangesFromReflection(const CatalogRpcContext &ctx, ClientContext &cont
 		return;
 	}
 	std::optional<ProtocolRanges> ranges;
-	if (!advertised.empty()) {
-		ranges = ParseProtocolRanges(advertised);
+	if (advertised) {
+		ranges = ParseProtocolRanges(*advertised);
 	}
 	if (!ranges && !listing.predates_reflection) {
 		ProtocolRanges declared;
@@ -433,7 +444,7 @@ void LearnRangesFromReflection(const CatalogRpcContext &ctx, ClientContext &cont
 	}
 	VGI_LOG(context, "protocol.server_ranges",
 	        {{"worker_path", ctx.params->worker_path()},
-	         {"source", !advertised.empty() ? "vgi_rpc.protocol_versions" : "reflection listing"},
+	         {"source", advertised ? "vgi_rpc.protocol_versions" : "reflection listing"},
 	         {"ranges", ranges ? FormatProtocolRanges(*ranges) : std::string("unknown")}});
 	if (ranges) {
 		ctx.params->protocol_session()->ObserveServerRanges(*ranges);
@@ -555,7 +566,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 
 	auto &session = *temp_params->protocol_session();
 	const std::string main_protocol(VGI_MAIN_PROTOCOL.name);
-	if (!HeaderTransport(worker_path)) {
+	if (!HeaderTransport(worker_path) && ShouldProbeRanges()) {
 		LearnRangesFromReflection(ctx, context);
 	}
 	// Before anything else when the ranges are already known (byte transports);

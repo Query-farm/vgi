@@ -22,9 +22,10 @@ Names are the protocol routing names (`vgi.v3`, `vgi.secret.v1`,
 
 - **Window**: `ClientProtocolWindows()` (`src/include/vgi_protocol_window.hpp`)
   lists every protocol the extension versions, with its `min..max` range.
-  `src/vgi_protocol_window.cpp` binds it to the generated constants; it is the
-  only code a regeneration touches. For 3.4 each window is the generated
-  current version.
+  `src/vgi_protocol_window.cpp` binds it to the generated constants
+  (`VGI_PROTOCOL_VERSION_MIN/MAX`, `VGI_SECRET_PROTOCOL_VERSION_MIN/MAX`);
+  `vgi.attach_tickets.v1` has no generated window yet and is exactly its
+  declared version. For 3.4 every window is one version.
 - **ProtocolSession** (`src/include/vgi_protocol_session.hpp`): one per
   endpoint, created at ATTACH and kept on the catalog's
   `VgiAttachParameters::protocol_session()`, shared with its unary RPCs and
@@ -47,10 +48,13 @@ Names are the protocol routing names (`vgi.v3`, `vgi.secret.v1`,
 
 ## ATTACH
 
-1. Byte transports: call `list_protocols` before anything else. Use its
-   `vgi_rpc.protocol_versions` if present; otherwise use the exact versions its
-   listing declares (a worker released before negotiation). If the worker has no
-   reflection, or the call fails, the ranges stay unknown.
+1. Byte transports: when the extension window for `vgi.v3` spans more than one
+   version, call `list_protocols` before anything else and use its
+   `vgi_rpc.protocol_versions` (or, from a worker released before negotiation,
+   the exact versions its listing declares). A single-version window (3.4)
+   skips this probe: there is nothing to choose, so 3.4 to 3.4 traffic has no
+   extra round trip (as in the reference client). The worker's ranges then
+   come from a refusal.
 2. HTTP: the capability probe and every response carry `VGI-Protocol-Versions`.
    The session stores it, even from a failed response.
 3. Negotiate `vgi.v3`. If the ranges are disjoint, fail ATTACH with:
@@ -58,12 +62,25 @@ Names are the protocol routing names (`vgi.v3`, `vgi.secret.v1`,
    (or `... is too new for this extension: upgrade the vgi extension ...`).
    `extra_info` carries `client_protocol_versions` and
    `server_protocol_versions`.
-4. If `catalog_attach` is refused (`protocol_version_unsupported`, or a
-   pre-negotiation server's `protocol_version_mismatch`, whose message names
-   `Server: X.Y.Z`), take the server's ranges from the refusal, negotiate
-   again, and retry once at the highest common version. This is safe because
-   `catalog_attach` is idempotent. No other request is retried.
+4. If `catalog_attach` is refused, take the server's ranges from the refusal
+   and negotiate again. A refusal is `protocol_version_unsupported`, carrying
+   `vgi_rpc.protocol_versions` in its error batch. A server released before
+   negotiation answers `protocol_version_mismatch`, read with
+   `(?:Server:\s*|server requires\s+)(\d+\.\d+)`. Disjoint ranges give the
+   error above. Otherwise retry once at the highest common version, which is
+   safe because `catalog_attach` is idempotent. No other request is retried.
 5. Unknown ranges: speak the client's current version, as before.
+
+Advertisement rules (from the reference's Decisions):
+- An absent header or key is a server released before negotiation.
+- A present but empty value means the server negotiates but gates nothing.
+- Entries that do not parse are skipped, and a repeated name keeps its first
+  window.
+- A negotiated version carries the client's own patch (`3.5.2` becomes
+  `3.4.2`).
+- Servers also send the ranges on the `describe` and `__transport_options__`
+  replies; the extension reads them from `list_protocols`, HTTP headers and
+  refusals.
 
 ## Tests
 

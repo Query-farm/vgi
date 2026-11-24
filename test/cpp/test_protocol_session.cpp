@@ -56,24 +56,29 @@ std::string MetadataValue(const std::vector<std::pair<std::string, std::string>>
 
 TEST_CASE("protocol ranges parse and format", "[protocol-versions]") {
 	auto ranges = ParseProtocolRanges("vgi.v3=3.4-3.4, vgi.secret.v1=1.0-1.2");
-	REQUIRE(ranges);
-	CHECK(ranges->size() == 2);
-	CHECK(ranges->at("vgi.v3") == R(3, 4, 3, 4));
-	CHECK(ranges->at("vgi.secret.v1") == R(1, 0, 1, 2));
-	CHECK(FormatProtocolRanges(*ranges) == "vgi.secret.v1=1.0-1.2, vgi.v3=3.4-3.4");
+	CHECK(ranges.size() == 2);
+	CHECK(ranges.at("vgi.v3") == R(3, 4, 3, 4));
+	CHECK(ranges.at("vgi.secret.v1") == R(1, 0, 1, 2));
+	CHECK(FormatProtocolRanges(ranges) == "vgi.secret.v1=1.0-1.2, vgi.v3=3.4-3.4");
 
-	// Whitespace, patch components and a malformed entry among good ones.
+	// Whitespace, patch components and malformed entries among good ones: the
+	// bad ones are skipped, never fatal.
 	ranges = ParseProtocolRanges("  vgi.v3 = 3.3.0 - 3.4.7 ,junk, x=1.0, y=2.1-2.0, vgi_rpc.Identity.v2=2.0-2.0");
-	REQUIRE(ranges);
-	CHECK(ranges->size() == 2);
-	CHECK(ranges->at("vgi.v3") == R(3, 3, 3, 4));
-	CHECK(ranges->at("vgi_rpc.Identity.v2") == R(2, 0, 2, 0));
+	CHECK(ranges.size() == 2);
+	CHECK(ranges.at("vgi.v3") == R(3, 3, 3, 4));
+	CHECK(ranges.at("vgi_rpc.Identity.v2") == R(2, 0, 2, 0));
 
-	CHECK_FALSE(ParseProtocolRanges(""));
-	CHECK_FALSE(ParseProtocolRanges("garbage"));
-	CHECK_FALSE(ParseProtocolRanges("vgi.v3=3.x-3.4"));
-	CHECK_FALSE(ParseProtocolRanges("vgi.v3=-3.4"));
-	CHECK_FALSE(ParseProtocolRanges("bad name=3.4-3.4"));
+	// A repeated name keeps its first window.
+	ranges = ParseProtocolRanges("vgi.v3=3.4-3.4, vgi.v3=3.0-3.9");
+	CHECK(ranges.at("vgi.v3") == R(3, 4, 3, 4));
+
+	// An empty (present) advertisement: the server negotiates, gating nothing.
+	CHECK(ParseProtocolRanges("").empty());
+	CHECK(ParseProtocolRanges("   ").empty());
+	CHECK(ParseProtocolRanges("garbage").empty());
+	CHECK(ParseProtocolRanges("vgi.v3=3.x-3.4").empty());
+	CHECK(ParseProtocolRanges("vgi.v3=-3.4").empty());
+	CHECK(ParseProtocolRanges("bad name=3.4-3.4").empty());
 
 	CHECK(ParseProtocolVersion("3.4") == std::optional<ProtocolVersion>(V(3, 4)));
 	CHECK(ParseProtocolVersion("3.4.0") == std::optional<ProtocolVersion>(V(3, 4)));
@@ -94,7 +99,15 @@ TEST_CASE("the client window covers the generated versions, each with a codec", 
 	CHECK_FALSE(FindClientProtocolWindow("vgi_rpc.Reflection.v1"));
 	CHECK(ClientProtocolVersionsString().find(std::string(VGI_MAIN_PROTOCOL.name) + "=" + main->range.ToString()) !=
 	      std::string::npos);
-	CHECK(ParseProtocolRanges(ClientProtocolVersionsString()) == std::optional<ProtocolRanges>(ClientProtocolRanges()));
+	CHECK(ParseProtocolRanges(ClientProtocolVersionsString()) == ClientProtocolRanges());
+	// The windows are the generated ones (vgi-python codegen).
+	CHECK(main->range.min == *ParseProtocolVersion(generated::VGI_PROTOCOL_VERSION_MIN));
+	CHECK(main->range.max == *ParseProtocolVersion(generated::VGI_PROTOCOL_VERSION_MAX));
+	CHECK(ClientProtocolVersionsString().find(std::string(generated::VGI_PROTOCOL_VERSIONS_CLIENT)) !=
+	      std::string::npos);
+	CHECK(ClientProtocolVersionsString().find(std::string(generated::VGI_SECRET_PROTOCOL_VERSIONS_CLIENT)) !=
+	      std::string::npos);
+	CHECK(ClientProtocolVersionsString().find("vgi.attach_tickets.v1=") != std::string::npos);
 	// Every version a window admits has a codec, and every codec sits in a window.
 	for (const auto &window : ClientProtocolWindows()) {
 		for (int minor = window.range.min.minor;
@@ -107,6 +120,33 @@ TEST_CASE("the client window covers the generated versions, each with a codec", 
 		const auto *window = FindClientProtocolWindow(codec->protocol());
 		REQUIRE(window);
 		CHECK(window->range.Contains(codec->version()));
+	}
+}
+
+namespace {
+
+class NoopCodec final : public ProtocolCodec {
+public:
+	using ProtocolCodec::ProtocolCodec;
+	VgiBatchPtr EncodeRequest(const std::string &, const VgiBatchPtr &params,
+	                          std::vector<std::pair<std::string, std::string>> &) const override {
+		return params;
+	}
+	void DecodeResponse(const std::string &, UnaryResponseResult &) const override {
+	}
+};
+
+} // namespace
+
+TEST_CASE("a negotiated version carries the client's own patch", "[protocol-versions]") {
+	// PROTOCOL_VERSIONS_V1: a 3.5.2 client speaking 3.4 sends 3.4.2.
+	NoopCodec older("vgi.v3", V(3, 4), "2");
+	CHECK(older.wire_version() == "3.4.2");
+	for (const auto *codec : RegisteredProtocolCodecs()) {
+		const auto *window = FindClientProtocolWindow(codec->protocol());
+		REQUIRE(window);
+		const auto patch = window->current_wire_version.substr(window->current_wire_version.rfind('.'));
+		CHECK(codec->wire_version() == codec->version().ToString() + std::string(patch));
 	}
 }
 
@@ -162,6 +202,16 @@ TEST_CASE("refusals yield the server's ranges", "[protocol-versions]") {
 		auto ranges = RangesFromRefusal(e);
 		REQUIRE(ranges);
 		CHECK(ranges->at("vgi.v3") == R(3, 1, 3, 1));
+	}
+	{
+		// The same, quoted by a precondition description.
+		VgiRpcException e(ErrorInfo(),
+		                  "protocol_version mismatch for protocol 'vgi.v3': client declares 3.4.0, server requires "
+		                  "3.2.1; major and minor must match",
+		                  kProtocolVersionMismatchKind);
+		auto ranges = RangesFromRefusal(e);
+		REQUIRE(ranges);
+		CHECK(ranges->at("vgi.v3") == R(3, 2, 3, 2));
 	}
 	{
 		VgiRpcException e(ErrorInfo(), "some other failure", "method_not_implemented");
@@ -342,7 +392,9 @@ private:
 				const bool is_head = lower.rfind("head ", 0) == 0;
 				std::string headers = "VGI-Accept-Max-Response-Bytes-Support: true\r\n"
 				                      "VGI-Supported-Encodings: \r\n";
-				if (!protocol_versions_.empty()) {
+				// "<absent>" omits the header (a server released before
+				// negotiation); "" sends it empty (negotiates, gates nothing).
+				if (protocol_versions_ != "<absent>") {
 					headers += "VGI-Protocol-Versions: " + protocol_versions_ + "\r\n";
 				}
 				std::string reply;
@@ -404,9 +456,9 @@ TEST_CASE("ATTACH over HTTP fails with both ranges when they are disjoint", "[pr
 	CHECK(server.ClientHeader() == StringUtil::Lower(StringUtil::Replace(ClientProtocolVersionsString(), " ", "")));
 }
 
-TEST_CASE("ATTACH over HTTP without the header, or with overlapping ranges, keeps the worker's error",
+TEST_CASE("ATTACH over HTTP without the header, gating nothing, or overlapping, keeps the worker's error",
           "[protocol-versions]") {
-	for (const char *advertised : {"", "vgi.v3=3.4-3.9"}) {
+	for (const char *advertised : {"<absent>", "", "vgi.secret.v1=1.0-1.0", "vgi.v3=3.4-3.9"}) {
 		INFO("advertised '" << advertised << "'");
 		RangeServer server(advertised);
 		auto error = AttachError(server.Url());

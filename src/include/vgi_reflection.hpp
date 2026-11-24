@@ -36,9 +36,11 @@ bool IsReflectionNotHostedError(const std::exception &e);
 // reflection yields PreReflectionListing() when `tolerate_pre_reflection`, and
 // rethrows the worker's error otherwise. Other failures always propagate.
 // protocol_versions, when non-null, receives the reply's
-// vgi_rpc.protocol_versions metadata ("" when absent).
+// vgi_rpc.protocol_versions metadata: nullopt when absent (a server released
+// before negotiation), "" when it negotiates but gates nothing.
 VgiProtocolListing InvokeListProtocols(const CatalogRpcContext &ctx, ClientContext &context,
-                                       bool tolerate_pre_reflection = true, std::string *protocol_versions = nullptr);
+                                       bool tolerate_pre_reflection = true,
+                                       std::optional<std::string> *protocol_versions = nullptr);
 
 // The catalog's cached listing, fetched on first use. Never null; throws only
 // when the worker cannot be reached (a pre-reflection worker is a listing).

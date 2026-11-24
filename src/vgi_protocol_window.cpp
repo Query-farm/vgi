@@ -83,7 +83,7 @@ std::optional<ProtocolVersion> ParseProtocolVersion(std::string_view text) {
 	return ProtocolVersion {*major, *minor};
 }
 
-std::optional<ProtocolRanges> ParseProtocolRanges(std::string_view text) {
+ProtocolRanges ParseProtocolRanges(std::string_view text) {
 	ProtocolRanges out;
 	while (!text.empty()) {
 		const auto comma = text.find(',');
@@ -106,10 +106,8 @@ std::optional<ProtocolRanges> ParseProtocolRanges(std::string_view text) {
 		if (!lo || !hi || *hi < *lo) {
 			continue;
 		}
-		out[std::string(name)] = ProtocolRange {*lo, *hi};
-	}
-	if (out.empty()) {
-		return std::nullopt;
+		// A repeated name keeps its first window.
+		out.emplace(std::string(name), ProtocolRange {*lo, *hi});
 	}
 	return out;
 }
@@ -128,30 +126,42 @@ std::string FormatProtocolRanges(const ProtocolRanges &ranges) {
 // ---------------------------------------------------------------------------
 // The supported window.
 //
-// Until vgi-python generates explicit window constants, every protocol's
-// window is exactly its generated current version (3.4 -> 3.4..3.4), which is
-// the 3.4 policy. When the generated header lands, this block is the only
-// code that changes: bind each window to its generated min/max.
+// vgi.v3 and vgi.secret.v1 take their windows from the generated constants
+// (VGI_*PROTOCOL_VERSION_MIN/MAX, vgi-python codegen). vgi.attach_tickets.v1
+// has no generated window yet, so it is exactly its declared version.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-ProtocolWindow ExactWindow(std::string_view protocol, std::string_view wire_version) {
-	auto v = ParseProtocolVersion(wire_version);
+ProtocolVersion RequireVersion(std::string_view text) {
+	auto v = ParseProtocolVersion(text);
 	if (!v) {
 		// A malformed generated constant is a build defect, not a runtime case.
 		std::abort();
 	}
-	return ProtocolWindow {protocol, ProtocolRange {*v, *v}, wire_version};
+	return *v;
+}
+
+ProtocolWindow GeneratedWindow(std::string_view protocol, std::string_view min, std::string_view max,
+                               std::string_view wire_version) {
+	ProtocolWindow window {protocol, ProtocolRange {RequireVersion(min), RequireVersion(max)}, wire_version};
+	// The newest version spoken is the window's top (PROTOCOL_VERSIONS_V1 §7.3).
+	if (window.range.max != RequireVersion(wire_version) || window.range.max < window.range.min) {
+		std::abort();
+	}
+	return window;
 }
 
 } // namespace
 
 const std::vector<ProtocolWindow> &ClientProtocolWindows() {
 	static const std::vector<ProtocolWindow> windows = {
-	    ExactWindow(generated::VGI_PROTOCOL_NAME, generated::VGI_PROTOCOL_VERSION),
-	    ExactWindow(generated::VGI_SECRET_PROTOCOL_NAME, generated::VGI_SECRET_PROTOCOL_VERSION),
-	    ExactWindow(ATTACH_TICKETS_PROTOCOL_NAME, ATTACH_TICKETS_PROTOCOL_VERSION),
+	    GeneratedWindow(generated::VGI_PROTOCOL_NAME, generated::VGI_PROTOCOL_VERSION_MIN,
+	                    generated::VGI_PROTOCOL_VERSION_MAX, generated::VGI_PROTOCOL_VERSION),
+	    GeneratedWindow(generated::VGI_SECRET_PROTOCOL_NAME, generated::VGI_SECRET_PROTOCOL_VERSION_MIN,
+	                    generated::VGI_SECRET_PROTOCOL_VERSION_MAX, generated::VGI_SECRET_PROTOCOL_VERSION),
+	    GeneratedWindow(ATTACH_TICKETS_PROTOCOL_NAME, ATTACH_TICKETS_PROTOCOL_VERSION, ATTACH_TICKETS_PROTOCOL_VERSION,
+	                    ATTACH_TICKETS_PROTOCOL_VERSION),
 	};
 	return windows;
 }
