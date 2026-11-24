@@ -143,9 +143,23 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url,
 // (http://127.0.0.1, http://[::1], http://localhost). Production stores are https.
 inline constexpr const char *kAllowLoopbackExternalLocationsEnv = "VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS";
 
-// Whether ResolveExternalLocation may fetch `url`: https://, or loopback http
-// with kAllowLoopbackExternalLocationsEnv=1 (always, in the browser).
-bool ExternalLocationUrlAllowed(const std::string &url);
+// Whether ResolveExternalLocation may fetch `url`: https:// on any host, plain
+// http:// on any host when allow_plain_http (vgi_storage_allow_plain_http), or
+// loopback http with kAllowLoopbackExternalLocationsEnv=1 (always, in the browser).
+bool ExternalLocationUrlAllowed(const std::string &url, bool allow_plain_http = false);
+// The same, reading vgi_storage_allow_plain_http from the session.
+bool ExternalLocationUrlAllowed(ClientContext &context, const std::string &url);
+bool StorageAllowsPlainHttp(ClientContext &context);
+
+// Storage transfers (HttpGetBytes, HttpPutBytes): connect and stall timeout
+// vgi_storage_stall_timeout_seconds, never a whole-request deadline; at most
+// 1 + kStorageTransferMaxRetries attempts (fewer under a lower http_retries),
+// backoff kStorageTransferRetryWaitMs x kStorageTransferRetryBackoff^n.
+// The values match vgi-rpc's storage clients.
+inline constexpr uint64_t kStorageTransferMaxRetries = 2;
+inline constexpr uint64_t kStorageTransferRetryWaitMs = 250;
+inline constexpr float kStorageTransferRetryBackoff = 2.0f;
+uint64_t GetStorageStallTimeoutSeconds(ClientContext &context);
 
 // vgi_external_location_max_bytes for this session.
 uint64_t GetExternalLocationMaxBytes(ClientContext &context);

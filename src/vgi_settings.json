@@ -84,6 +84,26 @@
     "maximum": 9223372036854775807
   },
   {
+    "name": "vgi_storage_stall_timeout_seconds",
+    "type": "BIGINT",
+    "default": 30,
+    "scope": "session",
+    "effect": "Next storage transfer; a transfer already running keeps its captured value.",
+    "platform": "all",
+    "description": "Connect and stall timeout in seconds for storage transfers (the pre-signed PUTs and GETs of uploaded arguments and requests, externalized results and catalog contents, and GitHub release downloads). A transfer fails only when it moves under 1 KiB/s for this long, never because it is slow overall; a stalled transfer is retried (at most 3 attempts, fewer when http_retries is lower). The worker-side equivalent is VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS.",
+    "minimum": 1,
+    "maximum": 2147483647
+  },
+  {
+    "name": "vgi_storage_allow_plain_http",
+    "type": "BOOLEAN",
+    "default": false,
+    "scope": "session",
+    "effect": "Next storage transfer.",
+    "platform": "all",
+    "description": "Accept plain http:// pre-signed storage URLs on any host (an in-network MinIO or Ceph endpoint). A pre-signed URL carries its credential in its query, which then crosses the network in the clear. https:// URLs are accepted on any host without this setting."
+  },
+  {
     "name": "vgi_github_allow_latest",
     "type": "BOOLEAN",
     "default": true,

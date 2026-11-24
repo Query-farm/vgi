@@ -19,10 +19,29 @@ ATTACH 'ext_probe' AS ep (TYPE vgi, LOCATION '${VGI_EXTERNAL_PROBE_WORKER}');
 statement error
 SELECT * FROM ep.ext_probe_ok(3, 10);
 ----
-plain http is accepted only for a loopback host with VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1
+plain http is accepted only with SET vgi_storage_allow_plain_http = true, or for a loopback host with VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1
 
 statement error
 SELECT * FROM ep.ext_probe_url('http://localhost:9/blob');
+----
+VGI external location refused: the URL must be https://
+
+# An operator who runs an in-network store over plain http (MinIO, Ceph)
+# opts in per session; any host is then accepted.
+
+statement ok
+SET vgi_storage_allow_plain_http = true;
+
+query II
+SELECT count(*), sum(strlen(payload)) FROM ep.ext_probe_ok(3, 10);
+----
+3	30
+
+statement ok
+RESET vgi_storage_allow_plain_http;
+
+statement error
+SELECT * FROM ep.ext_probe_ok(3, 10);
 ----
 VGI external location refused: the URL must be https://
 

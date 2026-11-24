@@ -13,13 +13,29 @@ threshold with a pointer: unary results, stream headers and data batches, on
 every transport (HTTP and the byte transports alike). The client resolves
 them in `ResolveExternalLocation` (`src/vgi_http_client.cpp`):
 
-- **Scheme.** Only `https://` is fetched. Plain `http://` is accepted only
-  for a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`, parsed from the
-  authority, so `http://127.0.0.1@evil/` is refused) and only with
+- **Scheme.** `https://` is fetched on any host (AWS, R2, GCS, or a custom
+  S3 endpoint such as MinIO, Ceph, Wasabi or B2). Plain `http://` is
+  accepted on any host only after `SET vgi_storage_allow_plain_http = true`
+  (an in-network MinIO; the pre-signed query, which is the credential, then
+  crosses the network in the clear). Without it, plain `http://` is accepted
+  only for a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`, parsed from
+  the authority, so `http://127.0.0.1@evil/` is refused) and only with
   `VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1` in the process environment
   (always in the browser, which has no environment and blocks mixed content
-  itself). `httpi://` is refused. Refusals are `UNSUPPORTED` and happen
-  before any request.
+  itself). The same rule covers vended upload and download URLs.
+  `httpi://` is refused. Refusals are `UNSUPPORTED` and happen before any
+  request.
+- **Timeouts and retries.** Every storage transfer (result and catalog
+  fetches, argument and request uploads) has a connect timeout and a stall
+  timeout, both `vgi_storage_stall_timeout_seconds` (default 30, the value
+  vgi-rpc's storage clients use, `VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS` on
+  workers), and no whole-request deadline: a 1 GiB transfer over a slow link
+  runs as long as it keeps moving (more than 1 KiB/s over the window). A
+  connect error, a stall, 408, 429 or 5xx is retried, at most 3 attempts in
+  all (fewer when `http_retries` is lower), with 0.25 s x 2^n backoff plus
+  jitter. A retried GET starts its body over; a retried PUT resends its body,
+  since a pre-signed PUT cannot resume. `vgi_http_timeout_seconds` does not
+  apply to storage transfers.
 - **Size.** `vgi_external_location_max_bytes` (default 1 GiB) caps both the
   transferred body and its decoded size: a `Content-Length` over the cap
   stops before the body is read, a body that grows past it stops at the cap,

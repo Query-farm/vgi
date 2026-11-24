@@ -148,6 +148,8 @@ jobs:
         # libhaybarn.so (rc10 engine option; the shell already links statically).
         env:
           EXT_FLAGS: -DHAYBARN_STATIC_UNITTEST=1
+          # Also builds vgi_http_interrupt_tests (make test_http_interrupt).
+          BUILD_VGI_HTTP_INTERRUPT_TESTS: "1"
         run: make release
 
       # SDKs changing the wire contract need the matching development client
@@ -174,6 +176,12 @@ jobs:
 
       - name: Run settings validation and cache ownership tests
         run: make test_settings
+
+      # HTTP interrupts, secret-free parameters and the external-location
+      # client, including the storage transfer timeouts against a local server
+      # that trickles or stalls (about 2 minutes).
+      - name: Run HTTP interrupt, external-location and storage timeout tests
+        run: make test_http_interrupt
 
       # enable-cache is off deliberately. The only uv project here is the
       # fixture checkout at /tmp/vgi-python, created after this step runs and

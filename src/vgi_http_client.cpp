@@ -209,6 +209,39 @@ static void ApplyHttpTimeout(ClientContext &context, HTTPParams &params) {
 	params.timeout = GetHttpTimeoutSeconds(context);
 }
 
+uint64_t GetStorageStallTimeoutSeconds(ClientContext &context) {
+	Value value;
+	if (context.TryGetCurrentSetting("vgi_storage_stall_timeout_seconds", value) && !value.IsNull()) {
+		return static_cast<uint64_t>(value.GetValue<int64_t>());
+	}
+	return static_cast<uint64_t>(defaults::STORAGE_STALL_TIMEOUT_SECONDS);
+}
+
+// Storage transfers (pre-signed PUTs and GETs) move bodies of up to the 1 GiB
+// caps over links of any speed, so they never get a whole-request deadline.
+// httpfs maps HTTPParams::timeout to a connect timeout plus a stall timeout:
+// curl's CURLOPT_CONNECTTIMEOUT and CURLOPT_LOW_SPEED_TIME (under 1 KiB/s for
+// that long) with CURLOPT_TIMEOUT 0, httplib's per-socket-operation connect,
+// read and write timeouts. Both are what vgi-rpc's storage clients use: connect
+// and stall 30 s (VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS on workers), at most 3
+// attempts with 0.25 s x 2^n backoff (HTTPUtil adds the jitter and keeps 429 and
+// 503 on their own throttle budget). Only connect errors, stalls, 408/429 and
+// 5xx are retried, so a progressing transfer is never cut off and resent. A
+// retry resends a PUT body whole: a pre-signed PUT cannot resume.
+static void ApplyStorageTransferParams(ClientContext &context, HTTPParams &params) {
+	params.timeout = GetStorageStallTimeoutSeconds(context);
+	params.timeout_usec = 0;
+	params.retries = MinValue<uint64_t>(params.retries, kStorageTransferMaxRetries);
+	params.retry_wait_ms = kStorageTransferRetryWaitMs;
+	params.retry_backoff = kStorageTransferRetryBackoff;
+}
+
+bool StorageAllowsPlainHttp(ClientContext &context) {
+	Value value;
+	return context.TryGetCurrentSetting("vgi_storage_allow_plain_http", value) && !value.IsNull() &&
+	       value.GetValue<bool>();
+}
+
 // https (case-insensitive) or httpi: gates Secure cookies.
 static bool UrlIsSecure(const std::string &url) {
 	if (url.size() < 8) {
@@ -908,7 +941,7 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 		params = InitSecretFreeHttpParams(context);
 		headers.Insert("User-Agent", SecretFreeUserAgent(context));
 	}
-	ApplyHttpTimeout(context, *params);
+	ApplyStorageTransferParams(context, *params);
 
 	headers.Insert("X-VGI-Accept-Encoding", ClientAcceptEncoding());
 	// No auth headers: pre-signed URLs reject an extra Authorization header.
@@ -918,7 +951,11 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url, ClientC
 	// stops before any body is read, and a body that grows past it (chunked, or
 	// a lying length) stops at the limit.
 	bool over_limit = false;
-	auto response_handler = [&over_limit, max_bytes](const HTTPResponse &response) {
+	// Called once per attempt, before its body: a retry after a stall starts
+	// the body over instead of appending to the stalled attempt's prefix.
+	auto response_handler = [&body, &over_limit, max_bytes](const HTTPResponse &response) {
+		body.clear();
+		over_limit = false;
 		if (max_bytes > 0 && response.HasHeader("Content-Length")) {
 			try {
 				if (std::stoull(response.GetHeaderValue("Content-Length")) > max_bytes) {
@@ -1000,8 +1037,11 @@ uint64_t GetExternalLocationMaxBytes(ClientContext &context) {
 	return defaults::EXTERNAL_LOCATION_MAX_BYTES;
 }
 
-bool ExternalLocationUrlAllowed(const std::string &url) {
+bool ExternalLocationUrlAllowed(const std::string &url, bool allow_plain_http) {
 	if (url.size() >= 8 && StringUtil::Lower(url.substr(0, 8)) == "https://") {
+		return true;
+	}
+	if (allow_plain_http && url.size() > 7 && StringUtil::Lower(url.substr(0, 7)) == "http://") {
 		return true;
 	}
 	if (!IsLoopbackHttpUrl(url)) {
@@ -1015,6 +1055,10 @@ bool ExternalLocationUrlAllowed(const std::string &url) {
 	const char *flag = std::getenv(kAllowLoopbackExternalLocationsEnv);
 	return flag && std::string(flag) == "1";
 #endif
+}
+
+bool ExternalLocationUrlAllowed(ClientContext &context, const std::string &url) {
+	return ExternalLocationUrlAllowed(url, StorageAllowsPlainHttp(context));
 }
 
 // Every failure while resolving a pointer is a storage failure: tag it
@@ -1070,10 +1114,10 @@ static UnaryResponseResult ResolveExternalLocationImpl(ClientContext &context, c
 		                  "https:// pre-signed URL [url: %s]",
 		                  shown_url);
 	}
-	if (!ExternalLocationUrlAllowed(location_url)) {
+	if (!ExternalLocationUrlAllowed(context, location_url)) {
 		throw IOException(location_error(http_error::kUnsupported),
-		                  "VGI external location refused: the URL must be https:// (plain http is accepted only for a "
-		                  "loopback host with %s=1) [url: %s]",
+		                  "VGI external location refused: the URL must be https:// (plain http is accepted only with "
+		                  "SET vgi_storage_allow_plain_http = true, or for a loopback host with %s=1) [url: %s]",
 		                  kAllowLoopbackExternalLocationsEnv, shown_url);
 	}
 	// Protocol 3.4: the pointer's SHA-256 is mandatory. Without it the client
@@ -1635,7 +1679,7 @@ void HttpPutBytes(ClientContext &context, const std::string &url, const uint8_t 
 	auto &http_util = HTTPUtil::Get(db);
 	// A pre-signed upload URL: no secrets (see vgi_http_params.hpp).
 	auto params = InitSecretFreeHttpParams(context);
-	ApplyHttpTimeout(context, *params);
+	ApplyStorageTransferParams(context, *params);
 
 	HTTPHeaders headers;
 	headers.Insert("User-Agent", SecretFreeUserAgent(context));
@@ -1741,10 +1785,10 @@ UploadedArguments UploadArgumentsForReference(ClientContext &context, const std:
 		                  "'ref'); upgrade the worker [url: %s]",
 		                  kArgumentsRefBytesHeader, base_url);
 	}
-	if (!ExternalLocationUrlAllowed(urls[0].upload_url)) {
+	if (!ExternalLocationUrlAllowed(context, urls[0].upload_url)) {
 		throw IOException(BuildHttpExtraInfo(http_error::kUnsupported, base_url),
-		                  "VGI server vended an upload URL that is not https:// (plain http is accepted only for "
-		                  "a loopback host with %s=1) [url: %s]",
+		                  "VGI server vended an upload URL that is not https:// (plain http is accepted only with "
+		                  "SET vgi_storage_allow_plain_http = true, or for a loopback host with %s=1) [url: %s]",
 		                  kAllowLoopbackExternalLocationsEnv, RedactPresignedUrl(urls[0].upload_url));
 	}
 	// Exactly the hashed bytes, uncompressed, straight from the caller's buffer.
@@ -1833,10 +1877,10 @@ bool MaybeExternalizeRequestBody(ClientContext &context, const std::string &base
 	// The same scheme rule as a fetched location: request bytes never leave
 	// over plaintext to a non-loopback host.
 	for (const auto *vended : {&urls[0].upload_url, &urls[0].download_url}) {
-		if (!ExternalLocationUrlAllowed(*vended)) {
+		if (!ExternalLocationUrlAllowed(context, *vended)) {
 			throw IOException(BuildHttpExtraInfo(http_error::kUnsupported, base_url),
-			                  "VGI server vended an upload URL that is not https:// (plain http is accepted only for "
-			                  "a loopback host with %s=1) [url: %s]",
+			                  "VGI server vended an upload URL that is not https:// (plain http is accepted only with "
+			                  "SET vgi_storage_allow_plain_http = true, or for a loopback host with %s=1) [url: %s]",
 			                  kAllowLoopbackExternalLocationsEnv, RedactPresignedUrl(*vended));
 		}
 	}
