@@ -135,6 +135,11 @@ send their evaluated SET values, cast to the column types, plus the row id).
   batches already applied. On a transactional attach the whole MERGE is staged in the
   statement's transaction and discarded with it.
 - Multi-branch tables refuse MERGE ([multi-branch scans](multi_branch.md)).
+- **Duplicate matches are written, not refused.** With Haybarn 2.0.1 (haybarn 27b4d10449d,
+  reverting upstream DuckDB 124ff39) a MERGE whose source matches one target row more than once
+  succeeds: the worker receives one write per matching source row and the last one applied wins.
+  Which source row is applied last is not specified. The reported count includes every match
+  (`writable_tx/merge.test`).
 
 Related fixes in the same release: DELETE sends each row id once per write call (DuckDB hands a
 non-native DELETE ... USING a target row once per matching source row), and a CTAS that fails

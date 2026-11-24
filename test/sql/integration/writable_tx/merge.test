@@ -174,18 +174,23 @@ WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name, 1);
 ----
 <REGEX>:.*txfix: duplicate id 3.*
 
-# The same target row matched twice is DuckDB's error, before any write.
-statement error
+# The same target row matched by two source rows. Haybarn 2.0.1 reverted
+# DuckDB's MERGE multi-match detection (haybarn 27b4d10449d, reverting upstream
+# duckdb 124ff39), so this is no longer an error: the MERGE succeeds, the worker
+# receives one write per matching source row, and the last write applied wins.
+# Which source row that is is not specified, so assert only the reported count
+# (one per match) and that the row holds one of the two values.
+query I
 MERGE INTO t.main.items AS tgt USING (VALUES (2, 1), (2, 2)) s(id, q) ON tgt.id = s.id
 WHEN MATCHED THEN UPDATE SET qty = s.q;
 ----
-<REGEX>:.*more than one source row.*
+2
 
-query ITI
-SELECT id, name, qty FROM t.main.items ORDER BY id;
+query ITT
+SELECT id, name, CASE WHEN id = 2 THEN qty IN (1, 2) ELSE qty = 33 END FROM t.main.items ORDER BY id;
 ----
-2	Y	120
-3	kept	33
+2	Y	true
+3	kept	true
 
 # ============================================================================
 # ERROR clause. The MERGE's write calls are not atomic together: on this
