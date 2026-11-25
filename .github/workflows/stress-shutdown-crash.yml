@@ -18,7 +18,7 @@ on:
       launcher_iterations:
         description: "Iterations per launcher job (each runs 4 copies at once)"
         required: false
-        default: "150"
+        default: "600"
       vendor_iterations:
         description: "Iterations per vendor job"
         required: false
@@ -56,7 +56,7 @@ jobs:
       # well inside the job timeout so the artifacts always upload.
       STRESS_BUDGET_SECONDS: "2700"
       STRESS_COPIES: "4"
-      STRESS_ITERATIONS: ${{ matrix.lane == 'launcher' && (inputs.launcher_iterations || '150') || (inputs.vendor_iterations || '30') }}
+      STRESS_ITERATIONS: ${{ matrix.lane == 'launcher' && (inputs.launcher_iterations || '600') || (inputs.vendor_iterations || '30') }}
       OUT: ${{ github.workspace }}/stress-out
 
     steps:
@@ -112,6 +112,16 @@ jobs:
       - name: Install the vgi-python fixture workers
         run: ./scripts/ci_install_fixtures.sh
 
+      # The fixture server resolves vendor pointers with aiohttp, which only
+      # vgi-python's `external` extra (or its dev set) installs; the plain
+      # `--extra http` sync fails every external_storage file at its first
+      # externalized value.
+      - name: Add the external extra for the vendor lane
+        if: matrix.lane == 'vendor'
+        run: |
+          uv sync --locked --project /tmp/vgi-python --extra http --extra external >/dev/null
+          uv run --project /tmp/vgi-python python -c 'import aiohttp; print("aiohttp", aiohttp.__version__)'
+
       # As 4ff9066 does for the integration suite.
       - name: Enable core dumps for test binaries
         run: |
@@ -119,6 +129,11 @@ jobs:
           sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p.%t
           sudo sysctl -w fs.suid_dumpable=1 || true
           nproc; free -m
+          # Prove the capture works: zero cores must mean zero crashes.
+          ulimit -c unlimited
+          sleep 30 & victim=$!; kill -SEGV "$victim"; wait "$victim" || true
+          ls /tmp/cores/core.sleep.* || { echo "::error::core capture is not working"; exit 1; }
+          rm -f /tmp/cores/core.sleep.*
 
       - name: Stress loop
         continue-on-error: true
