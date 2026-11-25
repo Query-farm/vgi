@@ -51,7 +51,9 @@ jobs:
       # The fixtures run 45534794571 used (integration.yml at d780e74/4ff9066).
       VGI_FIXTURES_REF: f2c066fb1d38603acb75361d019f8801012970ca
       VGI_PYTHON_DIR: /tmp/vgi-python
-      QUERY_FARM_TELEMETRY_OPT_OUT: "1"
+      # Telemetry stays ON, as in the crashing Integration step (it never set
+      # QUERY_FARM_TELEMETRY_OPT_OUT): its POST starts httpfs's curl multi
+      # Dispatcher thread, which is still exiting when exit() runs OPENSSL_cleanup.
       # The integration-suite run is ~3 s per file; stop starting iterations
       # well inside the job timeout so the artifacts always upload.
       STRESS_BUDGET_SECONDS: "2700"
