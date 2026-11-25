@@ -224,6 +224,16 @@ jobs:
           VGI_IROH_BRIDGE_BIN: /tmp/vgi-rpc-rust/target/release/vgi-iroh-bridge
         run: ./test/run_iroh_integration.sh
 
+      # A test binary that dies on a signal (a rare exit-time segfault was seen
+      # once, after every assertion had passed) leaves a core in /tmp/cores; the
+      # "Backtraces from crashed test binaries" step below prints and uploads its
+      # stacks, so the next occurrence is diagnosable instead of a bare exit=-11.
+      - name: Enable core dumps for test binaries
+        run: |
+          mkdir -p /tmp/cores
+          sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p
+          sudo sysctl -w fs.suid_dumpable=1 || true
+
       # --min-executed is the guard that makes this job worth having. A lane
       # that stops running tests still reports green — fewer results, all of
       # them passing — which is exactly how this suite went unrun for months.
@@ -243,6 +253,7 @@ jobs:
           # No vgi-python writable_tx fixture yet (docs/writable_tx_fixtures.md):
           # writable_tx/*.test skip on VGI_WRITABLE_TX_FIXTURES, allowed below.
         run: |
+          ulimit -c unlimited || true
           mkdir -p "$VGI_TEST_BRANCH_DIR"
           # --isolate-launcher, as `make test_launcher` uses: DuckDB 2.0's unittest
           # gives each run a temporary HOME and deletes it on exit. A launch: worker
@@ -299,6 +310,33 @@ jobs:
           VGI_TEST_WORKER: launch:uv run --project /tmp/vgi-python vgi-fixture-worker
           VGI_PROTOCOL_RANGE_WORKER: launch:env VGI_TEST_PROTOCOL_RANGE=3.3-3.3 uv run --project /tmp/vgi-python vgi-fixture-worker
         run: python3 scripts/run_tests.py -j 2 --isolate-launcher --min-executed 2 "test/sql/protocol_negotiation/*"
+
+      - name: Backtraces from crashed test binaries
+        if: always()
+        run: |
+          shopt -s nullglob
+          cores=(/tmp/cores/core.*)
+          if [ ${#cores[@]} -eq 0 ]; then
+            echo "no core dumps"
+            exit 0
+          fi
+          sudo apt-get install -y -qq gdb > /dev/null
+          for core in "${cores[@]}"; do
+            exe=$(file -b "$core" | sed -n "s/.*execfn: '\([^']*\)'.*/\1/p")
+            [ -n "$exe" ] || exe=build/release/test/unittest
+            echo "=== $core ($exe)"
+            gdb -batch -nx -ex "set pagination off" -ex "thread apply all bt" "$exe" "$core" 2>&1 \
+              | tee "$core.backtrace.txt" | head -400
+          done
+
+      - name: Upload crash backtraces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-backtraces
+          path: /tmp/cores/*.backtrace.txt
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Cache statistics
         if: always()
