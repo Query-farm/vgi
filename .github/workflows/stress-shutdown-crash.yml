@@ -131,9 +131,10 @@ jobs:
           nproc; free -m
           # Prove the capture works: zero cores must mean zero crashes.
           ulimit -c unlimited
-          sleep 30 & victim=$!; kill -SEGV "$victim"; wait "$victim" || true
-          ls /tmp/cores/core.sleep.* || { echo "::error::core capture is not working"; exit 1; }
-          rm -f /tmp/cores/core.sleep.*
+          # (Let the child exec first, or the core is named after bash.)
+          sleep 30 & victim=$!; sleep 1; kill -SEGV "$victim"; wait "$victim" || true
+          ls -la /tmp/cores/core.* || { echo "::error::core capture is not working"; exit 1; }
+          rm -f /tmp/cores/core.*
 
       - name: Stress loop
         continue-on-error: true
