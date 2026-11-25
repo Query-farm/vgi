@@ -97,7 +97,7 @@ jobs:
           install -m 0755 "$dir/unittest" build/release/test/unittest
           file build/release/test/unittest
           ldd build/release/test/unittest
-          build/release/test/unittest --list-test-names-only 'test/sql/integration/splits/cache_interaction.test'
+          build/release/test/unittest --list-test-names-only 'test/sql/integration/splits/cache_interaction.test' || true  # Catch exits with the match count
 
       - name: Install gdb and zstd
         run: |
