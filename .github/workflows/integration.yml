@@ -19,6 +19,8 @@ name: Integration suite
 
 on:
   push:
+    # stress/shutdown-crash branch only: leave the runners to the stress jobs.
+    branches-ignore: ['stress/**']
   pull_request:
   workflow_dispatch:
     inputs:

@@ -1,0 +1,145 @@
+# Stress for the rare exit-time crash of the statically linked unittest
+# (exit=-11 after "All tests passed" in cache_interaction.test, Integration run
+# 45534794571 attempt 1; "double free or corruption" at exit in a vgi-java
+# vendor lane). Lives only on the stress/shutdown-crash branch.
+#
+# It does not rebuild: every job runs the exact unittest that crashed, the
+# vgi-native-runner-linux_amd64 artifact from run 45534794571 (d780e74,
+# HAYBARN_STATIC_UNITTEST=1). Half the jobs loop cache_interaction.test under
+# the launcher transport, half loop the http_vendor external_storage lane. Any
+# core is backtraced with gdb and uploaded with a per-job summary.
+name: Stress shutdown crash
+
+on:
+  push:
+    branches: [stress/shutdown-crash]
+  workflow_dispatch:
+    inputs:
+      launcher_iterations:
+        description: "Iterations per launcher job (each runs 4 copies at once)"
+        required: false
+        default: "150"
+      vendor_iterations:
+        description: "Iterations per vendor job"
+        required: false
+        default: "30"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  stress:
+    name: stress ${{ matrix.lane }} ${{ matrix.shard }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [launcher, vendor]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    defaults:
+      run:
+        shell: bash
+    env:
+      VGI_INSTALL_FIXTURES: "1"
+      VGI_FIXTURES_DIR: /tmp/vgi-python
+      # The fixtures run 45534794571 used (integration.yml at d780e74/4ff9066).
+      VGI_FIXTURES_REF: f2c066fb1d38603acb75361d019f8801012970ca
+      VGI_PYTHON_DIR: /tmp/vgi-python
+      QUERY_FARM_TELEMETRY_OPT_OUT: "1"
+      # The integration-suite run is ~3 s per file; stop starting iterations
+      # well inside the job timeout so the artifacts always upload.
+      STRESS_BUDGET_SECONDS: "2700"
+      STRESS_COPIES: "4"
+      STRESS_ITERATIONS: ${{ matrix.lane == 'launcher' && (inputs.launcher_iterations || '150') || (inputs.vendor_iterations || '30') }}
+      OUT: ${{ github.workspace }}/stress-out
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Export engine feature variables
+        run: make -s --no-print-directory engine_test_env | tee -a "$GITHUB_ENV"
+
+      # Attempt 2's copy of the artifact (attempt 1, which crashed, uploaded an
+      # identical build of the same commit as 14986162386).
+      - name: Download the native runner from run 45534794571
+        uses: actions/download-artifact@v5
+        with:
+          artifact-ids: "14986704134"
+          repository: Query-farm/vgi
+          run-id: 45534794571
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/native
+
+      - name: Install it as build/release/test/unittest
+        run: |
+          dir="$RUNNER_TEMP/native"
+          # download-artifact puts an artifact-ids download in a subdirectory.
+          [ -f "$dir/manifest.json" ] || dir=$(dirname "$(find "$RUNNER_TEMP/native" -name manifest.json | head -1)")
+          cat "$dir/manifest.json"
+          python3 - "$dir" <<'EOF'
+          import hashlib, json, sys, pathlib
+          d = pathlib.Path(sys.argv[1]); m = json.loads((d / "manifest.json").read_text())
+          assert m["revision"].startswith("d780e74"), m["revision"]
+          for name in ("unittest", "haybarn"):
+              h = hashlib.sha256((d / name).read_bytes()).hexdigest()
+              assert h == m["sha256"][name], (name, h)
+          print("checksums ok")
+          EOF
+          mkdir -p build/release/test
+          install -m 0755 "$dir/unittest" build/release/test/unittest
+          file build/release/test/unittest
+          ldd build/release/test/unittest
+          build/release/test/unittest --list-test-names-only 'test/sql/integration/splits/cache_interaction.test'
+
+      - name: Install gdb and zstd
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb zstd file > /dev/null
+          gdb --version | head -1
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+
+      - name: Install the vgi-python fixture workers
+        run: ./scripts/ci_install_fixtures.sh
+
+      # As 4ff9066 does for the integration suite.
+      - name: Enable core dumps for test binaries
+        run: |
+          mkdir -p /tmp/cores
+          sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p.%t
+          sudo sysctl -w fs.suid_dumpable=1 || true
+          nproc; free -m
+
+      - name: Stress loop
+        continue-on-error: true
+        run: |
+          ulimit -c unlimited || true
+          .github/stress/shutdown_stress.sh "${{ matrix.lane }}" "$OUT" || true
+
+      - name: Leftover cores
+        if: always()
+        run: |
+          ls -la /tmp/cores "$OUT/backtraces" 2>/dev/null || true
+          shopt -s nullglob
+          for f in "$OUT"/backtraces/*.backtrace.txt; do
+            echo "=================== $f"; head -150 "$f"
+          done
+
+      - name: Upload backtraces, summary and failing logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-backtraces-${{ matrix.lane }}-${{ matrix.shard }}
+          path: ${{ env.OUT }}/
+          if-no-files-found: warn
+          retention-days: 30
