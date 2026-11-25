@@ -18,10 +18,14 @@ duckdb_extension_statically_link(vgi)
 # stack so the extension and httpfs share the same engine APIs.
 if(EXISTS "${CMAKE_SOURCE_DIR}/src/include/duckdb/haybarn.h")
     set(VGI_ENGINE_FLAVOR haybarn)
-    # The haybarn-httpfs revision the engine (haybarn-v2.0.1-rc3) pins in
-    # .github/config/haybarn/extensions/httpfs.cmake.
+    # haybarn-httpfs haybarn-2.0 (built against engine haybarn-v2.0.1-rc3): the
+    # rc3 engine's own pin (e0d2876, .github/config/haybarn/extensions/httpfs.cmake)
+    # plus the fix that joins the curl multi dispatcher thread at exit. Detached,
+    # its OpenSSL thread-exit destructor raced OPENSSL_cleanup: "double free or
+    # corruption" / SIGSEGV after all tests passed, in this statically linked
+    # unittest (published builds load httpfs from Haybarn core instead).
     set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
-    set(HTTPFS_GIT_TAG e0d2876400247a3feed6a78a9a67e19285379472)
+    set(HTTPFS_GIT_TAG fd8b426b87b6a7c74a3106fb9f8066798f342be5)
 else()
     set(VGI_ENGINE_FLAVOR duckdb)
     # The httpfs revision upstream v2.0.0 pins in
