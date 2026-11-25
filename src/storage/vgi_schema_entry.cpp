@@ -516,9 +516,10 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 				}
 			}
 			if (!found) {
-				throw BinderException("View \"%s\" does not have a column with name \"%s\"",
-				                      col_comment.GetQualifiedName().Name().GetIdentifierName(),
-				                      col_comment.column_name);
+				// Identifiers: the formatter quotes them (DuckDB 2.0.1 asserts that the
+				// format string does not quote them again).
+				throw BinderException("View %s does not have a column with name %s",
+				                      col_comment.GetQualifiedName().Name(), col_comment.column_name);
 			}
 			vgi::InvokeCatalogViewColumnCommentSet(
 			    rpc_ctx, name.GetIdentifierName(), col_comment.GetQualifiedName().Name().GetIdentifierName(),
